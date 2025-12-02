@@ -3,7 +3,7 @@
   "name": "MCP Thunderbird Extension",
   "version": "0.1",
   "description": "Access Thunderbird search index, send mails, manage calendar via experimental APIs",
-  "applications": {
+  "browser_specific_settings": {
     "gecko": {
       "id": "mcp@example.com",
       "strict_min_version": "102.0"
@@ -13,31 +13,12 @@
     "scripts": ["background.js"]
   },
   "experiment_apis": {
-    "searchIndex": {
-      "schema": "search_index/schema.json",
+    "mcpServer": {
+      "schema": "mcp_server/schema.json",
       "parent": {
         "scopes": ["addon_parent"],
-        "paths": [["messenger", "searchIndex"]],
-        "script": "search_index/api.mjs",
-        "events": ["startup"]
-      }
-    },
-    "calendarMcp": {
-      "schema": "calendar/schema.json",
-      "parent": {
-        "scopes": ["addon_parent"],
-        "paths": [["messenger", "calendarMcp"]],
-        "script": "calendar/api.mjs",
-        "events": ["startup"]
-      }
-    },
-    "contactsMcp": {
-      "schema": "contacts/schema.json",
-      "parent": {
-        "scopes": ["addon_parent"],
-        "paths": [["messenger", "contactsMcp"]],
-        "script": "contacts/api.mjs",
-        "events": ["startup"]
+        "paths": [["mcpServer"]],
+        "script": "mcp_server/api.js"
       }
     }
   },
@@ -49,5 +30,8 @@
     "messagesDelete",
     "accountsFolders",
     "compose"
+  ],
+  "web_accessible_resources": [
+    "httpd.sys.mjs"
   ]
 }
