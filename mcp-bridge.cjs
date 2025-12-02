@@ -7,38 +7,78 @@
  */
 
 const http = require('http');
+const readline = require('readline');
 
 const THUNDERBIRD_PORT = 8765;
 
-// Read all of stdin
-let input = '';
-process.stdin.setEncoding('utf8');
+// Track pending requests to wait for them before exiting
+let pendingRequests = 0;
+let stdinClosed = false;
 
-process.stdin.on('readable', () => {
-  let chunk;
-  while ((chunk = process.stdin.read()) !== null) {
-    input += chunk;
+function checkExit() {
+  if (stdinClosed && pendingRequests === 0) {
+    process.exit(0);
   }
+}
+
+// Create readline interface for persistent line-by-line reading
+const rl = readline.createInterface({
+  input: process.stdin,
+  terminal: false
 });
 
-process.stdin.on('end', async () => {
-  const lines = input.trim().split('\n').filter(l => l.trim());
+// Process each line as a JSON-RPC message
+rl.on('line', (line) => {
+  if (!line.trim()) return;
 
-  for (const line of lines) {
-    try {
-      const message = JSON.parse(line);
-      const response = await forwardToThunderbird(message);
-      process.stdout.write(JSON.stringify(response) + '\n');
-    } catch (e) {
-      const errorResponse = {
-        jsonrpc: '2.0',
-        id: null,
-        error: { code: -32700, message: `Bridge error: ${e.message}` }
-      };
-      process.stdout.write(JSON.stringify(errorResponse) + '\n');
-    }
-  }
+  pendingRequests++;
+  handleMessage(line).then(response => {
+    process.stdout.write(JSON.stringify(response) + '\n');
+  }).catch(err => {
+    const errorResponse = {
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32700, message: `Bridge error: ${err.message}` }
+    };
+    process.stdout.write(JSON.stringify(errorResponse) + '\n');
+  }).finally(() => {
+    pendingRequests--;
+    checkExit();
+  });
 });
+
+rl.on('close', () => {
+  stdinClosed = true;
+  checkExit();
+});
+
+async function handleMessage(line) {
+  const message = JSON.parse(line);
+
+  // Handle MCP protocol methods locally
+  if (message.method === 'initialize') {
+    return {
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: {
+          name: 'thunderbird-mcp',
+          version: '0.1.0'
+        }
+      }
+    };
+  }
+
+  if (message.method === 'notifications/initialized') {
+    // This is a notification, no response needed but we return empty for safety
+    return { jsonrpc: '2.0', id: message.id, result: {} };
+  }
+
+  // Forward everything else to Thunderbird
+  return forwardToThunderbird(message);
+}
 
 function forwardToThunderbird(message) {
   return new Promise((resolve, reject) => {
@@ -78,3 +118,7 @@ function forwardToThunderbird(message) {
     req.end();
   });
 }
+
+// Handle process signals gracefully
+process.on('SIGINT', () => process.exit(0));
+process.on('SIGTERM', () => process.exit(0));
