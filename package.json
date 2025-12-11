@@ -1,0 +1,31 @@
+{
+  "name": "thunderbird-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Thunderbird - enables AI assistants to access email, contacts, and calendars",
+  "author": "luthriel",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/luthriel/thunderbird-mcp"
+  },
+  "keywords": [
+    "mcp",
+    "thunderbird",
+    "email",
+    "ai",
+    "claude"
+  ],
+  "bin": {
+    "thunderbird-mcp": "./mcp-bridge.cjs"
+  },
+  "files": [
+    "mcp-bridge.cjs",
+    "extension/",
+    "scripts/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

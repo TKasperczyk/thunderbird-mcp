@@ -1,0 +1,19 @@
+# Build output
+dist/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-*
+
+# Node.js
+node_modules/
+package-lock.json
+npm-debug.log*

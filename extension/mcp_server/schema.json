@@ -1,0 +1,15 @@
+[
+  {
+    "namespace": "mcpServer",
+    "description": "MCP HTTP server for AI integration",
+    "functions": [
+      {
+        "name": "start",
+        "type": "function",
+        "async": true,
+        "description": "Start the MCP HTTP server on localhost:8765",
+        "parameters": []
+      }
+    ]
+  }
+]

@@ -1,0 +1,35 @@
+{
+  "manifest_version": 2,
+  "name": "Thunderbird MCP",
+  "version": "0.1",
+  "description": "MCP server for AI assistants to access email, contacts, and calendars",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "thunderbird-mcp@luthriel.dev",
+      "strict_min_version": "102.0"
+    }
+  },
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "experiment_apis": {
+    "mcpServer": {
+      "schema": "mcp_server/schema.json",
+      "parent": {
+        "scopes": ["addon_parent"],
+        "paths": [["mcpServer"]],
+        "script": "mcp_server/api.js"
+      }
+    }
+  },
+  "permissions": [
+    "accountsRead",
+    "addressBooks",
+    "messagesRead",
+    "accountsFolders",
+    "compose"
+  ],
+  "web_accessible_resources": [
+    "httpd.sys.mjs"
+  ]
+}
