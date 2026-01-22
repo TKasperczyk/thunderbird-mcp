@@ -62,7 +62,11 @@ async function handleMessage(line) {
         id: message.id,
         result: {
           protocolVersion: '2024-11-05',
-          capabilities: { tools: {} },
+          capabilities: {
+            tools: {},
+            resources: {},
+            prompts: {}
+          },
           serverInfo: { name: 'thunderbird-mcp', version: '0.1.0' }
         }
       };
@@ -72,6 +76,22 @@ async function handleMessage(line) {
 
     case 'notifications/cancelled':
       return null; // No response needed for notifications
+
+    case 'resources/list':
+      // Thunderbird MCP doesn't support resources
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resources: [] }
+      };
+
+    case 'prompts/list':
+      // Thunderbird MCP doesn't support prompts
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { prompts: [] }
+      };
 
     default:
       return forwardToThunderbird(message);
