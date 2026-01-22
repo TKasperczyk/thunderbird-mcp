@@ -108,6 +108,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["messageId", "folderPath", "body"],
         },
       },
+      {
+        name: "listAccounts",
+        title: "List Email Accounts",
+        description: "List all configured email accounts in Thunderbird",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "listFolders",
+        title: "List Folders",
+        description: "List all folders for a specific account or all accounts",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountKey: { type: "string", description: "Optional account key to list folders for (from listAccounts). If not provided, lists folders for all accounts" }
+          },
+          required: [],
+        },
+      },
+      {
+        name: "getRecentMessages",
+        title: "Get Recent Messages",
+        description: "Get recent messages from specific folders, sorted by date",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Optional folder URI to get messages from. If not provided, searches Inbox folders" },
+            limit: { type: "number", description: "Maximum number of messages to return (default: 20, max: 100)" },
+            daysBack: { type: "number", description: "Number of days back to search (default: 30)" },
+            unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" }
+          },
+          required: [],
+        },
+      },
     ];
 
     return {
@@ -265,6 +298,222 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   type: c.type,
                   readOnly: c.readOnly
                 }));
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            /**
+             * List all configured email accounts in Thunderbird.
+             * 
+             * Returns account information including:
+             * - key: Unique account identifier
+             * - name: Account display name
+             * - type: Account type (imap, pop3, rss, none)
+             * - email: Primary email address
+             * - username: Server username
+             * - hostName: Server hostname
+             * 
+             * @returns {Array<Object>} Array of account objects
+             */
+            function listAccounts() {
+              try {
+                const accounts = [];
+                for (const account of MailServices.accounts.accounts) {
+                  const server = account.incomingServer;
+                  accounts.push({
+                    key: account.key,
+                    name: account.name || server.prettyName,
+                    type: server.type,
+                    email: account.defaultIdentity?.email || "",
+                    username: server.username,
+                    hostName: server.hostName
+                  });
+                }
+                return accounts;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            /**
+             * List all folders (mailboxes) for one or all accounts.
+             * 
+             * Recursively traverses folder hierarchy and returns detailed information:
+             * - name: Folder display name
+             * - path: Folder URI (used for other operations)
+             * - type: inbox, sent, drafts, trash, templates, or folder
+             * - accountKey: Parent account identifier
+             * - accountName: Parent account name
+             * - totalMessages: Total message count
+             * - unreadMessages: Unread message count
+             * 
+             * Folder type detection uses Thunderbird's folder flags:
+             * - 0x00001000: Inbox
+             * - 0x00000200: Sent
+             * - 0x00000400: Drafts  
+             * - 0x00000100: Trash
+             * - 0x00000800: Templates
+             * 
+             * @param {string} accountKey - Optional account key to filter by (from listAccounts)
+             * @returns {Array<Object>} Array of folder objects
+             */
+            function listFolders(accountKey) {
+              try {
+                const folders = [];
+
+                function addFolderAndSubfolders(folder, accountInfo) {
+                  // Skip virtual folders (search folders, unified folders)
+                  if (folder.flags & 0x1000) return; // Ci.nsMsgFolderFlags.Virtual
+
+                  folders.push({
+                    name: folder.prettyName,
+                    path: folder.URI,
+                    type: folder.flags & 0x00001000 ? "inbox" : 
+                          folder.flags & 0x00000200 ? "sent" :
+                          folder.flags & 0x00000400 ? "drafts" :
+                          folder.flags & 0x00000100 ? "trash" :
+                          folder.flags & 0x00000800 ? "templates" : "folder",
+                    accountKey: accountInfo.key,
+                    accountName: accountInfo.name,
+                    totalMessages: folder.getTotalMessages(false),
+                    unreadMessages: folder.getNumUnread(false)
+                  });
+
+                  // Recursively process subfolders
+                  if (folder.hasSubFolders) {
+                    for (const subfolder of folder.subFolders) {
+                      addFolderAndSubfolders(subfolder, accountInfo);
+                    }
+                  }
+                }
+
+                if (accountKey) {
+                  // List folders for specific account
+                  const account = MailServices.accounts.getAccount(accountKey);
+                  if (!account) {
+                    return { error: `Account not found: ${accountKey}` };
+                  }
+                  const accountInfo = { key: account.key, name: account.name };
+                  addFolderAndSubfolders(account.incomingServer.rootFolder, accountInfo);
+                } else {
+                  // List folders for all accounts
+                  for (const account of MailServices.accounts.accounts) {
+                    const accountInfo = { key: account.key, name: account.name };
+                    addFolderAndSubfolders(account.incomingServer.rootFolder, accountInfo);
+                  }
+                }
+
+                return folders;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            /**
+             * Get recent messages from folders, sorted by date.
+             * 
+             * This function provides fast, efficient access to recent messages with:
+             * - Date-based filtering (default: last 30 days)
+             * - Sorting by date (newest first)
+             * - Optional unread-only filter
+             * - Folder-specific or inbox-wide search
+             * - Configurable result limit (max: 100)
+             * 
+             * When no folderPath is specified, searches all Inbox folders across accounts.
+             * For IMAP folders, attempts to refresh the folder before reading.
+             * 
+             * Uses mime2Decoded* properties for proper character encoding.
+             * 
+             * @param {string} folderPath - Optional folder URI to search (from listFolders)
+             * @param {number} limit - Maximum messages to return (default: 20, max: 100)
+             * @param {number} daysBack - Days to look back (default: 30)
+             * @param {boolean} unreadOnly - Only return unread messages (default: false)
+             * @returns {Array<Object>} Array of message objects, sorted newest first
+             */
+            function getRecentMessages(folderPath, limit, daysBack, unreadOnly) {
+              try {
+                const maxLimit = Math.min(limit || 20, 100);
+                const days = daysBack || 30;
+                const cutoffDate = Date.now() - (days * 24 * 60 * 60 * 1000);
+                const messages = [];
+
+                function getMessagesFromFolder(folder) {
+                  try {
+                    // Attempt to refresh IMAP folders to get latest messages
+                    // This is async and may not complete before we read
+                    if (folder.server && folder.server.type === "imap") {
+                      try {
+                        folder.updateFolder(null);
+                      } catch {}
+                    }
+
+                    const db = folder.msgDatabase;
+                    if (!db) return;
+
+                    for (const msgHdr of db.enumerateMessages()) {
+                      // Thunderbird stores dates in microseconds
+                      const msgDate = msgHdr.date ? msgHdr.date / 1000 : 0;
+                      
+                      // Skip messages older than cutoff date
+                      if (msgDate < cutoffDate) continue;
+                      
+                      // Skip read messages if unreadOnly is true
+                      if (unreadOnly && msgHdr.isRead) continue;
+
+                      messages.push({
+                        id: msgHdr.messageId,
+                        subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
+                        author: msgHdr.mime2DecodedAuthor || msgHdr.author,
+                        recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                        date: new Date(msgDate).toISOString(),
+                        folder: folder.prettyName,
+                        folderPath: folder.URI,
+                        read: msgHdr.isRead,
+                        flagged: msgHdr.isFlagged,
+                        dateTimestamp: msgDate  // Temporary field for sorting
+                      });
+                    }
+                  } catch {}
+                }
+
+                if (folderPath) {
+                  // Get messages from specific folder
+                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                  if (!folder) {
+                    return { error: `Folder not found: ${folderPath}` };
+                  }
+                  getMessagesFromFolder(folder);
+                } else {
+                  // Get messages from all Inbox folders across all accounts
+                  for (const account of MailServices.accounts.accounts) {
+                    const rootFolder = account.incomingServer.rootFolder;
+                    
+                    // Recursively find inbox folders
+                    function findInbox(folder) {
+                      if (folder.flags & 0x00001000) { // Inbox flag
+                        getMessagesFromFolder(folder);
+                        return;
+                      }
+                      if (folder.hasSubFolders) {
+                        for (const subfolder of folder.subFolders) {
+                          findInbox(subfolder);
+                        }
+                      }
+                    }
+                    
+                    findInbox(rootFolder);
+                  }
+                }
+
+                // Sort by date descending (newest first)
+                messages.sort((a, b) => b.dateTimestamp - a.dateTimestamp);
+                const limitedMessages = messages.slice(0, maxLimit);
+                
+                // Remove temporary timestamp field
+                limitedMessages.forEach(msg => delete msg.dateTimestamp);
+                
+                return limitedMessages;
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -492,6 +741,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return searchContacts(args.query || "");
                 case "listCalendars":
                   return listCalendars();
+                case "listAccounts":
+                  return listAccounts();
+                case "listFolders":
+                  return listFolders(args.accountKey);
+                case "getRecentMessages":
+                  return getRecentMessages(args.folderPath, args.limit, args.daysBack, args.unreadOnly);
                 case "sendMail":
                   return composeMail(args.to, args.subject, args.body, args.cc, args.isHtml);
                 case "replyToMessage":
