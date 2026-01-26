@@ -104,6 +104,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             body: { type: "string", description: "Reply body text" },
             replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            to: { type: "string", description: "Override recipient email (default: original sender)" },
           },
           required: ["messageId", "folderPath", "body"],
         },
@@ -416,7 +417,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * builds the quoted original message text. Threading is maintained
              * via the References header.
              */
-            function replyToMessage(messageId, folderPath, body, replyAll, isHtml) {
+            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to) {
               return new Promise((resolve) => {
                 try {
                   const folder = MailServices.folderLookup.getFolderForURL(folderPath);
@@ -470,7 +471,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         .createInstance(Ci.nsIMsgCompFields);
 
                       if (replyAll) {
-                        composeFields.to = msgHdr.author;
+                        composeFields.to = to || msgHdr.author;
                         const otherRecipients = (msgHdr.recipients || "").split(",")
                           .map(r => r.trim())
                           .filter(r => r && !r.includes(folder.server.username));
@@ -478,7 +479,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           composeFields.cc = otherRecipients.join(", ");
                         }
                       } else {
-                        composeFields.to = msgHdr.author;
+                        composeFields.to = to || msgHdr.author;
                       }
 
                       const origSubject = msgHdr.subject || "";
@@ -548,7 +549,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "sendMail":
                   return composeMail(args.to, args.subject, args.body, args.cc, args.isHtml);
                 case "replyToMessage":
-                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
+                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
