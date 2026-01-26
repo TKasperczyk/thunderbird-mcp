@@ -146,10 +146,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /**
              * Email bodies may contain control characters (BEL, etc.) that break
              * JSON.stringify. Remove them but preserve \n, \r, \t.
+             * Also handles UTF-8 encoding since Thunderbird's HTTP server writes raw bytes.
              */
             function sanitizeForJson(text) {
               if (!text) return text;
-              return text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+              // Loop-based approach (regex unreliable in Thunderbird's JS engine)
+              let result = "";
+              for (let i = 0; i < text.length; i++) {
+                const c = text.charCodeAt(i);
+                // Skip control chars (except \t, \n, \r), quotes, and backslash
+                if ((c >= 0x00 && c <= 0x08) || c === 0x0B || c === 0x0C ||
+                    (c >= 0x0E && c <= 0x1F) || c === 0x7F ||
+                    c === 0x22 || c === 0x5C) {
+                  continue;
+                }
+                // UTF-8 encode non-ASCII (Thunderbird HTTP server doesn't)
+                if (c >= 128 && c <= 2047) {
+                  result += String.fromCharCode(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
+                } else if (c >= 2048 && c <= 65535) {
+                  result += String.fromCharCode(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
+                } else {
+                  result += text[i];
+                }
+              }
+              return result;
             }
 
             function searchMessages(query) {
