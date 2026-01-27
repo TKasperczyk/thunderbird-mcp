@@ -109,6 +109,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["messageId", "folderPath", "body"],
         },
       },
+      {
+        name: "forwardMessage",
+        title: "Forward Message",
+        description: "Open a forward compose window for a message with attachments preserved",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The message ID to forward (from searchMessages results)" },
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+            to: { type: "string", description: "Recipient email address" },
+            body: { type: "string", description: "Additional text to prepend (optional)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+          },
+          required: ["messageId", "folderPath", "to"],
+        },
+      },
     ];
 
     return {
@@ -536,6 +552,143 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
+            /**
+             * Opens a forward compose window with attachments preserved.
+             * Uses New type with manual forward quote to preserve both intro body and forwarded content.
+             */
+            function forwardMessage(messageId, folderPath, to, body, isHtml) {
+              return new Promise((resolve) => {
+                try {
+                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                  if (!folder) {
+                    resolve({ error: `Folder not found: ${folderPath}` });
+                    return;
+                  }
+
+                  const db = folder.msgDatabase;
+                  if (!db) {
+                    resolve({ error: "Could not access folder database" });
+                    return;
+                  }
+
+                  let msgHdr = null;
+                  for (const hdr of db.enumerateMessages()) {
+                    if (hdr.messageId === messageId) {
+                      msgHdr = hdr;
+                      break;
+                    }
+                  }
+
+                  if (!msgHdr) {
+                    resolve({ error: `Message not found: ${messageId}` });
+                    return;
+                  }
+
+                  // Get attachments and body from original message
+                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+                  );
+
+                  MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
+                    try {
+                      const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
+                        .getService(Ci.nsIMsgComposeService);
+
+                      const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
+                        .createInstance(Ci.nsIMsgComposeParams);
+
+                      const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
+                        .createInstance(Ci.nsIMsgCompFields);
+
+                      composeFields.to = to;
+
+                      const origSubject = msgHdr.subject || "";
+                      composeFields.subject = origSubject.startsWith("Fwd:") ? origSubject : `Fwd: ${origSubject}`;
+
+                      // Get original body
+                      let originalBody = "";
+                      if (aMimeMsg) {
+                        try {
+                          originalBody = aMimeMsg.coerceBodyToPlaintext() || "";
+                        } catch {
+                          originalBody = "";
+                        }
+                      }
+
+                      // Build forward header block
+                      const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
+                      const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
+                      const subject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                      const recipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
+                      const escapedBody = originalBody
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/\n/g, '<br>');
+
+                      const forwardBlock = `-------- Forwarded Message --------<br>` +
+                        `Subject: ${subject.replace(/</g, '&lt;').replace(/>/g, '&gt;')}<br>` +
+                        `Date: ${dateStr}<br>` +
+                        `From: ${author.replace(/</g, '&lt;').replace(/>/g, '&gt;')}<br>` +
+                        `To: ${recipients.replace(/</g, '&lt;').replace(/>/g, '&gt;')}<br><br>` +
+                        escapedBody;
+
+                      // Combine intro body + forward block
+                      let introHtml = "";
+                      if (body) {
+                        if (isHtml) {
+                          let bodyText = body.replace(/\n/g, '');
+                          bodyText = [...bodyText].map(c => c.codePointAt(0) > 127 ? `&#${c.codePointAt(0)};` : c).join('');
+                          introHtml = bodyText;
+                        } else {
+                          introHtml = body
+                            .replace(/&/g, '&amp;')
+                            .replace(/</g, '&lt;')
+                            .replace(/>/g, '&gt;')
+                            .replace(/\n/g, '<br>');
+                        }
+                        introHtml += '<br><br>';
+                      }
+
+                      composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
+
+                      // Copy attachments from original message
+                      if (aMimeMsg && aMimeMsg.allUserAttachments) {
+                        for (const att of aMimeMsg.allUserAttachments) {
+                          const attachment = Cc["@mozilla.org/messengercompose/attachment;1"]
+                            .createInstance(Ci.nsIMsgAttachment);
+                          attachment.url = att.url;
+                          attachment.name = att.name;
+                          attachment.contentType = att.contentType;
+                          composeFields.addAttachment(attachment);
+                        }
+                      }
+
+                      // Use New type - we build forward quote manually
+                      msgComposeParams.type = Ci.nsIMsgCompType.New;
+                      msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+                      msgComposeParams.composeFields = composeFields;
+
+                      const account = MailServices.accounts.findAccountForServer(folder.server);
+                      if (account) {
+                        msgComposeParams.identity = account.defaultIdentity;
+                      }
+
+                      msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+
+                      const attCount = aMimeMsg?.allUserAttachments?.length || 0;
+                      resolve({ success: true, message: `Forward window opened with ${attCount} attachment(s)` });
+                    } catch (e) {
+                      resolve({ error: e.toString() });
+                    }
+                  }, true, { examineEncryptedParts: true });
+
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
             async function callTool(name, args) {
               switch (name) {
                 case "searchMessages":
@@ -550,6 +703,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return composeMail(args.to, args.subject, args.body, args.cc, args.isHtml);
                 case "replyToMessage":
                   return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to);
+                case "forwardMessage":
+                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
