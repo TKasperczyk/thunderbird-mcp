@@ -104,8 +104,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             body: { type: "string", description: "Reply body text" },
             replyAll: { type: "boolean", description: "Reply to all recipients (default: false)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+            to: { type: "string", description: "Override recipient email (default: original sender)" },
           },
           required: ["messageId", "folderPath", "body"],
+        },
+      },
+      {
+        name: "forwardMessage",
+        title: "Forward Message",
+        description: "Open a forward compose window for a message with attachments preserved",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The message ID to forward (from searchMessages results)" },
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+            to: { type: "string", description: "Recipient email address" },
+            body: { type: "string", description: "Additional text to prepend (optional)" },
+            isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
+          },
+          required: ["messageId", "folderPath", "to"],
         },
       },
     ];
@@ -146,10 +163,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /**
              * Email bodies may contain control characters (BEL, etc.) that break
              * JSON.stringify. Remove them but preserve \n, \r, \t.
+             * Also handles UTF-8 encoding since Thunderbird's HTTP server writes raw bytes.
              */
             function sanitizeForJson(text) {
               if (!text) return text;
-              return text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+              // Loop-based approach (regex unreliable in Thunderbird's JS engine)
+              let result = "";
+              for (let i = 0; i < text.length; i++) {
+                const c = text.charCodeAt(i);
+                // Skip control chars (except \t, \n, \r), quotes, and backslash
+                if ((c >= 0x00 && c <= 0x08) || c === 0x0B || c === 0x0C ||
+                    (c >= 0x0E && c <= 0x1F) || c === 0x7F ||
+                    c === 0x22 || c === 0x5C) {
+                  continue;
+                }
+                // UTF-8 encode non-ASCII (Thunderbird HTTP server doesn't)
+                if (c >= 128 && c <= 2047) {
+                  result += String.fromCharCode(0xC0 | (c >> 6), 0x80 | (c & 0x3F));
+                } else if (c >= 2048 && c <= 65535) {
+                  result += String.fromCharCode(0xE0 | (c >> 12), 0x80 | ((c >> 6) & 0x3F), 0x80 | (c & 0x3F));
+                } else {
+                  result += text[i];
+                }
+              }
+              return result;
             }
 
             function searchMessages(query) {
@@ -390,96 +427,266 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Opens a reply compose window for a message.
+             * Opens a reply compose window for a message with quoted original.
              *
-             * IMPORTANT: Uses nsIMsgCompType.New instead of Reply/ReplyAll.
-             * Using Reply type causes Thunderbird to overwrite our body with
-             * the quoted original message. We manually set To, Subject, and
-             * References headers for proper threading.
-             *
-             * Limitation: Does not include quoted original message text.
+             * Uses nsIMsgCompType.New to preserve our body content, then manually
+             * builds the quoted original message text. Threading is maintained
+             * via the References header.
              */
-            function replyToMessage(messageId, folderPath, body, replyAll, isHtml) {
-              try {
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
-
-                const db = folder.msgDatabase;
-                if (!db) {
-                  return { error: "Could not access folder database" };
-                }
-
-                let msgHdr = null;
-                for (const hdr of db.enumerateMessages()) {
-                  if (hdr.messageId === messageId) {
-                    msgHdr = hdr;
-                    break;
+            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to) {
+              return new Promise((resolve) => {
+                try {
+                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                  if (!folder) {
+                    resolve({ error: `Folder not found: ${folderPath}` });
+                    return;
                   }
-                }
 
-                if (!msgHdr) {
-                  return { error: `Message not found: ${messageId}` };
-                }
-
-                const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                  .getService(Ci.nsIMsgComposeService);
-
-                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
-                  .createInstance(Ci.nsIMsgComposeParams);
-
-                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
-                  .createInstance(Ci.nsIMsgCompFields);
-
-                if (replyAll) {
-                  composeFields.to = msgHdr.author;
-                  const otherRecipients = (msgHdr.recipients || "").split(",")
-                    .map(r => r.trim())
-                    .filter(r => r && !r.includes(folder.server.username));
-                  if (otherRecipients.length > 0) {
-                    composeFields.cc = otherRecipients.join(", ");
+                  const db = folder.msgDatabase;
+                  if (!db) {
+                    resolve({ error: "Could not access folder database" });
+                    return;
                   }
-                } else {
-                  composeFields.to = msgHdr.author;
+
+                  let msgHdr = null;
+                  for (const hdr of db.enumerateMessages()) {
+                    if (hdr.messageId === messageId) {
+                      msgHdr = hdr;
+                      break;
+                    }
+                  }
+
+                  if (!msgHdr) {
+                    resolve({ error: `Message not found: ${messageId}` });
+                    return;
+                  }
+
+                  // Fetch original message body for quoting
+                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+                  );
+
+                  MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
+                    try {
+                      let originalBody = "";
+                      if (aMimeMsg) {
+                        try {
+                          originalBody = aMimeMsg.coerceBodyToPlaintext() || "";
+                        } catch {
+                          originalBody = "";
+                        }
+                      }
+
+                      const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
+                        .getService(Ci.nsIMsgComposeService);
+
+                      const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
+                        .createInstance(Ci.nsIMsgComposeParams);
+
+                      const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
+                        .createInstance(Ci.nsIMsgCompFields);
+
+                      if (replyAll) {
+                        composeFields.to = to || msgHdr.author;
+                        const otherRecipients = (msgHdr.recipients || "").split(",")
+                          .map(r => r.trim())
+                          .filter(r => r && !r.includes(folder.server.username));
+                        if (otherRecipients.length > 0) {
+                          composeFields.cc = otherRecipients.join(", ");
+                        }
+                      } else {
+                        composeFields.to = to || msgHdr.author;
+                      }
+
+                      const origSubject = msgHdr.subject || "";
+                      composeFields.subject = origSubject.startsWith("Re:") ? origSubject : `Re: ${origSubject}`;
+
+                      // References header enables proper email threading
+                      composeFields.references = `<${messageId}>`;
+
+                      // Build quoted text block
+                      const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
+                      const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
+                      const quotedLines = originalBody.split('\n').map(line =>
+                        `&gt; ${line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}`
+                      ).join('<br>');
+                      const quoteBlock = `<br><br>On ${dateStr}, ${author.replace(/</g, '&lt;').replace(/>/g, '&gt;')} wrote:<br>${quotedLines}`;
+
+                      // Build reply body with quoted original
+                      let replyHtml;
+                      if (isHtml) {
+                        let bodyText = (body || "").replace(/\n/g, '');
+                        bodyText = [...bodyText].map(c => c.codePointAt(0) > 127 ? `&#${c.codePointAt(0)};` : c).join('');
+                        replyHtml = `<html><head><meta charset="UTF-8"></head><body>${bodyText}${quoteBlock}</body></html>`;
+                      } else {
+                        const htmlBody = (body || "")
+                          .replace(/&/g, '&amp;')
+                          .replace(/</g, '&lt;')
+                          .replace(/>/g, '&gt;')
+                          .replace(/\n/g, '<br>');
+                        replyHtml = `<html><head><meta charset="UTF-8"></head><body>${htmlBody}${quoteBlock}</body></html>`;
+                      }
+
+                      composeFields.body = replyHtml;
+
+                      msgComposeParams.type = Ci.nsIMsgCompType.New;
+                      msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+                      msgComposeParams.composeFields = composeFields;
+
+                      const account = MailServices.accounts.findAccountForServer(folder.server);
+                      if (account) {
+                        msgComposeParams.identity = account.defaultIdentity;
+                      }
+
+                      msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+
+                      resolve({ success: true, message: "Reply window opened" });
+                    } catch (e) {
+                      resolve({ error: e.toString() });
+                    }
+                  }, true, { examineEncryptedParts: true });
+
+                } catch (e) {
+                  resolve({ error: e.toString() });
                 }
+              });
+            }
 
-                const origSubject = msgHdr.subject || "";
-                composeFields.subject = origSubject.startsWith("Re:") ? origSubject : `Re: ${origSubject}`;
+            /**
+             * Opens a forward compose window with attachments preserved.
+             * Uses New type with manual forward quote to preserve both intro body and forwarded content.
+             */
+            function forwardMessage(messageId, folderPath, to, body, isHtml) {
+              return new Promise((resolve) => {
+                try {
+                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                  if (!folder) {
+                    resolve({ error: `Folder not found: ${folderPath}` });
+                    return;
+                  }
 
-                // References header enables proper email threading
-                composeFields.references = `<${messageId}>`;
+                  const db = folder.msgDatabase;
+                  if (!db) {
+                    resolve({ error: "Could not access folder database" });
+                    return;
+                  }
 
-                // Same HTML/charset handling as composeMail
-                if (isHtml) {
-                  let bodyText = (body || "").replace(/\n/g, '');
-                  bodyText = [...bodyText].map(c => c.codePointAt(0) > 127 ? `&#${c.codePointAt(0)};` : c).join('');
-                  composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${bodyText}</body></html>`;
-                } else {
-                  const htmlBody = (body || "")
-                    .replace(/&/g, '&amp;')
-                    .replace(/</g, '&lt;')
-                    .replace(/>/g, '&gt;')
-                    .replace(/\n/g, '<br>');
-                  composeFields.body = `<html><body>${htmlBody}</body></html>`;
+                  let msgHdr = null;
+                  for (const hdr of db.enumerateMessages()) {
+                    if (hdr.messageId === messageId) {
+                      msgHdr = hdr;
+                      break;
+                    }
+                  }
+
+                  if (!msgHdr) {
+                    resolve({ error: `Message not found: ${messageId}` });
+                    return;
+                  }
+
+                  // Get attachments and body from original message
+                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+                  );
+
+                  MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
+                    try {
+                      const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
+                        .getService(Ci.nsIMsgComposeService);
+
+                      const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
+                        .createInstance(Ci.nsIMsgComposeParams);
+
+                      const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
+                        .createInstance(Ci.nsIMsgCompFields);
+
+                      composeFields.to = to;
+
+                      const origSubject = msgHdr.subject || "";
+                      composeFields.subject = origSubject.startsWith("Fwd:") ? origSubject : `Fwd: ${origSubject}`;
+
+                      // Get original body
+                      let originalBody = "";
+                      if (aMimeMsg) {
+                        try {
+                          originalBody = aMimeMsg.coerceBodyToPlaintext() || "";
+                        } catch {
+                          originalBody = "";
+                        }
+                      }
+
+                      // Build forward header block
+                      const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
+                      const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
+                      const subject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                      const recipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
+                      const escapedBody = originalBody
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/\n/g, '<br>');
+
+                      const forwardBlock = `-------- Forwarded Message --------<br>` +
+                        `Subject: ${subject.replace(/</g, '&lt;').replace(/>/g, '&gt;')}<br>` +
+                        `Date: ${dateStr}<br>` +
+                        `From: ${author.replace(/</g, '&lt;').replace(/>/g, '&gt;')}<br>` +
+                        `To: ${recipients.replace(/</g, '&lt;').replace(/>/g, '&gt;')}<br><br>` +
+                        escapedBody;
+
+                      // Combine intro body + forward block
+                      let introHtml = "";
+                      if (body) {
+                        if (isHtml) {
+                          let bodyText = body.replace(/\n/g, '');
+                          bodyText = [...bodyText].map(c => c.codePointAt(0) > 127 ? `&#${c.codePointAt(0)};` : c).join('');
+                          introHtml = bodyText;
+                        } else {
+                          introHtml = body
+                            .replace(/&/g, '&amp;')
+                            .replace(/</g, '&lt;')
+                            .replace(/>/g, '&gt;')
+                            .replace(/\n/g, '<br>');
+                        }
+                        introHtml += '<br><br>';
+                      }
+
+                      composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
+
+                      // Copy attachments from original message
+                      if (aMimeMsg && aMimeMsg.allUserAttachments) {
+                        for (const att of aMimeMsg.allUserAttachments) {
+                          const attachment = Cc["@mozilla.org/messengercompose/attachment;1"]
+                            .createInstance(Ci.nsIMsgAttachment);
+                          attachment.url = att.url;
+                          attachment.name = att.name;
+                          attachment.contentType = att.contentType;
+                          composeFields.addAttachment(attachment);
+                        }
+                      }
+
+                      // Use New type - we build forward quote manually
+                      msgComposeParams.type = Ci.nsIMsgCompType.New;
+                      msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+                      msgComposeParams.composeFields = composeFields;
+
+                      const account = MailServices.accounts.findAccountForServer(folder.server);
+                      if (account) {
+                        msgComposeParams.identity = account.defaultIdentity;
+                      }
+
+                      msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
+
+                      const attCount = aMimeMsg?.allUserAttachments?.length || 0;
+                      resolve({ success: true, message: `Forward window opened with ${attCount} attachment(s)` });
+                    } catch (e) {
+                      resolve({ error: e.toString() });
+                    }
+                  }, true, { examineEncryptedParts: true });
+
+                } catch (e) {
+                  resolve({ error: e.toString() });
                 }
-
-                // New type preserves our body; Reply type overwrites it
-                msgComposeParams.type = Ci.nsIMsgCompType.New;
-                msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
-                msgComposeParams.composeFields = composeFields;
-
-                const account = MailServices.accounts.findAccountForServer(folder.server);
-                if (account) {
-                  msgComposeParams.identity = account.defaultIdentity;
-                }
-
-                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-
-                return { success: true, message: "Reply window opened" };
-              } catch (e) {
-                return { error: e.toString() };
-              }
+              });
             }
 
             async function callTool(name, args) {
@@ -495,7 +702,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "sendMail":
                   return composeMail(args.to, args.subject, args.body, args.cc, args.isHtml);
                 case "replyToMessage":
-                  return replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml);
+                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to);
+                case "forwardMessage":
+                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
