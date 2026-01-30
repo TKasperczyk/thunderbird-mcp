@@ -19,7 +19,7 @@ const resProto = Cc[
 ].getService(Ci.nsISubstitutingProtocolHandler);
 
 const MCP_PORT = 8765;
-const MAX_SEARCH_RESULTS = 50;
+const DEFAULT_MAX_RESULTS = 50;
 
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
@@ -36,11 +36,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "searchMessages",
         title: "Search Mail",
-        description: "Find messages using Thunderbird's search index",
+        description: "Search for email messages in Thunderbird. Returns up to maxResults messages (default 50) sorted by date (newest first by default). Each result includes: id (message ID for use with getMessage), subject, author, recipients, date (ISO 8601), folder, folderPath (for use with getMessage), read status, and flagged status.",
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Text to search for in messages (searches subject, body, author)" }
+            query: {
+              type: "string",
+              description: "Text to search for in message subject, author, or recipients. Use empty string to match all messages (useful with date filters)."
+            },
+            startDate: {
+              type: "string",
+              description: "Filter messages on or after this date. ISO 8601 format (e.g., '2024-01-15' or '2024-01-15T00:00:00Z'). If omitted, no start date filter is applied."
+            },
+            endDate: {
+              type: "string",
+              description: "Filter messages on or before this date. ISO 8601 format (e.g., '2024-01-31' or '2024-01-31T23:59:59Z'). If omitted, no end date filter is applied."
+            },
+            maxResults: {
+              type: "number",
+              description: "Maximum number of messages to return (default: 50, max: 200). Results are sorted by date before limiting."
+            },
+            sortOrder: {
+              type: "string",
+              enum: ["desc", "asc"],
+              description: "Sort order by date: 'desc' for newest first (default), 'asc' for oldest first."
+            }
           },
           required: ["query"],
         },
@@ -152,13 +172,54 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
             }
 
-            function searchMessages(query) {
+            /**
+             * Search for messages with optional date filtering and sorting.
+             *
+             * @param {string} query - Text to search for (empty string matches all)
+             * @param {string} startDate - ISO 8601 date string for start of range (optional)
+             * @param {string} endDate - ISO 8601 date string for end of range (optional)
+             * @param {number} maxResults - Maximum results to return (default: 50, max: 200)
+             * @param {string} sortOrder - 'desc' for newest first (default), 'asc' for oldest first
+             * @returns {Array} Array of message objects sorted by date
+             */
+            function searchMessages(query, startDate, endDate, maxResults, sortOrder) {
               const results = [];
-              const lowerQuery = query.toLowerCase();
+              const lowerQuery = query ? query.toLowerCase() : "";
+              const matchAll = !query || query.trim() === "";
+              
+              // Parse date filters
+              let startTimestamp = null;
+              let endTimestamp = null;
+              
+              if (startDate) {
+                const parsed = Date.parse(startDate);
+                if (!isNaN(parsed)) {
+                  // Thunderbird stores dates in microseconds
+                  startTimestamp = parsed * 1000;
+                }
+              }
+              
+              if (endDate) {
+                const parsed = Date.parse(endDate);
+                if (!isNaN(parsed)) {
+                  // Add 1 day to include the end date fully (end of day)
+                  endTimestamp = (parsed + 86400000) * 1000;
+                }
+              }
+              
+              // Validate and cap maxResults
+              const effectiveMaxResults = Math.min(
+                Math.max(1, maxResults || DEFAULT_MAX_RESULTS),
+                200
+              );
+              
+              // Default to descending (newest first)
+              const ascending = sortOrder === "asc";
+              
+              // Collect all matching messages first (we need to sort them)
+              const allMatches = [];
 
               function searchFolder(folder) {
-                if (results.length >= MAX_SEARCH_RESULTS) return;
-
                 try {
                   // Attempt to refresh IMAP folders. This is async and may not
                   // complete before we read, but helps with stale data.
@@ -174,7 +235,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (!db) return;
 
                   for (const msgHdr of db.enumerateMessages()) {
-                    if (results.length >= MAX_SEARCH_RESULTS) break;
+                    // Apply date filters first (most efficient)
+                    const msgDate = msgHdr.date;
+                    
+                    if (startTimestamp !== null && msgDate < startTimestamp) {
+                      continue;
+                    }
+                    
+                    if (endTimestamp !== null && msgDate > endTimestamp) {
+                      continue;
+                    }
 
                     // IMPORTANT: Use mime2Decoded* properties for searching.
                     // Raw headers contain MIME encoding like "=?UTF-8?Q?...?="
@@ -183,15 +253,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
                     const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
 
-                    if (subject.includes(lowerQuery) ||
+                    if (matchAll ||
+                        subject.includes(lowerQuery) ||
                         author.includes(lowerQuery) ||
                         recipients.includes(lowerQuery)) {
-                      results.push({
+                      allMatches.push({
                         id: msgHdr.messageId,
                         subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
                         author: msgHdr.mime2DecodedAuthor || msgHdr.author,
                         recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
-                        date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+                        date: msgDate ? new Date(msgDate / 1000).toISOString() : null,
+                        dateTimestamp: msgDate || 0,
                         folder: folder.prettyName,
                         folderPath: folder.URI,
                         read: msgHdr.isRead,
@@ -205,18 +277,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (folder.hasSubFolders) {
                   for (const subfolder of folder.subFolders) {
-                    if (results.length >= MAX_SEARCH_RESULTS) break;
                     searchFolder(subfolder);
                   }
                 }
               }
 
               for (const account of MailServices.accounts.accounts) {
-                if (results.length >= MAX_SEARCH_RESULTS) break;
                 searchFolder(account.incomingServer.rootFolder);
               }
 
-              return results;
+              // Sort by date
+              allMatches.sort((a, b) => {
+                if (ascending) {
+                  return a.dateTimestamp - b.dateTimestamp;
+                } else {
+                  return b.dateTimestamp - a.dateTimestamp;
+                }
+              });
+
+              // Take top N results and remove internal timestamp field
+              const finalResults = allMatches.slice(0, effectiveMaxResults).map(msg => {
+                const { dateTimestamp, ...rest } = msg;
+                return rest;
+              });
+
+              return finalResults;
             }
 
             function searchContacts(query) {
@@ -485,7 +570,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             async function callTool(name, args) {
               switch (name) {
                 case "searchMessages":
-                  return searchMessages(args.query || "");
+                  return searchMessages(
+                    args.query || "",
+                    args.startDate,
+                    args.endDate,
+                    args.maxResults,
+                    args.sortOrder
+                  );
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath);
                 case "searchContacts":
