@@ -19,7 +19,9 @@ const resProto = Cc[
 ].getService(Ci.nsISubstitutingProtocolHandler);
 
 const MCP_PORT = 8765;
-const MAX_SEARCH_RESULTS = 50;
+const DEFAULT_MAX_RESULTS = 50;
+const MAX_SEARCH_RESULTS_CAP = 200;
+const SEARCH_COLLECTION_CAP = 1000;
 
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
@@ -36,11 +38,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "searchMessages",
         title: "Search Mail",
-        description: "Find messages using Thunderbird's search index",
+        description: "Search message headers and return IDs/folder paths you can use with getMessage to read full email content",
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Text to search for in messages (searches subject, body, author)" }
+            query: { type: "string", description: "Text to search in subject, author, or recipients (use empty string to match all)" },
+            startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
+            endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date" },
+            maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
+            sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" }
           },
           required: ["query"],
         },
@@ -144,20 +150,81 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Email bodies may contain control characters (BEL, etc.) that break
-             * JSON.stringify. Remove them but preserve \n, \r, \t.
+             * Thunderbird's httpd.sys.mjs writes response strings as raw bytes.
+             * Pre-encode non-ASCII as UTF-8 byte chars and strip invalid controls.
              */
             function sanitizeForJson(text) {
               if (!text) return text;
-              return text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
+
+              let sanitized = "";
+
+              for (let i = 0; i < text.length; i++) {
+                const code = text.charCodeAt(i);
+
+                if (
+                  (code >= 0x00 && code <= 0x08) ||
+                  code === 0x0b ||
+                  code === 0x0c ||
+                  (code >= 0x0e && code <= 0x1f) ||
+                  code === 0x7f
+                ) {
+                  continue;
+                }
+
+                if (code <= 0x7f) {
+                  sanitized += text[i];
+                  continue;
+                }
+
+                const codePoint = text.codePointAt(i);
+                if (codePoint > 0xffff) {
+                  sanitized += String.fromCharCode(
+                    0xf0 | (codePoint >> 18),
+                    0x80 | ((codePoint >> 12) & 0x3f),
+                    0x80 | ((codePoint >> 6) & 0x3f),
+                    0x80 | (codePoint & 0x3f)
+                  );
+                  i++;
+                  continue;
+                }
+
+                if (codePoint <= 0x7ff) {
+                  sanitized += String.fromCharCode(
+                    0xc0 | (codePoint >> 6),
+                    0x80 | (codePoint & 0x3f)
+                  );
+                  continue;
+                }
+
+                sanitized += String.fromCharCode(
+                  0xe0 | (codePoint >> 12),
+                  0x80 | ((codePoint >> 6) & 0x3f),
+                  0x80 | (codePoint & 0x3f)
+                );
+              }
+
+              return sanitized;
             }
 
-            function searchMessages(query) {
+            function searchMessages(query, startDate, endDate, maxResults, sortOrder) {
               const results = [];
-              const lowerQuery = query.toLowerCase();
+              const lowerQuery = (query || "").toLowerCase();
+              const hasQuery = !!lowerQuery;
+              const parsedStartDate = startDate ? new Date(startDate).getTime() : NaN;
+              const parsedEndDate = endDate ? new Date(endDate).getTime() : NaN;
+              const startDateTs = Number.isFinite(parsedStartDate) ? parsedStartDate * 1000 : null;
+              // Add 24h only for date-only strings (no time component) to include the full day
+              const endDateOffset = endDate && !endDate.includes("T") ? 86400000 : 0;
+              const endDateTs = Number.isFinite(parsedEndDate) ? (parsedEndDate + endDateOffset) * 1000 : null;
+              const requestedLimit = Number(maxResults);
+              const effectiveLimit = Math.min(
+                Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.floor(requestedLimit) : DEFAULT_MAX_RESULTS,
+                MAX_SEARCH_RESULTS_CAP
+              );
+              const normalizedSortOrder = sortOrder === "asc" ? "asc" : "desc";
 
               function searchFolder(folder) {
-                if (results.length >= MAX_SEARCH_RESULTS) return;
+                if (results.length >= SEARCH_COLLECTION_CAP) return;
 
                 try {
                   // Attempt to refresh IMAP folders. This is async and may not
@@ -174,7 +241,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (!db) return;
 
                   for (const msgHdr of db.enumerateMessages()) {
-                    if (results.length >= MAX_SEARCH_RESULTS) break;
+                    if (results.length >= SEARCH_COLLECTION_CAP) break;
 
                     // IMPORTANT: Use mime2Decoded* properties for searching.
                     // Raw headers contain MIME encoding like "=?UTF-8?Q?...?="
@@ -182,8 +249,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const subject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
                     const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
                     const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
+                    const msgDateTs = msgHdr.date || 0;
 
-                    if (subject.includes(lowerQuery) ||
+                    if (startDateTs !== null && msgDateTs < startDateTs) continue;
+                    if (endDateTs !== null && msgDateTs > endDateTs) continue;
+
+                    if (!hasQuery ||
+                        subject.includes(lowerQuery) ||
                         author.includes(lowerQuery) ||
                         recipients.includes(lowerQuery)) {
                       results.push({
@@ -195,7 +267,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         folder: folder.prettyName,
                         folderPath: folder.URI,
                         read: msgHdr.isRead,
-                        flagged: msgHdr.isFlagged
+                        flagged: msgHdr.isFlagged,
+                        _dateTs: msgDateTs
                       });
                     }
                   }
@@ -205,18 +278,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (folder.hasSubFolders) {
                   for (const subfolder of folder.subFolders) {
-                    if (results.length >= MAX_SEARCH_RESULTS) break;
+                    if (results.length >= SEARCH_COLLECTION_CAP) break;
                     searchFolder(subfolder);
                   }
                 }
               }
 
               for (const account of MailServices.accounts.accounts) {
-                if (results.length >= MAX_SEARCH_RESULTS) break;
+                if (results.length >= SEARCH_COLLECTION_CAP) break;
                 searchFolder(account.incomingServer.rootFolder);
               }
 
-              return results;
+              results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
+
+              return results.slice(0, effectiveLimit).map(result => {
+                delete result._dateTs;
+                return result;
+              });
             }
 
             function searchContacts(query) {
@@ -246,9 +324,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     });
                   }
 
-                  if (results.length >= MAX_SEARCH_RESULTS) break;
+                  if (results.length >= DEFAULT_MAX_RESULTS) break;
                 }
-                if (results.length >= MAX_SEARCH_RESULTS) break;
+                if (results.length >= DEFAULT_MAX_RESULTS) break;
               }
 
               return results;
@@ -485,7 +563,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             async function callTool(name, args) {
               switch (name) {
                 case "searchMessages":
-                  return searchMessages(args.query || "");
+                  return searchMessages(args.query || "", args.startDate, args.endDate, args.maxResults, args.sortOrder);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath);
                 case "searchContacts":

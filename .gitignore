@@ -13,6 +13,9 @@ Thumbs.db
 .vscode/
 *.sublime-*
 
+# MCP config (contains local paths)
+.mcp.json
+
 # Node.js
 node_modules/
 package-lock.json

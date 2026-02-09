@@ -40,6 +40,8 @@ function writeOutput(data) {
 /**
  * Sanitize JSON response that may contain invalid control characters.
  * Email bodies often contain raw control chars that break JSON parsing.
+ * api.js now pre-encodes non-ASCII for Thunderbird's raw-byte HTTP writer;
+ * this remains a fallback for malformed responses.
  */
 function sanitizeJson(data) {
   // Remove control chars except \n, \r, \t
@@ -72,6 +74,20 @@ async function handleMessage(line) {
 
     case 'notifications/cancelled':
       return null; // No response needed for notifications
+
+    case 'resources/list':
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { resources: [] }
+      };
+
+    case 'prompts/list':
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { prompts: [] }
+      };
 
     default:
       return forwardToThunderbird(message);
@@ -129,6 +145,13 @@ const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on('line', (line) => {
   if (!line.trim()) return;
 
+  let messageId = null;
+  try {
+    messageId = JSON.parse(line).id ?? null;
+  } catch {
+    // Leave as null when request cannot be parsed
+  }
+
   pendingRequests++;
   handleMessage(line)
     .then(async (response) => {
@@ -139,7 +162,7 @@ rl.on('line', (line) => {
     .catch(async (err) => {
       await writeOutput(JSON.stringify({
         jsonrpc: '2.0',
-        id: null,
+        id: messageId,
         error: { code: -32700, message: `Bridge error: ${err.message}` }
       }) + '\n');
     })
