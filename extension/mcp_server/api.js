@@ -96,6 +96,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: { type: "object", properties: {}, required: [] },
       },
       {
+        name: "createEvent",
+        title: "Create Event",
+        description: "Open a pre-filled event dialog in Thunderbird for user review before saving",
+        inputSchema: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Event title" },
+            startDate: { type: "string", description: "Start date/time in ISO 8601 format" },
+            endDate: { type: "string", description: "End date/time in ISO 8601 (defaults to startDate + 1h for timed, +1 day for all-day)" },
+            location: { type: "string", description: "Event location" },
+            description: { type: "string", description: "Event description" },
+            calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable calendar)" },
+            allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
+          },
+          required: ["title", "startDate"],
+        },
+      },
+      {
         name: "searchContacts",
         title: "Search Contacts",
         description: "Find contacts the user interacted with",
@@ -165,11 +183,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             );
 
             let cal = null;
+            let CalEvent = null;
             try {
               const calModule = ChromeUtils.importESModule(
                 "resource:///modules/calendar/calUtils.sys.mjs"
               );
               cal = calModule.cal;
+              const { CalEvent: CE } = ChromeUtils.importESModule(
+                "resource:///modules/CalEvent.sys.mjs"
+              );
+              CalEvent = CE;
             } catch {
               // Calendar not available
             }
@@ -486,6 +509,104 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   type: c.type,
                   readOnly: c.readOnly
                 }));
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function createEvent(title, startDate, endDate, location, description, calendarId, allDay) {
+              if (!cal || !CalEvent) {
+                return { error: "Calendar module not available" };
+              }
+              try {
+                const win = Services.wm.getMostRecentWindow("mail:3pane");
+                if (!win) {
+                  return { error: "No Thunderbird window found" };
+                }
+
+                const startJs = new Date(startDate);
+                if (isNaN(startJs.getTime())) {
+                  return { error: `Invalid startDate: ${startDate}` };
+                }
+
+                let endJs = endDate ? new Date(endDate) : null;
+                if (endDate && (!endJs || isNaN(endJs.getTime()))) {
+                  return { error: `Invalid endDate: ${endDate}` };
+                }
+
+                const event = new CalEvent();
+                event.title = title;
+
+                if (allDay) {
+                  const startDt = cal.createDateTime();
+                  startDt.resetTo(startJs.getFullYear(), startJs.getMonth(), startJs.getDate(), 0, 0, 0, cal.dtz.floating);
+                  startDt.isDate = true;
+                  event.startDate = startDt;
+
+                  const endDt = cal.createDateTime();
+                  if (endJs) {
+                    endDt.resetTo(endJs.getFullYear(), endJs.getMonth(), endJs.getDate(), 0, 0, 0, cal.dtz.floating);
+                    endDt.isDate = true;
+                    // iCal DTEND is exclusive — bump if same as start
+                    if (endDt.compare(startDt) <= 0) {
+                      endDt.day += 1;
+                    }
+                  } else {
+                    endDt.resetTo(startJs.getFullYear(), startJs.getMonth(), startJs.getDate() + 1, 0, 0, 0, cal.dtz.floating);
+                    endDt.isDate = true;
+                  }
+                  event.endDate = endDt;
+                } else {
+                  event.startDate = cal.dtz.jsDateToDateTime(startJs, cal.dtz.defaultTimezone);
+                  if (endJs) {
+                    event.endDate = cal.dtz.jsDateToDateTime(endJs, cal.dtz.defaultTimezone);
+                  } else {
+                    const defaultEnd = new Date(startJs.getTime() + 3600000);
+                    event.endDate = cal.dtz.jsDateToDateTime(defaultEnd, cal.dtz.defaultTimezone);
+                  }
+                }
+
+                if (location) event.setProperty("LOCATION", location);
+                if (description) event.setProperty("DESCRIPTION", description);
+
+                // Find target calendar
+                const calendars = cal.manager.getCalendars();
+                let targetCalendar = null;
+                if (calendarId) {
+                  targetCalendar = calendars.find(c => c.id === calendarId);
+                  if (!targetCalendar) {
+                    return { error: `Calendar not found: ${calendarId}` };
+                  }
+                  if (targetCalendar.readOnly) {
+                    return { error: `Calendar is read-only: ${targetCalendar.name}` };
+                  }
+                } else {
+                  targetCalendar = calendars.find(c => !c.readOnly);
+                  if (!targetCalendar) {
+                    return { error: "No writable calendar found" };
+                  }
+                }
+
+                event.calendar = targetCalendar;
+
+                const args = {
+                  calendarEvent: event,
+                  calendar: targetCalendar,
+                  mode: "new",
+                  inTab: false,
+                  onOk(item, calendar) {
+                    calendar.addItem(item);
+                  },
+                };
+
+                win.openDialog(
+                  "chrome://calendar/content/calendar-event-dialog.xhtml",
+                  "_blank",
+                  "centerscreen,chrome,titlebar,toolbar,resizable",
+                  args
+                );
+
+                return { success: true, message: `Event dialog opened for "${title}" on calendar "${targetCalendar.name}"` };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -890,6 +1011,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return searchContacts(args.query || "");
                 case "listCalendars":
                   return listCalendars();
+                case "createEvent":
+                  return createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay);
                 case "sendMail":
                   return composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "replyToMessage":
