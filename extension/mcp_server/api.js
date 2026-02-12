@@ -534,8 +534,44 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       // sanitizeForJson removes control chars that break JSON
                       body = sanitizeForJson(aMimeMsg.coerceBodyToPlaintext());
                     } catch {
-                      body = "(Could not extract body text)";
+                      // coerceBodyToPlaintext fails for some HTML-only messages
                     }
+                    if (!body) {
+                      function findTextPart(part) {
+                        const ct = (part.contentType || part.type || "").split(";")[0].trim().toLowerCase();
+                        if (ct === "text/plain" && part.body) return { content: part.body, isHtml: false };
+                        if (ct === "text/html" && part.body) return { content: part.body, isHtml: true };
+                        if (part.parts) {
+                          for (const sub of part.parts) {
+                            const result = findTextPart(sub);
+                            if (result) return result;
+                          }
+                        }
+                        return null;
+                      }
+                      const found = findTextPart(aMimeMsg);
+                      if (found) {
+                        if (found.isHtml) {
+                          body = sanitizeForJson(
+                            found.content
+                              .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+                              .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+                              .replace(/<[^>]+>/g, " ")
+                              .replace(/&nbsp;/g, " ")
+                              .replace(/&amp;/g, "&")
+                              .replace(/&lt;/g, "<")
+                              .replace(/&gt;/g, ">")
+                              .replace(/&quot;/g, '"')
+                              .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+                              .replace(/\s+/g, " ")
+                              .trim()
+                          );
+                        } else {
+                          body = sanitizeForJson(found.content);
+                        }
+                      }
+                    }
+                    if (!body) body = "(Could not extract body text)";
 
                     resolve({
                       id: msgHdr.messageId,
@@ -952,15 +988,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   res.setStatusLine("1.1", 200, "OK");
                   // charset=utf-8 is critical for proper emoji handling in responses
                   res.setHeader("Content-Type", "application/json; charset=utf-8", false);
-                  res.write(JSON.stringify({ jsonrpc: "2.0", id, result }));
+                  res.write(sanitizeForJson(JSON.stringify({ jsonrpc: "2.0", id, result })));
                 } catch (e) {
                   res.setStatusLine("1.1", 200, "OK");
                   res.setHeader("Content-Type", "application/json; charset=utf-8", false);
-                  res.write(JSON.stringify({
+                  res.write(sanitizeForJson(JSON.stringify({
                     jsonrpc: "2.0",
                     id,
                     error: { code: -32000, message: e.toString() }
-                  }));
+                  })));
                 }
                 res.finish();
               })();
