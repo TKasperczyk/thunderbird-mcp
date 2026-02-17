@@ -148,6 +148,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["messageId", "folderPath", "to"],
         },
       },
+      {
+        name: "markAsRead",
+        title: "Mark As Read",
+        description: "Mark one or more messages as read (or unread). Accepts a single message or an array of messages.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messages: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  messageId: { type: "string", description: "The message ID (from searchMessages results)" },
+                  folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+                },
+                required: ["messageId", "folderPath"],
+              },
+              description: "Array of {messageId, folderPath} objects to mark",
+            },
+            read: { type: "boolean", description: "Set to true to mark as read, false to mark as unread (default: true)" },
+          },
+          required: ["messages"],
+        },
+      },
     ];
 
     return {
@@ -913,6 +937,41 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
+            function markAsRead(messages, read) {
+              const markRead = read !== false; // default true
+              const results = [];
+              for (const { messageId, folderPath } of messages) {
+                try {
+                  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                  if (!folder) {
+                    results.push({ messageId, folderPath, error: "Folder not found" });
+                    continue;
+                  }
+                  const db = folder.msgDatabase;
+                  if (!db) {
+                    results.push({ messageId, folderPath, error: "Could not access folder database" });
+                    continue;
+                  }
+                  let msgHdr = null;
+                  for (const hdr of db.enumerateMessages()) {
+                    if (hdr.messageId === messageId) {
+                      msgHdr = hdr;
+                      break;
+                    }
+                  }
+                  if (!msgHdr) {
+                    results.push({ messageId, folderPath, error: "Message not found" });
+                    continue;
+                  }
+                  msgHdr.markRead(markRead);
+                  results.push({ messageId, folderPath, success: true, read: markRead });
+                } catch (e) {
+                  results.push({ messageId, folderPath, error: e.toString() });
+                }
+              }
+              return results;
+            }
+
             async function callTool(name, args) {
               switch (name) {
                 case "listAccounts":
@@ -931,6 +990,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments);
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
+                case "markAsRead":
+                  return markAsRead(args.messages || [], args.read);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
