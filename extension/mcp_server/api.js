@@ -392,6 +392,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const subject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
                     const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
                     const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
+                    const ccList = (msgHdr.ccList || "").toLowerCase();
                     const msgDateTs = msgHdr.date || 0;
 
                     if (startDateTs !== null && msgDateTs < startDateTs) continue;
@@ -400,14 +401,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (!hasQuery ||
                         subject.includes(lowerQuery) ||
                         author.includes(lowerQuery) ||
-                        recipients.includes(lowerQuery)) {
+                        recipients.includes(lowerQuery) ||
+                        ccList.includes(lowerQuery)) {
                       results.push({
                         id: msgHdr.messageId,
-                        subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
-                        author: msgHdr.mime2DecodedAuthor || msgHdr.author,
-                        recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                        subject: sanitizeForJson(msgHdr.mime2DecodedSubject || msgHdr.subject),
+                        author: sanitizeForJson(msgHdr.mime2DecodedAuthor || msgHdr.author),
+                        recipients: sanitizeForJson(msgHdr.mime2DecodedRecipients || msgHdr.recipients),
+                        ccList: sanitizeForJson(msgHdr.ccList),
                         date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                        folder: folder.prettyName,
+                        folder: sanitizeForJson(folder.prettyName),
                         folderPath: folder.URI,
                         read: msgHdr.isRead,
                         flagged: msgHdr.isFlagged,
@@ -570,10 +573,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     resolve({
                       id: msgHdr.messageId,
-                      subject: msgHdr.subject,
-                      author: msgHdr.author,
-                      recipients: msgHdr.recipients,
-                      ccList: msgHdr.ccList,
+                      subject: sanitizeForJson(msgHdr.mime2DecodedSubject || msgHdr.subject),
+                      author: sanitizeForJson(msgHdr.mime2DecodedAuthor || msgHdr.author),
+                      recipients: sanitizeForJson(msgHdr.mime2DecodedRecipients || msgHdr.recipients),
+                      ccList: sanitizeForJson(msgHdr.ccList),
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
                       body,
                       bodyIsHtml
