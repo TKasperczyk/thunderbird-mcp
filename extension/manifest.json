@@ -26,6 +26,7 @@
     "accountsRead",
     "addressBooks",
     "messagesRead",
+    "messagesMove",
     "accountsFolders",
     "compose"
   ],

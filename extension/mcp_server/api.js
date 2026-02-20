@@ -179,27 +179,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
-        name: "markAsRead",
-        title: "Mark As Read",
-        description: "Mark one or more messages as read (or unread). Accepts a single message or an array of messages.",
+        name: "updateMessage",
+        title: "Update Message",
+        description: "Update a message's read/flagged state and optionally move it to another folder or to Trash.",
         inputSchema: {
           type: "object",
           properties: {
-            messages: {
-              type: "array",
-              items: {
-                type: "object",
-                properties: {
-                  messageId: { type: "string", description: "The message ID (from searchMessages results)" },
-                  folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
-                },
-                required: ["messageId", "folderPath"],
-              },
-              description: "Array of {messageId, folderPath} objects to mark",
-            },
-            read: { type: "boolean", description: "Set to true to mark as read, false to mark as unread (default: true)" },
+            messageId: { type: "string", description: "The message ID (from searchMessages results)" },
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+            read: { type: "boolean", description: "Set to true/false to mark read/unread (optional)" },
+            flagged: { type: "boolean", description: "Set to true/false to flag/unflag (optional)" },
+            moveTo: { type: "string", description: "Destination folder URI (optional). Cannot be used with trash." },
+            trash: { type: "boolean", description: "Set to true to move message to Trash (optional). Cannot be used with moveTo." },
           },
-          required: ["messages"],
+          required: ["messageId", "folderPath"],
         },
       },
     ];
@@ -1248,106 +1241,107 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-            function markAsRead(messages, read) {
-              const markRead = read !== false; // default true
-              if (!Array.isArray(messages)) {
-                if (messages && typeof messages === "object" && messages.messageId && messages.folderPath) {
-                  messages = [messages];
-                } else {
-                  return [{ error: "messages must be an array of {messageId, folderPath} objects or a single such object" }];
+            function updateMessage(messageId, folderPath, read, flagged, moveTo, trash) {
+              try {
+                if (typeof messageId !== "string" || !messageId) {
+                  return { error: "messageId must be a non-empty string" };
                 }
-              }
-
-              const results = new Array(messages.length);
-              const messagesByFolder = new Map();
-
-              for (let i = 0; i < messages.length; i++) {
-                const item = messages[i];
-                if (!item || typeof item !== "object") {
-                  results[i] = { error: "Invalid message entry" };
-                  continue;
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
                 }
 
-                const messageId = item.messageId;
-                const folderPath = item.folderPath;
-
-                if (typeof messageId !== "string" || typeof folderPath !== "string" || !messageId || !folderPath) {
-                  results[i] = { messageId, folderPath, error: "messageId and folderPath must be non-empty strings" };
-                  continue;
+                if (read !== undefined && typeof read !== "boolean") {
+                  return { error: "read must be a boolean" };
+                }
+                if (flagged !== undefined && typeof flagged !== "boolean") {
+                  return { error: "flagged must be a boolean" };
+                }
+                if (moveTo !== undefined && (typeof moveTo !== "string" || !moveTo)) {
+                  return { error: "moveTo must be a non-empty string" };
+                }
+                if (trash !== undefined && typeof trash !== "boolean") {
+                  return { error: "trash must be a boolean" };
                 }
 
-                if (!messagesByFolder.has(folderPath)) {
-                  messagesByFolder.set(folderPath, []);
+                if (moveTo && trash === true) {
+                  return { error: "Cannot specify both moveTo and trash" };
                 }
-                messagesByFolder.get(folderPath).push({ index: i, messageId, folderPath });
-              }
 
-	              for (const [folderPath, items] of messagesByFolder) {
-	                try {
-	                  const opened = openFolder(folderPath);
-	                  if (opened.error) {
-	                    for (const { index, messageId } of items) {
-	                      const error = opened.error.startsWith("Folder not found") ? "Folder not found" : opened.error;
-	                      results[index] = { messageId, folderPath, error };
-	                    }
-	                    continue;
-	                  }
+                const found = findMessage(messageId, folderPath);
+                if (found.error) return { error: found.error };
 
-	                  const { db } = opened;
+                const { msgHdr, folder } = found;
+                const actions = [];
 
-	                  const hasDirectLookup = typeof db.getMsgHdrForMessageID === "function";
-	                  let hdrMap = null;
+                if (read !== undefined) {
+                  msgHdr.markRead(read);
+                  actions.push({ type: "read", value: read });
+                }
 
-                  for (const entry of items) {
-                    let msgHdr = null;
+                if (flagged !== undefined) {
+                  msgHdr.markFlagged(flagged);
+                  actions.push({ type: "flagged", value: flagged });
+                }
 
-                    if (hasDirectLookup) {
-                      try {
-                        msgHdr = db.getMsgHdrForMessageID(entry.messageId);
-                      } catch {
-                        msgHdr = null;
+                let targetFolder = null;
+
+                if (trash === true) {
+                  const TRASH_FLAG = 0x00000100;
+                  let account = null;
+                  try {
+                    account = MailServices.accounts.findAccountForServer(folder.server);
+                  } catch {
+                    account = null;
+                  }
+                  if (!account) {
+                    return { error: "Could not determine account for message folder" };
+                  }
+                  const root = account.incomingServer?.rootFolder;
+                  if (!root) {
+                    return { error: "Account root folder not found" };
+                  }
+
+                  const stack = [root];
+                  while (stack.length > 0 && !targetFolder) {
+                    const current = stack.pop();
+                    try {
+                      if (current && typeof current.getFlag === "function" && current.getFlag(TRASH_FLAG)) {
+                        targetFolder = current;
+                        break;
                       }
+                    } catch {
+                      // ignore flag read errors
                     }
-
-                    if (!msgHdr) {
-                      if (!hdrMap) {
-                        hdrMap = new Map();
-                        try {
-                          for (const hdr of db.enumerateMessages()) {
-                            hdrMap.set(hdr.messageId, hdr);
-                          }
-                        } catch {
-                          // enumerateMessages may fail on some folders; handle per-item below
+                    try {
+                      if (current && current.hasSubFolders) {
+                        for (const subfolder of current.subFolders) {
+                          stack.push(subfolder);
                         }
                       }
-                      msgHdr = hdrMap.get(entry.messageId) || null;
-                    }
-
-                    if (!msgHdr) {
-                      results[entry.index] = { messageId: entry.messageId, folderPath, error: "Message not found" };
-                      continue;
-                    }
-
-                    try {
-                      msgHdr.markRead(markRead);
-                      results[entry.index] = { messageId: entry.messageId, folderPath, success: true, read: markRead };
-                    } catch (e) {
-                      results[entry.index] = { messageId: entry.messageId, folderPath, error: e.toString() };
+                    } catch {
+                      // ignore traversal errors
                     }
                   }
-                } catch (e) {
-                  for (const { index, messageId } of items) {
-                    results[index] = { messageId, folderPath, error: e.toString() };
+
+                  if (!targetFolder) {
+                    return { error: "Trash folder not found" };
+                  }
+                } else if (moveTo) {
+                  targetFolder = MailServices.folderLookup.getFolderForURL(moveTo);
+                  if (!targetFolder) {
+                    return { error: `Folder not found: ${moveTo}` };
                   }
                 }
-              }
 
-              // Fill any gaps (shouldn't happen, but keep shape stable)
-              for (let i = 0; i < results.length; i++) {
-                if (!results[i]) results[i] = { error: "Unknown error" };
-              }
+                if (targetFolder) {
+                  MailServices.copy.copyMessages(folder, [msgHdr], targetFolder, true, null, null, false);
+                  actions.push({ type: "move", to: targetFolder.URI });
+                }
 
-              return results;
+                return { success: true, actions };
+              } catch (e) {
+                return { error: e.toString() };
+              }
             }
 
             async function callTool(name, args) {
@@ -1372,8 +1366,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments);
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
-                case "markAsRead":
-                  return markAsRead(args.messages || [], args.read);
+                case "updateMessage":
+                  return updateMessage(args.messageId, args.folderPath, args.read, args.flagged, args.moveTo, args.trash);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
