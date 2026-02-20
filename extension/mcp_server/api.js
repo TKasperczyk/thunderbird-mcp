@@ -180,6 +180,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getRecentMessages",
+        title: "Get Recent Messages",
+        description: "Get recent messages from a specific folder or all folders, with date and unread filtering",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI to list messages from (defaults to all Inboxes)" },
+            daysBack: { type: "number", description: "Only return messages from the last N days (default: 7)" },
+            maxResults: { type: "number", description: "Maximum number of results (default: 50, max: 200)" },
+            unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "deleteMessages",
+        title: "Delete Messages",
+        description: "Delete messages from a folder. Drafts are moved to Trash instead of permanently deleted.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs to delete" },
+            folderPath: { type: "string", description: "The folder URI containing the messages" },
+          },
+          required: ["messageIds", "folderPath"],
+        },
+      },
+      {
         name: "updateMessage",
         title: "Update Message",
         description: "Update a message's read/flagged state and optionally move it to another folder or to Trash.",
@@ -201,6 +229,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     return {
       mcpServer: {
         start: async function() {
+          // Guard against double-start on extension reload (port conflict)
+          if (globalThis.__tbMcpStartPromise) {
+            return await globalThis.__tbMcpStartPromise;
+          }
+          const startPromise = (async () => {
           try {
             const { HttpServer } = ChromeUtils.importESModule(
               "resource://thunderbird-mcp/httpd.sys.mjs?" + Date.now()
@@ -1436,6 +1469,171 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
+            function getRecentMessages(folderPath, daysBack, maxResults, unreadOnly) {
+              const results = [];
+              const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
+              const cutoffTs = (Date.now() - days * 86400000) * 1000; // Thunderbird uses microseconds
+              const requestedLimit = Number(maxResults);
+              const effectiveLimit = Math.min(
+                Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.floor(requestedLimit) : DEFAULT_MAX_RESULTS,
+                MAX_SEARCH_RESULTS_CAP
+              );
+
+              function collectFromFolder(folder) {
+                if (results.length >= SEARCH_COLLECTION_CAP) return;
+
+                try {
+                  const db = folder.msgDatabase;
+                  if (!db) return;
+
+                  for (const msgHdr of db.enumerateMessages()) {
+                    if (results.length >= SEARCH_COLLECTION_CAP) break;
+
+                    const msgDateTs = msgHdr.date || 0;
+                    if (msgDateTs < cutoffTs) continue;
+                    if (unreadOnly && msgHdr.isRead) continue;
+
+                    results.push({
+                      id: msgHdr.messageId,
+                      subject: sanitizeForJson(msgHdr.mime2DecodedSubject || msgHdr.subject),
+                      author: sanitizeForJson(msgHdr.mime2DecodedAuthor || msgHdr.author),
+                      recipients: sanitizeForJson(msgHdr.mime2DecodedRecipients || msgHdr.recipients),
+                      date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+                      folder: sanitizeForJson(folder.prettyName),
+                      folderPath: folder.URI,
+                      read: msgHdr.isRead,
+                      flagged: msgHdr.isFlagged,
+                      _dateTs: msgDateTs
+                    });
+                  }
+                } catch {
+                  // Skip inaccessible folders
+                }
+
+                if (folder.hasSubFolders) {
+                  for (const subfolder of folder.subFolders) {
+                    if (results.length >= SEARCH_COLLECTION_CAP) break;
+                    collectFromFolder(subfolder);
+                  }
+                }
+              }
+
+              if (folderPath) {
+                // Specific folder
+                const opened = openFolder(folderPath);
+                if (opened.error) return { error: opened.error };
+                collectFromFolder(opened.folder);
+              } else {
+                // All folders across all accounts
+                for (const account of MailServices.accounts.accounts) {
+                  if (results.length >= SEARCH_COLLECTION_CAP) break;
+                  try {
+                    const root = account.incomingServer.rootFolder;
+                    collectFromFolder(root);
+                  } catch {
+                    // Skip inaccessible accounts
+                  }
+                }
+              }
+
+              results.sort((a, b) => b._dateTs - a._dateTs);
+
+              return results.slice(0, effectiveLimit).map(r => {
+                delete r._dateTs;
+                return r;
+              });
+            }
+
+            function deleteMessages(messageIds, folderPath) {
+              try {
+                if (!Array.isArray(messageIds) || messageIds.length === 0) {
+                  return { error: "messageIds must be a non-empty array of strings" };
+                }
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
+                }
+
+                const opened = openFolder(folderPath);
+                if (opened.error) return { error: opened.error };
+                const { folder, db } = opened;
+
+                // Find all requested message headers
+                const found = [];
+                const notFound = [];
+                for (const msgId of messageIds) {
+                  if (typeof msgId !== "string" || !msgId) {
+                    notFound.push(msgId);
+                    continue;
+                  }
+                  let hdr = null;
+                  const hasDirectLookup = typeof db.getMsgHdrForMessageID === "function";
+                  if (hasDirectLookup) {
+                    try { hdr = db.getMsgHdrForMessageID(msgId); } catch { hdr = null; }
+                  }
+                  if (!hdr) {
+                    for (const h of db.enumerateMessages()) {
+                      if (h.messageId === msgId) { hdr = h; break; }
+                    }
+                  }
+                  if (hdr) {
+                    found.push(hdr);
+                  } else {
+                    notFound.push(msgId);
+                  }
+                }
+
+                if (found.length === 0) {
+                  return { error: "No matching messages found" };
+                }
+
+                // Drafts get moved to Trash instead of hard-deleted
+                const DRAFTS_FLAG = 0x00000400;
+                const isDrafts = typeof folder.getFlag === "function" && folder.getFlag(DRAFTS_FLAG);
+                let trashFolder = null;
+
+                if (isDrafts) {
+                  // Find trash folder
+                  const TRASH_FLAG = 0x00000100;
+                  try {
+                    const account = MailServices.accounts.findAccountForServer(folder.server);
+                    const root = account?.incomingServer?.rootFolder;
+                    if (root) {
+                      const stack = [root];
+                      while (stack.length > 0 && !trashFolder) {
+                        const current = stack.pop();
+                        try {
+                          if (current && typeof current.getFlag === "function" && current.getFlag(TRASH_FLAG)) {
+                            trashFolder = current;
+                          }
+                        } catch {}
+                        try {
+                          if (current && current.hasSubFolders) {
+                            for (const sf of current.subFolders) stack.push(sf);
+                          }
+                        } catch {}
+                      }
+                    }
+                  } catch {}
+
+                  if (trashFolder) {
+                    MailServices.copy.copyMessages(folder, found, trashFolder, true, null, null, false);
+                  } else {
+                    // No trash found, fall back to regular delete
+                    folder.deleteMessages(found, null, false, true, null, false);
+                  }
+                } else {
+                  folder.deleteMessages(found, null, false, true, null, false);
+                }
+
+                let result = { success: true, deleted: found.length };
+                if (isDrafts && trashFolder) result.movedToTrash = true;
+                if (notFound.length > 0) result.notFound = notFound;
+                return result;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             function updateMessage(messageId, folderPath, read, flagged, moveTo, trash) {
               try {
                 if (typeof messageId !== "string" || !messageId) {
@@ -1561,6 +1759,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments);
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
+                case "getRecentMessages":
+                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.unreadOnly);
+                case "deleteMessages":
+                  return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
                   return updateMessage(args.messageId, args.folderPath, args.read, args.flagged, args.moveTo, args.trash);
                 default:
@@ -1638,8 +1840,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             return { success: true, port: MCP_PORT };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
+            // Clear cached promise so a retry can attempt to bind again
+            globalThis.__tbMcpStartPromise = null;
             return { success: false, error: e.toString() };
           }
+          })();
+          globalThis.__tbMcpStartPromise = startPromise;
+          return await startPromise;
         }
       }
     };

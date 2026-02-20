@@ -50,7 +50,9 @@ Example for `~/.claude.json`:
 | `listFolders` | List all mail folders with message counts |
 | `searchMessages` | Find emails by subject, sender, recipient, or date range |
 | `getMessage` | Read full email content with optional attachment saving |
+| `getRecentMessages` | Get recent messages with date and unread filtering |
 | `updateMessage` | Mark read/unread, flag/unflag, move to folder, or trash |
+| `deleteMessages` | Delete messages (drafts are moved to Trash) |
 | `sendMail` | Open a compose window with pre-filled content |
 | `replyToMessage` | Reply with quoted original and proper threading |
 | `forwardMessage` | Forward with original attachments preserved |
