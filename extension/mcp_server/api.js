@@ -77,7 +77,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             messageId: { type: "string", description: "The message ID (from searchMessages results)" },
-            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" }
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+            saveAttachments: { type: "boolean", description: "If true, save attachments to /tmp/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" }
           },
           required: ["messageId", "folderPath"],
         },
@@ -819,7 +820,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-	            function getMessage(messageId, folderPath) {
+	            function getMessage(messageId, folderPath, saveAttachments) {
 	              return new Promise((resolve) => {
 	                try {
 	                  const found = findMessage(messageId, folderPath);
@@ -935,7 +936,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     }
 
-                    resolve({
+                    // Always collect attachment metadata
+                    const attachments = [];
+                    const attachmentSources = [];
+                    if (aMimeMsg && aMimeMsg.allUserAttachments) {
+                      for (const att of aMimeMsg.allUserAttachments) {
+                        const info = {
+                          name: sanitizeForJson(att?.name || ""),
+                          contentType: sanitizeForJson(att?.contentType || ""),
+                          size: typeof att?.size === "number" ? att.size : null
+                        };
+                        attachments.push(info);
+                        attachmentSources.push({
+                          info,
+                          url: att?.url || "",
+                          size: typeof att?.size === "number" ? att.size : null
+                        });
+                      }
+                    }
+
+                    const baseResponse = {
                       id: msgHdr.messageId,
                       subject: sanitizeForJson(msgHdr.mime2DecodedSubject || msgHdr.subject),
                       author: sanitizeForJson(msgHdr.mime2DecodedAuthor || msgHdr.author),
@@ -943,15 +963,190 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       ccList: sanitizeForJson(msgHdr.ccList),
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
                       body,
-                      bodyIsHtml
-                    });
+                      bodyIsHtml,
+                      attachments
+                    };
+
+                    if (!saveAttachments || attachmentSources.length === 0) {
+                      resolve(baseResponse);
+                      return;
+                    }
+
+                    function sanitizePathSegment(s) {
+                      const sanitized = String(s || "").replace(/[^a-zA-Z0-9]/g, "_");
+                      return sanitized || "message";
+                    }
+
+                    function sanitizeFilename(s) {
+                      let name = String(s || "").trim();
+                      if (!name) name = "attachment";
+                      name = name.replace(/[^a-zA-Z0-9._-]/g, "_");
+                      name = name.replace(/^_+/, "").replace(/_+$/, "");
+                      return name || "attachment";
+                    }
+
+                    function ensureAttachmentDir(sanitizedId) {
+                      const root = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+                      root.initWithPath("/tmp/thunderbird-mcp");
+                      try {
+                        root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+                      } catch (e) {
+                        if (!root.exists() || !root.isDirectory()) throw e;
+                        // already exists, fine
+                      }
+                      const dir = root.clone();
+                      dir.append(sanitizedId);
+                      try {
+                        dir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+                      } catch (e) {
+                        if (!dir.exists() || !dir.isDirectory()) throw e;
+                        // already exists, fine
+                      }
+                      return dir;
+                    }
+
+                    const sanitizedId = sanitizePathSegment(messageId);
+                    let dir;
+                    try {
+                      dir = ensureAttachmentDir(sanitizedId);
+                    } catch (e) {
+                      for (const { info } of attachmentSources) {
+                        info.error = `Failed to create attachment directory: ${e}`;
+                      }
+                      resolve(baseResponse);
+                      return;
+                    }
+
+                    const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+
+                    const saveOne = ({ info, url, size }, index) =>
+                      new Promise((done) => {
+                        try {
+                          if (!url) {
+                            info.error = "Missing attachment URL";
+                            done();
+                            return;
+                          }
+
+                          const knownSize = typeof size === "number" ? size : null;
+                          if (knownSize !== null && knownSize > MAX_ATTACHMENT_BYTES) {
+                            info.error = `Attachment too large (${knownSize} bytes, limit ${MAX_ATTACHMENT_BYTES})`;
+                            done();
+                            return;
+                          }
+
+                          const idx = typeof index === "number" && Number.isFinite(index) ? index : 0;
+                          let safeName = sanitizeFilename(info.name);
+                          if (!safeName || safeName === "." || safeName === "..") {
+                            safeName = `attachment_${idx}`;
+                          }
+                          const file = dir.clone();
+                          file.append(safeName);
+
+                          try {
+                            file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o644);
+                          } catch (e) {
+                            info.error = `Failed to create file: ${e}`;
+                            done();
+                            return;
+                          }
+
+                          const channel = NetUtil.newChannel({
+                            uri: url,
+                            loadUsingSystemPrincipal: true
+                          });
+
+                          NetUtil.asyncFetch(channel, (inputStream, status, request) => {
+                            try {
+                              if (status && status !== 0) {
+                                try { inputStream?.close(); } catch {}
+                                info.error = `Fetch failed: ${status}`;
+                                try { file.remove(false); } catch {}
+                                done();
+                                return;
+                              }
+                              if (!inputStream) {
+                                info.error = "Fetch returned no data";
+                                try { file.remove(false); } catch {}
+                                done();
+                                return;
+                              }
+
+                              try {
+                                const reqLen = request && typeof request.contentLength === "number" ? request.contentLength : -1;
+                                if (reqLen >= 0 && reqLen > MAX_ATTACHMENT_BYTES) {
+                                  try { inputStream.close(); } catch {}
+                                  info.error = `Attachment too large (${reqLen} bytes, limit ${MAX_ATTACHMENT_BYTES})`;
+                                  try { file.remove(false); } catch {}
+                                  done();
+                                  return;
+                                }
+                              } catch {
+                                // ignore contentLength failures
+                              }
+
+                              const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                                .createInstance(Ci.nsIFileOutputStream);
+                              ostream.init(file, -1, -1, 0);
+
+                              NetUtil.asyncCopy(inputStream, ostream, (copyStatus) => {
+                                try {
+                                  if (copyStatus && copyStatus !== 0) {
+                                    info.error = `Write failed: ${copyStatus}`;
+                                    try { file.remove(false); } catch {}
+                                    done();
+                                    return;
+                                  }
+
+                                  try {
+                                    if (file.fileSize > MAX_ATTACHMENT_BYTES) {
+                                      info.error = `Attachment too large (${file.fileSize} bytes, limit ${MAX_ATTACHMENT_BYTES})`;
+                                      try { file.remove(false); } catch {}
+                                      done();
+                                      return;
+                                    }
+                                  } catch {
+                                    // ignore fileSize failures
+                                  }
+
+                                  info.filePath = file.path;
+                                  done();
+                                } catch (e) {
+                                  info.error = `Write failed: ${e}`;
+                                  try { file.remove(false); } catch {}
+                                  done();
+                                }
+                              });
+                            } catch (e) {
+                              info.error = `Fetch failed: ${e}`;
+                              try { file.remove(false); } catch {}
+                              done();
+                            }
+                          });
+                        } catch (e) {
+                          info.error = String(e);
+                          done();
+                        }
+                      });
+
+                    (async () => {
+                      try {
+                        await Promise.all(attachmentSources.map((src, i) => saveOne(src, i)));
+                      } catch (e) {
+                        // Per-attachment errors are handled; this is just a safeguard.
+                        for (const { info } of attachmentSources) {
+                          if (!info.error) info.error = `Unexpected save error: ${e}`;
+                        }
+                      }
+                      resolve(baseResponse);
+                    })();
                   }, true, { examineEncryptedParts: true });
 
-                } catch (e) {
-                  resolve({ error: e.toString() });
-                }
-              });
-            }
+	                } catch (e) {
+	                  resolve({ error: e.toString() });
+	                }
+	              });
+	            }
 
             /**
              * Opens a compose window with pre-filled fields.
@@ -1353,7 +1548,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "searchMessages":
                   return searchMessages(args.query || "", args.startDate, args.endDate, args.maxResults, args.sortOrder);
                 case "getMessage":
-                  return await getMessage(args.messageId, args.folderPath);
+                  return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
                   return searchContacts(args.query || "");
                 case "listCalendars":
