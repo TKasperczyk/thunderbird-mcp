@@ -561,6 +561,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: `Invalid endDate: ${endDate}` };
                 }
 
+                if (endJs) {
+                  if (allDay) {
+                    const startDay = new Date(startJs.getFullYear(), startJs.getMonth(), startJs.getDate());
+                    const endDay = new Date(endJs.getFullYear(), endJs.getMonth(), endJs.getDate());
+                    if (endDay.getTime() < startDay.getTime()) {
+                      return { error: "endDate must not be before startDate" };
+                    }
+                  } else if (endJs.getTime() <= startJs.getTime()) {
+                    return { error: "endDate must be after startDate" };
+                  }
+                }
+
                 const event = new CalEvent();
                 event.title = title;
 
@@ -576,10 +588,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     endDt.isDate = true;
                     // iCal DTEND is exclusive — bump if same as start
                     if (endDt.compare(startDt) <= 0) {
-                      endDt.day += 1;
+                      const bumpedEnd = new Date(endJs.getFullYear(), endJs.getMonth(), endJs.getDate());
+                      bumpedEnd.setDate(bumpedEnd.getDate() + 1);
+                      endDt.resetTo(
+                        bumpedEnd.getFullYear(),
+                        bumpedEnd.getMonth(),
+                        bumpedEnd.getDate(),
+                        0,
+                        0,
+                        0,
+                        cal.dtz.floating
+                      );
+                      endDt.isDate = true;
                     }
                   } else {
-                    endDt.resetTo(startJs.getFullYear(), startJs.getMonth(), startJs.getDate() + 1, 0, 0, 0, cal.dtz.floating);
+                    const defaultEnd = new Date(startJs.getTime());
+                    defaultEnd.setDate(defaultEnd.getDate() + 1);
+                    endDt.resetTo(
+                      defaultEnd.getFullYear(),
+                      defaultEnd.getMonth(),
+                      defaultEnd.getDate(),
+                      0,
+                      0,
+                      0,
+                      cal.dtz.floating
+                    );
                     endDt.isDate = true;
                   }
                   event.endDate = endDt;
@@ -689,25 +722,82 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // If plain text extraction failed, try to get HTML body from MIME parts
                     if (!body) {
                       try {
-                        function findBody(part) {
-                          if (part.parts) {
-                            for (const sub of part.parts) {
-                              const result = findBody(sub);
-                              if (result) return result;
+                        function stripHtml(html) {
+                          if (!html) return "";
+                          let text = String(html);
+
+                          // Remove style/script blocks
+                          text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ");
+                          text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ");
+
+                          // Convert block-level tags to newlines before stripping
+                          text = text.replace(/<br\s*\/?>/gi, "\n");
+                          text = text.replace(/<\/(p|div|li|tr|h[1-6]|blockquote|pre)>/gi, "\n");
+                          text = text.replace(/<(p|div|li|tr|h[1-6]|blockquote|pre)\b[^>]*>/gi, "\n");
+
+                          // Strip remaining tags
+                          text = text.replace(/<[^>]+>/g, " ");
+
+                          // Decode entities in a single pass
+                          const NAMED_ENTITIES = {
+                            nbsp: " ",
+                            amp: "&",
+                            lt: "<",
+                            gt: ">",
+                            quot: "\"",
+                            apos: "'",
+                            "#39": "'",
+                          };
+                          text = text.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/gi, (match, entity) => {
+                            if (entity.startsWith("#x") || entity.startsWith("#X")) {
+                              const cp = parseInt(entity.slice(2), 16);
+                              return cp ? String.fromCodePoint(cp) : match;
                             }
+                            if (entity.startsWith("#")) {
+                              const cp = parseInt(entity.slice(1), 10);
+                              return cp ? String.fromCodePoint(cp) : match;
+                            }
+                            return NAMED_ENTITIES[entity.toLowerCase()] || match;
+                          });
+
+                          // Normalize newlines/spaces
+                          text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+                          text = text.replace(/\n{3,}/g, "\n\n");
+                          text = text.replace(/[ \t\f\v]+/g, " ");
+                          text = text.replace(/ *\n */g, "\n");
+                          text = text.trim();
+                          return text;
+                        }
+
+                        function findBody(part) {
+                          const contentType = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
+                          if (contentType === "text/plain" && part.body) {
+                            return { text: part.body, isHtml: false };
                           }
-                          if (part.contentType === "text/html" && part.body) {
+                          if (contentType === "text/html" && part.body) {
                             return { text: part.body, isHtml: true };
                           }
-                          if (part.contentType === "text/plain" && part.body) {
-                            return { text: part.body, isHtml: false };
+                          if (part.parts) {
+                            let htmlFallback = null;
+                            for (const sub of part.parts) {
+                              const result = findBody(sub);
+                              if (result && !result.isHtml) return result;
+                              if (result && result.isHtml && !htmlFallback) htmlFallback = result;
+                            }
+                            if (htmlFallback) return htmlFallback;
                           }
                           return null;
                         }
                         const found = findBody(aMimeMsg);
                         if (found) {
-                          body = sanitizeForJson(found.text);
-                          bodyIsHtml = found.isHtml;
+                          let extracted = found.text;
+                          if (found.isHtml) {
+                            extracted = stripHtml(extracted);
+                            bodyIsHtml = false;
+                          } else {
+                            bodyIsHtml = false;
+                          }
+                          body = sanitizeForJson(extracted);
                         } else {
                           body = "(Could not extract body text)";
                         }
@@ -1060,36 +1150,117 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function markAsRead(messages, read) {
               const markRead = read !== false; // default true
-              const results = [];
-              for (const { messageId, folderPath } of messages) {
+              if (!Array.isArray(messages)) {
+                if (messages && typeof messages === "object" && messages.messageId && messages.folderPath) {
+                  messages = [messages];
+                } else {
+                  return [{ error: "messages must be an array of {messageId, folderPath} objects or a single such object" }];
+                }
+              }
+
+              const results = new Array(messages.length);
+              const messagesByFolder = new Map();
+
+              for (let i = 0; i < messages.length; i++) {
+                const item = messages[i];
+                if (!item || typeof item !== "object") {
+                  results[i] = { error: "Invalid message entry" };
+                  continue;
+                }
+
+                const messageId = item.messageId;
+                const folderPath = item.folderPath;
+
+                if (typeof messageId !== "string" || typeof folderPath !== "string" || !messageId || !folderPath) {
+                  results[i] = { messageId, folderPath, error: "messageId and folderPath must be non-empty strings" };
+                  continue;
+                }
+
+                if (!messagesByFolder.has(folderPath)) {
+                  messagesByFolder.set(folderPath, []);
+                }
+                messagesByFolder.get(folderPath).push({ index: i, messageId, folderPath });
+              }
+
+              for (const [folderPath, items] of messagesByFolder) {
                 try {
                   const folder = MailServices.folderLookup.getFolderForURL(folderPath);
                   if (!folder) {
-                    results.push({ messageId, folderPath, error: "Folder not found" });
+                    for (const { index, messageId } of items) {
+                      results[index] = { messageId, folderPath, error: "Folder not found" };
+                    }
                     continue;
                   }
-                  const db = folder.msgDatabase;
-                  if (!db) {
-                    results.push({ messageId, folderPath, error: "Could not access folder database" });
-                    continue;
-                  }
-                  let msgHdr = null;
-                  for (const hdr of db.enumerateMessages()) {
-                    if (hdr.messageId === messageId) {
-                      msgHdr = hdr;
-                      break;
+
+                  // Best-effort refresh for IMAP folders (db may be stale)
+                  if (folder.server && folder.server.type === "imap") {
+                    try {
+                      folder.updateFolder(null);
+                    } catch {
+                      // ignore refresh failures
                     }
                   }
-                  if (!msgHdr) {
-                    results.push({ messageId, folderPath, error: "Message not found" });
+
+                  const db = folder.msgDatabase;
+                  if (!db) {
+                    for (const { index, messageId } of items) {
+                      results[index] = { messageId, folderPath, error: "Could not access folder database" };
+                    }
                     continue;
                   }
-                  msgHdr.markRead(markRead);
-                  results.push({ messageId, folderPath, success: true, read: markRead });
+
+                  const hasDirectLookup = typeof db.getMsgHdrForMessageID === "function";
+                  let hdrMap = null;
+
+                  for (const entry of items) {
+                    let msgHdr = null;
+
+                    if (hasDirectLookup) {
+                      try {
+                        msgHdr = db.getMsgHdrForMessageID(entry.messageId);
+                      } catch {
+                        msgHdr = null;
+                      }
+                    }
+
+                    if (!msgHdr) {
+                      if (!hdrMap) {
+                        hdrMap = new Map();
+                        try {
+                          for (const hdr of db.enumerateMessages()) {
+                            hdrMap.set(hdr.messageId, hdr);
+                          }
+                        } catch {
+                          // enumerateMessages may fail on some folders; handle per-item below
+                        }
+                      }
+                      msgHdr = hdrMap.get(entry.messageId) || null;
+                    }
+
+                    if (!msgHdr) {
+                      results[entry.index] = { messageId: entry.messageId, folderPath, error: "Message not found" };
+                      continue;
+                    }
+
+                    try {
+                      msgHdr.markRead(markRead);
+                      results[entry.index] = { messageId: entry.messageId, folderPath, success: true, read: markRead };
+                    } catch (e) {
+                      results[entry.index] = { messageId: entry.messageId, folderPath, error: e.toString() };
+                    }
+                  }
                 } catch (e) {
-                  results.push({ messageId, folderPath, error: e.toString() });
+                  for (const { index, messageId } of items) {
+                    results[index] = { messageId, folderPath, error: e.toString() };
+                  }
                 }
               }
+
+              // Fill any gaps (shouldn't happen, but keep shape stable)
+              for (let i = 0; i < results.length; i++) {
+                if (!results[i]) results[i] = { error: "Unknown error" };
+              }
+
               return results;
             }
 
