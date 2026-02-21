@@ -7,6 +7,10 @@
 
 Give your AI assistant full access to Thunderbird — search mail, compose messages, manage filters, and organize your inbox. All through the [Model Context Protocol](https://modelcontextprotocol.io/).
 
+<p align="center">
+  <img src="docs/demo.gif" alt="Thunderbird MCP Demo" width="800">
+</p>
+
 > Inspired by [bb1/thunderbird-mcp](https://github.com/bb1/thunderbird-mcp). Rewritten from scratch with a bundled HTTP server, proper MIME decoding, and UTF-8 handling throughout.
 
 ---
