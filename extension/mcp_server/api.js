@@ -224,6 +224,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["messageId", "folderPath"],
         },
       },
+      {
+        name: "createFolder",
+        title: "Create Folder",
+        description: "Create a new mail subfolder under an existing folder",
+        inputSchema: {
+          type: "object",
+          properties: {
+            parentFolderPath: { type: "string", description: "URI of the parent folder (from listFolders)" },
+            name: { type: "string", description: "Name for the new subfolder" },
+          },
+          required: ["parentFolderPath", "name"],
+        },
+      },
     ];
 
     return {
@@ -1736,6 +1749,51 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function createFolder(parentFolderPath, name) {
+              try {
+                if (typeof parentFolderPath !== "string" || !parentFolderPath) {
+                  return { error: "parentFolderPath must be a non-empty string" };
+                }
+                if (typeof name !== "string" || !name) {
+                  return { error: "name must be a non-empty string" };
+                }
+
+                const parent = MailServices.folderLookup.getFolderForURL(parentFolderPath);
+                if (!parent) {
+                  return { error: `Parent folder not found: ${parentFolderPath}` };
+                }
+
+                parent.createSubfolder(name, null);
+
+                // Try to return the new folder's URI
+                let newPath = null;
+                try {
+                  if (parent.hasSubFolders) {
+                    for (const sub of parent.subFolders) {
+                      if (sub.prettyName === name || sub.name === name) {
+                        newPath = sub.URI;
+                        break;
+                      }
+                    }
+                  }
+                } catch {
+                  // Folder may not be immediately visible (IMAP)
+                }
+
+                return {
+                  success: true,
+                  message: `Folder "${name}" created`,
+                  path: newPath
+                };
+              } catch (e) {
+                const msg = e.toString();
+                if (msg.includes("NS_MSG_FOLDER_EXISTS")) {
+                  return { error: `Folder "${name}" already exists under this parent` };
+                }
+                return { error: msg };
+              }
+            }
+
             async function callTool(name, args) {
               switch (name) {
                 case "listAccounts":
@@ -1764,6 +1822,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
                   return updateMessage(args.messageId, args.folderPath, args.read, args.flagged, args.moveTo, args.trash);
+                case "createFolder":
+                  return createFolder(args.parentFolderPath, args.name);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }

@@ -53,6 +53,7 @@ Example for `~/.claude.json`:
 | `getRecentMessages` | Get recent messages with date and unread filtering |
 | `updateMessage` | Mark read/unread, flag/unflag, move to folder, or trash |
 | `deleteMessages` | Delete messages (drafts are moved to Trash) |
+| `createFolder` | Create a new subfolder under an existing folder |
 | `sendMail` | Open a compose window with pre-filled content |
 | `replyToMessage` | Reply with quoted original and proper threading |
 | `forwardMessage` | Forward with original attachments preserved |
