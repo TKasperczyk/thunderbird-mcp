@@ -1956,9 +1956,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const ACTION_MAP = {
               moveToFolder: 0x01, copyToFolder: 0x02, changePriority: 0x03,
               delete: 0x04, markRead: 0x05, killThread: 0x06,
-              watchThread: 0x07, markFlagged: 0x08, reply: 0x0A,
-              forward: 0x0B, stopExecution: 0x0C, deleteFromServer: 0x0D,
-              leaveOnServer: 0x0E, junkScore: 0x0F, addTag: 0x11,
+              watchThread: 0x07, markFlagged: 0x08, label: 0x09,
+              reply: 0x0A, forward: 0x0B, stopExecution: 0x0C,
+              deleteFromServer: 0x0D, leaveOnServer: 0x0E, junkScore: 0x0F,
+              fetchBody: 0x10, addTag: 0x11, deleteBody: 0x12,
               markUnread: 0x14, custom: 0x15,
             };
             const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
@@ -2024,7 +2025,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               return {
                 index,
-                name: filter.filterName,
+                name: sanitizeForJson(filter.filterName),
                 enabled: filter.enabled,
                 type: filter.filterType,
                 temporary: filter.temporary,
@@ -2082,9 +2083,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function listFilters(accountId) {
               try {
                 const results = [];
-                const accounts = accountId
-                  ? [MailServices.accounts.getAccount(accountId)]
-                  : Array.from(MailServices.accounts.accounts);
+                let accounts;
+                if (accountId) {
+                  const account = MailServices.accounts.getAccount(accountId);
+                  if (!account) return { error: `Account not found: ${accountId}` };
+                  accounts = [account];
+                } else {
+                  accounts = Array.from(MailServices.accounts.accounts);
+                }
 
                 for (const account of accounts) {
                   if (!account) continue;
@@ -2132,6 +2138,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   try { actions = JSON.parse(actions); } catch { /* leave as-is */ }
                 }
                 if (typeof enabled === "string") enabled = enabled === "true";
+                if (typeof type === "string") type = parseInt(type);
                 if (typeof insertAtIndex === "string") insertAtIndex = parseInt(insertAtIndex);
 
                 if (!Array.isArray(conditions) || conditions.length === 0) {
@@ -2147,7 +2154,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const filter = filterList.createFilter(name);
                 filter.enabled = enabled !== false;
-                filter.filterType = type || 17; // inbox + manual
+                filter.filterType = (Number.isFinite(type) && type > 0) ? type : 17; // inbox + manual
 
                 buildTerms(filter, conditions);
                 buildActions(filter, actions);
@@ -2173,13 +2180,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               try {
                 // Coerce from MCP client
                 if (typeof filterIndex === "string") filterIndex = parseInt(filterIndex);
+                if (!Number.isInteger(filterIndex)) return { error: "filterIndex must be an integer" };
                 if (typeof enabled === "string") enabled = enabled === "true";
                 if (typeof type === "string") type = parseInt(type);
                 if (typeof conditions === "string") {
-                  try { conditions = JSON.parse(conditions); } catch { /* leave as-is */ }
+                  try { conditions = JSON.parse(conditions); } catch {
+                    return { error: "conditions must be a valid JSON array" };
+                  }
                 }
                 if (typeof actions === "string") {
-                  try { actions = JSON.parse(actions); } catch { /* leave as-is */ }
+                  try { actions = JSON.parse(actions); } catch {
+                    return { error: "actions must be a valid JSON array" };
+                  }
                 }
 
                 const fl = getFilterListForAccount(accountId);
@@ -2206,22 +2218,49 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   changes.push("type");
                 }
 
-                if (Array.isArray(conditions) && conditions.length > 0) {
-                  // Clear existing terms by recreating the filter's search terms
-                  // There's no clearTerms method, so we remove and re-add
-                  // Actually, we can use parseCondition or just rebuild
-                  // Safest: create a temp filter, build terms, then swap
-                  const tempFilter = filterList.createFilter("__temp__");
-                  buildTerms(tempFilter, conditions);
-                  // Copy terms from temp to real filter
-                  // Unfortunately there's no clearTerms, so we need to
-                  // remove the filter and re-insert a new one with same props
+                const replaceConditions = Array.isArray(conditions) && conditions.length > 0;
+                const replaceActions = Array.isArray(actions) && actions.length > 0;
+
+                if (replaceConditions || replaceActions) {
+                  // No clearTerms/clearActions API -- rebuild filter via remove+insert
                   const newFilter = filterList.createFilter(filter.filterName);
                   newFilter.enabled = filter.enabled;
                   newFilter.filterType = filter.filterType;
-                  buildTerms(newFilter, conditions);
-                  // Copy existing actions if not being replaced
-                  if (Array.isArray(actions) && actions.length > 0) {
+
+                  // Build or copy conditions
+                  if (replaceConditions) {
+                    buildTerms(newFilter, conditions);
+                    changes.push("conditions");
+                  } else {
+                    // Copy existing terms -- abort on failure to prevent data loss
+                    let termsCopied = 0;
+                    try {
+                      for (const term of filter.searchTerms) {
+                        const newTerm = newFilter.createTerm();
+                        newTerm.attrib = term.attrib;
+                        newTerm.op = term.op;
+                        const val = newTerm.value;
+                        val.attrib = term.attrib;
+                        try { val.str = term.value.str || ""; } catch {}
+                        try { if (term.attrib === 3) val.date = term.value.date; } catch {}
+                        newTerm.value = val;
+                        newTerm.booleanAnd = term.booleanAnd;
+                        try { newTerm.beginsGrouping = term.beginsGrouping; } catch {}
+                        try { newTerm.endsGrouping = term.endsGrouping; } catch {}
+                        try { if (term.arbitraryHeader) newTerm.arbitraryHeader = term.arbitraryHeader; } catch {}
+                        newFilter.appendTerm(newTerm);
+                        termsCopied++;
+                      }
+                    } catch (e) {
+                      return { error: `Failed to copy existing conditions: ${e.toString()}` };
+                    }
+                    if (termsCopied === 0) {
+                      return { error: "Cannot update: failed to read existing filter conditions" };
+                    }
+                  }
+
+                  // Build or copy actions
+                  if (replaceActions) {
                     buildActions(newFilter, actions);
                     changes.push("actions");
                   } else {
@@ -2238,33 +2277,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       } catch {}
                     }
                   }
+
                   filterList.removeFilterAt(filterIndex);
                   filterList.insertFilterAt(filterIndex, newFilter);
-                  changes.push("conditions");
-                } else if (Array.isArray(actions) && actions.length > 0) {
-                  // Only replacing actions, not conditions
-                  const newFilter = filterList.createFilter(filter.filterName);
-                  newFilter.enabled = filter.enabled;
-                  newFilter.filterType = filter.filterType;
-                  // Copy existing terms
-                  try {
-                    for (const term of filter.searchTerms) {
-                      const newTerm = newFilter.createTerm();
-                      newTerm.attrib = term.attrib;
-                      newTerm.op = term.op;
-                      const val = newTerm.value;
-                      val.attrib = term.attrib;
-                      try { val.str = term.value.str || ""; } catch {}
-                      newTerm.value = val;
-                      newTerm.booleanAnd = term.booleanAnd;
-                      try { if (term.arbitraryHeader) newTerm.arbitraryHeader = term.arbitraryHeader; } catch {}
-                      newFilter.appendTerm(newTerm);
-                    }
-                  } catch {}
-                  buildActions(newFilter, actions);
-                  filterList.removeFilterAt(filterIndex);
-                  filterList.insertFilterAt(filterIndex, newFilter);
-                  changes.push("actions");
                 }
 
                 filterList.saveToDefaultFile();
@@ -2282,6 +2297,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function deleteFilter(accountId, filterIndex) {
               try {
                 if (typeof filterIndex === "string") filterIndex = parseInt(filterIndex);
+                if (!Number.isInteger(filterIndex)) return { error: "filterIndex must be an integer" };
 
                 const fl = getFilterListForAccount(accountId);
                 if (fl.error) return fl;
@@ -2306,6 +2322,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               try {
                 if (typeof fromIndex === "string") fromIndex = parseInt(fromIndex);
                 if (typeof toIndex === "string") toIndex = parseInt(toIndex);
+                if (!Number.isInteger(fromIndex)) return { error: "fromIndex must be an integer" };
+                if (!Number.isInteger(toIndex)) return { error: "toIndex must be an integer" };
 
                 const fl = getFilterListForAccount(accountId);
                 if (fl.error) return fl;
@@ -2319,9 +2337,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 // moveFilterAt is unreliable — use remove + insert instead
+                // Adjust toIndex after removal: if moving down, indices shift
                 const filter = filterList.getFilterAt(fromIndex);
                 filterList.removeFilterAt(fromIndex);
-                filterList.insertFilterAt(toIndex, filter);
+                const adjustedTo = (fromIndex < toIndex) ? toIndex - 1 : toIndex;
+                filterList.insertFilterAt(adjustedTo, filter);
                 filterList.saveToDefaultFile();
 
                 return { success: true, name: filter.filterName, fromIndex, toIndex };
