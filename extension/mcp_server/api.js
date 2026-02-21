@@ -239,6 +239,123 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["parentFolderPath", "name"],
         },
       },
+      {
+        name: "listFilters",
+        title: "List Filters",
+        description: "List all mail filters/rules for an account with their conditions and actions",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Account ID from listAccounts (omit for all accounts)" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "createFilter",
+        title: "Create Filter",
+        description: "Create a new mail filter rule on an account",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Account ID" },
+            name: { type: "string", description: "Filter name" },
+            enabled: { type: "boolean", description: "Whether filter is active (default: true)" },
+            type: { type: "number", description: "Filter type bitmask (default: 17 = inbox + manual). 1=inbox, 16=manual, 32=post-plugin, 64=post-outgoing" },
+            conditions: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, body, date, priority, status, size, ageInDays, hasAttachment, junkStatus, tag, otherHeader" },
+                  op: { type: "string", description: "Operator: contains, doesntContain, is, isnt, isEmpty, beginsWith, endsWith, isGreaterThan, isLessThan, isBefore, isAfter, matches, doesntMatch" },
+                  value: { type: "string", description: "Value to match against" },
+                  booleanAnd: { type: "boolean", description: "true=AND with previous, false=OR (default: true)" },
+                  header: { type: "string", description: "Custom header name (only when attrib is otherHeader)" },
+                },
+              },
+              description: "Array of filter conditions",
+            },
+            actions: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  type: { type: "string", description: "Action: moveToFolder, copyToFolder, markRead, markUnread, markFlagged, addTag, changePriority, delete, stopExecution, forward, reply" },
+                  value: { type: "string", description: "Action parameter (folder URI for move/copy, tag name for addTag, priority for changePriority, email for forward)" },
+                },
+              },
+              description: "Array of actions to perform",
+            },
+            insertAtIndex: { type: "number", description: "Position to insert (0 = top priority, default: end of list)" },
+          },
+          required: ["accountId", "name", "conditions", "actions"],
+        },
+      },
+      {
+        name: "updateFilter",
+        title: "Update Filter",
+        description: "Modify an existing filter's properties, conditions, or actions",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Account ID" },
+            filterIndex: { type: "number", description: "Filter index (from listFilters)" },
+            name: { type: "string", description: "New filter name (optional)" },
+            enabled: { type: "boolean", description: "Enable/disable (optional)" },
+            type: { type: "number", description: "New filter type bitmask (optional)" },
+            conditions: {
+              type: "array",
+              description: "Replace all conditions (optional, same format as createFilter)",
+            },
+            actions: {
+              type: "array",
+              description: "Replace all actions (optional, same format as createFilter)",
+            },
+          },
+          required: ["accountId", "filterIndex"],
+        },
+      },
+      {
+        name: "deleteFilter",
+        title: "Delete Filter",
+        description: "Delete a mail filter by index",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Account ID" },
+            filterIndex: { type: "number", description: "Filter index to delete (from listFilters)" },
+          },
+          required: ["accountId", "filterIndex"],
+        },
+      },
+      {
+        name: "reorderFilters",
+        title: "Reorder Filters",
+        description: "Move a filter to a different position in the execution order",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Account ID" },
+            fromIndex: { type: "number", description: "Current filter index" },
+            toIndex: { type: "number", description: "Target index (0 = highest priority)" },
+          },
+          required: ["accountId", "fromIndex", "toIndex"],
+        },
+      },
+      {
+        name: "applyFilters",
+        title: "Apply Filters",
+        description: "Manually run all enabled filters on a folder to organize existing messages",
+        inputSchema: {
+          type: "object",
+          properties: {
+            accountId: { type: "string", description: "Account ID (uses its filters)" },
+            folderPath: { type: "string", description: "Folder URI to apply filters to (from listFolders)" },
+          },
+          required: ["accountId", "folderPath"],
+        },
+      },
     ];
 
     return {
@@ -1818,6 +1935,419 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // ── Filter constant maps ──
+
+            const ATTRIB_MAP = {
+              subject: 0, from: 1, body: 2, date: 3, priority: 4,
+              status: 5, to: 6, cc: 7, toOrCc: 8, allAddresses: 9,
+              ageInDays: 10, size: 11, tag: 12, hasAttachment: 13,
+              junkStatus: 14, junkPercent: 15, otherHeader: 16,
+            };
+            const ATTRIB_NAMES = Object.fromEntries(Object.entries(ATTRIB_MAP).map(([k, v]) => [v, k]));
+
+            const OP_MAP = {
+              contains: 0, doesntContain: 1, is: 2, isnt: 3, isEmpty: 4,
+              isBefore: 5, isAfter: 6, isHigherThan: 7, isLowerThan: 8,
+              beginsWith: 9, endsWith: 10, isInAB: 11, isntInAB: 12,
+              isGreaterThan: 13, isLessThan: 14, matches: 15, doesntMatch: 16,
+            };
+            const OP_NAMES = Object.fromEntries(Object.entries(OP_MAP).map(([k, v]) => [v, k]));
+
+            const ACTION_MAP = {
+              moveToFolder: 0x01, copyToFolder: 0x02, changePriority: 0x03,
+              delete: 0x04, markRead: 0x05, killThread: 0x06,
+              watchThread: 0x07, markFlagged: 0x08, reply: 0x0A,
+              forward: 0x0B, stopExecution: 0x0C, deleteFromServer: 0x0D,
+              leaveOnServer: 0x0E, junkScore: 0x0F, addTag: 0x11,
+              markUnread: 0x14, custom: 0x15,
+            };
+            const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
+
+            function getFilterListForAccount(accountId) {
+              const account = MailServices.accounts.getAccount(accountId);
+              if (!account) return { error: `Account not found: ${accountId}` };
+              const server = account.incomingServer;
+              if (!server) return { error: "Account has no server" };
+              if (server.canHaveFilters === false) return { error: "Account does not support filters" };
+              const filterList = server.getFilterList(null);
+              if (!filterList) return { error: "Could not access filter list" };
+              return { account, server, filterList };
+            }
+
+            function serializeFilter(filter, index) {
+              const terms = [];
+              try {
+                for (const term of filter.searchTerms) {
+                  const t = {
+                    attrib: ATTRIB_NAMES[term.attrib] || String(term.attrib),
+                    op: OP_NAMES[term.op] || String(term.op),
+                    booleanAnd: term.booleanAnd,
+                  };
+                  try { t.value = term.value.str || ""; } catch { t.value = ""; }
+                  if (term.arbitraryHeader) t.header = term.arbitraryHeader;
+                  terms.push(t);
+                }
+              } catch {
+                // searchTerms iteration may fail on some TB versions
+                // Try indexed access via termAsString as fallback
+              }
+
+              const actions = [];
+              for (let a = 0; a < filter.actionCount; a++) {
+                try {
+                  const action = filter.getActionAt(a);
+                  const act = { type: ACTION_NAMES[action.type] || String(action.type) };
+                  if (action.type === 0x01 || action.type === 0x02) {
+                    act.value = action.targetFolderUri || "";
+                  } else if (action.type === 0x03) {
+                    act.value = String(action.priority);
+                  } else if (action.type === 0x0F) {
+                    act.value = String(action.junkScore);
+                  } else {
+                    try { if (action.strValue) act.value = action.strValue; } catch {}
+                  }
+                  actions.push(act);
+                } catch {
+                  // Skip unreadable actions
+                }
+              }
+
+              return {
+                index,
+                name: filter.filterName,
+                enabled: filter.enabled,
+                type: filter.filterType,
+                temporary: filter.temporary,
+                terms,
+                actions,
+              };
+            }
+
+            function buildTerms(filter, conditions) {
+              for (const cond of conditions) {
+                const term = filter.createTerm();
+                const attribNum = ATTRIB_MAP[cond.attrib] ?? parseInt(cond.attrib);
+                if (isNaN(attribNum)) throw new Error(`Unknown attribute: ${cond.attrib}`);
+                term.attrib = attribNum;
+
+                const opNum = OP_MAP[cond.op] ?? parseInt(cond.op);
+                if (isNaN(opNum)) throw new Error(`Unknown operator: ${cond.op}`);
+                term.op = opNum;
+
+                const value = term.value;
+                value.attrib = term.attrib;
+                value.str = cond.value || "";
+                term.value = value;
+
+                term.booleanAnd = cond.booleanAnd !== false;
+                if (cond.header) term.arbitraryHeader = cond.header;
+                filter.appendTerm(term);
+              }
+            }
+
+            function buildActions(filter, actions) {
+              for (const act of actions) {
+                const action = filter.createAction();
+                const typeNum = ACTION_MAP[act.type] ?? parseInt(act.type);
+                if (isNaN(typeNum)) throw new Error(`Unknown action type: ${act.type}`);
+                action.type = typeNum;
+
+                if (act.value) {
+                  if (typeNum === 0x01 || typeNum === 0x02) {
+                    action.targetFolderUri = act.value;
+                  } else if (typeNum === 0x03) {
+                    action.priority = parseInt(act.value);
+                  } else if (typeNum === 0x0F) {
+                    action.junkScore = parseInt(act.value);
+                  } else {
+                    action.strValue = act.value;
+                  }
+                }
+                filter.appendAction(action);
+              }
+            }
+
+            // ── Filter tool handlers ──
+
+            function listFilters(accountId) {
+              try {
+                const results = [];
+                const accounts = accountId
+                  ? [MailServices.accounts.getAccount(accountId)]
+                  : Array.from(MailServices.accounts.accounts);
+
+                for (const account of accounts) {
+                  if (!account) continue;
+                  try {
+                    const server = account.incomingServer;
+                    if (!server || server.canHaveFilters === false) continue;
+
+                    const filterList = server.getFilterList(null);
+                    if (!filterList) continue;
+
+                    const filters = [];
+                    for (let i = 0; i < filterList.filterCount; i++) {
+                      try {
+                        filters.push(serializeFilter(filterList.getFilterAt(i), i));
+                      } catch {
+                        // Skip unreadable filters
+                      }
+                    }
+
+                    results.push({
+                      accountId: account.key,
+                      accountName: sanitizeForJson(server.prettyName),
+                      filterCount: filterList.filterCount,
+                      loggingEnabled: filterList.loggingEnabled,
+                      filters,
+                    });
+                  } catch {
+                    // Skip inaccessible accounts
+                  }
+                }
+
+                return results;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function createFilter(accountId, name, enabled, type, conditions, actions, insertAtIndex) {
+              try {
+                // Coerce arrays from MCP client string serialization
+                if (typeof conditions === "string") {
+                  try { conditions = JSON.parse(conditions); } catch { /* leave as-is */ }
+                }
+                if (typeof actions === "string") {
+                  try { actions = JSON.parse(actions); } catch { /* leave as-is */ }
+                }
+                if (typeof enabled === "string") enabled = enabled === "true";
+                if (typeof insertAtIndex === "string") insertAtIndex = parseInt(insertAtIndex);
+
+                if (!Array.isArray(conditions) || conditions.length === 0) {
+                  return { error: "conditions must be a non-empty array" };
+                }
+                if (!Array.isArray(actions) || actions.length === 0) {
+                  return { error: "actions must be a non-empty array" };
+                }
+
+                const fl = getFilterListForAccount(accountId);
+                if (fl.error) return fl;
+                const { filterList } = fl;
+
+                const filter = filterList.createFilter(name);
+                filter.enabled = enabled !== false;
+                filter.filterType = type || 17; // inbox + manual
+
+                buildTerms(filter, conditions);
+                buildActions(filter, actions);
+
+                const idx = (insertAtIndex != null && insertAtIndex >= 0)
+                  ? Math.min(insertAtIndex, filterList.filterCount)
+                  : filterList.filterCount;
+                filterList.insertFilterAt(idx, filter);
+                filterList.saveToDefaultFile();
+
+                return {
+                  success: true,
+                  name: filter.filterName,
+                  index: idx,
+                  filterCount: filterList.filterCount,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function updateFilter(accountId, filterIndex, name, enabled, type, conditions, actions) {
+              try {
+                // Coerce from MCP client
+                if (typeof filterIndex === "string") filterIndex = parseInt(filterIndex);
+                if (typeof enabled === "string") enabled = enabled === "true";
+                if (typeof type === "string") type = parseInt(type);
+                if (typeof conditions === "string") {
+                  try { conditions = JSON.parse(conditions); } catch { /* leave as-is */ }
+                }
+                if (typeof actions === "string") {
+                  try { actions = JSON.parse(actions); } catch { /* leave as-is */ }
+                }
+
+                const fl = getFilterListForAccount(accountId);
+                if (fl.error) return fl;
+                const { filterList } = fl;
+
+                if (filterIndex < 0 || filterIndex >= filterList.filterCount) {
+                  return { error: `Invalid filter index: ${filterIndex}` };
+                }
+
+                const filter = filterList.getFilterAt(filterIndex);
+                const changes = [];
+
+                if (name !== undefined) {
+                  filter.filterName = name;
+                  changes.push("name");
+                }
+                if (enabled !== undefined) {
+                  filter.enabled = enabled;
+                  changes.push("enabled");
+                }
+                if (type !== undefined) {
+                  filter.filterType = type;
+                  changes.push("type");
+                }
+
+                if (Array.isArray(conditions) && conditions.length > 0) {
+                  // Clear existing terms by recreating the filter's search terms
+                  // There's no clearTerms method, so we remove and re-add
+                  // Actually, we can use parseCondition or just rebuild
+                  // Safest: create a temp filter, build terms, then swap
+                  const tempFilter = filterList.createFilter("__temp__");
+                  buildTerms(tempFilter, conditions);
+                  // Copy terms from temp to real filter
+                  // Unfortunately there's no clearTerms, so we need to
+                  // remove the filter and re-insert a new one with same props
+                  const newFilter = filterList.createFilter(filter.filterName);
+                  newFilter.enabled = filter.enabled;
+                  newFilter.filterType = filter.filterType;
+                  buildTerms(newFilter, conditions);
+                  // Copy existing actions if not being replaced
+                  if (Array.isArray(actions) && actions.length > 0) {
+                    buildActions(newFilter, actions);
+                    changes.push("actions");
+                  } else {
+                    for (let a = 0; a < filter.actionCount; a++) {
+                      try {
+                        const origAction = filter.getActionAt(a);
+                        const newAction = newFilter.createAction();
+                        newAction.type = origAction.type;
+                        try { newAction.targetFolderUri = origAction.targetFolderUri; } catch {}
+                        try { newAction.priority = origAction.priority; } catch {}
+                        try { newAction.strValue = origAction.strValue; } catch {}
+                        try { newAction.junkScore = origAction.junkScore; } catch {}
+                        newFilter.appendAction(newAction);
+                      } catch {}
+                    }
+                  }
+                  filterList.removeFilterAt(filterIndex);
+                  filterList.insertFilterAt(filterIndex, newFilter);
+                  changes.push("conditions");
+                } else if (Array.isArray(actions) && actions.length > 0) {
+                  // Only replacing actions, not conditions
+                  const newFilter = filterList.createFilter(filter.filterName);
+                  newFilter.enabled = filter.enabled;
+                  newFilter.filterType = filter.filterType;
+                  // Copy existing terms
+                  try {
+                    for (const term of filter.searchTerms) {
+                      const newTerm = newFilter.createTerm();
+                      newTerm.attrib = term.attrib;
+                      newTerm.op = term.op;
+                      const val = newTerm.value;
+                      val.attrib = term.attrib;
+                      try { val.str = term.value.str || ""; } catch {}
+                      newTerm.value = val;
+                      newTerm.booleanAnd = term.booleanAnd;
+                      try { if (term.arbitraryHeader) newTerm.arbitraryHeader = term.arbitraryHeader; } catch {}
+                      newFilter.appendTerm(newTerm);
+                    }
+                  } catch {}
+                  buildActions(newFilter, actions);
+                  filterList.removeFilterAt(filterIndex);
+                  filterList.insertFilterAt(filterIndex, newFilter);
+                  changes.push("actions");
+                }
+
+                filterList.saveToDefaultFile();
+
+                return {
+                  success: true,
+                  changes,
+                  filter: serializeFilter(filterList.getFilterAt(filterIndex), filterIndex),
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function deleteFilter(accountId, filterIndex) {
+              try {
+                if (typeof filterIndex === "string") filterIndex = parseInt(filterIndex);
+
+                const fl = getFilterListForAccount(accountId);
+                if (fl.error) return fl;
+                const { filterList } = fl;
+
+                if (filterIndex < 0 || filterIndex >= filterList.filterCount) {
+                  return { error: `Invalid filter index: ${filterIndex}` };
+                }
+
+                const filter = filterList.getFilterAt(filterIndex);
+                const filterName = filter.filterName;
+                filterList.removeFilterAt(filterIndex);
+                filterList.saveToDefaultFile();
+
+                return { success: true, deleted: filterName, remainingCount: filterList.filterCount };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function reorderFilters(accountId, fromIndex, toIndex) {
+              try {
+                if (typeof fromIndex === "string") fromIndex = parseInt(fromIndex);
+                if (typeof toIndex === "string") toIndex = parseInt(toIndex);
+
+                const fl = getFilterListForAccount(accountId);
+                if (fl.error) return fl;
+                const { filterList } = fl;
+
+                if (fromIndex < 0 || fromIndex >= filterList.filterCount) {
+                  return { error: `Invalid source index: ${fromIndex}` };
+                }
+                if (toIndex < 0 || toIndex >= filterList.filterCount) {
+                  return { error: `Invalid target index: ${toIndex}` };
+                }
+
+                filterList.moveFilterAt(fromIndex, toIndex);
+                filterList.saveToDefaultFile();
+
+                return { success: true, fromIndex, toIndex };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function applyFilters(accountId, folderPath) {
+              try {
+                const fl = getFilterListForAccount(accountId);
+                if (fl.error) return fl;
+                const { filterList } = fl;
+
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) return { error: `Folder not found: ${folderPath}` };
+
+                const filterService = Cc["@mozilla.org/messenger/filter-service;1"]
+                  .getService(Ci.nsIMsgFilterService);
+                filterService.applyFiltersToFolders(filterList, [folder], null);
+
+                // applyFiltersToFolders is async — returns immediately
+                return {
+                  success: true,
+                  message: "Filters applied (processing may take a moment)",
+                  folder: folderPath,
+                  enabledFilters: (() => {
+                    let count = 0;
+                    for (let i = 0; i < filterList.filterCount; i++) {
+                      if (filterList.getFilterAt(i).enabled) count++;
+                    }
+                    return count;
+                  })(),
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             async function callTool(name, args) {
               switch (name) {
                 case "listAccounts":
@@ -1848,6 +2378,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return updateMessage(args.messageId, args.folderPath, args.read, args.flagged, args.moveTo, args.trash);
                 case "createFolder":
                   return createFolder(args.parentFolderPath, args.name);
+                case "listFilters":
+                  return listFilters(args.accountId);
+                case "createFilter":
+                  return createFilter(args.accountId, args.name, args.enabled, args.type, args.conditions, args.actions, args.insertAtIndex);
+                case "updateFilter":
+                  return updateFilter(args.accountId, args.filterIndex, args.name, args.enabled, args.type, args.conditions, args.actions);
+                case "deleteFilter":
+                  return deleteFilter(args.accountId, args.filterIndex);
+                case "reorderFilters":
+                  return reorderFilters(args.accountId, args.fromIndex, args.toIndex);
+                case "applyFilters":
+                  return applyFilters(args.accountId, args.folderPath);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }

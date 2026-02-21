@@ -57,6 +57,12 @@ Example for `~/.claude.json`:
 | `sendMail` | Open a compose window with pre-filled content |
 | `replyToMessage` | Reply with quoted original and proper threading |
 | `forwardMessage` | Forward with original attachments preserved |
+| `listFilters` | List all mail filter rules with conditions and actions |
+| `createFilter` | Create a new mail filter with conditions and actions |
+| `updateFilter` | Modify an existing filter's name, state, conditions, or actions |
+| `deleteFilter` | Delete a mail filter by index |
+| `reorderFilters` | Change filter execution priority order |
+| `applyFilters` | Manually run filters on a folder to organize messages |
 | `searchContacts` | Look up contacts |
 | `listCalendars` | List your calendars |
 | `createEvent` | Open a pre-filled calendar event dialog |
