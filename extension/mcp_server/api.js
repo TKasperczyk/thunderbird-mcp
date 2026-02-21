@@ -1983,7 +1983,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     op: OP_NAMES[term.op] || String(term.op),
                     booleanAnd: term.booleanAnd,
                   };
-                  try { t.value = term.value.str || ""; } catch { t.value = ""; }
+                  try {
+                    if (term.attrib === 3 || term.attrib === 10) {
+                      // Date or AgeInDays: try date first, then str
+                      try {
+                        const d = term.value.date;
+                        t.value = d ? new Date(d / 1000).toISOString() : (term.value.str || "");
+                      } catch { t.value = term.value.str || ""; }
+                    } else {
+                      t.value = term.value.str || "";
+                    }
+                  } catch { t.value = ""; }
                   if (term.arbitraryHeader) t.header = term.arbitraryHeader;
                   terms.push(t);
                 }
@@ -2308,10 +2318,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: `Invalid target index: ${toIndex}` };
                 }
 
-                filterList.moveFilterAt(fromIndex, toIndex);
+                // moveFilterAt is unreliable — use remove + insert instead
+                const filter = filterList.getFilterAt(fromIndex);
+                filterList.removeFilterAt(fromIndex);
+                filterList.insertFilterAt(toIndex, filter);
                 filterList.saveToDefaultFile();
 
-                return { success: true, fromIndex, toIndex };
+                return { success: true, name: filter.filterName, fromIndex, toIndex };
               } catch (e) {
                 return { error: e.toString() };
               }
