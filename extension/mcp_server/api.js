@@ -49,6 +49,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             accountId: { type: "string", description: "Optional account ID (from listAccounts) to limit results to a single account" },
+            folderPath: { type: "string", description: "Optional folder URI to list only that folder and its subfolders" },
           },
           required: [],
         },
@@ -61,6 +62,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             query: { type: "string", description: "Text to search in subject, author, or recipients (use empty string to match all)" },
+            folderPath: { type: "string", description: "Optional folder URI to limit search to that folder and its subfolders" },
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
             endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date" },
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
@@ -369,13 +371,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Lists all folders (optionally limited to a single account).
              * Depth is 0 for root children, increasing for subfolders.
              */
-            function listFolders(accountId) {
+            function listFolders(accountId, folderPath) {
               const results = [];
 
               function walkFolder(folder, accountKey, depth) {
                 try {
+                  const prettyName = folder.prettyName;
                   results.push({
-                    name: sanitizeForJson(folder.prettyName),
+                    name: sanitizeForJson(prettyName) || folder.name || "(unnamed)",
                     path: folder.URI,
                     accountId: accountKey,
                     totalMessages: folder.getTotalMessages(false),
@@ -395,6 +398,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 } catch {
                   // Skip subfolder traversal errors
                 }
+              }
+
+              // folderPath filter: list that folder and its subtree
+              if (folderPath) {
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+                const accountKey = folder.server
+                  ? (MailServices.accounts.findAccountForServer(folder.server)?.key || "unknown")
+                  : "unknown";
+                walkFolder(folder, accountKey, 0);
+                return results;
               }
 
               if (accountId) {
@@ -590,7 +606,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, startDate, endDate, maxResults, sortOrder) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, sortOrder) {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -671,9 +687,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
 
-              for (const account of MailServices.accounts.accounts) {
-                if (results.length >= SEARCH_COLLECTION_CAP) break;
-                searchFolder(account.incomingServer.rootFolder);
+              if (folderPath) {
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+                searchFolder(folder);
+              } else {
+                for (const account of MailServices.accounts.accounts) {
+                  if (results.length >= SEARCH_COLLECTION_CAP) break;
+                  searchFolder(account.incomingServer.rootFolder);
+                }
               }
 
               results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
@@ -1799,9 +1823,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listAccounts":
                   return listAccounts();
                 case "listFolders":
-                  return listFolders(args.accountId);
+                  return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.startDate, args.endDate, args.maxResults, args.sortOrder);
+                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.sortOrder);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":

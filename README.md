@@ -47,8 +47,8 @@ Example for `~/.claude.json`:
 | Tool | What it does |
 |------|--------------|
 | `listAccounts` | List all email accounts and their identities |
-| `listFolders` | List all mail folders with message counts |
-| `searchMessages` | Find emails by subject, sender, recipient, or date range |
+| `listFolders` | List all mail folders with message counts (filterable by account or folder subtree) |
+| `searchMessages` | Find emails by subject, sender, recipient, date range, or within a specific folder |
 | `getMessage` | Read full email content with optional attachment saving |
 | `getRecentMessages` | Get recent messages with date and unread filtering |
 | `updateMessage` | Mark read/unread, flag/unflag, move to folder, or trash |
