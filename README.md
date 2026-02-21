@@ -1,9 +1,9 @@
 # Thunderbird MCP
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Tools](https://img.shields.io/badge/20_Tools-email%2C_compose%2C_filters%2C_calendar-blue.svg)](#what-you-can-do)
+[![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
-[![MCP](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io/)
-[![Tools](https://img.shields.io/badge/Tools-20-orange.svg)](#what-you-can-do)
+[![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
 
 Give your AI assistant full access to Thunderbird — search mail, compose messages, manage filters, and organize your inbox. All through the [Model Context Protocol](https://modelcontextprotocol.io/).
 
