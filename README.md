@@ -6,7 +6,7 @@
 
 > Inspired by [bb1/thunderbird-mcp](https://github.com/bb1/thunderbird-mcp). Rewritten from scratch with a bundled HTTP server, proper MIME decoding, and UTF-8 handling throughout.
 
-An MCP server that lets AI assistants read email, manage calendars, and compose messages in Thunderbird.
+An MCP server that lets AI assistants read email, manage calendars, compose messages, and control message filters in Thunderbird.
 
 ## How it works
 
@@ -68,6 +68,8 @@ Example for `~/.claude.json`:
 | `createEvent` | Open a pre-filled calendar event dialog |
 
 Compose tools open a window for you to review before sending. Nothing gets sent automatically.
+
+Filter tools give full control over Thunderbird's message filters — create rules, modify conditions and actions, reorder priority, and run filters on demand. Changes persist immediately to `msgFilterRules.dat`.
 
 ## Security
 
