@@ -2339,8 +2339,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const folder = MailServices.folderLookup.getFolderForURL(folderPath);
                 if (!folder) return { error: `Folder not found: ${folderPath}` };
 
-                const filterService = Cc["@mozilla.org/messenger/filter-service;1"]
-                  .getService(Ci.nsIMsgFilterService);
+                // Try MailServices.filters first, fall back to XPCOM contract ID
+                let filterService;
+                try {
+                  filterService = MailServices.filters;
+                } catch {}
+                if (!filterService) {
+                  try {
+                    filterService = Cc["@mozilla.org/messenger/filter-service;1"]
+                      .getService(Ci.nsIMsgFilterService);
+                  } catch {}
+                }
+                if (!filterService) {
+                  return { error: "Filter service not available in this Thunderbird version" };
+                }
                 filterService.applyFiltersToFolders(filterList, [folder], null);
 
                 // applyFiltersToFolders is async — returns immediately
