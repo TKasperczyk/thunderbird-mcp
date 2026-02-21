@@ -1,5 +1,5 @@
-# Build output
-dist/
+# Build output (keep dist/thunderbird-mcp.xpi for easy install)
+dist/*.log
 
 # OS files
 .DS_Store

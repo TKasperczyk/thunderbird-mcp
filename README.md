@@ -89,11 +89,9 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 
 ```bash
 git clone https://github.com/TKasperczyk/thunderbird-mcp.git
-cd thunderbird-mcp
-./scripts/build.sh
 ```
 
-Install `dist/thunderbird-mcp.xpi` in Thunderbird (Tools > Add-ons > Install from File), then restart.
+Install `dist/thunderbird-mcp.xpi` in Thunderbird (Tools > Add-ons > Install from File), then restart. A pre-built XPI is included in the repo — no build step needed.
 
 ### 2. Configure your MCP client
 
