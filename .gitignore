@@ -16,6 +16,9 @@ Thumbs.db
 # MCP config (contains local paths)
 .mcp.json
 
+# Claude Code
+CLAUDE.md
+
 # Node.js
 node_modules/
 package-lock.json

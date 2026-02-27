@@ -19,6 +19,7 @@ const resProto = Cc[
 ].getService(Ci.nsISubstitutingProtocolHandler);
 
 const MCP_PORT = 8765;
+const AUTH_TOKEN_FILENAME = ".thunderbird-mcp-auth";
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 1000;
@@ -392,6 +393,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // Calendar not available
             }
 
+            // Generate auth token and write to ~/.thunderbird-mcp-auth
+            // The bridge reads this file to authenticate HTTP requests.
+            const authBytes = new Uint8Array(32);
+            crypto.getRandomValues(authBytes);
+            const authToken = Array.from(authBytes, b => b.toString(16).padStart(2, "0")).join("");
+            try {
+              const authFile = Cc["@mozilla.org/file/directory_service;1"]
+                .getService(Ci.nsIProperties)
+                .get("Home", Ci.nsIFile);
+              authFile.append(AUTH_TOKEN_FILENAME);
+              const foStream = Cc["@mozilla.org/network/file-output-stream;1"]
+                .createInstance(Ci.nsIFileOutputStream);
+              foStream.init(authFile, 0x02 | 0x08 | 0x20, 0o600, 0);
+              const data = authToken + "\n";
+              foStream.write(data, data.length);
+              foStream.close();
+            } catch (e) {
+              console.error("Failed to write auth token file:", e);
+            }
+
             /**
              * CRITICAL: Must specify { charset: "UTF-8" } or emojis/special chars
              * will be corrupted. NetUtil defaults to Latin-1.
@@ -723,6 +744,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
+	            /**
+	             * Walk the account's folder tree to find the Trash folder.
+	             * Returns the trash nsIMsgFolder or null.
+	             */
+	            function findTrashFolder(folder) {
+	              const TRASH_FLAG = 0x00000100;
+	              try {
+	                const account = MailServices.accounts.findAccountForServer(folder.server);
+	                const root = account?.incomingServer?.rootFolder;
+	                if (!root) return null;
+	                const stack = [root];
+	                while (stack.length > 0) {
+	                  const current = stack.pop();
+	                  try {
+	                    if (current && typeof current.getFlag === "function" && current.getFlag(TRASH_FLAG)) {
+	                      return current;
+	                    }
+	                  } catch {}
+	                  try {
+	                    if (current && current.hasSubFolders) {
+	                      for (const sf of current.subFolders) stack.push(sf);
+	                    }
+	                  } catch {}
+	                }
+	              } catch {}
+	              return null;
+	            }
+
 	            function searchMessages(query, folderPath, startDate, endDate, maxResults, sortOrder) {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
@@ -844,11 +893,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       lastName.includes(lowerQuery)) {
                     results.push({
                       id: card.UID,
-                      displayName: card.displayName,
-                      email: card.primaryEmail,
-                      firstName: card.firstName,
-                      lastName: card.lastName,
-                      addressBook: book.dirName
+                      displayName: sanitizeForJson(card.displayName),
+                      email: sanitizeForJson(card.primaryEmail),
+                      firstName: sanitizeForJson(card.firstName),
+                      lastName: sanitizeForJson(card.lastName),
+                      addressBook: sanitizeForJson(book.dirName)
                     });
                   }
 
@@ -1465,7 +1514,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                       composeFields.bcc = bcc || "";
 
-                      const origSubject = msgHdr.subject || "";
+                      const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
                       composeFields.subject = origSubject.startsWith("Re:") ? origSubject : `Re: ${origSubject}`;
 
                       // Threading headers
@@ -1544,7 +1593,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       composeFields.cc = cc || "";
                       composeFields.bcc = bcc || "";
 
-                      const origSubject = msgHdr.subject || "";
+                      const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
                       composeFields.subject = origSubject.startsWith("Fwd:") ? origSubject : `Fwd: ${origSubject}`;
 
                       // Get original body
@@ -1750,28 +1799,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 let trashFolder = null;
 
                 if (isDrafts) {
-                  // Find trash folder
-                  const TRASH_FLAG = 0x00000100;
-                  try {
-                    const account = MailServices.accounts.findAccountForServer(folder.server);
-                    const root = account?.incomingServer?.rootFolder;
-                    if (root) {
-                      const stack = [root];
-                      while (stack.length > 0 && !trashFolder) {
-                        const current = stack.pop();
-                        try {
-                          if (current && typeof current.getFlag === "function" && current.getFlag(TRASH_FLAG)) {
-                            trashFolder = current;
-                          }
-                        } catch {}
-                        try {
-                          if (current && current.hasSubFolders) {
-                            for (const sf of current.subFolders) stack.push(sf);
-                          }
-                        } catch {}
-                      }
-                    }
-                  } catch {}
+                  trashFolder = findTrashFolder(folder);
 
                   if (trashFolder) {
                     MailServices.copy.copyMessages(folder, found, trashFolder, true, null, null, false);
@@ -1832,43 +1860,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 let targetFolder = null;
 
                 if (trash === true) {
-                  const TRASH_FLAG = 0x00000100;
-                  let account = null;
-                  try {
-                    account = MailServices.accounts.findAccountForServer(folder.server);
-                  } catch {
-                    account = null;
-                  }
-                  if (!account) {
-                    return { error: "Could not determine account for message folder" };
-                  }
-                  const root = account.incomingServer?.rootFolder;
-                  if (!root) {
-                    return { error: "Account root folder not found" };
-                  }
-
-                  const stack = [root];
-                  while (stack.length > 0 && !targetFolder) {
-                    const current = stack.pop();
-                    try {
-                      if (current && typeof current.getFlag === "function" && current.getFlag(TRASH_FLAG)) {
-                        targetFolder = current;
-                        break;
-                      }
-                    } catch {
-                      // ignore flag read errors
-                    }
-                    try {
-                      if (current && current.hasSubFolders) {
-                        for (const subfolder of current.subFolders) {
-                          stack.push(subfolder);
-                        }
-                      }
-                    } catch {
-                      // ignore traversal errors
-                    }
-                  }
-
+                  targetFolder = findTrashFolder(folder);
                   if (!targetFolder) {
                     return { error: "Trash folder not found" };
                   }
@@ -2452,6 +2444,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return;
               }
 
+              // Verify auth token from bridge
+              let reqToken = "";
+              try { reqToken = req.getHeader("Authorization"); } catch {}
+              if (reqToken !== `Bearer ${authToken}`) {
+                res.setStatusLine("1.1", 401, "Unauthorized");
+                res.write("Invalid or missing auth token");
+                res.finish();
+                return;
+              }
+
               let message;
               try {
                 message = JSON.parse(readRequestBody(req));
@@ -2524,6 +2526,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
   onShutdown(isAppShutdown) {
     if (isAppShutdown) return;
+    // Remove auth token file
+    try {
+      const authFile = Cc["@mozilla.org/file/directory_service;1"]
+        .getService(Ci.nsIProperties)
+        .get("Home", Ci.nsIFile);
+      authFile.append(AUTH_TOKEN_FILENAME);
+      if (authFile.exists()) authFile.remove(false);
+    } catch {}
     resProto.setSubstitution("thunderbird-mcp", null);
     Services.obs.notifyObservers(null, "startupcache-invalidate");
   }

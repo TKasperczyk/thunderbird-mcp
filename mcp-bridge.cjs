@@ -8,9 +8,21 @@
 
 const http = require('http');
 const readline = require('readline');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 const THUNDERBIRD_PORT = 8765;
 const REQUEST_TIMEOUT = 30000;
+const AUTH_TOKEN_FILE = path.join(os.homedir(), '.thunderbird-mcp-auth');
+
+// Read auth token written by the Thunderbird extension
+let authToken = '';
+try {
+  authToken = fs.readFileSync(AUTH_TOKEN_FILE, 'utf8').trim();
+} catch {
+  process.stderr.write('Warning: Could not read auth token from ' + AUTH_TOKEN_FILE + '. Is Thunderbird running with the MCP extension?\n');
+}
 
 // Ensure stdout doesn't buffer - critical for MCP protocol
 if (process.stdout._handle?.setBlocking) {
@@ -105,7 +117,8 @@ function forwardToThunderbird(message) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData)
+        'Content-Length': Buffer.byteLength(postData),
+        'Authorization': `Bearer ${authToken}`
       }
     }, (res) => {
       const chunks = [];
@@ -163,7 +176,7 @@ rl.on('line', (line) => {
       await writeOutput(JSON.stringify({
         jsonrpc: '2.0',
         id: messageId,
-        error: { code: -32700, message: `Bridge error: ${err.message}` }
+        error: { code: -32603, message: `Bridge error: ${err.message}` }
       }) + '\n');
     })
     .finally(() => {
