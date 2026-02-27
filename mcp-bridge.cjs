@@ -15,13 +15,21 @@ const os = require('os');
 const THUNDERBIRD_PORT = 8765;
 const REQUEST_TIMEOUT = 30000;
 const AUTH_TOKEN_FILE = path.join(os.homedir(), '.thunderbird-mcp-auth');
+// Snap-packaged Thunderbird writes to its sandboxed home directory instead of $HOME
+const AUTH_TOKEN_FILE_SNAP = path.join(os.homedir(), 'snap', 'thunderbird', 'common', '.thunderbird-mcp-auth');
 
 // Read auth token written by the Thunderbird extension
 let authToken = '';
+let authTokenFile = AUTH_TOKEN_FILE;
 try {
   authToken = fs.readFileSync(AUTH_TOKEN_FILE, 'utf8').trim();
 } catch {
-  process.stderr.write('Warning: Could not read auth token from ' + AUTH_TOKEN_FILE + '. Is Thunderbird running with the MCP extension?\n');
+  try {
+    authToken = fs.readFileSync(AUTH_TOKEN_FILE_SNAP, 'utf8').trim();
+    authTokenFile = AUTH_TOKEN_FILE_SNAP;
+  } catch {
+    process.stderr.write('Warning: Could not read auth token from ' + AUTH_TOKEN_FILE + '. Is Thunderbird running with the MCP extension?\n');
+  }
 }
 
 // Ensure stdout doesn't buffer - critical for MCP protocol

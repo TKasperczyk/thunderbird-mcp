@@ -394,25 +394,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // Calendar not available
             }
 
-            // Generate auth token and write to ~/.thunderbird-mcp-auth
-            // The bridge reads this file to authenticate HTTP requests.
-            const authBytes = new Uint8Array(32);
-            crypto.getRandomValues(authBytes);
+            // Generate auth token — written to disk only after server.start() succeeds
+            // (below) so that a failed second-start attempt cannot overwrite the token
+            // of an already-running server.
+            // Note: Web Crypto API (crypto.getRandomValues) is not available in the
+            // experiment_apis parent scope; use XPCOM's nsIRandomGenerator instead.
+            const rng = Cc["@mozilla.org/security/random-generator;1"].createInstance(Ci.nsIRandomGenerator);
+            const authBytes = rng.generateRandomBytes(32);
             const authToken = Array.from(authBytes, b => b.toString(16).padStart(2, "0")).join("");
-            try {
-              const authFile = Cc["@mozilla.org/file/directory_service;1"]
-                .getService(Ci.nsIProperties)
-                .get("Home", Ci.nsIFile);
-              authFile.append(AUTH_TOKEN_FILENAME);
-              const foStream = Cc["@mozilla.org/network/file-output-stream;1"]
-                .createInstance(Ci.nsIFileOutputStream);
-              foStream.init(authFile, 0x02 | 0x08 | 0x20, 0o600, 0);
-              const data = authToken + "\n";
-              foStream.write(data, data.length);
-              foStream.close();
-            } catch (e) {
-              console.error("Failed to write auth token file:", e);
-            }
 
             /**
              * CRITICAL: Must specify { charset: "UTF-8" } or emojis/special chars
@@ -2528,9 +2517,35 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             });
 
             server.start(MCP_PORT);
+
+            // Write auth token only after port binding succeeds, so a failed
+            // concurrent start cannot overwrite the token of the running server.
+            try {
+              const authFile = Cc["@mozilla.org/file/directory_service;1"]
+                .getService(Ci.nsIProperties)
+                .get("Home", Ci.nsIFile);
+              authFile.append(AUTH_TOKEN_FILENAME);
+              console.log(`MCP: writing auth token to ${authFile.path}`);
+              const foStream = Cc["@mozilla.org/network/file-output-stream;1"]
+                .createInstance(Ci.nsIFileOutputStream);
+              foStream.init(authFile, 0x02 | 0x08 | 0x20, 0o600, 0);
+              const data = authToken + "\n";
+              foStream.write(data, data.length);
+              foStream.close();
+              console.log(`MCP: auth token written successfully`);
+            } catch (e) {
+              console.error("MCP: Failed to write auth token file:", e);
+            }
+
             console.log(`Thunderbird MCP server listening on port ${MCP_PORT}`);
             return { success: true, port: MCP_PORT };
           } catch (e) {
+            // If the port is already in use, the server is already running from a
+            // previous start() call. Return success so the caller doesn't retry.
+            if (String(e).includes("NS_ERROR_SOCKET_ADDRESS_IN_USE")) {
+              console.log(`MCP: port ${MCP_PORT} already in use — server already running`);
+              return { success: true, port: MCP_PORT };
+            }
             console.error("Failed to start MCP server:", e);
             // Clear cached promise so a retry can attempt to bind again
             globalThis.__tbMcpStartPromise = null;
@@ -2546,14 +2561,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
   onShutdown(isAppShutdown) {
     if (isAppShutdown) return;
-    // Remove auth token file
-    try {
-      const authFile = Cc["@mozilla.org/file/directory_service;1"]
-        .getService(Ci.nsIProperties)
-        .get("Home", Ci.nsIFile);
-      authFile.append(AUTH_TOKEN_FILENAME);
-      if (authFile.exists()) authFile.remove(false);
-    } catch {}
+    // NOTE: We intentionally do NOT delete the auth token file here.
+    // During extension updates, onShutdown(false) for the old version can run
+    // AFTER the new version has already written its token, deleting it.
+    // Stale tokens on disk are harmless — they won't match the server's in-memory token.
+
     // Clean up saved attachments
     try {
       const attachDir = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
