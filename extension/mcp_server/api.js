@@ -20,6 +20,7 @@ const resProto = Cc[
 
 const MCP_PORT = 8765;
 const AUTH_TOKEN_FILENAME = ".thunderbird-mcp-auth";
+const ATTACHMENT_DIR = "/tmp/thunderbird-mcp";
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 1000;
@@ -609,17 +610,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return null;
             }
 
+            // Paths that should never be attached (sensitive system directories)
+            const BLOCKED_PATH_PREFIXES = ["/etc/", "/root/", "/proc/", "/sys/", "/dev/"];
+            const BLOCKED_PATH_PATTERNS = [/[/.]ssh[/]/, /[/.]gnupg[/]/, /[/.]aws[/]/, /[/.]config[/]gcloud/];
+            const homeDir = Cc["@mozilla.org/file/directory_service;1"]
+              .getService(Ci.nsIProperties)
+              .get("Home", Ci.nsIFile).path;
+
             /**
              * Adds file attachments to compose fields.
-             * Returns { added: number, failed: string[] } for failure reporting.
+             * Rejects paths to sensitive system directories.
+             * Returns { added: number, failed: string[], blocked: string[] }.
              */
             function addAttachments(composeFields, attachments) {
-              const result = { added: 0, failed: [] };
+              const result = { added: 0, failed: [], blocked: [] };
               if (!attachments || !Array.isArray(attachments)) return result;
               for (const filePath of attachments) {
                 try {
+                  // Block sensitive system paths
+                  if (BLOCKED_PATH_PREFIXES.some(p => filePath.startsWith(p)) ||
+                      BLOCKED_PATH_PATTERNS.some(p => p.test(filePath))) {
+                    result.blocked.push(filePath);
+                    continue;
+                  }
                   const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
                   file.initWithPath(filePath);
+                  // Resolve symlinks and verify the real path isn't blocked
+                  const resolvedPath = file.target || file.path;
+                  if (BLOCKED_PATH_PREFIXES.some(p => resolvedPath.startsWith(p)) ||
+                      BLOCKED_PATH_PATTERNS.some(p => p.test(resolvedPath))) {
+                    result.blocked.push(filePath);
+                    continue;
+                  }
                   if (file.exists()) {
                     const attachment = Cc["@mozilla.org/messengercompose/attachment;1"]
                       .createInstance(Ci.nsIMsgAttachment);
@@ -678,7 +700,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	            /**
 	             * Opens a folder and its message database.
 	             * Best-effort refresh for IMAP folders (db may be stale).
-	             * Returns { folder, db } or { error }.
+	             * Returns { folder, db, isImap } or { error }.
 	             */
 	            function openFolder(folderPath) {
 	              try {
@@ -687,13 +709,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  return { error: `Folder not found: ${folderPath}` };
 	                }
 
+	                const isImap = !!(folder.server && folder.server.type === "imap");
+
 	                // Attempt to refresh IMAP folders. This is async and may not
 	                // complete before we read, but helps with stale data.
-	                if (folder.server && folder.server.type === "imap") {
+	                if (isImap) {
 	                  try {
 	                    folder.updateFolder(null);
-	                  } catch {
-	                    // updateFolder may fail, continue anyway
+	                  } catch (e) {
+	                    console.debug("IMAP updateFolder failed:", e);
 	                  }
 	                }
 
@@ -702,7 +726,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  return { error: "Could not access folder database" };
 	                }
 
-	                return { folder, db };
+	                return { folder, db, isImap };
 	              } catch (e) {
 	                return { error: e.toString() };
 	              }
@@ -710,13 +734,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
 	            /**
 	             * Finds a single message header by messageId within a folderPath.
-	             * Returns { msgHdr, folder, db } or { error }.
+	             * Returns { msgHdr, folder, db, isImap } or { error }.
 	             */
 	            function findMessage(messageId, folderPath) {
 	              const opened = openFolder(folderPath);
 	              if (opened.error) return opened;
 
-	              const { folder, db } = opened;
+	              const { folder, db, isImap } = opened;
 	              let msgHdr = null;
 
 	              const hasDirectLookup = typeof db.getMsgHdrForMessageID === "function";
@@ -741,7 +765,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                return { error: `Message not found: ${messageId}` };
 	              }
 
-	              return { msgHdr, folder, db };
+	              return { msgHdr, folder, db, isImap };
 	            }
 
 	            /**
@@ -789,6 +813,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               );
               const normalizedSortOrder = sortOrder === "asc" ? "asc" : "desc";
 
+              let hasImapFolders = false;
+
               function searchFolder(folder) {
                 if (results.length >= SEARCH_COLLECTION_CAP) return;
 
@@ -796,10 +822,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // Attempt to refresh IMAP folders. This is async and may not
                   // complete before we read, but helps with stale data.
                   if (folder.server && folder.server.type === "imap") {
+                    hasImapFolders = true;
                     try {
                       folder.updateFolder(null);
-                    } catch {
-                      // updateFolder may fail, continue anyway
+                    } catch (e) {
+                      console.debug("IMAP updateFolder failed:", e);
                     }
                   }
 
@@ -841,8 +868,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       });
                     }
                   }
-                } catch {
-                  // Skip inaccessible folders
+                } catch (e) {
+                  console.debug("Skipping inaccessible folder:", folder?.URI, e);
                 }
 
                 if (folder.hasSubFolders) {
@@ -868,10 +895,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
 
-              return results.slice(0, effectiveLimit).map(result => {
+              const messages = results.slice(0, effectiveLimit).map(result => {
                 delete result._dateTs;
                 return result;
               });
+              if (hasImapFolders) {
+                return { messages, imapSyncPending: true, note: "IMAP folder sync is async — results may not include the latest messages. Retry if expected messages are missing." };
+              }
+              return messages;
             }
 
             function searchContacts(query) {
@@ -1223,7 +1254,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     function ensureAttachmentDir(sanitizedId) {
                       const root = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
-                      root.initWithPath("/tmp/thunderbird-mcp");
+                      root.initWithPath(ATTACHMENT_DIR);
                       try {
                         root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
                       } catch (e) {
@@ -1674,6 +1705,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function getRecentMessages(folderPath, daysBack, maxResults, unreadOnly) {
               const results = [];
+              let hasImapFolders = false;
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
               const cutoffTs = (Date.now() - days * 86400000) * 1000; // Thunderbird uses microseconds
               const requestedLimit = Number(maxResults);
@@ -1709,8 +1741,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       _dateTs: msgDateTs
                     });
                   }
-                } catch {
-                  // Skip inaccessible folders
+                } catch (e) {
+                  console.debug("Skipping inaccessible folder:", folder?.URI, e);
                 }
 
                 if (folder.hasSubFolders) {
@@ -1725,12 +1757,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // Specific folder
                 const opened = openFolder(folderPath);
                 if (opened.error) return { error: opened.error };
+                if (opened.isImap) hasImapFolders = true;
                 collectFromFolder(opened.folder);
               } else {
                 // All folders across all accounts
                 for (const account of MailServices.accounts.accounts) {
                   if (results.length >= SEARCH_COLLECTION_CAP) break;
                   try {
+                    if (account.incomingServer.type === "imap") hasImapFolders = true;
                     const root = account.incomingServer.rootFolder;
                     collectFromFolder(root);
                   } catch {
@@ -1741,10 +1775,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => b._dateTs - a._dateTs);
 
-              return results.slice(0, effectiveLimit).map(r => {
+              const messages = results.slice(0, effectiveLimit).map(r => {
                 delete r._dateTs;
                 return r;
               });
+              if (hasImapFolders) {
+                return { messages, imapSyncPending: true, note: "IMAP folder sync is async — results may not include the latest messages. Retry if expected messages are missing." };
+              }
+              return messages;
             }
 
             function deleteMessages(messageIds, folderPath) {
@@ -1990,9 +2028,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (term.arbitraryHeader) t.header = term.arbitraryHeader;
                   terms.push(t);
                 }
-              } catch {
-                // searchTerms iteration may fail on some TB versions
-                // Try indexed access via termAsString as fallback
+              } catch (e) {
+                console.debug("searchTerms iteration failed:", e);
               }
 
               const actions = [];
@@ -2010,8 +2047,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     try { if (action.strValue) act.value = action.strValue; } catch {}
                   }
                   actions.push(act);
-                } catch {
-                  // Skip unreadable actions
+                } catch (e) {
+                  console.debug("Skipping unreadable filter action at index", a, e);
                 }
               }
 
@@ -2385,51 +2422,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            const toolHandlers = {
+              listAccounts: () => listAccounts(),
+              listFolders: (a) => listFolders(a.accountId, a.folderPath),
+              searchMessages: (a) => searchMessages(a.query || "", a.folderPath, a.startDate, a.endDate, a.maxResults, a.sortOrder),
+              getMessage: (a) => getMessage(a.messageId, a.folderPath, a.saveAttachments),
+              searchContacts: (a) => searchContacts(a.query || ""),
+              listCalendars: () => listCalendars(),
+              createEvent: (a) => createEvent(a.title, a.startDate, a.endDate, a.location, a.description, a.calendarId, a.allDay),
+              sendMail: (a) => composeMail(a.to, a.subject, a.body, a.cc, a.bcc, a.isHtml, a.from, a.attachments),
+              replyToMessage: (a) => replyToMessage(a.messageId, a.folderPath, a.body, a.replyAll, a.isHtml, a.to, a.cc, a.bcc, a.from, a.attachments),
+              forwardMessage: (a) => forwardMessage(a.messageId, a.folderPath, a.to, a.body, a.isHtml, a.cc, a.bcc, a.from, a.attachments),
+              getRecentMessages: (a) => getRecentMessages(a.folderPath, a.daysBack, a.maxResults, a.unreadOnly),
+              deleteMessages: (a) => deleteMessages(a.messageIds, a.folderPath),
+              updateMessage: (a) => updateMessage(a.messageId, a.folderPath, a.read, a.flagged, a.moveTo, a.trash),
+              createFolder: (a) => createFolder(a.parentFolderPath, a.name),
+              listFilters: (a) => listFilters(a.accountId),
+              createFilter: (a) => createFilter(a.accountId, a.name, a.enabled, a.type, a.conditions, a.actions, a.insertAtIndex),
+              updateFilter: (a) => updateFilter(a.accountId, a.filterIndex, a.name, a.enabled, a.type, a.conditions, a.actions),
+              deleteFilter: (a) => deleteFilter(a.accountId, a.filterIndex),
+              reorderFilters: (a) => reorderFilters(a.accountId, a.fromIndex, a.toIndex),
+              applyFilters: (a) => applyFilters(a.accountId, a.folderPath),
+            };
+
             async function callTool(name, args) {
-              switch (name) {
-                case "listAccounts":
-                  return listAccounts();
-                case "listFolders":
-                  return listFolders(args.accountId, args.folderPath);
-                case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.sortOrder);
-                case "getMessage":
-                  return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
-                case "searchContacts":
-                  return searchContacts(args.query || "");
-                case "listCalendars":
-                  return listCalendars();
-                case "createEvent":
-                  return createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay);
-                case "sendMail":
-                  return composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
-                case "replyToMessage":
-                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments);
-                case "forwardMessage":
-                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
-                case "getRecentMessages":
-                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.unreadOnly);
-                case "deleteMessages":
-                  return deleteMessages(args.messageIds, args.folderPath);
-                case "updateMessage":
-                  return updateMessage(args.messageId, args.folderPath, args.read, args.flagged, args.moveTo, args.trash);
-                case "createFolder":
-                  return createFolder(args.parentFolderPath, args.name);
-                case "listFilters":
-                  return listFilters(args.accountId);
-                case "createFilter":
-                  return createFilter(args.accountId, args.name, args.enabled, args.type, args.conditions, args.actions, args.insertAtIndex);
-                case "updateFilter":
-                  return updateFilter(args.accountId, args.filterIndex, args.name, args.enabled, args.type, args.conditions, args.actions);
-                case "deleteFilter":
-                  return deleteFilter(args.accountId, args.filterIndex);
-                case "reorderFilters":
-                  return reorderFilters(args.accountId, args.fromIndex, args.toIndex);
-                case "applyFilters":
-                  return applyFilters(args.accountId, args.folderPath);
-                default:
-                  throw new Error(`Unknown tool: ${name}`);
-              }
+              const handler = toolHandlers[name];
+              if (!handler) throw new Error(`Unknown tool: ${name}`);
+              return await handler(args);
             }
 
             const server = new HttpServer();
@@ -2457,7 +2476,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               let message;
               try {
                 message = JSON.parse(readRequestBody(req));
-              } catch {
+              } catch (e) {
+                console.debug("Failed to parse request JSON:", e);
                 res.setStatusLine("1.1", 400, "Bad Request");
                 res.write("Invalid JSON");
                 res.finish();
@@ -2533,6 +2553,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         .get("Home", Ci.nsIFile);
       authFile.append(AUTH_TOKEN_FILENAME);
       if (authFile.exists()) authFile.remove(false);
+    } catch {}
+    // Clean up saved attachments
+    try {
+      const attachDir = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+      attachDir.initWithPath(ATTACHMENT_DIR);
+      if (attachDir.exists() && attachDir.isDirectory()) {
+        attachDir.remove(true);
+      }
     } catch {}
     resProto.setSubstitution("thunderbird-mcp", null);
     Services.obs.notifyObservers(null, "startupcache-invalidate");

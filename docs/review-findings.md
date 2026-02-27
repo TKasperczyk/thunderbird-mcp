@@ -13,35 +13,36 @@ Tracked from full codebase review conducted 2026-02-27.
   - Fixed: auth token generated at extension startup, written to `~/.thunderbird-mcp-auth`,
     bridge reads it and sends `Authorization: Bearer <token>`. Cleaned up on shutdown.
 
-- [ ] **S3** — Attachment saves to `/tmp/thunderbird-mcp/` grow unboundedly
-  - `api.js:1162-1193` — no cleanup mechanism
-  - Fix: document cleanup responsibility, consider on-shutdown cleanup
+- [x] **S3** — Attachment saves to `/tmp/thunderbird-mcp/` grow unboundedly
+  - Fixed: `ATTACHMENT_DIR` constant extracted, `/tmp/thunderbird-mcp/` recursively removed in `onShutdown`.
 
-- [ ] **S4** — `addAttachments` accepts arbitrary file paths
-  - `api.js:595-617` — could attach sensitive files like `/etc/shadow`
-  - Fix: restrict to home directory or whitelist, or log warnings
+- [x] **S4** — `addAttachments` accepts arbitrary file paths
+  - Fixed: blocked sensitive path prefixes (`/etc/`, `/root/`, `/proc/`, `/sys/`, `/dev/`)
+    and patterns (`.ssh/`, `.gnupg/`, `.aws/`). Symlinks resolved before checking.
+    Returns `blocked` array in result.
 
-- [ ] **R1** — IMAP `updateFolder` is fire-and-forget, results may be stale
-  - `api.js:669-677` — no staleness indication in results
-  - Fix: add `imapSyncPending` field to search/recent results for IMAP folders
+- [x] **R1** — IMAP `updateFolder` is fire-and-forget, results may be stale
+  - Fixed: `openFolder` returns `isImap` flag. `searchMessages` and `getRecentMessages`
+    return `{ messages, imapSyncPending: true, note: "..." }` when IMAP folders are involved.
 
 - [x] **R5** — Reply/Forward use raw subject for Re:/Fwd: prefix check
-  - Fixed: both now use `msgHdr.mime2DecodedSubject` with fallback to `msgHdr.subject`
+  - Fixed: both now use `msgHdr.mime2DecodedSubject` with fallback to `msgHdr.subject`.
 
 - [x] **Q2** — "Find trash folder" logic duplicated
-  - Fixed: extracted `findTrashFolder(folder)` helper, used in `deleteMessages` and `updateMessage`
+  - Fixed: extracted `findTrashFolder(folder)` helper, used in `deleteMessages` and `updateMessage`.
 
 ## Suggestions
 
-- [ ] **R3** — 40+ empty `catch {}` blocks suppress debugging info
-  - Fix: add `console.debug` to critical paths
+- [x] **R3** — 40+ empty `catch {}` blocks suppress debugging info
+  - Fixed: added `console.debug` to critical paths (IMAP refresh, folder access,
+    search iteration, filter operations, HTTP request parsing). Low-risk folder-walking
+    catches left as-is to avoid log noise.
 
 - [x] **R6** — `searchContacts` doesn't run output through `sanitizeForJson`
-  - Fixed: all contact fields now wrapped with `sanitizeForJson()`
+  - Fixed: all contact fields now wrapped with `sanitizeForJson()`.
 
 - [x] **P3** — Bridge uses wrong JSON-RPC error code (-32700 for connection failures)
-  - Fixed: changed to -32603 (Internal error)
+  - Fixed: changed to -32603 (Internal error).
 
-- [ ] **Q3** — `callTool` switch and `tools[]` array can drift out of sync
-  - `api.js:2396-2441`
-  - Fix: consider registry pattern (lower priority)
+- [x] **Q3** — `callTool` switch and `tools[]` array can drift out of sync
+  - Fixed: replaced switch with `toolHandlers` registry map. `callTool` does a map lookup.
