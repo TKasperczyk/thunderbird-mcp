@@ -18,6 +18,7 @@ Thumbs.db
 
 # Claude Code
 CLAUDE.md
+.code-explorer/
 
 # Node.js
 node_modules/
