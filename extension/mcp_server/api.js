@@ -889,7 +889,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return result;
               });
               if (hasImapFolders) {
-                return { messages, imapSyncPending: true, note: "IMAP folder sync is async — results may not include the latest messages. Retry if expected messages are missing." };
+                return { messages, imapSyncPending: true, note: "IMAP folder sync is async - results may not include the latest messages. Retry if expected messages are missing." };
               }
               return messages;
             }
@@ -1769,7 +1769,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return r;
               });
               if (hasImapFolders) {
-                return { messages, imapSyncPending: true, note: "IMAP folder sync is async — results may not include the latest messages. Retry if expected messages are missing." };
+                return { messages, imapSyncPending: true, note: "IMAP folder sync is async - results may not include the latest messages. Retry if expected messages are missing." };
               }
               return messages;
             }
