@@ -3818,7 +3818,18 @@ Response.prototype = {
     }
 
     var dataAsString = String(data);
-    this.bodyOutputStream.write(dataAsString, dataAsString.length);
+    // Encode as UTF-8 to correctly handle non-ASCII characters.
+    // The default bodyOutputStream.write() only takes the low byte of each
+    // UTF-16 code unit, silently discarding the high byte and corrupting
+    // any non-Latin-1 text (e.g., CJK characters).
+    var encoder = new TextEncoder();
+    var utf8Bytes = encoder.encode(dataAsString);
+    var binaryChars = new Array(utf8Bytes.length);
+    for (var i = 0; i < utf8Bytes.length; i++) {
+      binaryChars[i] = String.fromCharCode(utf8Bytes[i]);
+    }
+    var binaryStr = binaryChars.join('');
+    this.bodyOutputStream.write(binaryStr, binaryStr.length);
   },
 
   //

@@ -401,62 +401,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return NetUtil.readInputStreamToString(stream, stream.available(), { charset: "UTF-8" });
             }
 
-            /**
-             * Thunderbird's httpd.sys.mjs writes response strings as raw bytes.
-             * Pre-encode non-ASCII as UTF-8 byte chars and strip invalid controls.
-             */
-            function sanitizeForJson(text) {
-              if (!text) return text;
 
-              let sanitized = "";
-
-              for (let i = 0; i < text.length; i++) {
-                const code = text.charCodeAt(i);
-
-                if (
-                  (code >= 0x00 && code <= 0x08) ||
-                  code === 0x0b ||
-                  code === 0x0c ||
-                  (code >= 0x0e && code <= 0x1f) ||
-                  code === 0x7f
-                ) {
-                  continue;
-                }
-
-                if (code <= 0x7f) {
-                  sanitized += text[i];
-                  continue;
-                }
-
-                const codePoint = text.codePointAt(i);
-                if (codePoint > 0xffff) {
-                  sanitized += String.fromCharCode(
-                    0xf0 | (codePoint >> 18),
-                    0x80 | ((codePoint >> 12) & 0x3f),
-                    0x80 | ((codePoint >> 6) & 0x3f),
-                    0x80 | (codePoint & 0x3f)
-                  );
-                  i++;
-                  continue;
-                }
-
-                if (codePoint <= 0x7ff) {
-                  sanitized += String.fromCharCode(
-                    0xc0 | (codePoint >> 6),
-                    0x80 | (codePoint & 0x3f)
-                  );
-                  continue;
-                }
-
-                sanitized += String.fromCharCode(
-                  0xe0 | (codePoint >> 12),
-                  0x80 | ((codePoint >> 6) & 0x3f),
-                  0x80 | (codePoint & 0x3f)
-                );
-              }
-
-              return sanitized;
-            }
 
             /**
              * Lists all email accounts and their identities.
@@ -495,7 +440,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   const prettyName = folder.prettyName;
                   results.push({
-                    name: sanitizeForJson(prettyName) || folder.name || "(unnamed)",
+                    name: prettyName || folder.name || "(unnamed)",
                     path: folder.URI,
                     accountId: accountKey,
                     totalMessages: folder.getTotalMessages(false),
@@ -779,12 +724,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         ccList.includes(lowerQuery)) {
                       results.push({
                         id: msgHdr.messageId,
-                        subject: sanitizeForJson(msgHdr.mime2DecodedSubject || msgHdr.subject),
-                        author: sanitizeForJson(msgHdr.mime2DecodedAuthor || msgHdr.author),
-                        recipients: sanitizeForJson(msgHdr.mime2DecodedRecipients || msgHdr.recipients),
-                        ccList: sanitizeForJson(msgHdr.ccList),
+                        subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
+                        author: msgHdr.mime2DecodedAuthor || msgHdr.author,
+                        recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                        ccList: msgHdr.ccList,
                         date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                        folder: sanitizeForJson(folder.prettyName),
+                        folder: folder.prettyName,
                         folderPath: folder.URI,
                         read: msgHdr.isRead,
                         flagged: msgHdr.isFlagged,
@@ -1030,8 +975,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     let body = "";
                     let bodyIsHtml = false;
                     try {
-                      // sanitizeForJson removes control chars that break JSON
-                      body = sanitizeForJson(aMimeMsg.coerceBodyToPlaintext());
+                      body = aMimeMsg.coerceBodyToPlaintext();
                     } catch {
                       body = "";
                     }
@@ -1114,7 +1058,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           } else {
                             bodyIsHtml = false;
                           }
-                          body = sanitizeForJson(extracted);
+                          body = extracted;
                         } else {
                           body = "(Could not extract body text)";
                         }
@@ -1129,8 +1073,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (aMimeMsg && aMimeMsg.allUserAttachments) {
                       for (const att of aMimeMsg.allUserAttachments) {
                         const info = {
-                          name: sanitizeForJson(att?.name || ""),
-                          contentType: sanitizeForJson(att?.contentType || ""),
+                          name: att?.name || "",
+                          contentType: att?.contentType || "",
                           size: typeof att?.size === "number" ? att.size : null
                         };
                         attachments.push(info);
@@ -1144,10 +1088,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     const baseResponse = {
                       id: msgHdr.messageId,
-                      subject: sanitizeForJson(msgHdr.mime2DecodedSubject || msgHdr.subject),
-                      author: sanitizeForJson(msgHdr.mime2DecodedAuthor || msgHdr.author),
-                      recipients: sanitizeForJson(msgHdr.mime2DecodedRecipients || msgHdr.recipients),
-                      ccList: sanitizeForJson(msgHdr.ccList),
+                      subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
+                      author: msgHdr.mime2DecodedAuthor || msgHdr.author,
+                      recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                      ccList: msgHdr.ccList,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
                       body,
                       bodyIsHtml,
@@ -1649,11 +1593,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     results.push({
                       id: msgHdr.messageId,
-                      subject: sanitizeForJson(msgHdr.mime2DecodedSubject || msgHdr.subject),
-                      author: sanitizeForJson(msgHdr.mime2DecodedAuthor || msgHdr.author),
-                      recipients: sanitizeForJson(msgHdr.mime2DecodedRecipients || msgHdr.recipients),
+                      subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
+                      author: msgHdr.mime2DecodedAuthor || msgHdr.author,
+                      recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                      folder: sanitizeForJson(folder.prettyName),
+                      folder: folder.prettyName,
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
@@ -2025,7 +1969,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               return {
                 index,
-                name: sanitizeForJson(filter.filterName),
+                name: filter.filterName,
                 enabled: filter.enabled,
                 type: filter.filterType,
                 temporary: filter.temporary,
@@ -2112,7 +2056,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     results.push({
                       accountId: account.key,
-                      accountName: sanitizeForJson(server.prettyName),
+                      accountName: server.prettyName,
                       filterCount: filterList.filterCount,
                       loggingEnabled: filterList.loggingEnabled,
                       filters,
