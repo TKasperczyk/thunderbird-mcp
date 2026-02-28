@@ -13,6 +13,9 @@ echo "Building Thunderbird MCP extension..."
 # Create dist directory
 mkdir -p "$DIST_DIR"
 
+# Remove old XPI to ensure a clean build
+rm -f "$DIST_DIR/thunderbird-mcp.xpi"
+
 # Package extension
 cd "$EXTENSION_DIR"
 zip -r "$DIST_DIR/thunderbird-mcp.xpi" . -x "*.DS_Store" -x "*.git*"
