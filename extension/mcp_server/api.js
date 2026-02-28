@@ -2409,8 +2409,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               res.processAsync();
 
               if (req.method !== "POST") {
-                res.setStatusLine("1.1", 405, "Method Not Allowed");
-                res.write("POST only");
+                res.setStatusLine("1.1", 200, "OK");
+                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                res.write(JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32600, message: "Invalid Request" }
+                }));
                 res.finish();
                 return;
               }
@@ -2419,18 +2424,55 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               try {
                 message = JSON.parse(readRequestBody(req));
               } catch {
-                res.setStatusLine("1.1", 400, "Bad Request");
-                res.write("Invalid JSON");
+                res.setStatusLine("1.1", 200, "OK");
+                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                res.write(JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32700, message: "Parse error" }
+                }));
+                res.finish();
+                return;
+              }
+
+              if (!message || typeof message !== "object" || Array.isArray(message)) {
+                res.setStatusLine("1.1", 200, "OK");
+                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                res.write(JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32600, message: "Invalid Request" }
+                }));
                 res.finish();
                 return;
               }
 
               const { id, method, params } = message;
 
+              // Notifications don't expect a response
+              if (typeof method === "string" && method.startsWith("notifications/")) {
+                res.setStatusLine("1.1", 204, "No Content");
+                res.finish();
+                return;
+              }
+
               (async () => {
                 try {
                   let result;
                   switch (method) {
+                    case "initialize":
+                      result = {
+                        protocolVersion: "2024-11-05",
+                        capabilities: { tools: {} },
+                        serverInfo: { name: "thunderbird-mcp", version: "0.1.0" }
+                      };
+                      break;
+                    case "resources/list":
+                      result = { resources: [] };
+                      break;
+                    case "prompts/list":
+                      result = { prompts: [] };
+                      break;
                     case "tools/list":
                       result = { tools };
                       break;
@@ -2446,21 +2488,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       };
                       break;
                     default:
-                      res.setStatusLine("1.1", 404, "Not Found");
-                      res.write(`Unknown method: ${method}`);
+                      res.setStatusLine("1.1", 200, "OK");
+                      res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                      res.write(JSON.stringify({
+                        jsonrpc: "2.0",
+                        id: id ?? null,
+                        error: { code: -32601, message: "Method not found" }
+                      }));
                       res.finish();
                       return;
                   }
                   res.setStatusLine("1.1", 200, "OK");
                   // charset=utf-8 is critical for proper emoji handling in responses
                   res.setHeader("Content-Type", "application/json; charset=utf-8", false);
-                  res.write(JSON.stringify({ jsonrpc: "2.0", id, result }));
+                  res.write(JSON.stringify({ jsonrpc: "2.0", id: id ?? null, result }));
                 } catch (e) {
                   res.setStatusLine("1.1", 200, "OK");
                   res.setHeader("Content-Type", "application/json; charset=utf-8", false);
                   res.write(JSON.stringify({
                     jsonrpc: "2.0",
-                    id,
+                    id: id ?? null,
                     error: { code: -32000, message: e.toString() }
                   }));
                 }

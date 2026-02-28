@@ -55,43 +55,16 @@ function sanitizeJson(data) {
 
 async function handleMessage(line) {
   const message = JSON.parse(line);
+  const hasId = Object.prototype.hasOwnProperty.call(message, 'id');
+  const isNotification =
+    !hasId ||
+    (typeof message.method === 'string' && message.method.startsWith('notifications/'));
 
-  // Handle MCP protocol methods locally
-  switch (message.method) {
-    case 'initialize':
-      return {
-        jsonrpc: '2.0',
-        id: message.id,
-        result: {
-          protocolVersion: '2024-11-05',
-          capabilities: { tools: {} },
-          serverInfo: { name: 'thunderbird-mcp', version: '0.1.0' }
-        }
-      };
-
-    case 'notifications/initialized':
-      return null; // Notifications don't expect responses
-
-    case 'notifications/cancelled':
-      return null; // No response needed for notifications
-
-    case 'resources/list':
-      return {
-        jsonrpc: '2.0',
-        id: message.id,
-        result: { resources: [] }
-      };
-
-    case 'prompts/list':
-      return {
-        jsonrpc: '2.0',
-        id: message.id,
-        result: { prompts: [] }
-      };
-
-    default:
-      return forwardToThunderbird(message);
+  if (isNotification) {
+    return null;
   }
+
+  return forwardToThunderbird(message);
 }
 
 function forwardToThunderbird(message) {
