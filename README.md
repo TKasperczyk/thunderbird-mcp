@@ -43,7 +43,7 @@ The Thunderbird extension embeds a local HTTP server. The Node.js bridge transla
 |------|-------------|
 | `listAccounts` | List all email accounts and their identities |
 | `listFolders` | Browse folder tree with message counts — filter by account or subtree |
-| `searchMessages` | Find emails by subject, sender, recipient, date range, or within a specific folder |
+| `searchMessages` | Find emails by subject, sender, recipient, date range, read status, or within a specific folder |
 | `getMessage` | Read full email content with optional attachment saving to disk |
 | `getRecentMessages` | Get recent messages with date and unread filtering |
 | `updateMessage` | Mark read/unread, flag/unflag, move between folders, or trash |

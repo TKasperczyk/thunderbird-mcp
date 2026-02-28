@@ -66,7 +66,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
             endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date" },
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
-            sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" }
+            sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
+            unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" }
           },
           required: ["query"],
         },
@@ -436,12 +437,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function listFolders(accountId, folderPath) {
               const results = [];
 
+              function folderType(flags) {
+                if (flags & 0x00001000) return "inbox";
+                if (flags & 0x00000200) return "sent";
+                if (flags & 0x00000400) return "drafts";
+                if (flags & 0x00000100) return "trash";
+                if (flags & 0x00400000) return "templates";
+                if (flags & 0x00000800) return "queue";
+                if (flags & 0x40000000) return "junk";
+                if (flags & 0x00004000) return "archive";
+                return "folder";
+              }
+
               function walkFolder(folder, accountKey, depth) {
                 try {
+                  // Skip virtual/search folders to avoid duplicates
+                  if (folder.flags & 0x00000020) return;
+
                   const prettyName = folder.prettyName;
                   results.push({
                     name: prettyName || folder.name || "(unnamed)",
                     path: folder.URI,
+                    type: folderType(folder.flags),
                     accountId: accountKey,
                     totalMessages: folder.getTotalMessages(false),
                     unreadMessages: folder.getNumUnread(false),
@@ -668,7 +685,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, sortOrder) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, sortOrder, unreadOnly) {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -705,37 +722,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   for (const msgHdr of db.enumerateMessages()) {
                     if (results.length >= SEARCH_COLLECTION_CAP) break;
 
+                    // Check cheap numeric/boolean filters before string work
+                    const msgDateTs = msgHdr.date || 0;
+                    if (startDateTs !== null && msgDateTs < startDateTs) continue;
+                    if (endDateTs !== null && msgDateTs > endDateTs) continue;
+                    if (unreadOnly && msgHdr.isRead) continue;
+
                     // IMPORTANT: Use mime2Decoded* properties for searching.
                     // Raw headers contain MIME encoding like "=?UTF-8?Q?...?="
                     // which won't match plain text searches.
-                    const subject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
-                    const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
-                    const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
-                    const ccList = (msgHdr.ccList || "").toLowerCase();
-                    const msgDateTs = msgHdr.date || 0;
-
-                    if (startDateTs !== null && msgDateTs < startDateTs) continue;
-                    if (endDateTs !== null && msgDateTs > endDateTs) continue;
-
-                    if (!hasQuery ||
-                        subject.includes(lowerQuery) ||
-                        author.includes(lowerQuery) ||
-                        recipients.includes(lowerQuery) ||
-                        ccList.includes(lowerQuery)) {
-                      results.push({
-                        id: msgHdr.messageId,
-                        subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
-                        author: msgHdr.mime2DecodedAuthor || msgHdr.author,
-                        recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
-                        ccList: msgHdr.ccList,
-                        date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
-                        folder: folder.prettyName,
-                        folderPath: folder.URI,
-                        read: msgHdr.isRead,
-                        flagged: msgHdr.isFlagged,
-                        _dateTs: msgDateTs
-                      });
+                    if (hasQuery) {
+                      const subject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
+                      const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
+                      const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
+                      const ccList = (msgHdr.ccList || "").toLowerCase();
+                      if (!subject.includes(lowerQuery) &&
+                          !author.includes(lowerQuery) &&
+                          !recipients.includes(lowerQuery) &&
+                          !ccList.includes(lowerQuery)) continue;
                     }
+
+                    results.push({
+                      id: msgHdr.messageId,
+                      subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
+                      author: msgHdr.mime2DecodedAuthor || msgHdr.author,
+                      recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                      ccList: msgHdr.ccList,
+                      date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+                      folder: folder.prettyName,
+                      folderPath: folder.URI,
+                      read: msgHdr.isRead,
+                      flagged: msgHdr.isFlagged,
+                      _dateTs: msgDateTs
+                    });
                   }
                 } catch {
                   // Skip inaccessible folders
@@ -2344,7 +2363,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.sortOrder);
+                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.sortOrder, args.unreadOnly);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
