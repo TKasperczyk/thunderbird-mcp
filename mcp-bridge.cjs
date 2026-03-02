@@ -64,6 +64,19 @@ async function handleMessage(line) {
     return null;
   }
 
+  // Handle MCP protocol handshake locally — Thunderbird extension doesn't support these
+  if (message.method === 'initialize') {
+    return {
+      jsonrpc: '2.0',
+      id: message.id,
+      result: {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        serverInfo: { name: 'thunderbird-mcp', version: '1.0.0' }
+      }
+    };
+  }
+
   return forwardToThunderbird(message);
 }
 
