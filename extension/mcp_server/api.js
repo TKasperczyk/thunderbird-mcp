@@ -115,7 +115,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "createEvent",
         title: "Create Event",
-        description: "Open a pre-filled event dialog in Thunderbird for user review before saving",
+        description: "Create a calendar event. By default opens a review dialog; set skipReview to add directly.",
         inputSchema: {
           type: "object",
           properties: {
@@ -126,8 +126,55 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             description: { type: "string", description: "Event description" },
             calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable calendar)" },
             allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
+            skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
           },
           required: ["title", "startDate"],
+        },
+      },
+      {
+        name: "listEvents",
+        title: "List Events",
+        description: "List calendar events within a date range",
+        inputSchema: {
+          type: "object",
+          properties: {
+            calendarId: { type: "string", description: "Calendar ID to query (from listCalendars). If omitted, queries all calendars." },
+            startDate: { type: "string", description: "Start of date range in ISO 8601 format (default: now)" },
+            endDate: { type: "string", description: "End of date range in ISO 8601 format (default: 30 days from startDate)" },
+            maxResults: { type: "number", description: "Maximum number of events to return (default: 100)" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "updateEvent",
+        title: "Update Event",
+        description: "Update an existing calendar event's title, dates, location, or description",
+        inputSchema: {
+          type: "object",
+          properties: {
+            eventId: { type: "string", description: "The event ID (from listEvents results)" },
+            calendarId: { type: "string", description: "The calendar ID containing the event (from listEvents results)" },
+            title: { type: "string", description: "New event title (optional)" },
+            startDate: { type: "string", description: "New start date/time in ISO 8601 format (optional)" },
+            endDate: { type: "string", description: "New end date/time in ISO 8601 format (optional)" },
+            location: { type: "string", description: "New event location (optional)" },
+            description: { type: "string", description: "New event description (optional)" },
+          },
+          required: ["eventId", "calendarId"],
+        },
+      },
+      {
+        name: "deleteEvent",
+        title: "Delete Event",
+        description: "Delete a calendar event",
+        inputSchema: {
+          type: "object",
+          properties: {
+            eventId: { type: "string", description: "The event ID (from listEvents results)" },
+            calendarId: { type: "string", description: "The calendar ID containing the event (from listEvents results)" },
+          },
+          required: ["eventId", "calendarId"],
         },
       },
       {
@@ -843,7 +890,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function createEvent(title, startDate, endDate, location, description, calendarId, allDay) {
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -951,6 +998,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 event.calendar = targetCalendar;
 
+                if (skipReview) {
+                  await targetCalendar.addItem(event);
+                  return { success: true, message: `Event "${title}" added to calendar "${targetCalendar.name}"` };
+                }
+
                 const args = {
                   calendarEvent: event,
                   calendar: targetCalendar,
@@ -969,6 +1021,238 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 );
 
                 return { success: true, message: `Event dialog opened for "${title}" on calendar "${targetCalendar.name}"` };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function listEvents(calendarId, startDate, endDate, maxResults) {
+              if (!cal) {
+                return { error: "Calendar not available" };
+              }
+              try {
+                const calendars = cal.manager.getCalendars();
+                let targets = calendars;
+                if (calendarId) {
+                  const found = calendars.find(c => c.id === calendarId);
+                  if (!found) {
+                    return { error: `Calendar not found: ${calendarId}` };
+                  }
+                  targets = [found];
+                }
+
+                const startJs = startDate ? new Date(startDate) : new Date();
+                if (isNaN(startJs.getTime())) {
+                  return { error: `Invalid startDate: ${startDate}` };
+                }
+                const endJs = endDate ? new Date(endDate) : new Date(startJs.getTime() + 30 * 86400000);
+                if (isNaN(endJs.getTime())) {
+                  return { error: `Invalid endDate: ${endDate}` };
+                }
+
+                const rangeStart = cal.dtz.jsDateToDateTime(startJs, cal.dtz.defaultTimezone);
+                const rangeEnd = cal.dtz.jsDateToDateTime(endJs, cal.dtz.defaultTimezone);
+                const startMs = startJs.getTime();
+                const endMs = endJs.getTime();
+                const limit = Math.min(maxResults || 100, 500);
+
+                // ITEM_FILTER_TYPE_EVENT
+                const FILTER_EVENT = 1 << 3;
+
+                function formatItem(item, calendar) {
+                  let start = null;
+                  let end = null;
+                  if (item.startDate) {
+                    start = new Date(item.startDate.nativeTime / 1000).toISOString();
+                  }
+                  if (item.endDate) {
+                    end = new Date(item.endDate.nativeTime / 1000).toISOString();
+                  }
+                  return {
+                    id: item.id,
+                    calendarId: calendar.id,
+                    calendarName: calendar.name,
+                    title: item.title || "",
+                    startDate: start,
+                    endDate: end,
+                    location: item.getProperty("LOCATION") || "",
+                    description: item.getProperty("DESCRIPTION") || "",
+                    allDay: item.startDate ? item.startDate.isDate : false,
+                  };
+                }
+
+                const results = [];
+                for (const calendar of targets) {
+                  // Fetch all events (no range) so recurring base events are included,
+                  // then expand occurrences manually within the requested range
+                  const items = await getCalendarItems(calendar, null, null);
+                  for (const item of items) {
+                    if (item.recurrenceInfo) {
+                      // Expand recurring events into occurrences within the range
+                      try {
+                        const occurrences = item.getOccurrencesBetween(rangeStart, rangeEnd);
+                        for (const occ of occurrences) {
+                          results.push(formatItem(occ, calendar));
+                          if (results.length >= limit) break;
+                        }
+                      } catch {
+                        results.push(formatItem(item, calendar));
+                      }
+                    } else {
+                      // Non-recurring: filter by date range
+                      if (item.startDate) {
+                        const itemMs = item.startDate.nativeTime / 1000;
+                        if (itemMs < startMs || itemMs >= endMs) continue;
+                      }
+                      results.push(formatItem(item, calendar));
+                    }
+                    if (results.length >= limit) break;
+                  }
+                  if (results.length >= limit) break;
+                }
+
+                results.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+                return results;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function getCalendarItems(calendar, rangeStart, rangeEnd) {
+              const FILTER_EVENT = 1 << 3;
+              if (typeof calendar.getItemsAsArray === "function") {
+                return await calendar.getItemsAsArray(FILTER_EVENT, 0, rangeStart, rangeEnd);
+              }
+              // Fallback for older Thunderbird versions using ReadableStream
+              const items = [];
+              const stream = cal.iterate.streamValues(calendar.getItems(FILTER_EVENT, 0, rangeStart, rangeEnd));
+              for await (const chunk of stream) {
+                for (const i of chunk) items.push(i);
+              }
+              return items;
+            }
+
+            async function findEvent(eventId, calendarId) {
+              const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
+              if (!calendar) {
+                return { error: `Calendar not found: ${calendarId}` };
+              }
+              const rangeStart = cal.dtz.jsDateToDateTime(new Date(0), cal.dtz.defaultTimezone);
+              const rangeEnd = cal.dtz.jsDateToDateTime(new Date(2100, 0, 1), cal.dtz.defaultTimezone);
+              const items = await getCalendarItems(calendar, rangeStart, rangeEnd);
+              const item = items.find(i => i.id === eventId);
+              if (!item) {
+                return { error: `Event not found: ${eventId}` };
+              }
+              return { item, calendar };
+            }
+
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description) {
+              if (!cal) {
+                return { error: "Calendar not available" };
+              }
+              try {
+                if (typeof eventId !== "string" || !eventId) {
+                  return { error: "eventId must be a non-empty string" };
+                }
+                if (typeof calendarId !== "string" || !calendarId) {
+                  return { error: "calendarId must be a non-empty string" };
+                }
+
+                const found = await findEvent(eventId, calendarId);
+                if (found.error) return found;
+                const { item: oldItem, calendar } = found;
+
+                if (calendar.readOnly) {
+                  return { error: `Calendar is read-only: ${calendar.name}` };
+                }
+                if (!oldItem) {
+                  return { error: `Event not found: ${eventId}` };
+                }
+
+                const newItem = oldItem.clone();
+                const changes = [];
+
+                if (title !== undefined) {
+                  newItem.title = title;
+                  changes.push("title");
+                }
+
+                if (startDate !== undefined) {
+                  const js = new Date(startDate);
+                  if (isNaN(js.getTime())) {
+                    return { error: `Invalid startDate: ${startDate}` };
+                  }
+                  if (newItem.startDate && newItem.startDate.isDate) {
+                    const dt = cal.createDateTime();
+                    dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                    dt.isDate = true;
+                    newItem.startDate = dt;
+                  } else {
+                    newItem.startDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  }
+                  changes.push("startDate");
+                }
+
+                if (endDate !== undefined) {
+                  const js = new Date(endDate);
+                  if (isNaN(js.getTime())) {
+                    return { error: `Invalid endDate: ${endDate}` };
+                  }
+                  if (newItem.endDate && newItem.endDate.isDate) {
+                    const dt = cal.createDateTime();
+                    dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                    dt.isDate = true;
+                    newItem.endDate = dt;
+                  } else {
+                    newItem.endDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  }
+                  changes.push("endDate");
+                }
+
+                if (location !== undefined) {
+                  newItem.setProperty("LOCATION", location);
+                  changes.push("location");
+                }
+
+                if (description !== undefined) {
+                  newItem.setProperty("DESCRIPTION", description);
+                  changes.push("description");
+                }
+
+                if (changes.length === 0) {
+                  return { error: "No changes specified" };
+                }
+
+                await calendar.modifyItem(newItem, oldItem);
+                return { success: true, updated: changes };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function deleteEvent(eventId, calendarId) {
+              if (!cal) {
+                return { error: "Calendar not available" };
+              }
+              try {
+                if (typeof eventId !== "string" || !eventId) {
+                  return { error: "eventId must be a non-empty string" };
+                }
+                if (typeof calendarId !== "string" || !calendarId) {
+                  return { error: "calendarId must be a non-empty string" };
+                }
+
+                const found = await findEvent(eventId, calendarId);
+                if (found.error) return found;
+                const { item, calendar } = found;
+
+                if (calendar.readOnly) {
+                  return { error: `Calendar is read-only: ${calendar.name}` };
+                }
+
+                await calendar.deleteItem(item);
+                return { success: true, deleted: eventId };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -2375,7 +2659,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview);
+                case "listEvents":
+                  return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
+                case "updateEvent":
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description);
+                case "deleteEvent":
+                  return await deleteEvent(args.eventId, args.calendarId);
                 case "sendMail":
                   return composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "replyToMessage":
