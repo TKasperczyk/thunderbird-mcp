@@ -10,6 +10,7 @@ const http = require('http');
 const readline = require('readline');
 
 const THUNDERBIRD_PORT = 8765;
+const THUNDERBIRD_HOSTS = ['127.0.0.1', '::1'];
 const REQUEST_TIMEOUT = 30000;
 
 // Ensure stdout doesn't buffer - critical for MCP protocol
@@ -67,12 +68,10 @@ async function handleMessage(line) {
   return forwardToThunderbird(message);
 }
 
-function forwardToThunderbird(message) {
+function tryRequest(hostname, postData) {
   return new Promise((resolve, reject) => {
-    const postData = JSON.stringify(message);
-
     const req = http.request({
-      hostname: 'localhost',
+      hostname,
       port: THUNDERBIRD_PORT,
       path: '/',
       method: 'POST',
@@ -88,7 +87,6 @@ function forwardToThunderbird(message) {
         try {
           resolve(JSON.parse(data));
         } catch {
-          // Thunderbird may return JSON with invalid control chars in email content
           try {
             resolve(JSON.parse(sanitizeJson(data)));
           } catch (e) {
@@ -98,9 +96,7 @@ function forwardToThunderbird(message) {
       });
     });
 
-    req.on('error', (e) => {
-      reject(new Error(`Connection failed: ${e.message}. Is Thunderbird running with the MCP extension?`));
-    });
+    req.on('error', reject);
 
     req.setTimeout(REQUEST_TIMEOUT, () => {
       req.destroy();
@@ -110,6 +106,24 @@ function forwardToThunderbird(message) {
     req.write(postData);
     req.end();
   });
+}
+
+function forwardToThunderbird(message) {
+  const postData = JSON.stringify(message);
+
+  // Try each host in order - handles platforms where 'localhost' resolves to
+  // IPv6 (::1) but the extension only listens on IPv4 (127.0.0.1), or vice versa.
+  const tryNext = (hosts) => {
+    const [hostname, ...rest] = hosts;
+    return tryRequest(hostname, postData).catch((err) => {
+      if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
+        return tryNext(rest);
+      }
+      throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
+    });
+  };
+
+  return tryNext(THUNDERBIRD_HOSTS);
 }
 
 // Process stdin as JSON-RPC messages
