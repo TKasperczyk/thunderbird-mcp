@@ -148,17 +148,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "createTask",
         title: "Create Task",
-        description: "Open a pre-filled task/todo dialog in Thunderbird for user review before saving",
+        description: "Open a pre-filled task dialog in Thunderbird (title + due date pre-filled, other fields set in dialog)",
         inputSchema: {
           type: "object",
           properties: {
             title: { type: "string", description: "Task title" },
             dueDate: { type: "string", description: "Due date/time in ISO 8601. Date-only (YYYY-MM-DD) creates a date-only task without time." },
-            startDate: { type: "string", description: "Start date/time in ISO 8601 (optional). Date-only (YYYY-MM-DD) creates a date-only task without time." },
-            description: { type: "string", description: "Task description" },
-            location: { type: "string", description: "Task location" },
-            priority: { type: "number", description: "Priority: 0=undefined, 1=high, 5=medium, 9=low" },
-            calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable)" },
+            calendarId: { type: "string", description: "Target calendar ID (from listCalendars, must have supportsTasks=true)" },
           },
           required: ["title"],
         },
@@ -892,7 +888,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   id: c.id,
                   name: c.name,
                   type: c.type,
-                  readOnly: c.readOnly
+                  readOnly: c.readOnly,
+                  supportsEvents: c.getProperty("capabilities.events.supported") !== false,
+                  supportsTasks: c.getProperty("capabilities.tasks.supported") !== false,
                 }));
               } catch (e) {
                 return { error: e.toString() };
@@ -1102,55 +1100,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function createTask(title, dueDate, startDate, description, location, priority, calendarId) {
+            function createTask(title, dueDate, calendarId) {
               if (!cal || !CalTodo) return { error: "Calendar module not available" };
               try {
                 const win = Services.wm.getMostRecentWindow("mail:3pane");
                 if (!win) return { error: "No Thunderbird window found" };
-
-                const todo = new CalTodo();
-                todo.title = title;
 
                 let dueDt = null;
                 if (dueDate) {
                   const js = new Date(dueDate);
                   if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
                   if (!dueDate.includes("T")) {
-                    // Date-only: create CalDateTime with isDate=true (no time component)
                     dueDt = cal.createDateTime();
                     dueDt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
                     dueDt.isDate = true;
                   } else {
                     dueDt = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
                   }
-                  todo.dueDate = dueDt;
                 }
-                if (startDate) {
-                  const js = new Date(startDate);
-                  if (isNaN(js.getTime())) return { error: `Invalid startDate: ${startDate}` };
-                  if (!startDate.includes("T")) {
-                    const dt = cal.createDateTime();
-                    dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
-                    dt.isDate = true;
-                    todo.entryDate = dt;
-                  } else {
-                    todo.entryDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
-                  }
-                }
-                if (description) todo.setProperty("DESCRIPTION", description);
-                if (location) todo.setProperty("LOCATION", location);
-                if (typeof priority === "number") todo.priority = priority;
 
-                // Find target calendar
+                // Find target calendar (must support tasks)
                 let targetCalendar = null;
                 if (calendarId) {
                   targetCalendar = cal.manager.getCalendars().find(c => c.id === calendarId);
                   if (!targetCalendar) return { error: `Calendar not found: ${calendarId}` };
                   if (targetCalendar.readOnly) return { error: `Calendar is read-only: ${targetCalendar.name}` };
+                  if (targetCalendar.getProperty("capabilities.tasks.supported") === false) {
+                    return { error: `Calendar "${targetCalendar.name}" does not support tasks. Use listCalendars to find one with supportsTasks=true.` };
+                  }
                 }
 
-                // Use TB's built-in dialog helper (handles calendar filtering, ACL, tasks.supported)
-                win.createTodoWithDialog(targetCalendar, dueDt, null, todo);
+                // Cross-context CalTodo objects cause silent save failure in dialog.
+                // Pass title as summary param; TB creates its own CalTodo internally.
+                // Limitation: only title + due date are pre-filled; other fields must be set in dialog.
+                win.createTodoWithDialog(targetCalendar, dueDt, title, null);
 
                 return { success: true, message: `Task dialog opened for "${title}"` };
               } catch (e) {
@@ -2616,7 +2599,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "getEvents":
                   return await getEvents(args.startDate, args.endDate, args.calendarId, args.maxResults);
                 case "createTask":
-                  return createTask(args.title, args.dueDate, args.startDate, args.description, args.location, args.priority, args.calendarId);
+                  return createTask(args.title, args.dueDate, args.calendarId);
                 case "updateEvent":
                   return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description);
                 case "sendMail":
