@@ -1109,40 +1109,58 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     }
 
-                    // Find inline CID images not included in allUserAttachments
-                    // (e.g. signature logos, inline screenshots)
+                    // Find inline CID images not included in allUserAttachments.
+                    // Gloda's MimeMessage strips content-id headers, so we identify
+                    // inline images by: image/* parts inside multipart/related that
+                    // aren't already in allUserAttachments. URLs are resolved via
+                    // MailServices.messageServiceFromURI (imap-message:// isn't
+                    // directly fetchable by NetUtil).
                     if (aMimeMsg) {
-                      const existingUrls = new Set(attachmentSources.map(s => s.url));
-                      function collectCidParts(part, results) {
-                        const cid = part.headers?.["content-id"];
-                        if (cid && cid.length > 0) {
-                          const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
-                          if (ct.startsWith("image/")) {
-                            results.push(part);
+                      const existingNames = new Set(attachments.map(a => a.name));
+                      function collectInlineImages(part, insideRelated, results) {
+                        const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
+                        if (ct === "multipart/related") insideRelated = true;
+                        if (insideRelated && ct.startsWith("image/") && part.partName) {
+                          // Extract filename from headers (contentType field lacks params)
+                          const ctHeader = part.headers?.["content-type"]?.[0] || "";
+                          const nameMatch = ctHeader.match(/name\s*=\s*"?([^";]+)"?/i);
+                          const name = nameMatch ? nameMatch[1] : `inline_${part.partName}`;
+                          if (!existingNames.has(name)) {
+                            results.push({ part, name, ct });
                           }
                         }
                         if (part.parts) {
-                          for (const sub of part.parts) collectCidParts(sub, results);
+                          for (const sub of part.parts) collectInlineImages(sub, insideRelated, results);
                         }
                       }
-                      const cidParts = [];
-                      collectCidParts(aMimeMsg, cidParts);
-                      for (const part of cidParts) {
-                        const partUrl = part.url || "";
-                        if (!partUrl || existingUrls.has(partUrl)) continue;
-                        const rawCid = part.headers["content-id"][0] || "";
-                        const contentId = rawCid.replace(/^<|>$/g, "");
-                        const ct = ((part.contentType || "").split(";")[0] || "").trim();
-                        const info = {
-                          name: part.name || `inline_${contentId}`,
-                          contentType: ct,
-                          size: typeof part.size === "number" ? part.size : null,
-                          contentId,
-                          isInline: true,
-                        };
-                        attachments.push(info);
-                        attachmentSources.push({ info, url: partUrl, size: info.size });
-                        existingUrls.add(partUrl);
+                      const inlineImages = [];
+                      collectInlineImages(aMimeMsg, false, inlineImages);
+                      if (inlineImages.length > 0) {
+                        const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
+                        for (const { part, name, ct } of inlineImages) {
+                          // Resolve to a fetchable URL via the message service
+                          let partUrl = "";
+                          try {
+                            const svc = MailServices.messageServiceFromURI(msgUri);
+                            const baseUri = svc.getUrlForUri(msgUri);
+                            // Append part parameter to the resolved fetchable URL
+                            const sep = baseUri.spec.includes("?") ? "&" : "?";
+                            partUrl = `${baseUri.spec}${sep}part=${part.partName}`;
+                          } catch {
+                            partUrl = "";
+                          }
+                          const info = {
+                            name,
+                            contentType: ct,
+                            size: typeof part.size === "number" && part.size > 0 ? part.size : null,
+                            partName: part.partName,
+                            isInline: true,
+                          };
+                          attachments.push(info);
+                          if (partUrl) {
+                            attachmentSources.push({ info, url: partUrl, size: info.size });
+                          }
+                        }
                       }
                     }
 
