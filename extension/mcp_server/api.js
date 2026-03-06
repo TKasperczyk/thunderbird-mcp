@@ -153,8 +153,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             title: { type: "string", description: "Task title" },
-            dueDate: { type: "string", description: "Due date/time in ISO 8601 format" },
-            startDate: { type: "string", description: "Start date/time in ISO 8601 (optional)" },
+            dueDate: { type: "string", description: "Due date/time in ISO 8601. Date-only (YYYY-MM-DD) creates a date-only task without time." },
+            startDate: { type: "string", description: "Start date/time in ISO 8601 (optional). Date-only (YYYY-MM-DD) creates a date-only task without time." },
             description: { type: "string", description: "Task description" },
             priority: { type: "number", description: "Priority: 0=undefined, 1=high, 5=medium, 9=low" },
             calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable)" },
@@ -1114,13 +1114,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (dueDate) {
                   const js = new Date(dueDate);
                   if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
-                  dueDt = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  if (!dueDate.includes("T")) {
+                    // Date-only: create CalDateTime with isDate=true (no time component)
+                    dueDt = cal.createDateTime();
+                    dueDt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                    dueDt.isDate = true;
+                  } else {
+                    dueDt = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  }
                   todo.dueDate = dueDt;
                 }
                 if (startDate) {
                   const js = new Date(startDate);
                   if (isNaN(js.getTime())) return { error: `Invalid startDate: ${startDate}` };
-                  todo.entryDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  if (!startDate.includes("T")) {
+                    const dt = cal.createDateTime();
+                    dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                    dt.isDate = true;
+                    todo.entryDate = dt;
+                  } else {
+                    todo.entryDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  }
                 }
                 if (description) todo.setProperty("DESCRIPTION", description);
                 if (typeof priority === "number") todo.priority = priority;
