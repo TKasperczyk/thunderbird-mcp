@@ -1142,6 +1142,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         };
                         attachments.push(info);
                         attachmentSources.push({ info, url: partUrl, size: info.size });
+                        existingUrls.add(partUrl);
                       }
                     }
 
