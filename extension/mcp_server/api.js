@@ -19,6 +19,8 @@ const resProto = Cc[
 ].getService(Ci.nsISubstitutingProtocolHandler);
 
 const MCP_PORT = 8765;
+// Keep a reference to the attach timer to prevent GC before it fires.
+let _attachTimer = null;
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 1000;
@@ -1332,9 +1334,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
                 }
 
-                // Add file attachments
-                const attResult = addAttachments(composeFields, attachments);
-
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
                 msgComposeParams.composeFields = composeFields;
@@ -1343,11 +1342,43 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
+                // Inject attachments after compose window has loaded.
+                // composeFields.addAttachment() before OpenComposeWindowWithParams is
+                // silently dropped on nsIMsgCompType.New; use nsITimer + getMostRecentWindow
+                // to add them after the window is ready (setTimeout not available in XPCOM context).
+                if (attachments && attachments.length > 0) {
+                  _attachTimer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  _attachTimer.initWithCallback({
+                    notify() {
+                      try {
+                        const composeWin = Services.wm.getMostRecentWindow("msgcompose");
+                        if (!composeWin) return;
+                        const attachList = [];
+                        for (const filePath of attachments) {
+                          try {
+                            const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+                            file.initWithPath(filePath);
+                            if (file.exists()) {
+                              const att = Cc["@mozilla.org/messengercompose/attachment;1"]
+                                .createInstance(Ci.nsIMsgAttachment);
+                              att.url = Services.io.newFileURI(file).spec;
+                              att.name = file.leafName;
+                              att.size = file.fileSize;
+                              attachList.push(att);
+                            }
+                          } catch {}
+                        }
+                        if (attachList.length > 0 && typeof composeWin.AddAttachments === "function") {
+                          composeWin.AddAttachments(attachList);
+                        }
+                      } catch(e) {}
+                      _attachTimer = null;
+                    }
+                  }, 1500, Ci.nsITimer.TYPE_ONE_SHOT);
+                }
+
                 let msg = "Compose window opened";
                 if (identityWarning) msg += ` (${identityWarning})`;
-                if (attResult.failed.length > 0) {
-                  msg += ` (failed to attach: ${attResult.failed.join(", ")})`;
-                }
                 return { success: true, message: msg };
               } catch (e) {
                 return { error: e.toString() };
