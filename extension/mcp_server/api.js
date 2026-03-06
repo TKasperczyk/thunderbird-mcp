@@ -156,6 +156,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             dueDate: { type: "string", description: "Due date/time in ISO 8601. Date-only (YYYY-MM-DD) creates a date-only task without time." },
             startDate: { type: "string", description: "Start date/time in ISO 8601 (optional). Date-only (YYYY-MM-DD) creates a date-only task without time." },
             description: { type: "string", description: "Task description" },
+            location: { type: "string", description: "Task location" },
             priority: { type: "number", description: "Priority: 0=undefined, 1=high, 5=medium, 9=low" },
             calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable)" },
           },
@@ -1101,7 +1102,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function createTask(title, dueDate, startDate, description, priority, calendarId) {
+            function createTask(title, dueDate, startDate, description, location, priority, calendarId) {
               if (!cal || !CalTodo) return { error: "Calendar module not available" };
               try {
                 const win = Services.wm.getMostRecentWindow("mail:3pane");
@@ -1137,6 +1138,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                 }
                 if (description) todo.setProperty("DESCRIPTION", description);
+                if (location) todo.setProperty("LOCATION", location);
                 if (typeof priority === "number") todo.priority = priority;
 
                 // Find target calendar
@@ -2614,7 +2616,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "getEvents":
                   return await getEvents(args.startDate, args.endDate, args.calendarId, args.maxResults);
                 case "createTask":
-                  return createTask(args.title, args.dueDate, args.startDate, args.description, args.priority, args.calendarId);
+                  return createTask(args.title, args.dueDate, args.startDate, args.description, args.location, args.priority, args.calendarId);
                 case "updateEvent":
                   return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description);
                 case "sendMail":
