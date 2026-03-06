@@ -1097,7 +1097,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         const info = {
                           name: att?.name || "",
                           contentType: att?.contentType || "",
-                          size: typeof att?.size === "number" ? att.size : null
+                          size: typeof att?.size === "number" ? att.size : null,
+                          isInline: false,
                         };
                         attachments.push(info);
                         attachmentSources.push({
@@ -1105,6 +1106,42 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           url: att?.url || "",
                           size: typeof att?.size === "number" ? att.size : null
                         });
+                      }
+                    }
+
+                    // Find inline CID images not included in allUserAttachments
+                    // (e.g. signature logos, inline screenshots)
+                    if (aMimeMsg) {
+                      const existingUrls = new Set(attachmentSources.map(s => s.url));
+                      function collectCidParts(part, results) {
+                        const cid = part.headers?.["content-id"];
+                        if (cid && cid.length > 0) {
+                          const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
+                          if (ct.startsWith("image/")) {
+                            results.push(part);
+                          }
+                        }
+                        if (part.parts) {
+                          for (const sub of part.parts) collectCidParts(sub, results);
+                        }
+                      }
+                      const cidParts = [];
+                      collectCidParts(aMimeMsg, cidParts);
+                      for (const part of cidParts) {
+                        const partUrl = part.url || "";
+                        if (!partUrl || existingUrls.has(partUrl)) continue;
+                        const rawCid = part.headers["content-id"][0] || "";
+                        const contentId = rawCid.replace(/^<|>$/g, "");
+                        const ct = ((part.contentType || "").split(";")[0] || "").trim();
+                        const info = {
+                          name: part.name || `inline_${contentId}`,
+                          contentType: ct,
+                          size: typeof part.size === "number" ? part.size : null,
+                          contentId,
+                          isInline: true,
+                        };
+                        attachments.push(info);
+                        attachmentSources.push({ info, url: partUrl, size: info.size });
                       }
                     }
 
