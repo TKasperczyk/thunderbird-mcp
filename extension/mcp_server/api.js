@@ -131,6 +131,56 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getEvents",
+        title: "Get Events",
+        description: "Query calendar events within a date range",
+        inputSchema: {
+          type: "object",
+          properties: {
+            startDate: { type: "string", description: "Start of range in ISO 8601 (defaults to now)" },
+            endDate: { type: "string", description: "End of range in ISO 8601 (defaults to startDate + 30 days)" },
+            calendarId: { type: "string", description: "Limit to specific calendar ID (from listCalendars)" },
+            maxResults: { type: "number", description: "Maximum events to return (default: 100)" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "createTask",
+        title: "Create Task",
+        description: "Open a pre-filled task/todo dialog in Thunderbird for user review before saving",
+        inputSchema: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Task title" },
+            dueDate: { type: "string", description: "Due date/time in ISO 8601 format" },
+            startDate: { type: "string", description: "Start date/time in ISO 8601 (optional)" },
+            description: { type: "string", description: "Task description" },
+            priority: { type: "number", description: "Priority: 0=undefined, 1=high, 5=medium, 9=low" },
+            calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable)" },
+          },
+          required: ["title"],
+        },
+      },
+      {
+        name: "updateEvent",
+        title: "Update Event",
+        description: "Pre-fill changes on an existing event and open edit dialog for user review before saving",
+        inputSchema: {
+          type: "object",
+          properties: {
+            eventId: { type: "string", description: "Event ID (from getEvents)" },
+            calendarId: { type: "string", description: "Calendar ID the event belongs to (from getEvents)" },
+            title: { type: "string", description: "New event title" },
+            startDate: { type: "string", description: "New start date/time in ISO 8601" },
+            endDate: { type: "string", description: "New end date/time in ISO 8601" },
+            location: { type: "string", description: "New location" },
+            description: { type: "string", description: "New description" },
+          },
+          required: ["eventId", "calendarId"],
+        },
+      },
+      {
         name: "searchContacts",
         title: "Search Contacts",
         description: "Find contacts the user interacted with",
@@ -382,6 +432,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             let cal = null;
             let CalEvent = null;
+            let CalTodo = null;
             try {
               const calModule = ChromeUtils.importESModule(
                 "resource:///modules/calendar/calUtils.sys.mjs"
@@ -391,6 +442,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 "resource:///modules/CalEvent.sys.mjs"
               );
               CalEvent = CE;
+              const { CalTodo: CT } = ChromeUtils.importESModule(
+                "resource:///modules/CalTodo.sys.mjs"
+              );
+              CalTodo = CT;
             } catch {
               // Calendar not available
             }
@@ -969,6 +1024,172 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 );
 
                 return { success: true, message: `Event dialog opened for "${title}" on calendar "${targetCalendar.name}"` };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function getEvents(startDate, endDate, calendarId, maxResults) {
+              if (!cal) return { error: "Calendar not available" };
+              try {
+                const limit = Math.min(maxResults || 100, 500);
+
+                let startDt, endDt;
+                const startJs = startDate ? new Date(startDate) : new Date();
+                if (isNaN(startJs.getTime())) return { error: `Invalid startDate: ${startDate}` };
+                startDt = cal.dtz.jsDateToDateTime(startJs, cal.dtz.defaultTimezone);
+
+                if (endDate) {
+                  const js = new Date(endDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid endDate: ${endDate}` };
+                  endDt = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                } else {
+                  const defaultEnd = new Date(startJs.getTime() + 30 * 86400000);
+                  endDt = cal.dtz.jsDateToDateTime(defaultEnd, cal.dtz.defaultTimezone);
+                }
+
+                let calendars = cal.manager.getCalendars();
+                if (calendarId) {
+                  calendars = calendars.filter(c => c.id === calendarId);
+                  if (calendars.length === 0) return { error: `Calendar not found: ${calendarId}` };
+                }
+
+                function calDateToISO(dt) {
+                  if (!dt) return null;
+                  try {
+                    if (dt.jsDate) return dt.jsDate.toISOString();
+                    // nativeTime is microseconds since epoch
+                    if (dt.nativeTime) return new Date(dt.nativeTime / 1000).toISOString();
+                    if (dt.icalString) return dt.icalString;
+                  } catch {}
+                  return null;
+                }
+
+                const filter = Ci.calICalendar.ITEM_FILTER_TYPE_EVENT |
+                               Ci.calICalendar.ITEM_FILTER_CLASS_OCCURRENCES;
+                const events = [];
+                for (const calendar of calendars) {
+                  try {
+                    const stream = calendar.getItems(filter, 0, startDt, endDt);
+                    for await (const chunk of stream) {
+                      for (const item of chunk) {
+                        events.push({
+                          title: item.title || "",
+                          startDate: calDateToISO(item.startDate),
+                          endDate: calDateToISO(item.endDate),
+                          location: item.getProperty("LOCATION") || "",
+                          description: item.getProperty("DESCRIPTION") || "",
+                          calendar: calendar.name,
+                          calendarId: calendar.id,
+                          allDay: item.startDate?.isDate || false,
+                          status: item.getProperty("STATUS") || "",
+                          id: item.id || "",
+                        });
+                        if (events.length >= limit) break;
+                      }
+                      if (events.length >= limit) break;
+                    }
+                  } catch {
+                    // Skip calendars that fail (e.g. offline CalDAV)
+                  }
+                }
+
+                events.sort((a, b) => (a.startDate || "").localeCompare(b.startDate || ""));
+                return events.slice(0, limit);
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function createTask(title, dueDate, startDate, description, priority, calendarId) {
+              if (!cal || !CalTodo) return { error: "Calendar module not available" };
+              try {
+                const win = Services.wm.getMostRecentWindow("mail:3pane");
+                if (!win) return { error: "No Thunderbird window found" };
+
+                const todo = new CalTodo();
+                todo.title = title;
+
+                let dueDt = null;
+                if (dueDate) {
+                  const js = new Date(dueDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
+                  dueDt = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  todo.dueDate = dueDt;
+                }
+                if (startDate) {
+                  const js = new Date(startDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid startDate: ${startDate}` };
+                  todo.entryDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                }
+                if (description) todo.setProperty("DESCRIPTION", description);
+                if (typeof priority === "number") todo.priority = priority;
+
+                // Find target calendar
+                let targetCalendar = null;
+                if (calendarId) {
+                  targetCalendar = cal.manager.getCalendars().find(c => c.id === calendarId);
+                  if (!targetCalendar) return { error: `Calendar not found: ${calendarId}` };
+                  if (targetCalendar.readOnly) return { error: `Calendar is read-only: ${targetCalendar.name}` };
+                }
+
+                // Use TB's built-in dialog helper (handles calendar filtering, ACL, tasks.supported)
+                win.createTodoWithDialog(targetCalendar, dueDt, null, todo);
+
+                return { success: true, message: `Task dialog opened for "${title}"` };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description) {
+              if (!cal) return { error: "Calendar not available" };
+              try {
+                const win = Services.wm.getMostRecentWindow("mail:3pane");
+                if (!win) return { error: "No Thunderbird window found" };
+
+                const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
+                if (!calendar) return { error: `Calendar not found: ${calendarId}` };
+                if (calendar.readOnly) return { error: `Calendar is read-only: ${calendar.name}` };
+
+                const item = await calendar.getItem(eventId);
+                if (!item) return { error: `Event not found: ${eventId}` };
+
+                // Apply requested changes before opening dialog
+                const modified = item.clone();
+                if (title !== undefined) modified.title = title;
+                if (location !== undefined) modified.setProperty("LOCATION", location);
+                if (description !== undefined) modified.setProperty("DESCRIPTION", description);
+                if (startDate) {
+                  const js = new Date(startDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid startDate: ${startDate}` };
+                  if (modified.startDate?.isDate) {
+                    const dt = cal.createDateTime();
+                    dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                    dt.isDate = true;
+                    modified.startDate = dt;
+                  } else {
+                    modified.startDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  }
+                }
+                if (endDate) {
+                  const js = new Date(endDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid endDate: ${endDate}` };
+                  if (modified.endDate?.isDate) {
+                    const dt = cal.createDateTime();
+                    dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                    dt.isDate = true;
+                    modified.endDate = dt;
+                  } else {
+                    modified.endDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  }
+                }
+
+                // Use TB's built-in dialog helper (handles ACL, recurrence prompts, transactions)
+                // false = don't prompt for occurrence vs series (edit the specific item)
+                win.modifyEventWithDialog(modified, false);
+
+                return { success: true, message: `Edit dialog opened for "${modified.title}" on calendar "${calendar.name}"` };
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -2376,6 +2597,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return listCalendars();
                 case "createEvent":
                   return createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay);
+                case "getEvents":
+                  return await getEvents(args.startDate, args.endDate, args.calendarId, args.maxResults);
+                case "createTask":
+                  return createTask(args.title, args.dueDate, args.startDate, args.description, args.priority, args.calendarId);
+                case "updateEvent":
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description);
                 case "sendMail":
                   return composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "replyToMessage":
