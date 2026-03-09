@@ -1,6 +1,6 @@
 # Thunderbird MCP
 
-[![Tools](https://img.shields.io/badge/20_Tools-email%2C_compose%2C_filters%2C_calendar-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/24_Tools-email%2C_compose%2C_filters%2C_calendar-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -17,7 +17,7 @@ Give your AI assistant full access to Thunderbird — search mail, compose messa
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that — it exposes 20 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 24 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Compose tools open a review window before sending. **Nothing gets sent without your approval.**
 
@@ -31,7 +31,7 @@ Compose tools open a review window before sending. **Nothing gets sent without y
   (Claude, etc.)           mcp-bridge.cjs                    Extension + HTTP Server
 ```
 
-The Thunderbird extension embeds a local HTTP server. The Node.js bridge translates between MCP's stdio protocol and HTTP. Your AI talks stdio, Thunderbird talks HTTP, the bridge connects them.
+The Thunderbird extension embeds a local HTTP server. The Node.js bridge translates between MCP's stdio protocol and HTTP. Your AI talks stdio, Thunderbird talks HTTP, the bridge connects them. The bridge handles MCP lifecycle methods (initialize, ping) locally, so clients can connect even before Thunderbird is fully loaded.
 
 ---
 
@@ -44,9 +44,9 @@ The Thunderbird extension embeds a local HTTP server. The Node.js bridge transla
 | `listAccounts` | List all email accounts and their identities |
 | `listFolders` | Browse folder tree with message counts — filter by account or subtree |
 | `searchMessages` | Find emails by subject, sender, recipient, date range, read status, or within a specific folder |
-| `getMessage` | Read full email content with optional attachment saving to disk |
+| `getMessage` | Read full email content with optional attachment saving -- includes inline CID images |
 | `getRecentMessages` | Get recent messages with date and unread filtering |
-| `updateMessage` | Mark read/unread, flag/unflag, move between folders, or trash |
+| `updateMessage` | Mark read/unread, flag/unflag, move between folders, or trash -- supports bulk via `messageIds` |
 | `deleteMessages` | Delete messages — drafts are safely moved to Trash |
 | `createFolder` | Create new subfolders to organize your mail |
 
@@ -78,8 +78,12 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 | Tool | Description |
 |------|-------------|
 | `searchContacts` | Look up contacts from your address books |
-| `listCalendars` | List all calendars (local and CalDAV) |
-| `createEvent` | Open a pre-filled calendar event dialog for review |
+| `listCalendars` | List all calendars with read-only, event, and task support flags |
+| `createEvent` | Create a calendar event -- opens a review dialog, or set `skipReview` to add directly |
+| `listEvents` | Query events by date range with recurring event expansion |
+| `updateEvent` | Modify an event's title, dates, location, or description |
+| `deleteEvent` | Delete a calendar event by ID |
+| `createTask` | Open a pre-filled task dialog for review |
 
 ---
 
@@ -158,7 +162,7 @@ thunderbird-mcp/
 │   ├── background.js           # Extension entry point
 │   ├── httpd.sys.mjs           # Embedded HTTP server (Mozilla)
 │   └── mcp_server/
-│       ├── api.js              # All 20 MCP tools
+│       ├── api.js              # All 24 MCP tools
 │       └── schema.json
 └── scripts/
     ├── build.sh
@@ -170,6 +174,7 @@ thunderbird-mcp/
 - IMAP folder databases can be stale until you click on them in Thunderbird
 - Email bodies with control characters are sanitized to avoid breaking JSON
 - HTML-only emails are converted to plain text (original formatting is lost)
+- Recurring calendar event CRUD operates on the series, not individual occurrences
 
 ---
 
