@@ -655,6 +655,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	             * Finds a single message header by messageId within a folderPath.
 	             * Returns { msgHdr, folder, db } or { error }.
 	             */
+            function findTrashFolder(folder) {
+              const TRASH_FLAG = 0x00000100;
+              let account = null;
+              try {
+                account = MailServices.accounts.findAccountForServer(folder.server);
+              } catch {
+                return null;
+              }
+              const root = account?.incomingServer?.rootFolder;
+              if (!root) return null;
+
+              let fallback = null;
+              const TRASH_NAMES = ["trash", "deleted items"];
+              const stack = [root];
+              while (stack.length > 0) {
+                const current = stack.pop();
+                try {
+                  if (current && typeof current.getFlag === "function" && current.getFlag(TRASH_FLAG)) {
+                    return current;
+                  }
+                } catch {}
+                if (!fallback && current?.prettyName && TRASH_NAMES.includes(current.prettyName.toLowerCase())) {
+                  fallback = current;
+                }
+                try {
+                  if (current?.hasSubFolders) {
+                    for (const sf of current.subFolders) stack.push(sf);
+                  }
+                } catch {}
+              }
+              return fallback;
+            }
+
 	            function findMessage(messageId, folderPath) {
 	              const opened = openFolder(folderPath);
 	              if (opened.error) return opened;
@@ -1717,28 +1750,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 let trashFolder = null;
 
                 if (isDrafts) {
-                  // Find trash folder
-                  const TRASH_FLAG = 0x00000100;
-                  try {
-                    const account = MailServices.accounts.findAccountForServer(folder.server);
-                    const root = account?.incomingServer?.rootFolder;
-                    if (root) {
-                      const stack = [root];
-                      while (stack.length > 0 && !trashFolder) {
-                        const current = stack.pop();
-                        try {
-                          if (current && typeof current.getFlag === "function" && current.getFlag(TRASH_FLAG)) {
-                            trashFolder = current;
-                          }
-                        } catch {}
-                        try {
-                          if (current && current.hasSubFolders) {
-                            for (const sf of current.subFolders) stack.push(sf);
-                          }
-                        } catch {}
-                      }
-                    }
-                  } catch {}
+                  trashFolder = findTrashFolder(folder);
 
                   if (trashFolder) {
                     MailServices.copy.copyMessages(folder, found, trashFolder, true, null, null, false);
@@ -1799,43 +1811,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 let targetFolder = null;
 
                 if (trash === true) {
-                  const TRASH_FLAG = 0x00000100;
-                  let account = null;
-                  try {
-                    account = MailServices.accounts.findAccountForServer(folder.server);
-                  } catch {
-                    account = null;
-                  }
-                  if (!account) {
-                    return { error: "Could not determine account for message folder" };
-                  }
-                  const root = account.incomingServer?.rootFolder;
-                  if (!root) {
-                    return { error: "Account root folder not found" };
-                  }
-
-                  const stack = [root];
-                  while (stack.length > 0 && !targetFolder) {
-                    const current = stack.pop();
-                    try {
-                      if (current && typeof current.getFlag === "function" && current.getFlag(TRASH_FLAG)) {
-                        targetFolder = current;
-                        break;
-                      }
-                    } catch {
-                      // ignore flag read errors
-                    }
-                    try {
-                      if (current && current.hasSubFolders) {
-                        for (const subfolder of current.subFolders) {
-                          stack.push(subfolder);
-                        }
-                      }
-                    } catch {
-                      // ignore traversal errors
-                    }
-                  }
-
+                  targetFolder = findTrashFolder(folder);
                   if (!targetFolder) {
                     return { error: "Trash folder not found" };
                   }
