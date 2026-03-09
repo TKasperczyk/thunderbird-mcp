@@ -10,7 +10,7 @@ const http = require('http');
 const readline = require('readline');
 
 const THUNDERBIRD_PORT = 8765;
-const THUNDERBIRD_HOSTS = ['127.0.0.1', '::1'];
+const THUNDERBIRD_HOSTS = ['127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
 
 // Ensure stdout doesn't buffer - critical for MCP protocol
