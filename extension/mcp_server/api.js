@@ -1126,7 +1126,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         const info = {
                           name: att?.name || "",
                           contentType: att?.contentType || "",
-                          size: typeof att?.size === "number" ? att.size : null
+                          size: typeof att?.size === "number" ? att.size : null,
+                          isInline: false,
                         };
                         attachments.push(info);
                         attachmentSources.push({
@@ -1134,6 +1135,61 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           url: att?.url || "",
                           size: typeof att?.size === "number" ? att.size : null
                         });
+                      }
+                    }
+
+                    // Find inline CID images not included in allUserAttachments.
+                    // Gloda's MimeMessage strips content-id headers, so we identify
+                    // inline images by: image/* parts inside multipart/related that
+                    // aren't already in allUserAttachments. URLs are resolved via
+                    // MailServices.messageServiceFromURI (imap-message:// isn't
+                    // directly fetchable by NetUtil).
+                    if (aMimeMsg) {
+                      const existingNames = new Set(attachments.map(a => a.name));
+                      function collectInlineImages(part, insideRelated, results) {
+                        const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
+                        if (ct === "multipart/related") insideRelated = true;
+                        if (insideRelated && ct.startsWith("image/") && part.partName) {
+                          // Extract filename from headers (contentType field lacks params)
+                          const ctHeader = part.headers?.["content-type"]?.[0] || "";
+                          const nameMatch = ctHeader.match(/name\s*=\s*"?([^";]+)"?/i);
+                          const name = nameMatch ? nameMatch[1] : `inline_${part.partName}`;
+                          if (!existingNames.has(name)) {
+                            results.push({ part, name, ct });
+                          }
+                        }
+                        if (part.parts) {
+                          for (const sub of part.parts) collectInlineImages(sub, insideRelated, results);
+                        }
+                      }
+                      const inlineImages = [];
+                      collectInlineImages(aMimeMsg, false, inlineImages);
+                      if (inlineImages.length > 0) {
+                        const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
+                        for (const { part, name, ct } of inlineImages) {
+                          // Resolve to a fetchable URL via the message service
+                          let partUrl = "";
+                          try {
+                            const svc = MailServices.messageServiceFromURI(msgUri);
+                            const baseUri = svc.getUrlForUri(msgUri);
+                            // Append part parameter to the resolved fetchable URL
+                            const sep = baseUri.spec.includes("?") ? "&" : "?";
+                            partUrl = `${baseUri.spec}${sep}part=${part.partName}`;
+                          } catch {
+                            partUrl = "";
+                          }
+                          const info = {
+                            name,
+                            contentType: ct,
+                            size: typeof part.size === "number" && part.size > 0 ? part.size : null,
+                            partName: part.partName,
+                            isInline: true,
+                          };
+                          attachments.push(info);
+                          if (partUrl) {
+                            attachmentSources.push({ info, url: partUrl, size: info.size });
+                          }
+                        }
                       }
                     }
 
