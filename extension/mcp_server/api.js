@@ -1189,17 +1189,35 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             function formatEvent(item, calendar) {
-              return {
+              const allDay = item.startDate ? item.startDate.isDate : false;
+              // For all-day events, iCal DTEND is exclusive. Convert to inclusive
+              // (last day of event) so the API is intuitive and round-trips correctly.
+              let endDateISO = calDateToISO(item.endDate);
+              if (allDay && item.endDate) {
+                try {
+                  const raw = new Date(item.endDate.nativeTime / 1000);
+                  raw.setDate(raw.getDate() - 1);
+                  endDateISO = raw.toISOString();
+                } catch { /* keep raw value */ }
+              }
+              const result = {
                 id: item.id,
                 calendarId: calendar.id,
                 calendarName: calendar.name,
                 title: item.title || "",
                 startDate: calDateToISO(item.startDate),
-                endDate: calDateToISO(item.endDate),
+                endDate: endDateISO,
                 location: item.getProperty("LOCATION") || "",
                 description: item.getProperty("DESCRIPTION") || "",
-                allDay: item.startDate ? item.startDate.isDate : false,
+                allDay,
+                isRecurring: !!item.recurrenceInfo,
               };
+              // Occurrences of recurring events share the parent's id.
+              // Include recurrenceId so callers can distinguish them.
+              if (item.recurrenceId) {
+                result.recurrenceId = calDateToISO(item.recurrenceId);
+              }
+              return result;
             }
 
             async function listEvents(calendarId, startDate, endDate, maxResults) {
@@ -1339,7 +1357,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 await calendar.modifyItem(newItem, oldItem);
-                return { success: true, updated: changes };
+                const result = { success: true, updated: changes };
+                if (oldItem.recurrenceInfo) {
+                  result.warning = "This is a recurring event -- changes apply to the entire series.";
+                }
+                return result;
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -1365,8 +1387,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (!item) return { error: `Event not found: ${eventId}` };
 
+                const isRecurring = !!item.recurrenceInfo;
                 await calendar.deleteItem(item);
-                return { success: true, deleted: eventId };
+                const result = { success: true, deleted: eventId };
+                if (isRecurring) {
+                  result.warning = "This was a recurring event -- the entire series was deleted.";
+                }
+                return result;
               } catch (e) {
                 return { error: e.toString() };
               }
