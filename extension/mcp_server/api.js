@@ -21,6 +21,8 @@ const resProto = Cc[
 const MCP_PORT = 8765;
 // Keep references to active attach timers to prevent GC before they fire.
 const _attachTimers = new Set();
+// Delay before injecting attachments into a newly opened compose window.
+const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 1000;
@@ -554,6 +556,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return null;
             }
 
+            /** Creates an nsIFile instance for the given path. */
+            function createLocalFile(path) {
+              const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+              file.initWithPath(path);
+              return file;
+            }
+
             /**
              * Converts local file paths to attachment descriptors, validating existence upfront.
              * Returns { descs: [{url, name, size}], failed: string[] }
@@ -565,8 +574,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (!filePaths || !Array.isArray(filePaths)) return { descs, failed };
               for (const filePath of filePaths) {
                 try {
-                  const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
-                  file.initWithPath(filePath);
+                  const file = createLocalFile(filePath);
                   if (file.exists()) {
                     descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: file.fileSize });
                   } else {
@@ -612,7 +620,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
                   } catch(e) {}
                 }
-              }, 1500, Ci.nsITimer.TYPE_ONE_SHOT);
+              }, COMPOSE_WINDOW_LOAD_DELAY_MS, Ci.nsITimer.TYPE_ONE_SHOT);
             }
 
             function escapeHtml(s) {
@@ -1174,8 +1182,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
 
                     function ensureAttachmentDir(sanitizedId) {
-                      const root = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
-                      root.initWithPath("/tmp/thunderbird-mcp");
+                      const root = createLocalFile("/tmp/thunderbird-mcp");
                       try {
                         root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
                       } catch (e) {
