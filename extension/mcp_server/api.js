@@ -2764,6 +2764,61 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            /**
+             * Build a lookup from tool name to inputSchema for fast validation.
+             */
+            const toolSchemas = Object.create(null);
+            for (const t of tools) {
+              toolSchemas[t.name] = t.inputSchema;
+            }
+
+            /**
+             * Validate tool arguments against the tool's inputSchema.
+             * Checks required fields, types (string, number, boolean, array, object),
+             * and rejects unknown properties.
+             * Returns an array of error strings (empty = valid).
+             */
+            function validateToolArgs(name, args) {
+              const schema = toolSchemas[name];
+              if (!schema) return [`Unknown tool: ${name}`];
+
+              const errors = [];
+              const props = schema.properties || {};
+              const required = schema.required || [];
+
+              // Check required fields
+              for (const key of required) {
+                if (args[key] === undefined || args[key] === null) {
+                  errors.push(`Missing required parameter: ${key}`);
+                }
+              }
+
+              // Check types and reject unknown properties
+              for (const [key, value] of Object.entries(args)) {
+                const propSchema = props[key];
+                if (!propSchema) {
+                  errors.push(`Unknown parameter: ${key}`);
+                  continue;
+                }
+                if (value === undefined || value === null) continue;
+
+                const expectedType = propSchema.type;
+                if (expectedType === "array") {
+                  if (!Array.isArray(value)) {
+                    errors.push(`Parameter '${key}' must be an array, got ${typeof value}`);
+                  }
+                } else if (expectedType === "object") {
+                  if (typeof value !== "object" || Array.isArray(value)) {
+                    errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
+                  }
+                } else if (expectedType && typeof value !== expectedType) {
+                  errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
+                }
+              }
+
+              return errors;
+            }
+
             async function callTool(name, args) {
               switch (name) {
                 case "listAccounts":
@@ -2896,12 +2951,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       if (!params?.name) {
                         throw new Error("Missing tool name");
                       }
-                      result = {
-                        content: [{
-                          type: "text",
-                          text: JSON.stringify(await callTool(params.name, params.arguments || {}), null, 2)
-                        }]
-                      };
+                      {
+                        const toolArgs = params.arguments || {};
+                        const validationErrors = validateToolArgs(params.name, toolArgs);
+                        if (validationErrors.length > 0) {
+                          throw new Error(`Invalid parameters for '${params.name}': ${validationErrors.join("; ")}`);
+                        }
+                        result = {
+                          content: [{
+                            type: "text",
+                            text: JSON.stringify(await callTool(params.name, toolArgs), null, 2)
+                          }]
+                        };
+                      }
                       break;
                     default:
                       res.setStatusLine("1.1", 200, "OK");
