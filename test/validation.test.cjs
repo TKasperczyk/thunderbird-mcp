@@ -123,6 +123,38 @@ const sampleTools = [
     },
   },
   {
+    name: "renameFolder",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folderPath: { type: "string" },
+        newName: { type: "string" },
+      },
+      required: ["folderPath", "newName"],
+    },
+  },
+  {
+    name: "deleteFolder",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folderPath: { type: "string" },
+      },
+      required: ["folderPath"],
+    },
+  },
+  {
+    name: "moveFolder",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folderPath: { type: "string" },
+        newParentPath: { type: "string" },
+      },
+      required: ["folderPath", "newParentPath"],
+    },
+  },
+  {
     name: "getAccountAccess",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
@@ -404,5 +436,67 @@ describe('Validation: account access control', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must be an array/);
+  });
+});
+
+describe('Validation: folder management', () => {
+  it('renameFolder requires both params', () => {
+    const errors = validate('renameFolder', {});
+    assert.equal(errors.length, 2);
+    assert.ok(errors.some(e => e.includes('folderPath')));
+    assert.ok(errors.some(e => e.includes('newName')));
+  });
+
+  it('renameFolder accepts valid params', () => {
+    const errors = validate('renameFolder', {
+      folderPath: 'imap://user@server/INBOX/Old',
+      newName: 'New',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('renameFolder rejects number for newName', () => {
+    const errors = validate('renameFolder', {
+      folderPath: 'imap://user@server/INBOX/Old',
+      newName: 123,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('deleteFolder requires folderPath', () => {
+    const errors = validate('deleteFolder', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /folderPath/);
+  });
+
+  it('deleteFolder accepts valid path', () => {
+    const errors = validate('deleteFolder', {
+      folderPath: 'imap://user@server/INBOX/ToDelete',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('moveFolder requires both params', () => {
+    const errors = validate('moveFolder', {});
+    assert.equal(errors.length, 2);
+  });
+
+  it('moveFolder accepts valid params', () => {
+    const errors = validate('moveFolder', {
+      folderPath: 'imap://user@server/INBOX/Source',
+      newParentPath: 'imap://user@server/Archive',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('moveFolder rejects unknown params', () => {
+    const errors = validate('moveFolder', {
+      folderPath: '/Source',
+      newParentPath: '/Dest',
+      recursive: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
   });
 });

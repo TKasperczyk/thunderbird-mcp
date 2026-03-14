@@ -1270,3 +1270,79 @@ describe('Account access: validation edge cases', () => {
     assert.ok(errors.some(e => e.includes('Unknown parameter: constructor')));
   });
 });
+
+// ─── Folder management stress tests ──────────────────────────────
+
+describe('Folder management: validation edge cases', () => {
+  const folderTools = [
+    {
+      name: "renameFolder",
+      inputSchema: {
+        type: "object",
+        properties: { folderPath: { type: "string" }, newName: { type: "string" } },
+        required: ["folderPath", "newName"],
+      },
+    },
+    {
+      name: "deleteFolder",
+      inputSchema: {
+        type: "object",
+        properties: { folderPath: { type: "string" } },
+        required: ["folderPath"],
+      },
+    },
+    {
+      name: "moveFolder",
+      inputSchema: {
+        type: "object",
+        properties: { folderPath: { type: "string" }, newParentPath: { type: "string" } },
+        required: ["folderPath", "newParentPath"],
+      },
+    },
+  ];
+  const folderValidate = createValidator(folderTools);
+
+  it('rejects renameFolder with null folderPath', () => {
+    const errors = folderValidate('renameFolder', { folderPath: null, newName: 'test' });
+    assert.ok(errors.some(e => e.includes('folderPath')));
+  });
+
+  it('rejects renameFolder with array newName', () => {
+    const errors = folderValidate('renameFolder', { folderPath: '/INBOX', newName: ['a'] });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects deleteFolder with number folderPath', () => {
+    const errors = folderValidate('deleteFolder', { folderPath: 12345 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects moveFolder with boolean paths', () => {
+    const errors = folderValidate('moveFolder', { folderPath: true, newParentPath: false });
+    assert.equal(errors.length, 2);
+  });
+
+  it('rejects unknown params on renameFolder', () => {
+    const errors = folderValidate('renameFolder', {
+      folderPath: '/INBOX', newName: 'test', force: true
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: force/);
+  });
+
+  it('handles very long folder name in renameFolder', () => {
+    const longName = 'a'.repeat(10000);
+    const errors = folderValidate('renameFolder', { folderPath: '/INBOX', newName: longName });
+    assert.equal(errors.length, 0); // Validation passes; filesystem will reject
+  });
+
+  it('handles special characters in folder paths', () => {
+    const errors = folderValidate('moveFolder', {
+      folderPath: 'imap://user@server/INBOX/Über Spëcial & "Quotes"',
+      newParentPath: 'imap://user@server/Archive/日本語'
+    });
+    assert.equal(errors.length, 0);
+  });
+});

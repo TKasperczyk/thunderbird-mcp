@@ -312,6 +312,44 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "renameFolder",
+        title: "Rename Folder",
+        description: "Rename an existing mail folder",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "URI of the folder to rename (from listFolders)" },
+            newName: { type: "string", description: "New name for the folder" },
+          },
+          required: ["folderPath", "newName"],
+        },
+      },
+      {
+        name: "deleteFolder",
+        title: "Delete Folder",
+        description: "Delete a mail folder and all its contents. This moves the folder to Trash, or permanently deletes it if it is already in Trash.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "URI of the folder to delete (from listFolders)" },
+          },
+          required: ["folderPath"],
+        },
+      },
+      {
+        name: "moveFolder",
+        title: "Move Folder",
+        description: "Move a mail folder to a new parent folder within the same account",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "URI of the folder to move (from listFolders)" },
+            newParentPath: { type: "string", description: "URI of the destination parent folder (from listFolders)" },
+          },
+          required: ["folderPath", "newParentPath"],
+        },
+      },
+      {
         name: "listFilters",
         title: "List Filters",
         description: "List all mail filters/rules for an account with their conditions and actions",
@@ -2538,6 +2576,112 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function renameFolder(folderPath, newName) {
+              try {
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
+                }
+                if (typeof newName !== "string" || !newName) {
+                  return { error: "newName must be a non-empty string" };
+                }
+
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+
+                folder.rename(newName, null);
+                return {
+                  success: true,
+                  message: `Folder renamed to "${newName}"`,
+                  oldPath: folderPath,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function deleteFolder(folderPath) {
+              try {
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
+                }
+
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+
+                const parent = folder.parent;
+                if (!parent) {
+                  return { error: "Cannot delete a root folder" };
+                }
+
+                // Check if folder is already in Trash — if so, permanently delete
+                const TRASH_FLAG = 0x00000100;
+                let inTrash = false;
+                let ancestor = folder;
+                while (ancestor) {
+                  try {
+                    if (ancestor.getFlag && ancestor.getFlag(TRASH_FLAG)) {
+                      inTrash = true;
+                      break;
+                    }
+                  } catch { /* ignore */ }
+                  ancestor = ancestor.parent;
+                }
+
+                if (inTrash) {
+                  // Permanently delete
+                  parent.deleteSubFolders([folder], null);
+                  return { success: true, message: `Folder "${folder.prettyName}" permanently deleted` };
+                } else {
+                  // Move to trash
+                  const trashFolder = findTrashFolder(folder);
+                  if (!trashFolder) {
+                    return { error: "Trash folder not found" };
+                  }
+                  MailServices.copy.copyFolders([folder], trashFolder, true, null, null);
+                  return { success: true, message: `Folder "${folder.prettyName}" moved to Trash` };
+                }
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function moveFolder(folderPath, newParentPath) {
+              try {
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
+                }
+                if (typeof newParentPath !== "string" || !newParentPath) {
+                  return { error: "newParentPath must be a non-empty string" };
+                }
+
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+
+                const newParent = MailServices.folderLookup.getFolderForURL(newParentPath);
+                if (!newParent) {
+                  return { error: `Destination folder not found: ${newParentPath}` };
+                }
+
+                if (folder.parent && folder.parent.URI === newParentPath) {
+                  return { error: "Folder is already under this parent" };
+                }
+
+                MailServices.copy.copyFolders([folder], newParent, true, null, null);
+                return {
+                  success: true,
+                  message: `Folder "${folder.prettyName}" moved to "${newParent.prettyName}"`,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             // ── Filter constant maps ──
 
             const ATTRIB_MAP = {
@@ -3097,6 +3241,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash);
                 case "createFolder":
                   return createFolder(args.parentFolderPath, args.name);
+                case "renameFolder":
+                  return renameFolder(args.folderPath, args.newName);
+                case "deleteFolder":
+                  return deleteFolder(args.folderPath);
+                case "moveFolder":
+                  return moveFolder(args.folderPath, args.newParentPath);
                 case "listFilters":
                   return listFilters(args.accountId);
                 case "createFilter":
