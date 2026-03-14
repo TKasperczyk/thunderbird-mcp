@@ -91,6 +91,7 @@ const sampleTools = [
         query: { type: "string" },
         folderPath: { type: "string" },
         maxResults: { type: "number" },
+        offset: { type: "number" },
         unreadOnly: { type: "boolean" },
       },
       required: ["query"],
