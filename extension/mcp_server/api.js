@@ -2873,7 +2873,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               // Check types and reject unknown properties
               for (const [key, value] of Object.entries(args)) {
-                const propSchema = props[key];
+                // Use hasOwnProperty to avoid inherited properties like
+                // 'constructor' or 'toString' bypassing unknown-param checks.
+                const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
                 if (!propSchema) {
                   errors.push(`Unknown parameter: ${key}`);
                   continue;

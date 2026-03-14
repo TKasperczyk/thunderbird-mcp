@@ -40,7 +40,7 @@ function createValidator(tools) {
     }
 
     for (const [key, value] of Object.entries(args)) {
-      const propSchema = props[key];
+      const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
       if (!propSchema) {
         errors.push(`Unknown parameter: ${key}`);
         continue;

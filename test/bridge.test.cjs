@@ -13,6 +13,8 @@
 const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('http');
+const fs = require('fs');
+const os = require('os');
 const { spawn } = require('child_process');
 const path = require('path');
 
@@ -151,8 +153,14 @@ describe('Bridge: notifications', () => {
 describe('Bridge: HTTP forwarding', () => {
   let mockServer;
   let mockPort = 8765;
+  const connDir = path.join(os.tmpdir(), 'thunderbird-mcp');
+  const connFile = path.join(connDir, 'connection.json');
+  let savedConnData = null;
 
   before(async () => {
+    // Back up existing connection file
+    try { savedConnData = fs.readFileSync(connFile, 'utf8'); } catch { savedConnData = null; }
+
     // Start a mock server on port 8765 to simulate Thunderbird
     mockServer = http.createServer((req, res) => {
       let body = '';
@@ -195,13 +203,25 @@ describe('Bridge: HTTP forwarding', () => {
           reject(err);
         }
       });
-      mockServer.listen(mockPort, '127.0.0.1', resolve);
+      mockServer.listen(mockPort, '127.0.0.1', () => {
+        // Write connection file so the bridge finds our mock server
+        fs.mkdirSync(connDir, { recursive: true });
+        fs.writeFileSync(connFile, JSON.stringify({ port: mockPort, token: 'mock-test-token' }), 'utf8');
+        resolve();
+      });
     });
   });
 
   after(async () => {
     if (mockServer) {
       await new Promise((resolve) => mockServer.close(resolve));
+    }
+    // Restore original connection file
+    if (savedConnData !== null) {
+      fs.mkdirSync(connDir, { recursive: true });
+      fs.writeFileSync(connFile, savedConnData, 'utf8');
+    } else {
+      try { fs.unlinkSync(connFile); } catch { /* ignore */ }
     }
   });
 

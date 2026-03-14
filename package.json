@@ -27,7 +27,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.cjs",
-    "test": "node --test test/*.test.cjs"
+    "test": "node --test --test-concurrency=1 test/*.test.cjs"
   },
   "engines": {
     "node": ">=18.0.0"
