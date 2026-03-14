@@ -2934,6 +2934,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             const server = new HttpServer();
 
+            // Health check endpoint — no auth required, allows clients
+            // to verify the server is running before reading connection.json.
+            server.registerPathHandler("/health", (req, res) => {
+              res.setStatusLine("1.1", 200, "OK");
+              res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+              res.write(JSON.stringify({
+                status: "ok",
+                server: "thunderbird-mcp",
+                version: "0.1.0"
+              }));
+              res.finish();
+            });
+
             server.registerPathHandler("/", (req, res) => {
               res.processAsync();
 
@@ -3058,12 +3071,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   res.setHeader("Content-Type", "application/json; charset=utf-8", false);
                   res.write(JSON.stringify({ jsonrpc: "2.0", id: id ?? null, result }));
                 } catch (e) {
+                  // Include the tool name and method in error messages for easier debugging
+                  const toolName = method === "tools/call" ? params?.name : null;
+                  const errorPrefix = toolName ? `[${toolName}] ` : `[${method}] `;
                   res.setStatusLine("1.1", 200, "OK");
                   res.setHeader("Content-Type", "application/json; charset=utf-8", false);
                   res.write(JSON.stringify({
                     jsonrpc: "2.0",
                     id: id ?? null,
-                    error: { code: -32000, message: e.toString() }
+                    error: { code: -32000, message: `${errorPrefix}${e.message || e.toString()}` }
                   }));
                 }
                 res.finish();
