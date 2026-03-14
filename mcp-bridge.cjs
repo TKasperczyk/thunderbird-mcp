@@ -3,15 +3,66 @@
  * MCP Bridge for Thunderbird
  *
  * Converts stdio MCP protocol to HTTP requests for the Thunderbird MCP extension.
- * The extension exposes an HTTP endpoint on localhost:8765.
+ * The extension exposes an HTTP endpoint on localhost (dynamic port).
+ * Connection details (port, auth token) are read from a connection file
+ * written by the extension at <TmpD>/thunderbird-mcp/connection.json.
  */
 
 const http = require('http');
 const readline = require('readline');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
-const THUNDERBIRD_PORT = 8765;
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
+const CONNECTION_FILE = path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json');
+const CONNECTION_RETRY_ATTEMPTS = 10;
+const CONNECTION_RETRY_DELAY_MS = 500;
+
+// Cached connection info from the extension's connection file
+let cachedConnection = null;
+
+/**
+ * Read connection file written by the Thunderbird extension.
+ * Returns { port, token } or null if the file doesn't exist yet.
+ */
+function readConnectionFile() {
+  try {
+    const data = fs.readFileSync(CONNECTION_FILE, 'utf8');
+    const parsed = JSON.parse(data);
+    if (typeof parsed.port === 'number' && typeof parsed.token === 'string') {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get connection info, retrying if the file doesn't exist yet
+ * (the extension may still be starting up).
+ */
+async function getConnection() {
+  if (cachedConnection) {
+    return cachedConnection;
+  }
+
+  for (let attempt = 0; attempt < CONNECTION_RETRY_ATTEMPTS; attempt++) {
+    const conn = readConnectionFile();
+    if (conn) {
+      cachedConnection = conn;
+      return conn;
+    }
+    if (attempt < CONNECTION_RETRY_ATTEMPTS - 1) {
+      await new Promise(resolve => setTimeout(resolve, CONNECTION_RETRY_DELAY_MS));
+    }
+  }
+  throw new Error(
+    `Connection file not found at ${CONNECTION_FILE}. Is Thunderbird running with the MCP extension?`
+  );
+}
 
 // Ensure stdout doesn't buffer - critical for MCP protocol
 if (process.stdout._handle?.setBlocking) {
@@ -89,16 +140,17 @@ async function handleMessage(line) {
   return forwardToThunderbird(message);
 }
 
-function tryRequest(hostname, postData) {
+function tryRequest(hostname, postData, port, token) {
   return new Promise((resolve, reject) => {
     const req = http.request({
       hostname,
-      port: THUNDERBIRD_PORT,
+      port,
       path: '/',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData)
+        'Content-Length': Buffer.byteLength(postData),
+        'Authorization': `Bearer ${token}`
       }
     }, (res) => {
       const chunks = [];
@@ -129,20 +181,23 @@ function tryRequest(hostname, postData) {
   });
 }
 
-function forwardToThunderbird(message) {
+async function forwardToThunderbird(message) {
+  const conn = await getConnection();
   const postData = JSON.stringify(message);
 
   // Try each host in order - handles platforms where 'localhost' resolves to
   // IPv6 (::1) but the extension only listens on IPv4 (127.0.0.1).
   const tryNext = (hosts) => {
     const [hostname, ...rest] = hosts;
-    return tryRequest(hostname, postData).catch((err) => {
+    return tryRequest(hostname, postData, conn.port, conn.token).catch((err) => {
       if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
         return tryNext(rest);
       }
       // Only wrap connection-level errors with the "Is Thunderbird running?" hint.
       // Timeout, JSON parse, and other errors should propagate with their original message.
       if (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT') {
+        // Invalidate cached connection in case the extension restarted on a new port
+        cachedConnection = null;
         throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
       }
       throw err;

@@ -5,7 +5,7 @@
  * Thunderbird MCP Server Extension
  * Exposes email, calendar, and contacts via MCP protocol over HTTP.
  *
- * Architecture: MCP Client <-> mcp-bridge.cjs (stdio<->HTTP) <-> This extension (port 8765)
+ * Architecture: MCP Client <-> mcp-bridge.cjs (stdio<->HTTP) <-> This extension (dynamic port)
  *
  * Key quirks documented inline:
  * - MIME header decoding (mime2Decoded* properties)
@@ -18,7 +18,6 @@ const resProto = Cc[
   "@mozilla.org/network/protocol;1?name=resource"
 ].getService(Ci.nsISubstitutingProtocolHandler);
 
-const MCP_PORT = 8765;
 // Keep references to active attach timers to prevent GC before they fire.
 const _attachTimers = new Set();
 // Delay before injecting attachments into a newly opened compose window.
@@ -445,6 +444,46 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const { MailServices } = ChromeUtils.importESModule(
               "resource:///modules/MailServices.sys.mjs"
             );
+
+            // --- Security: generate random auth token ---
+            const tokenBytes = new Uint8Array(32);
+            crypto.getRandomValues(tokenBytes);
+            const authToken = Array.from(tokenBytes, b => b.toString(16).padStart(2, "0")).join("");
+
+            /**
+             * Timing-safe comparison to prevent timing side-channel attacks.
+             * Always compares all bytes regardless of mismatch position.
+             */
+            function timingSafeEqual(a, b) {
+              if (a.length !== b.length) {
+                // Compare b against itself to burn the same time, then return false
+                let dummy = 0;
+                for (let i = 0; i < b.length; i++) {
+                  dummy |= b.charCodeAt(i) ^ b.charCodeAt(i);
+                }
+                void dummy;
+                return false;
+              }
+              let result = 0;
+              for (let i = 0; i < a.length; i++) {
+                result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+              }
+              return result === 0;
+            }
+
+            /**
+             * Verify Authorization header. Returns true if valid, false otherwise.
+             * Fail-closed: missing or malformed header always rejects.
+             */
+            function checkAuth(req) {
+              const authHeader = req.hasHeader("Authorization")
+                ? req.getHeader("Authorization")
+                : "";
+              if (!authHeader.startsWith("Bearer ")) {
+                return false;
+              }
+              return timingSafeEqual(authHeader.slice(7), authToken);
+            }
 
             let cal = null;
             let CalEvent = null;
@@ -2861,8 +2900,29 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             const server = new HttpServer();
 
+            // Health endpoint — unauthenticated, just confirms server is running
+            server.registerPathHandler("/health", (req, res) => {
+              res.setStatusLine("1.1", 200, "OK");
+              res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+              res.write(JSON.stringify({ status: "ok" }));
+              res.finish();
+            });
+
             server.registerPathHandler("/", (req, res) => {
               res.processAsync();
+
+              // --- Fail-closed auth check ---
+              if (!checkAuth(req)) {
+                res.setStatusLine("1.1", 403, "Forbidden");
+                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                res.write(JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32000, message: "Unauthorized" }
+                }));
+                res.finish();
+                return;
+              }
 
               if (req.method !== "POST") {
                 res.setStatusLine("1.1", 200, "OK");
@@ -2971,9 +3031,53 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               })();
             });
 
-            server.start(MCP_PORT);
-            console.log(`Thunderbird MCP server listening on port ${MCP_PORT}`);
-            return { success: true, port: MCP_PORT };
+            // Dynamic port: let OS assign an available port
+            server.start(-1);
+            const actualPort = server.identity.primaryPort;
+            console.log(`Thunderbird MCP server listening on port ${actualPort}`);
+
+            // --- Write connection file for the bridge ---
+            try {
+              const connDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+              connDir.append("thunderbird-mcp");
+              if (!connDir.exists()) {
+                connDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+              }
+
+              const connFile = connDir.clone();
+              connFile.append("connection.json");
+              // Remove existing file to prevent symlink attacks
+              if (connFile.exists()) {
+                connFile.remove(false);
+              }
+
+              const connData = JSON.stringify({ port: actualPort, token: authToken });
+              const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                .createInstance(Ci.nsIFileOutputStream);
+              // 0x02 = WRONLY, 0x08 = CREAT, 0x20 = EXCL (fail if exists)
+              ostream.init(connFile, 0x02 | 0x08 | 0x20, 0o600, 0);
+              const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
+                .createInstance(Ci.nsIConverterOutputStream);
+              converter.init(ostream, "UTF-8");
+              converter.writeString(connData);
+              converter.close(); // also closes ostream
+              console.log(`Connection file written to ${connFile.path}`);
+
+              // Store cleanup function for shutdown
+              globalThis.__tbMcpRemoveConnectionInfo = () => {
+                try {
+                  if (connFile.exists()) {
+                    connFile.remove(false);
+                  }
+                } catch (cleanupErr) {
+                  console.error("Failed to remove connection file:", cleanupErr);
+                }
+              };
+            } catch (connErr) {
+              console.error("Failed to write connection file:", connErr);
+            }
+
+            return { success: true, port: actualPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
             // Clear cached promise so a retry can attempt to bind again
@@ -2989,6 +3093,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   }
 
   onShutdown(isAppShutdown) {
+    // Always clean up the connection file, even on app shutdown,
+    // so stale credentials are not left in the temp directory.
+    if (typeof globalThis.__tbMcpRemoveConnectionInfo === "function") {
+      globalThis.__tbMcpRemoveConnectionInfo();
+      globalThis.__tbMcpRemoveConnectionInfo = null;
+    }
     if (isAppShutdown) return;
     resProto.setSubstitution("thunderbird-mcp", null);
     Services.obs.notifyObservers(null, "startupcache-invalidate");
