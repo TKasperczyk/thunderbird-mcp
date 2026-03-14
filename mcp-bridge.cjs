@@ -8,10 +8,43 @@
 
 const http = require('http');
 const readline = require('readline');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
-const THUNDERBIRD_PORT = 8765;
+const THUNDERBIRD_DEFAULT_PORT = 8765;
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
+const CONNECTION_FILE = path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json');
+
+/**
+ * Read connection info (port + auth token) written by the Thunderbird extension.
+ * Returns { port, token } or null if the file doesn't exist.
+ * Caches the result and refreshes on connection errors.
+ */
+let cachedConnectionInfo = null;
+let connectionInfoMtime = 0;
+
+function readConnectionInfo() {
+  try {
+    const stat = fs.statSync(CONNECTION_FILE);
+    // Re-read if file has been modified since last read
+    if (cachedConnectionInfo && stat.mtimeMs === connectionInfoMtime) {
+      return cachedConnectionInfo;
+    }
+    const data = JSON.parse(fs.readFileSync(CONNECTION_FILE, 'utf8'));
+    cachedConnectionInfo = data;
+    connectionInfoMtime = stat.mtimeMs;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function clearConnectionCache() {
+  cachedConnectionInfo = null;
+  connectionInfoMtime = 0;
+}
 
 // Ensure stdout doesn't buffer - critical for MCP protocol
 if (process.stdout._handle?.setBlocking) {
@@ -89,17 +122,21 @@ async function handleMessage(line) {
   return forwardToThunderbird(message);
 }
 
-function tryRequest(hostname, postData) {
+function tryRequest(hostname, postData, port, token) {
   return new Promise((resolve, reject) => {
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(postData)
+    };
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
     const req = http.request({
       hostname,
-      port: THUNDERBIRD_PORT,
+      port,
       path: '/',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData)
-      }
+      headers
     }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
@@ -132,17 +169,24 @@ function tryRequest(hostname, postData) {
 function forwardToThunderbird(message) {
   const postData = JSON.stringify(message);
 
+  // Read connection info (port + auth token) from the file written by the extension.
+  // Falls back to default port with no auth if the file doesn't exist (backward compat).
+  const connInfo = readConnectionInfo();
+  const port = connInfo?.port || THUNDERBIRD_DEFAULT_PORT;
+  const token = connInfo?.token || null;
+
   // Try each host in order - handles platforms where 'localhost' resolves to
   // IPv6 (::1) but the extension only listens on IPv4 (127.0.0.1).
   const tryNext = (hosts) => {
     const [hostname, ...rest] = hosts;
-    return tryRequest(hostname, postData).catch((err) => {
+    return tryRequest(hostname, postData, port, token).catch((err) => {
       if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
         return tryNext(rest);
       }
-      // Only wrap connection-level errors with the "Is Thunderbird running?" hint.
-      // Timeout, JSON parse, and other errors should propagate with their original message.
+      // On connection failure, clear cache so next request re-reads the file
+      // (Thunderbird may have restarted on a different port with a new token).
       if (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT') {
+        clearConnectionCache();
         throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
       }
       throw err;

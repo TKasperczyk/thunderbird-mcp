@@ -18,7 +18,8 @@ const resProto = Cc[
   "@mozilla.org/network/protocol;1?name=resource"
 ].getService(Ci.nsISubstitutingProtocolHandler);
 
-const MCP_PORT = 8765;
+const MCP_DEFAULT_PORT = 8765;
+const MCP_MAX_PORT_ATTEMPTS = 10;
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 1000;
@@ -471,7 +472,64 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return NetUtil.readInputStreamToString(stream, stream.available(), { charset: "UTF-8" });
             }
 
+            /**
+             * Generate a cryptographically random auth token (hex string).
+             * Used to authenticate bridge requests to the HTTP server.
+             */
+            function generateAuthToken() {
+              const bytes = new Uint8Array(32);
+              // crypto.getRandomValues is not available in Thunderbird experiment API scope;
+              // use the XPCOM random generator instead.
+              const rng = Cc["@mozilla.org/security/random-generator;1"]
+                .createInstance(Ci.nsIRandomGenerator);
+              const randomBytes = rng.generateRandomBytes(32);
+              for (let i = 0; i < 32; i++) bytes[i] = randomBytes[i];
+              return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+            }
 
+            /**
+             * Write connection info (port + auth token) to a well-known file
+             * so the bridge can discover how to connect.
+             * File: <TmpD>/thunderbird-mcp/connection.json
+             */
+            function writeConnectionInfo(port, token) {
+              const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+              tmpDir.append("thunderbird-mcp");
+              if (!tmpDir.exists()) {
+                tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+              }
+              const connFile = tmpDir.clone();
+              connFile.append("connection.json");
+              const data = JSON.stringify({ port, token, pid: Services.appinfo.processID });
+              const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                .createInstance(Ci.nsIFileOutputStream);
+              ostream.init(connFile, 0x02 | 0x08 | 0x20, 0o600, 0);
+              const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
+                .createInstance(Ci.nsIConverterOutputStream);
+              converter.init(ostream, "UTF-8");
+              converter.writeString(data);
+              converter.close();
+              return connFile.path;
+            }
+
+            /**
+             * Remove the connection info file on shutdown.
+             */
+            function removeConnectionInfo() {
+              try {
+                const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+                tmpDir.append("thunderbird-mcp");
+                const connFile = tmpDir.clone();
+                connFile.append("connection.json");
+                if (connFile.exists()) {
+                  connFile.remove(false);
+                }
+              } catch {
+                // Best-effort cleanup
+              }
+            }
+
+            const authToken = generateAuthToken();
 
             /**
              * Lists all email accounts and their identities.
@@ -2891,6 +2949,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return;
               }
 
+              // Verify auth token from Authorization header
+              let reqToken = "";
+              try {
+                reqToken = req.getHeader("Authorization") || "";
+              } catch {
+                // getHeader throws if header is missing in httpd.sys.mjs
+              }
+              if (reqToken !== `Bearer ${authToken}`) {
+                res.setStatusLine("1.1", 403, "Forbidden");
+                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                res.write(JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32600, message: "Invalid or missing auth token" }
+                }));
+                res.finish();
+                return;
+              }
+
               let message;
               try {
                 message = JSON.parse(readRequestBody(req));
@@ -2993,13 +3070,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               })();
             });
 
-            server.start(MCP_PORT);
-            console.log(`Thunderbird MCP server listening on port ${MCP_PORT}`);
-            return { success: true, port: MCP_PORT };
+            // Try the default port first, then fall back to nearby ports
+            let boundPort = null;
+            for (let attempt = 0; attempt < MCP_MAX_PORT_ATTEMPTS; attempt++) {
+              const tryPort = MCP_DEFAULT_PORT + attempt;
+              try {
+                server.start(tryPort);
+                boundPort = tryPort;
+                break;
+              } catch (portErr) {
+                if (attempt === MCP_MAX_PORT_ATTEMPTS - 1) {
+                  throw new Error(`Could not bind to any port in range ${MCP_DEFAULT_PORT}-${tryPort}: ${portErr}`);
+                }
+                console.warn(`Port ${tryPort} in use, trying ${tryPort + 1}...`);
+              }
+            }
+
+            const connFilePath = writeConnectionInfo(boundPort, authToken);
+            console.log(`Thunderbird MCP server listening on port ${boundPort}`);
+            console.log(`Connection info written to ${connFilePath}`);
+            return { success: true, port: boundPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
             // Clear cached promise so a retry can attempt to bind again
             globalThis.__tbMcpStartPromise = null;
+            removeConnectionInfo();
             return { success: false, error: e.toString() };
           }
           })();
@@ -3011,6 +3106,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   }
 
   onShutdown(isAppShutdown) {
+    // Always clean up the connection info file so stale tokens don't linger
+    try {
+      const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+      tmpDir.append("thunderbird-mcp");
+      const connFile = tmpDir.clone();
+      connFile.append("connection.json");
+      if (connFile.exists()) {
+        connFile.remove(false);
+      }
+    } catch {
+      // Best-effort cleanup
+    }
+
     if (isAppShutdown) return;
     resProto.setSubstitution("thunderbird-mcp", null);
     Services.obs.notifyObservers(null, "startupcache-invalidate");
