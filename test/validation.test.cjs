@@ -1,9 +1,9 @@
 /**
  * Tests for the schema validation logic used in api.js.
  *
- * Since the validation function runs inside the Thunderbird extension context,
- * we replicate the exact same logic here to verify it independently.
- * This ensures validation behavior is correct before deploying to the extension.
+ * The validator is shared via test/helpers.cjs which replicates the exact
+ * logic from api.js. This ensures validation behavior is correct before
+ * deploying to the extension.
  *
  * Covers:
  * - Required parameter enforcement
@@ -15,55 +15,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 
-/**
- * Exact copy of validateToolArgs from api.js.
- * Kept in sync manually — if the logic in api.js changes, update here too.
- */
-function createValidator(tools) {
-  const toolSchemas = Object.create(null);
-  for (const t of tools) {
-    toolSchemas[t.name] = t.inputSchema;
-  }
-
-  return function validateToolArgs(name, args) {
-    const schema = toolSchemas[name];
-    if (!schema) return [`Unknown tool: ${name}`];
-
-    const errors = [];
-    const props = schema.properties || {};
-    const required = schema.required || [];
-
-    for (const key of required) {
-      if (args[key] === undefined || args[key] === null) {
-        errors.push(`Missing required parameter: ${key}`);
-      }
-    }
-
-    for (const [key, value] of Object.entries(args)) {
-      const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
-      if (!propSchema) {
-        errors.push(`Unknown parameter: ${key}`);
-        continue;
-      }
-      if (value === undefined || value === null) continue;
-
-      const expectedType = propSchema.type;
-      if (expectedType === "array") {
-        if (!Array.isArray(value)) {
-          errors.push(`Parameter '${key}' must be an array, got ${typeof value}`);
-        }
-      } else if (expectedType === "object") {
-        if (typeof value !== "object" || Array.isArray(value)) {
-          errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
-        }
-      } else if (expectedType && typeof value !== expectedType) {
-        errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
-      }
-    }
-
-    return errors;
-  };
-}
+const { createValidator } = require('./helpers.cjs');
 
 // Sample tool definitions matching the shapes in api.js
 const sampleTools = [
@@ -195,16 +147,6 @@ const sampleTools = [
   {
     name: "getAccountAccess",
     inputSchema: { type: "object", properties: {}, required: [] },
-  },
-  {
-    name: "setAccountAccess",
-    inputSchema: {
-      type: "object",
-      properties: {
-        allowedAccountIds: { type: "array", items: { type: "string" } },
-      },
-      required: ["allowedAccountIds"],
-    },
   },
   {
     name: "updateMessage",
@@ -446,34 +388,6 @@ describe('Validation: account access control', () => {
     const errors = validate('getAccountAccess', { bogus: 'value' });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /Unknown parameter/);
-  });
-
-  it('setAccountAccess requires allowedAccountIds', () => {
-    const errors = validate('setAccountAccess', {});
-    assert.equal(errors.length, 1);
-    assert.match(errors[0], /Missing required parameter/);
-  });
-
-  it('setAccountAccess accepts array of strings', () => {
-    const errors = validate('setAccountAccess', {
-      allowedAccountIds: ['account1', 'account2'],
-    });
-    assert.equal(errors.length, 0);
-  });
-
-  it('setAccountAccess accepts empty array', () => {
-    const errors = validate('setAccountAccess', {
-      allowedAccountIds: [],
-    });
-    assert.equal(errors.length, 0);
-  });
-
-  it('setAccountAccess rejects string instead of array', () => {
-    const errors = validate('setAccountAccess', {
-      allowedAccountIds: 'account1',
-    });
-    assert.equal(errors.length, 1);
-    assert.match(errors[0], /must be an array/);
   });
 });
 
