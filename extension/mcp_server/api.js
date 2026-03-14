@@ -475,6 +475,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
+             * Apply offset-based pagination to a sorted results array.
+             * Removes the internal _dateTs property from each result.
+             * Returns { messages, totalMatches, offset, limit, hasMore }.
+             */
+            function paginate(results, offset, effectiveLimit) {
+              const effectiveOffset = Number.isFinite(Number(offset)) && Number(offset) > 0 ? Math.floor(Number(offset)) : 0;
+              const page = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(r => {
+                delete r._dateTs;
+                return r;
+              });
+              return {
+                messages: page,
+                totalMatches: results.length,
+                offset: effectiveOffset,
+                limit: effectiveLimit,
+                hasMore: effectiveOffset + effectiveLimit < results.length
+              };
+            }
+
+            /**
              * Generate a cryptographically random auth token (hex string).
              * Used to authenticate bridge requests to the HTTP server.
              */
@@ -1033,19 +1053,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
 
-              const effectiveOffset = Number.isFinite(Number(offset)) && Number(offset) > 0 ? Math.floor(Number(offset)) : 0;
-              const page = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(result => {
-                delete result._dateTs;
-                return result;
-              });
-
-              return {
-                messages: page,
-                totalMatches: results.length,
-                offset: effectiveOffset,
-                limit: effectiveLimit,
-                hasMore: effectiveOffset + effectiveLimit < results.length
-              };
+              return paginate(results, offset, effectiveLimit);
             }
 
             function searchContacts(query) {
@@ -2148,19 +2156,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => b._dateTs - a._dateTs);
 
-              const effectiveOffset = Number.isFinite(Number(offset)) && Number(offset) > 0 ? Math.floor(Number(offset)) : 0;
-              const page = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(r => {
-                delete r._dateTs;
-                return r;
-              });
-
-              return {
-                messages: page,
-                totalMatches: results.length,
-                offset: effectiveOffset,
-                limit: effectiveLimit,
-                hasMore: effectiveOffset + effectiveLimit < results.length
-              };
+              return paginate(results, offset, effectiveLimit);
             }
 
             function deleteMessages(messageIds, folderPath) {
