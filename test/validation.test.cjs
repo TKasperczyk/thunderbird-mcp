@@ -123,6 +123,44 @@ const sampleTools = [
     },
   },
   {
+    name: "createContact",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string" },
+        displayName: { type: "string" },
+        firstName: { type: "string" },
+        lastName: { type: "string" },
+        addressBookId: { type: "string" },
+      },
+      required: ["email"],
+    },
+  },
+  {
+    name: "updateContact",
+    inputSchema: {
+      type: "object",
+      properties: {
+        contactId: { type: "string" },
+        email: { type: "string" },
+        displayName: { type: "string" },
+        firstName: { type: "string" },
+        lastName: { type: "string" },
+      },
+      required: ["contactId"],
+    },
+  },
+  {
+    name: "deleteContact",
+    inputSchema: {
+      type: "object",
+      properties: {
+        contactId: { type: "string" },
+      },
+      required: ["contactId"],
+    },
+  },
+  {
     name: "renameFolder",
     inputSchema: {
       type: "object",
@@ -541,5 +579,63 @@ describe('Validation: attachment sending', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must be an array/);
+  });
+});
+
+describe('Validation: contact write operations', () => {
+  it('createContact requires email', () => {
+    const errors = validate('createContact', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /email/);
+  });
+
+  it('createContact accepts valid params', () => {
+    const errors = validate('createContact', {
+      email: 'user@example.com',
+      displayName: 'Test User',
+      firstName: 'Test',
+      lastName: 'User',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('createContact rejects number for email', () => {
+    const errors = validate('createContact', { email: 123 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('updateContact requires contactId', () => {
+    const errors = validate('updateContact', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /contactId/);
+  });
+
+  it('updateContact accepts contactId with optional fields', () => {
+    const errors = validate('updateContact', {
+      contactId: 'uid-123',
+      email: 'new@example.com',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('deleteContact requires contactId', () => {
+    const errors = validate('deleteContact', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /contactId/);
+  });
+
+  it('deleteContact accepts valid contactId', () => {
+    const errors = validate('deleteContact', { contactId: 'uid-456' });
+    assert.equal(errors.length, 0);
+  });
+
+  it('deleteContact rejects unknown params', () => {
+    const errors = validate('deleteContact', {
+      contactId: 'uid-456',
+      force: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
   });
 });

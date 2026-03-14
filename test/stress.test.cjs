@@ -1414,3 +1414,110 @@ describe('Attachment sending: validation edge cases', () => {
     assert.equal(errors.length, 0);
   });
 });
+
+// ─── Contact write support stress tests ─────────────────────────
+
+describe('Contact write: validation edge cases', () => {
+  const contactTools = [
+    {
+      name: "createContact",
+      inputSchema: {
+        type: "object",
+        properties: {
+          email: { type: "string" },
+          displayName: { type: "string" },
+          firstName: { type: "string" },
+          lastName: { type: "string" },
+          addressBookId: { type: "string" },
+        },
+        required: ["email"],
+      },
+    },
+    {
+      name: "updateContact",
+      inputSchema: {
+        type: "object",
+        properties: {
+          contactId: { type: "string" },
+          email: { type: "string" },
+          displayName: { type: "string" },
+          firstName: { type: "string" },
+          lastName: { type: "string" },
+        },
+        required: ["contactId"],
+      },
+    },
+    {
+      name: "deleteContact",
+      inputSchema: {
+        type: "object",
+        properties: {
+          contactId: { type: "string" },
+        },
+        required: ["contactId"],
+      },
+    },
+  ];
+  const contactValidate = createValidator(contactTools);
+
+  it('rejects createContact with null email', () => {
+    const errors = contactValidate('createContact', { email: null });
+    assert.ok(errors.some(e => e.includes('email')));
+  });
+
+  it('rejects createContact with array email', () => {
+    const errors = contactValidate('createContact', { email: ['a@b.com'] });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects updateContact with boolean contactId', () => {
+    const errors = contactValidate('updateContact', { contactId: true });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects deleteContact with number contactId', () => {
+    const errors = contactValidate('deleteContact', { contactId: 42 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects unknown params on createContact', () => {
+    const errors = contactValidate('createContact', {
+      email: 'a@b.com', phone: '555-1234'
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: phone/);
+  });
+
+  it('handles prototype pollution on createContact', () => {
+    const malicious = Object.create(null);
+    malicious.email = 'a@b.com';
+    malicious.constructor = 'attack';
+    const errors = contactValidate('createContact', malicious);
+    assert.ok(errors.some(e => e.includes('Unknown parameter: constructor')));
+  });
+
+  it('accepts all optional fields on createContact', () => {
+    const errors = contactValidate('createContact', {
+      email: 'a@b.com',
+      displayName: 'Test',
+      firstName: 'First',
+      lastName: 'Last',
+      addressBookId: 'book-1',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts contactId-only for updateContact (no changes)', () => {
+    const errors = contactValidate('updateContact', { contactId: 'uid-1' });
+    assert.equal(errors.length, 0);
+  });
+
+  it('handles very long email on createContact', () => {
+    const longEmail = 'a'.repeat(5000) + '@example.com';
+    const errors = contactValidate('createContact', { email: longEmail });
+    assert.equal(errors.length, 0);
+  });
+});
