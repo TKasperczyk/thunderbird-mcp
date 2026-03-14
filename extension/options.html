@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Thunderbird MCP Settings</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      padding: 16px;
+      background: #f9f9fa;
+      color: #15141a;
+      font-size: 14px;
+    }
+    h2 {
+      font-size: 16px;
+      margin: 0 0 12px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #cfcfd8;
+    }
+    .section {
+      background: #fff;
+      border: 1px solid #cfcfd8;
+      border-radius: 6px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .status-dot.running { background: #30e60b; }
+    .status-dot.stopped { background: #ff0039; }
+    .info-label {
+      color: #5b5b66;
+      min-width: 110px;
+      display: inline-block;
+    }
+    .info-value {
+      font-family: monospace;
+      font-size: 13px;
+    }
+    .account-list {
+      list-style: none;
+      padding: 0;
+      margin: 8px 0 0;
+    }
+    .account-list li {
+      padding: 6px 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .account-list li + li {
+      border-top: 1px solid #ededf0;
+    }
+    .account-list label {
+      cursor: pointer;
+      flex: 1;
+    }
+    .account-type {
+      color: #5b5b66;
+      font-size: 12px;
+      text-transform: uppercase;
+      margin-left: 4px;
+    }
+    .mode-note {
+      color: #5b5b66;
+      font-size: 13px;
+      margin: 8px 0 0;
+    }
+    .save-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 12px;
+    }
+    button {
+      background: #0060df;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 8px 16px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button:hover { background: #003eaa; }
+    button:disabled { background: #cfcfd8; cursor: default; }
+    .save-status {
+      color: #058b00;
+      font-size: 13px;
+    }
+    .save-status.error {
+      color: #d70022;
+    }
+  </style>
+</head>
+<body>
+
+<div class="section">
+  <h2>Server Status</h2>
+  <div class="status-row">
+    <span id="statusDot" class="status-dot stopped"></span>
+    <span id="statusText">Checking...</span>
+  </div>
+  <div>
+    <span class="info-label">Port:</span>
+    <span id="serverPort" class="info-value">--</span>
+  </div>
+  <div>
+    <span class="info-label">Connection file:</span>
+    <span id="connFile" class="info-value">--</span>
+  </div>
+  <div>
+    <span class="info-label">Build:</span>
+    <span id="buildInfo" class="info-value">--</span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Account Access</h2>
+  <p class="mode-note">
+    Select which accounts the MCP server can access. If none are checked, all accounts are accessible.
+  </p>
+  <ul id="accountList" class="account-list">
+    <li>Loading...</li>
+  </ul>
+  <div class="save-row">
+    <button id="saveBtn" disabled>Save</button>
+    <span id="saveStatus" class="save-status"></span>
+  </div>
+</div>
+
+<script src="options.js"></script>
+</body>
+</html>

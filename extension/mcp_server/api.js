@@ -21,6 +21,7 @@ const resProto = Cc[
 const MCP_DEFAULT_PORT = 8765;
 const MCP_MAX_PORT_ATTEMPTS = 10;
 const DEFAULT_MAX_RESULTS = 50;
+const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 1000;
 
@@ -427,6 +428,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           required: ["accountId", "folderPath"],
         },
       },
+      {
+        name: "getAccountAccess",
+        title: "Get Account Access",
+        description: "Get the current account access control list. When the list is empty, all accounts are accessible (default). When set, only the listed account IDs are exposed via MCP tools.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "setAccountAccess",
+        title: "Set Account Access",
+        description: "Set which accounts are accessible via MCP. Pass an array of account IDs (from listAccounts) to restrict access, or an empty array to allow all accounts. This setting persists across restarts.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            allowedAccountIds: { type: "array", items: { type: "string" }, description: "Array of account IDs to allow. Empty array = all accounts allowed." },
+          },
+          required: ["allowedAccountIds"],
+        },
+      },
     ];
 
     return {
@@ -559,9 +578,46 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /**
              * Lists all email accounts and their identities.
              */
+            /**
+             * Get the list of allowed account IDs from preferences.
+             * Returns an empty array if no restriction is set (all accounts allowed).
+             */
+            function getAllowedAccountIds() {
+              try {
+                const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
+                if (!pref) return [];
+                return JSON.parse(pref);
+              } catch {
+                return [];
+              }
+            }
+
+            /**
+             * Check if an account is accessible based on the allowed accounts list.
+             * When the list is empty, all accounts are accessible (default).
+             */
+            function isAccountAllowed(accountKey) {
+              const allowed = getAllowedAccountIds();
+              if (allowed.length === 0) return true;
+              return allowed.includes(accountKey);
+            }
+
+            /**
+             * Get all accessible Thunderbird accounts, filtered by allowed list.
+             */
+            function getAccessibleAccounts() {
+              const result = [];
+              for (const account of MailServices.accounts.accounts) {
+                if (isAccountAllowed(account.key)) {
+                  result.push(account);
+                }
+              }
+              return result;
+            }
+
             function listAccounts() {
               const accounts = [];
-              for (const account of MailServices.accounts.accounts) {
+              for (const account of getAccessibleAccounts()) {
                 const server = account.incomingServer;
                 const identities = [];
                 for (const identity of account.identities) {
@@ -580,6 +636,61 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 });
               }
               return accounts;
+            }
+
+            /**
+             * Get the current account access control list.
+             */
+            function getAccountAccess() {
+              const allowed = getAllowedAccountIds();
+              // Also return all available accounts for reference
+              const allAccounts = [];
+              for (const account of MailServices.accounts.accounts) {
+                const server = account.incomingServer;
+                allAccounts.push({
+                  id: account.key,
+                  name: server.prettyName,
+                  type: server.type,
+                  allowed: allowed.length === 0 || allowed.includes(account.key),
+                });
+              }
+              return {
+                mode: allowed.length === 0 ? "all" : "restricted",
+                allowedAccountIds: allowed,
+                accounts: allAccounts,
+              };
+            }
+
+            /**
+             * Set the account access control list.
+             * Pass an empty array to allow all accounts.
+             */
+            function setAccountAccess(allowedAccountIds) {
+              if (!Array.isArray(allowedAccountIds)) {
+                return { error: "allowedAccountIds must be an array" };
+              }
+              // Validate that all specified IDs are real accounts
+              const validIds = new Set();
+              for (const account of MailServices.accounts.accounts) {
+                validIds.add(account.key);
+              }
+              const invalid = allowedAccountIds.filter(id => !validIds.has(id));
+              if (invalid.length > 0) {
+                return { error: `Unknown account IDs: ${invalid.join(", ")}. Use listAccounts (or getAccountAccess) to see valid IDs.` };
+              }
+
+              if (allowedAccountIds.length === 0) {
+                // Clear the preference — allow all accounts
+                try { Services.prefs.clearUserPref(PREF_ALLOWED_ACCOUNTS); } catch { /* ignore */ }
+              } else {
+                Services.prefs.setStringPref(PREF_ALLOWED_ACCOUNTS, JSON.stringify(allowedAccountIds));
+              }
+
+              return {
+                success: true,
+                mode: allowedAccountIds.length === 0 ? "all" : "restricted",
+                allowedAccountIds,
+              };
             }
 
             /**
@@ -645,6 +756,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               if (accountId) {
+                if (!isAccountAllowed(accountId)) {
+                  return { error: `Account not accessible: ${accountId}` };
+                }
                 let target = null;
                 for (const account of MailServices.accounts.accounts) {
                   if (account.key === accountId) {
@@ -668,7 +782,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return results;
               }
 
-              for (const account of MailServices.accounts.accounts) {
+              for (const account of getAccessibleAccounts()) {
                 try {
                   const root = account.incomingServer.rootFolder;
                   if (!root) continue;
@@ -692,7 +806,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function findIdentity(emailOrId) {
               if (!emailOrId) return null;
               const lowerInput = emailOrId.toLowerCase();
-              for (const account of MailServices.accounts.accounts) {
+              for (const account of getAccessibleAccounts()) {
                 for (const identity of account.identities) {
                   if (identity.key === emailOrId || (identity.email || "").toLowerCase() === lowerInput) {
                     return identity;
@@ -1054,7 +1168,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 searchFolder(folder);
               } else {
-                for (const account of MailServices.accounts.accounts) {
+                for (const account of getAccessibleAccounts()) {
                   if (results.length >= SEARCH_COLLECTION_CAP) break;
                   searchFolder(account.incomingServer.rootFolder);
                 }
@@ -2155,8 +2269,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (opened.error) return { error: opened.error };
                 collectFromFolder(opened.folder);
               } else {
-                // All folders across all accounts
-                for (const account of MailServices.accounts.accounts) {
+                // All folders across accessible accounts
+                for (const account of getAccessibleAccounts()) {
                   if (results.length >= SEARCH_COLLECTION_CAP) break;
                   try {
                     const root = account.incomingServer.rootFolder;
@@ -2454,6 +2568,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
 
             function getFilterListForAccount(accountId) {
+              if (!isAccountAllowed(accountId)) {
+                return { error: `Account not accessible: ${accountId}` };
+              }
               const account = MailServices.accounts.getAccount(accountId);
               if (!account) return { error: `Account not found: ${accountId}` };
               const server = account.incomingServer;
@@ -2574,11 +2691,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const results = [];
                 let accounts;
                 if (accountId) {
+                  if (!isAccountAllowed(accountId)) {
+                    return { error: `Account not accessible: ${accountId}` };
+                  }
                   const account = MailServices.accounts.getAccount(accountId);
                   if (!account) return { error: `Account not found: ${accountId}` };
                   accounts = [account];
                 } else {
-                  accounts = Array.from(MailServices.accounts.accounts);
+                  accounts = Array.from(getAccessibleAccounts());
                 }
 
                 for (const account of accounts) {
@@ -2989,6 +3109,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return reorderFilters(args.accountId, args.fromIndex, args.toIndex);
                 case "applyFilters":
                   return applyFilters(args.accountId, args.folderPath);
+                case "getAccountAccess":
+                  return getAccountAccess();
+                case "setAccountAccess":
+                  return setAccountAccess(args.allowedAccountIds);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }
@@ -3178,7 +3302,115 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           })();
           globalThis.__tbMcpStartPromise = startPromise;
           return await startPromise;
-        }
+        },
+
+        getServerInfo: async function() {
+          let port = null;
+          let connectionFile = null;
+          let buildCommit = null;
+          let buildDate = null;
+
+          // Read build info from bundled file via resource: protocol
+          try {
+            const uri = Services.io.newURI("resource://thunderbird-mcp/buildinfo.json");
+            const channel = Services.io.newChannelFromURI(uri, null,
+              Services.scriptSecurityManager.getSystemPrincipal(), null,
+              Ci.nsILoadInfo.SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+              Ci.nsIContentPolicy.TYPE_OTHER);
+            const sis = Cc["@mozilla.org/scriptableinputstream;1"]
+              .createInstance(Ci.nsIScriptableInputStream);
+            sis.init(channel.open());
+            const text = sis.read(sis.available());
+            sis.close();
+            const bi = JSON.parse(text);
+            buildCommit = bi.commit || null;
+            buildDate = bi.builtAt || null;
+          } catch { /* build info not available */ }
+
+          // Read connection info from temp file using XPCOM file I/O
+          try {
+            const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+            tmpDir.append("thunderbird-mcp");
+            const connFile = tmpDir.clone();
+            connFile.append("connection.json");
+            connectionFile = connFile.path;
+            if (connFile.exists()) {
+              const fis = Cc["@mozilla.org/network/file-input-stream;1"]
+                .createInstance(Ci.nsIFileInputStream);
+              fis.init(connFile, 0x01, 0, 0);
+              const sis = Cc["@mozilla.org/scriptableinputstream;1"]
+                .createInstance(Ci.nsIScriptableInputStream);
+              sis.init(fis);
+              const text = sis.read(sis.available());
+              sis.close();
+              const data = JSON.parse(text);
+              port = data.port || null;
+            }
+          } catch { /* ignore */ }
+
+          return {
+            running: !!globalThis.__tbMcpStartPromise,
+            port,
+            connectionFile,
+            buildCommit,
+            buildDate,
+          };
+        },
+
+        getAccountAccess: async function() {
+          const { MailServices } = ChromeUtils.importESModule(
+            "resource:///modules/MailServices.sys.mjs"
+          );
+          let allowed = [];
+          try {
+            const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
+            if (pref) allowed = JSON.parse(pref);
+          } catch { /* ignore */ }
+
+          const accounts = [];
+          for (const account of MailServices.accounts.accounts) {
+            const server = account.incomingServer;
+            accounts.push({
+              id: account.key,
+              name: server.prettyName,
+              type: server.type,
+              allowed: allowed.length === 0 || allowed.includes(account.key),
+            });
+          }
+          return {
+            mode: allowed.length === 0 ? "all" : "restricted",
+            allowedAccountIds: allowed,
+            accounts,
+          };
+        },
+
+        setAccountAccess: async function(allowedAccountIds) {
+          if (!Array.isArray(allowedAccountIds)) {
+            return { error: "allowedAccountIds must be an array" };
+          }
+          const { MailServices } = ChromeUtils.importESModule(
+            "resource:///modules/MailServices.sys.mjs"
+          );
+          const validIds = new Set();
+          for (const account of MailServices.accounts.accounts) {
+            validIds.add(account.key);
+          }
+          const invalid = allowedAccountIds.filter(id => !validIds.has(id));
+          if (invalid.length > 0) {
+            return { error: `Unknown account IDs: ${invalid.join(", ")}` };
+          }
+
+          if (allowedAccountIds.length === 0) {
+            try { Services.prefs.clearUserPref(PREF_ALLOWED_ACCOUNTS); } catch { /* ignore */ }
+          } else {
+            Services.prefs.setStringPref(PREF_ALLOWED_ACCOUNTS, JSON.stringify(allowedAccountIds));
+          }
+          return {
+            success: true,
+            mode: allowedAccountIds.length === 0 ? "all" : "restricted",
+            allowedAccountIds,
+          };
+        },
       }
     };
   }

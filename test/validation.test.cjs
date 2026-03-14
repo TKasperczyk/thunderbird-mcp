@@ -123,6 +123,20 @@ const sampleTools = [
     },
   },
   {
+    name: "getAccountAccess",
+    inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "setAccountAccess",
+    inputSchema: {
+      type: "object",
+      properties: {
+        allowedAccountIds: { type: "array", items: { type: "string" } },
+      },
+      required: ["allowedAccountIds"],
+    },
+  },
+  {
     name: "updateMessage",
     inputSchema: {
       type: "object",
@@ -349,5 +363,46 @@ describe('Validation: updateMessage with tags', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must be string/);
+  });
+});
+
+describe('Validation: account access control', () => {
+  it('getAccountAccess accepts no params', () => {
+    const errors = validate('getAccountAccess', {});
+    assert.equal(errors.length, 0);
+  });
+
+  it('getAccountAccess rejects unknown params', () => {
+    const errors = validate('getAccountAccess', { bogus: 'value' });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
+  });
+
+  it('setAccountAccess requires allowedAccountIds', () => {
+    const errors = validate('setAccountAccess', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter/);
+  });
+
+  it('setAccountAccess accepts array of strings', () => {
+    const errors = validate('setAccountAccess', {
+      allowedAccountIds: ['account1', 'account2'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('setAccountAccess accepts empty array', () => {
+    const errors = validate('setAccountAccess', {
+      allowedAccountIds: [],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('setAccountAccess rejects string instead of array', () => {
+    const errors = validate('setAccountAccess', {
+      allowedAccountIds: 'account1',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
   });
 });

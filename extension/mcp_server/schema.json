@@ -7,8 +7,36 @@
         "name": "start",
         "type": "function",
         "async": true,
-        "description": "Start the MCP HTTP server on localhost:8765",
+        "description": "Start the MCP HTTP server on localhost",
         "parameters": []
+      },
+      {
+        "name": "getServerInfo",
+        "type": "function",
+        "async": true,
+        "description": "Get current server status, port, and connection file path",
+        "parameters": []
+      },
+      {
+        "name": "getAccountAccess",
+        "type": "function",
+        "async": true,
+        "description": "Get the current account access control configuration",
+        "parameters": []
+      },
+      {
+        "name": "setAccountAccess",
+        "type": "function",
+        "async": true,
+        "description": "Set which accounts the MCP server can access",
+        "parameters": [
+          {
+            "name": "allowedAccountIds",
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Array of account IDs to allow. Empty array means all accounts."
+          }
+        ]
       }
     ]
   }
