@@ -29,6 +29,11 @@ const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 1000;
+// Internal IMAP/Thunderbird keywords that should not appear as user-visible tags
+const INTERNAL_KEYWORDS = new Set([
+  "junk", "notjunk", "$forwarded", "$replied",
+  "\\seen", "\\answered", "\\flagged", "\\deleted", "\\draft", "\\recent",
+]);
 
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
@@ -1122,7 +1127,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           !ccList.includes(lowerQuery)) continue;
                     }
 
-                    const msgKeywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(Boolean);
+                    const msgKeywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
                     results.push({
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -1849,7 +1854,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     }
 
-                    const msgTags = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(Boolean);
+                    const msgTags = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
                     const baseResponse = {
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -2335,7 +2340,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (unreadOnly && msgHdr.isRead) continue;
                     if (flaggedOnly && !msgHdr.isFlagged) continue;
 
-                    const recentKeywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(Boolean);
+                    const recentKeywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
                     results.push({
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -2551,21 +2556,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 if (addTags || removeTags) {
-                  const tagsToAdd = addTags || [];
-                  const tagsToRemove = new Set(removeTags || []);
-                  for (const hdr of foundHdrs) {
-                    const existing = (hdr.getStringProperty("keywords") || "").split(/\s+/).filter(Boolean);
-                    const updated = new Set(existing);
-                    for (const t of tagsToAdd) {
-                      if (typeof t === "string" && t) updated.add(t);
-                    }
-                    for (const t of tagsToRemove) {
-                      updated.delete(t);
-                    }
-                    hdr.setStringProperty("keywords", [...updated].join(" "));
+                  const tagsToAdd = (addTags || []).filter(t => typeof t === "string" && t);
+                  const tagsToRemove = (removeTags || []).filter(t => typeof t === "string" && t);
+                  // Use folder-level keyword APIs for proper IMAP sync
+                  if (tagsToAdd.length > 0) {
+                    folder.addKeywordsToMessages(foundHdrs, tagsToAdd.join(" "));
+                    actions.push({ type: "addTags", value: tagsToAdd });
                   }
-                  if (tagsToAdd.length > 0) actions.push({ type: "addTags", value: tagsToAdd });
-                  if (tagsToRemove.size > 0) actions.push({ type: "removeTags", value: [...tagsToRemove] });
+                  if (tagsToRemove.length > 0) {
+                    folder.removeKeywordsFromMessages(foundHdrs, tagsToRemove.join(" "));
+                    actions.push({ type: "removeTags", value: tagsToRemove });
+                  }
                 }
 
                 let targetFolder = null;
