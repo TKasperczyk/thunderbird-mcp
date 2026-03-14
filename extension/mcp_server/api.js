@@ -23,7 +23,8 @@ const MCP_PORT = 8765;
 const _attachTimers = new Set();
 // Track temp files created for inline base64 attachments (cleaned up on shutdown).
 const _tempAttachFiles = new Set();
-const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 attachments
+const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
+let _tempFileCounter = 0;
 // Delay before injecting attachments into a newly opened compose window.
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
@@ -33,6 +34,8 @@ const SEARCH_COLLECTION_CAP = 1000;
 const INTERNAL_KEYWORDS = new Set([
   "junk", "notjunk", "$forwarded", "$replied",
   "\\seen", "\\answered", "\\flagged", "\\deleted", "\\draft", "\\recent",
+  // Some IMAP servers store flags without the backslash prefix
+  "seen", "answered", "flagged", "deleted", "draft", "recent",
 ]);
 
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
@@ -353,7 +356,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "createFolder",
         title: "Create Folder",
-        description: "Create a new mail subfolder under an existing folder",
+        description: "Create a new mail subfolder under an existing folder. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
         inputSchema: {
           type: "object",
           properties: {
@@ -366,7 +369,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "renameFolder",
         title: "Rename Folder",
-        description: "Rename an existing mail folder",
+        description: "Rename an existing mail folder. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
         inputSchema: {
           type: "object",
           properties: {
@@ -379,7 +382,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "deleteFolder",
         title: "Delete Folder",
-        description: "Delete a mail folder and all its contents. This moves the folder to Trash, or permanently deletes it if it is already in Trash.",
+        description: "Delete a mail folder and all its contents. Moves to Trash, or permanently deletes if already in Trash. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
         inputSchema: {
           type: "object",
           properties: {
@@ -391,7 +394,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "moveFolder",
         title: "Move Folder",
-        description: "Move a mail folder to a new parent folder within the same account",
+        description: "Move a mail folder to a new parent folder within the same account. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
         inputSchema: {
           type: "object",
           properties: {
@@ -723,10 +726,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return file;
             }
 
-            /**
-             * Converts local file paths to attachment descriptors, validating existence upfront.
-             * Returns { descs: [{url, name, size}], failed: string[] }
-             */
+            /** Returns user-visible tag keywords from a message header, filtering out internal IMAP flags. */
+            function getUserTags(msgHdr) {
+              return (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
+            }
+
             /**
              * Converts attachment entries to attachment descriptors.
              * Each entry can be:
@@ -756,7 +760,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(`${entry.name} (exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB size limit)`);
                       continue;
                     }
-                    const raw = atob(b64Data);
+                    let raw;
+                    try {
+                      raw = atob(b64Data);
+                    } catch {
+                      failed.push(`${entry.name} (invalid base64 data)`);
+                      continue;
+                    }
                     const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
                     tmpDir.append("thunderbird-mcp");
                     tmpDir.append("attachments");
@@ -765,7 +775,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
                     const tmpFile = tmpDir.clone();
                     const safeName = (entry.name || entry.filename || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
-                    tmpFile.append(`${Date.now()}_${safeName}`);
+                    tmpFile.append(`${Date.now()}_${++_tempFileCounter}_${safeName}`);
                     // Write in chunks via XPCOM binary stream to avoid stack overflow on large files
                     const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
                       .createInstance(Ci.nsIFileOutputStream);
@@ -1127,7 +1137,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           !ccList.includes(lowerQuery)) continue;
                     }
 
-                    const msgKeywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
+                    const msgTags = getUserTags(msgHdr);
                     results.push({
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -1139,7 +1149,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
-                      tags: msgKeywords,
+                      tags: msgTags,
                       _dateTs: msgDateTs
                     });
                   }
@@ -1854,7 +1864,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     }
 
-                    const msgTags = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
+                    const msgTags = getUserTags(msgHdr);
                     const baseResponse = {
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -2340,7 +2350,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (unreadOnly && msgHdr.isRead) continue;
                     if (flaggedOnly && !msgHdr.isFlagged) continue;
 
-                    const recentKeywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
+                    const msgTags = getUserTags(msgHdr);
                     results.push({
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -2351,7 +2361,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
-                      tags: recentKeywords,
+                      tags: msgTags,
                       _dateTs: msgDateTs
                     });
                   }
@@ -3402,8 +3412,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   }
 
   onShutdown(isAppShutdown) {
-    if (isAppShutdown) return;
-    // Clean up temp attachment files
+    // Always clean up temp attachment files (even on app shutdown) to avoid
+    // leaving sensitive decoded attachments on disk.
     for (const tmpPath of _tempAttachFiles) {
       try {
         const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
@@ -3412,6 +3422,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       } catch {}
     }
     _tempAttachFiles.clear();
+    if (isAppShutdown) return;
     resProto.setSubstitution("thunderbird-mcp", null);
     Services.obs.notifyObservers(null, "startupcache-invalidate");
   }
