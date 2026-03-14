@@ -40,14 +40,20 @@ Every new tool, feature, or capability change **must** include all of the follow
    - Wrong types are rejected
    - Edge cases and error paths
 
-4. **Documentation** — Update:
+4. **Stress tests** — Add stress/adversarial tests in `test/stress.test.cjs`. Cover:
+   - Boundary values (empty, null, undefined, max-length, zero, negative)
+   - Malformed input (wrong types, prototype pollution attempts, injection)
+   - Concurrency (parallel requests, interleaved operations)
+   - Large payloads (oversized strings, many items, deep nesting)
+
+5. **Documentation** — Update:
    - Tool description in the `tools` array (user-facing, shown to AI assistants)
    - README.md if the feature affects setup, usage, or architecture
    - Inline code comments for non-obvious logic
 
-5. **Commit message** — Use conventional commits (`feat:`, `fix:`, `test:`, `docs:`). Include a clear description of *what* and *why*, not just *how*. Each logical change should be its own commit.
+6. **Commit message** — Use conventional commits (`feat:`, `fix:`, `test:`, `docs:`). Include a clear description of *what* and *why*, not just *how*. Each logical change should be its own commit.
 
-6. **PR description** — At the end of a feature branch, collect all changes into a comprehensive pull request with:
+7. **PR description** — At the end of a feature branch, collect all changes into a comprehensive pull request with:
    - Summary of all changes
    - Test plan / verification steps
    - Breaking changes (if any)
