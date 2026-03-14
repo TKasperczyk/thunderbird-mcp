@@ -435,3 +435,82 @@ describe('Contact write: validation edge cases', () => {
     assert.equal(errors.length, 0);
   });
 });
+
+// ─── Account access control stress tests ──────────────────────────
+
+describe('Account access: validation edge cases', () => {
+  const accessTools = [
+    {
+      name: "setAccountAccess",
+      inputSchema: {
+        type: "object",
+        properties: {
+          allowedAccountIds: { type: "array", items: { type: "string" } },
+        },
+        required: ["allowedAccountIds"],
+      },
+    },
+    {
+      name: "getAccountAccess",
+      inputSchema: { type: "object", properties: {}, required: [] },
+    },
+  ];
+  const accessValidate = createValidator(accessTools);
+
+  it('rejects allowedAccountIds as object', () => {
+    const errors = accessValidate('setAccountAccess', {
+      allowedAccountIds: { id: 'account1' }
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects allowedAccountIds as boolean', () => {
+    const errors = accessValidate('setAccountAccess', {
+      allowedAccountIds: true
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects allowedAccountIds as number', () => {
+    const errors = accessValidate('setAccountAccess', {
+      allowedAccountIds: 42
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('accepts large number of account IDs', () => {
+    const ids = Array.from({ length: 50 }, (_, i) => `account${i}`);
+    const errors = accessValidate('setAccountAccess', {
+      allowedAccountIds: ids
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects unknown parameters on setAccountAccess', () => {
+    const errors = accessValidate('setAccountAccess', {
+      allowedAccountIds: ['acct1'],
+      inject: 'malicious',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: inject/);
+  });
+
+  it('rejects unknown parameters on getAccountAccess', () => {
+    const errors = accessValidate('getAccountAccess', {
+      admin: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: admin/);
+  });
+
+  it('handles prototype pollution on setAccountAccess', () => {
+    const malicious = Object.create(null);
+    malicious.allowedAccountIds = ['acct1'];
+    malicious.constructor = 'attack';
+    const errors = accessValidate('setAccountAccess', malicious);
+    assert.ok(errors.some(e => e.includes('Unknown parameter: constructor')));
+  });
+});
