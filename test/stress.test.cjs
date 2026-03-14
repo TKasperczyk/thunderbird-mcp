@@ -1346,3 +1346,71 @@ describe('Folder management: validation edge cases', () => {
     assert.equal(errors.length, 0);
   });
 });
+
+// ─── Attachment sending stress tests ────────────────────────────
+
+describe('Attachment sending: validation edge cases', () => {
+  const mailTools = [
+    {
+      name: "sendMail",
+      inputSchema: {
+        type: "object",
+        properties: {
+          to: { type: "string" },
+          subject: { type: "string" },
+          body: { type: "string" },
+          attachments: { type: "array" },
+        },
+        required: ["to", "subject", "body"],
+      },
+    },
+  ];
+  const mailValidate = createValidator(mailTools);
+
+  it('rejects attachments as object (not array)', () => {
+    const errors = mailValidate('sendMail', {
+      to: 'a@b.com', subject: 's', body: 'b',
+      attachments: { file: '/path' }
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects attachments as boolean', () => {
+    const errors = mailValidate('sendMail', {
+      to: 'a@b.com', subject: 's', body: 'b',
+      attachments: true
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('accepts empty attachments array', () => {
+    const errors = mailValidate('sendMail', {
+      to: 'a@b.com', subject: 's', body: 'b',
+      attachments: []
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts large number of attachments in validation', () => {
+    const attachments = Array.from({ length: 100 }, (_, i) => `/path/file${i}.pdf`);
+    const errors = mailValidate('sendMail', {
+      to: 'a@b.com', subject: 's', body: 'b',
+      attachments
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts mixed file paths and inline objects in array', () => {
+    const errors = mailValidate('sendMail', {
+      to: 'a@b.com', subject: 's', body: 'b',
+      attachments: [
+        '/path/to/file.pdf',
+        { name: 'inline.txt', contentType: 'text/plain', base64: 'SGVsbG8=' },
+        '/another/file.doc'
+      ]
+    });
+    assert.equal(errors.length, 0);
+  });
+});

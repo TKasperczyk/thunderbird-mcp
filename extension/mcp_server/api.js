@@ -105,7 +105,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", items: { type: "string" }, description: "Array of file paths to attach" },
+            attachments: { type: "array", description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
           },
           required: ["to", "subject", "body"],
         },
@@ -223,7 +223,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", items: { type: "string" }, description: "Array of file paths to attach" },
+            attachments: { type: "array", description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
           },
           required: ["messageId", "folderPath", "body"],
         },
@@ -243,7 +243,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", items: { type: "string" }, description: "Array of additional file paths to attach" },
+            attachments: { type: "array", description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
           },
           required: ["messageId", "folderPath", "to"],
         },
@@ -858,25 +858,64 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Adds file attachments to compose fields.
              * Returns { added: number, failed: string[] } for failure reporting.
              */
+            /**
+             * Add attachments to compose fields.
+             * Each entry can be:
+             *   - A string (file path) — attached from disk
+             *   - An object { name, contentType, base64 } — decoded and written
+             *     to a temp file, then attached (no permanent disk write needed)
+             */
             function addAttachments(composeFields, attachments) {
               const result = { added: 0, failed: [] };
               if (!attachments || !Array.isArray(attachments)) return result;
-              for (const filePath of attachments) {
+              for (const entry of attachments) {
                 try {
-                  const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
-                  file.initWithPath(filePath);
-                  if (file.exists()) {
+                  if (typeof entry === "string") {
+                    // File path attachment
+                    const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+                    file.initWithPath(entry);
+                    if (file.exists()) {
+                      const attachment = Cc["@mozilla.org/messengercompose/attachment;1"]
+                        .createInstance(Ci.nsIMsgAttachment);
+                      attachment.url = Services.io.newFileURI(file).spec;
+                      attachment.name = file.leafName;
+                      composeFields.addAttachment(attachment);
+                      result.added++;
+                    } else {
+                      result.failed.push(entry);
+                    }
+                  } else if (entry && typeof entry === "object" && entry.base64 && entry.name) {
+                    // Inline base64 attachment — decode and write to temp file
+                    const bytes = Uint8Array.from(atob(entry.base64), c => c.charCodeAt(0));
+                    const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+                    tmpDir.append("thunderbird-mcp");
+                    tmpDir.append("attachments");
+                    if (!tmpDir.exists()) {
+                      tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+                    }
+                    const tmpFile = tmpDir.clone();
+                    // Use timestamp prefix to avoid collisions
+                    tmpFile.append(`${Date.now()}_${entry.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`);
+                    const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                      .createInstance(Ci.nsIFileOutputStream);
+                    ostream.init(tmpFile, 0x02 | 0x08 | 0x20, 0o600, 0);
+                    ostream.write(String.fromCharCode(...bytes), bytes.length);
+                    ostream.close();
+
                     const attachment = Cc["@mozilla.org/messengercompose/attachment;1"]
                       .createInstance(Ci.nsIMsgAttachment);
-                    attachment.url = Services.io.newFileURI(file).spec;
-                    attachment.name = file.leafName;
+                    attachment.url = Services.io.newFileURI(tmpFile).spec;
+                    attachment.name = entry.name;
+                    if (entry.contentType) {
+                      attachment.contentType = entry.contentType;
+                    }
                     composeFields.addAttachment(attachment);
                     result.added++;
                   } else {
-                    result.failed.push(filePath);
+                    result.failed.push(typeof entry === "object" ? JSON.stringify(entry) : String(entry));
                   }
-                } catch {
-                  result.failed.push(filePath);
+                } catch (e) {
+                  result.failed.push(typeof entry === "object" ? (entry.name || JSON.stringify(entry)) : String(entry));
                 }
               }
               return result;

@@ -117,7 +117,7 @@ const sampleTools = [
         to: { type: "string" },
         subject: { type: "string" },
         body: { type: "string" },
-        attachments: { type: "array", items: { type: "string" } },
+        attachments: { type: "array" },
       },
       required: ["to", "subject", "body"],
     },
@@ -498,5 +498,48 @@ describe('Validation: folder management', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /Unknown parameter/);
+  });
+});
+
+describe('Validation: attachment sending', () => {
+  it('accepts attachments as array of strings (file paths)', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: ['/path/to/file.pdf'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts attachments as array of objects (inline base64)', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ name: 'file.pdf', contentType: 'application/pdf', base64: 'AAAA' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts mixed attachment types', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: ['/path/to/file.pdf', { name: 'img.png', base64: 'AAAA' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects attachments as string', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: '/path/to/file.pdf',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
   });
 });
