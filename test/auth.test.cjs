@@ -258,11 +258,10 @@ describe('Auth: token verification', () => {
       method: 'tools/list'
     });
 
-    // The bridge receives the 403 response body which has an error
-    // The mock returns a JSON-RPC error, so the bridge should parse it
-    assert.equal(response.id, null); // 403 response uses id: null
+    // The bridge clears its cache and rejects on 403 responses
+    assert.equal(response.id, 11);
     assert.ok(response.error);
-    assert.match(response.error.message, /auth token/i);
+    assert.match(response.error.message, /authentication failed/i);
   });
 });
 

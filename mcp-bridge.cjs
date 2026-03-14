@@ -142,6 +142,11 @@ function tryRequest(hostname, postData, port, token) {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {
+        if (res.statusCode === 403) {
+          clearConnectionCache();
+          reject(new Error('Authentication failed (403). Token may be stale — retrying with fresh connection info.'));
+          return;
+        }
         const data = Buffer.concat(chunks).toString('utf8');
         try {
           resolve(JSON.parse(data));

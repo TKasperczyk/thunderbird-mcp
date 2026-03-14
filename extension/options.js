@@ -40,7 +40,7 @@ async function loadServerInfo() {
 
 async function loadAccountAccess() {
   try {
-    const data = await browser.mcpServer.getAccountAccess();
+    const data = await browser.mcpServer.getAccountAccessConfig();
     currentAccounts = data.accounts || [];
 
     if (currentAccounts.length === 0) {

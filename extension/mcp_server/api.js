@@ -665,9 +665,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Lists all email accounts and their identities.
-             */
-            /**
              * Get the list of allowed account IDs from preferences.
              * Returns an empty array if no restriction is set (all accounts allowed).
              */
@@ -675,9 +672,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               try {
                 const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
                 if (!pref) return [];
-                return JSON.parse(pref);
-              } catch {
-                return [];
+                const parsed = JSON.parse(pref);
+                if (!Array.isArray(parsed)) {
+                  console.error("thunderbird-mcp: allowed accounts pref is not an array, blocking all accounts");
+                  return ["__invalid__"];
+                }
+                return parsed;
+              } catch (e) {
+                // Fail closed: corrupt pref means block all accounts, not allow all
+                console.error("thunderbird-mcp: failed to parse allowed accounts pref, blocking all accounts:", e);
+                return ["__invalid__"];
               }
             }
 
@@ -699,6 +703,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (!folder || !folder.server) return false;
               const account = MailServices.accounts.findAccountForServer(folder.server);
               return account ? isAccountAllowed(account.key) : false;
+            }
+
+            /**
+             * Lookup a folder by URI and verify it exists and is accessible.
+             * Returns { folder } on success, or { error } if not found or restricted.
+             */
+            function getAccessibleFolder(folderPath) {
+              const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+              if (!folder) return { error: `Folder not found: ${folderPath}` };
+              if (!isFolderAccessible(folder)) return { error: `Account not accessible for folder: ${folderPath}` };
+              return { folder };
             }
 
             /**
@@ -760,10 +775,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Set the account access control list.
-             * Pass an empty array to allow all accounts.
-             */
-            /**
              * Lists all folders (optionally limited to a single account).
              * Depth is 0 for root children, increasing for subfolders.
              */
@@ -814,13 +825,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               // folderPath filter: list that folder and its subtree
               if (folderPath) {
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
-                if (!isFolderAccessible(folder)) {
-                  return { error: `Account not accessible for folder: ${folderPath}` };
-                }
+                const result = getAccessibleFolder(folderPath);
+                if (result.error) return result;
+                const folder = result.folder;
                 const accountKey = folder.server
                   ? (MailServices.accounts.findAccountForServer(folder.server)?.key || "unknown")
                   : "unknown";
@@ -1187,13 +1194,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	             */
 	            function openFolder(folderPath) {
 	              try {
-	                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-	                if (!folder) {
-	                  return { error: `Folder not found: ${folderPath}` };
-	                }
-	                if (!isFolderAccessible(folder)) {
-	                  return { error: `Account not accessible for folder: ${folderPath}` };
-	                }
+	                const result = getAccessibleFolder(folderPath);
+	                if (result.error) return result;
+	                const folder = result.folder;
 
 	                // Attempt to refresh IMAP folders. This is async and may not
 	                // complete before we read, but helps with stale data.
@@ -1376,14 +1379,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               if (folderPath) {
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
-                if (!isFolderAccessible(folder)) {
-                  return { error: `Account not accessible for folder: ${folderPath}` };
-                }
-                searchFolder(folder);
+                const result = getAccessibleFolder(folderPath);
+                if (result.error) return result;
+                searchFolder(result.folder);
               } else {
                 for (const account of getAccessibleAccounts()) {
                   if (results.length >= SEARCH_COLLECTION_CAP) break;
@@ -2800,13 +2798,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return { error: "Trash folder not found" };
                   }
                 } else if (moveTo) {
-                  targetFolder = MailServices.folderLookup.getFolderForURL(moveTo);
-                  if (!targetFolder) {
-                    return { error: `Folder not found: ${moveTo}` };
-                  }
-                  if (!isFolderAccessible(targetFolder)) {
-                    return { error: `Account not accessible for folder: ${moveTo}` };
-                  }
+                  const moveResult = getAccessibleFolder(moveTo);
+                  if (moveResult.error) return moveResult;
+                  targetFolder = moveResult.folder;
                 }
 
                 if (targetFolder) {
@@ -2831,13 +2825,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "name must be a non-empty string" };
                 }
 
-                const parent = MailServices.folderLookup.getFolderForURL(parentFolderPath);
-                if (!parent) {
-                  return { error: `Parent folder not found: ${parentFolderPath}` };
-                }
-                if (!isFolderAccessible(parent)) {
-                  return { error: `Account not accessible for folder: ${parentFolderPath}` };
-                }
+                const parentResult = getAccessibleFolder(parentFolderPath);
+                if (parentResult.error) return parentResult;
+                const parent = parentResult.folder;
 
                 parent.createSubfolder(name, null);
 
@@ -2879,13 +2869,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "newName must be a non-empty string" };
                 }
 
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
-                if (!isFolderAccessible(folder)) {
-                  return { error: `Account not accessible for folder: ${folderPath}` };
-                }
+                const renameResult = getAccessibleFolder(folderPath);
+                if (renameResult.error) return renameResult;
+                const folder = renameResult.folder;
 
                 folder.rename(newName, null);
                 return {
@@ -2904,13 +2890,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "folderPath must be a non-empty string" };
                 }
 
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
-                if (!isFolderAccessible(folder)) {
-                  return { error: `Account not accessible for folder: ${folderPath}` };
-                }
+                const delResult = getAccessibleFolder(folderPath);
+                if (delResult.error) return delResult;
+                const folder = delResult.folder;
                 const folderName = folder.prettyName || folder.name || folderPath;
 
                 const parent = folder.parent;
@@ -2960,22 +2942,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "newParentPath must be a non-empty string" };
                 }
 
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) {
-                  return { error: `Folder not found: ${folderPath}` };
-                }
-                if (!isFolderAccessible(folder)) {
-                  return { error: `Account not accessible for folder: ${folderPath}` };
-                }
+                const srcResult = getAccessibleFolder(folderPath);
+                if (srcResult.error) return srcResult;
+                const folder = srcResult.folder;
                 const folderName = folder.prettyName || folder.name || folderPath;
 
-                const newParent = MailServices.folderLookup.getFolderForURL(newParentPath);
-                if (!newParent) {
-                  return { error: `Destination folder not found: ${newParentPath}` };
-                }
-                if (!isFolderAccessible(newParent)) {
-                  return { error: `Account not accessible for folder: ${newParentPath}` };
-                }
+                const destResult = getAccessibleFolder(newParentPath);
+                if (destResult.error) return destResult;
+                const newParent = destResult.folder;
                 const parentName = newParent.prettyName || newParent.name || newParentPath;
 
                 if (folder.parent && folder.parent.URI === newParentPath) {
@@ -3419,11 +3393,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (fl.error) return fl;
                 const { filterList } = fl;
 
-                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-                if (!folder) return { error: `Folder not found: ${folderPath}` };
-                if (!isFolderAccessible(folder)) {
-                  return { error: `Account not accessible for folder: ${folderPath}` };
-                }
+                const afResult = getAccessibleFolder(folderPath);
+                if (afResult.error) return afResult;
+                const folder = afResult.folder;
 
                 // Try MailServices.filters first, fall back to XPCOM contract ID
                 let filterService;
@@ -3746,7 +3718,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           };
         },
 
-        getAccountAccess: async function() {
+        getAccountAccessConfig: async function() {
           const { MailServices } = ChromeUtils.importESModule(
             "resource:///modules/MailServices.sys.mjs"
           );
@@ -3814,6 +3786,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     globalThis.__tbMcpStartPromise = null;
 
     // Always clean up the connection info file so stale tokens don't linger
+    // (Inlined here because removeConnectionInfo() is scoped inside start())
     try {
       const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
       tmpDir.append("thunderbird-mcp");
