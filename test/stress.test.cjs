@@ -488,8 +488,8 @@ function paginateResults(allResults, maxResults, offset) {
     MAX_RESULTS_CAP
   );
   const offsetProvided = offset !== undefined && offset !== null;
-  const effectiveOffset = offsetProvided && Number.isFinite(Number(offset)) && Number(offset) > 0
-    ? Math.floor(Number(offset)) : 0;
+  // Matches production paginate() offset logic exactly
+  const effectiveOffset = (offset > 0) ? Math.floor(offset) : 0;
 
   const page = allResults.slice(effectiveOffset, effectiveOffset + effectiveLimit);
 
@@ -565,9 +565,10 @@ describe('Pagination: boundary conditions', () => {
     assert.equal(result.offset, 0);
   });
 
-  it('Infinity offset is treated as 0', () => {
+  it('Infinity offset returns empty page (not valid JSON, cannot arrive via MCP)', () => {
     const result = paginateResults(mockData, 50, Infinity);
-    assert.equal(result.offset, 0);
+    assert.equal(result.offset, Infinity);
+    assert.deepStrictEqual(result.messages, []);
   });
 
   it('fractional offset is floored', () => {

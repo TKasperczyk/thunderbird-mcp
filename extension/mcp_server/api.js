@@ -83,7 +83,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
             endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date" },
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
-            offset: { type: "number", description: "Number of results to skip for pagination (default 0). Use with maxResults to page through large result sets." },
+            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 1000." },
             sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
@@ -317,7 +317,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "Folder URI to list messages from (defaults to all Inboxes)" },
             daysBack: { type: "number", description: "Only return messages from the last N days (default: 7)" },
             maxResults: { type: "number", description: "Maximum number of results (default: 50, max: 200)" },
-            offset: { type: "number", description: "Number of results to skip for pagination (default 0). Use with maxResults to page through results." },
+            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 1000." },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
           },
@@ -589,11 +589,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /**
              * Apply offset-based pagination to a sorted results array.
              * Removes the internal _dateTs property from each result.
-             * Returns { messages, totalMatches, offset, limit, hasMore }.
-             */
-            /**
-             * Apply offset-based pagination to a sorted results array.
-             * Removes the internal _dateTs property from each result.
              *
              * Backward-compatible: when offset is undefined/null (not provided),
              * returns a plain array. When offset is explicitly provided (even 0),
@@ -602,8 +597,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function paginate(results, offset, effectiveLimit) {
               const offsetProvided = offset !== undefined && offset !== null;
-              const effectiveOffset = offsetProvided && Number.isFinite(Number(offset)) && Number(offset) > 0
-                ? Math.floor(Number(offset)) : 0;
+              const effectiveOffset = (offset > 0) ? Math.floor(offset) : 0;
               const page = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(r => {
                 delete r._dateTs;
                 return r;
