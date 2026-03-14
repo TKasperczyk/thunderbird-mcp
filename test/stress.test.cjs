@@ -20,9 +20,21 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 
+const net = require('net');
+
 const BRIDGE_PATH = path.resolve(__dirname, '..', 'mcp-bridge.cjs');
 const CONN_DIR = path.join(os.tmpdir(), 'thunderbird-mcp');
 const CONN_FILE = path.join(CONN_DIR, 'connection.json');
+const DEFAULT_PORT = 8765;
+
+/** Check if the default MCP port is already in use (e.g. real Thunderbird). */
+function isDefaultPortInUse() {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ port: DEFAULT_PORT, host: '127.0.0.1' });
+    sock.on('connect', () => { sock.destroy(); resolve(true); });
+    sock.on('error', () => resolve(false));
+  });
+}
 
 // ─── Helpers ───────────────────────────────────────────────────────
 
@@ -461,7 +473,10 @@ describe('Auth: connection file corruption', () => {
   before(() => backupConnectionFile());
   after(() => restoreConnectionFile());
 
-  it('handles empty connection file gracefully', async () => {
+  it('handles empty connection file gracefully', async (t) => {
+    if (await isDefaultPortInUse()) {
+      return t.skip('Port 8765 in use (Thunderbird running), skipping fallback test');
+    }
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, '', 'utf8');
 
@@ -475,7 +490,10 @@ describe('Auth: connection file corruption', () => {
     assert.ok(response.result || response.error);
   });
 
-  it('handles malformed JSON in connection file', async () => {
+  it('handles malformed JSON in connection file', async (t) => {
+    if (await isDefaultPortInUse()) {
+      return t.skip('Port 8765 in use (Thunderbird running), skipping fallback test');
+    }
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, '{ port: invalid json }', 'utf8');
 
@@ -487,7 +505,10 @@ describe('Auth: connection file corruption', () => {
     assert.ok(response.result || response.error);
   });
 
-  it('handles connection file with missing port field', async () => {
+  it('handles connection file with missing port field', async (t) => {
+    if (await isDefaultPortInUse()) {
+      return t.skip('Port 8765 in use (Thunderbird running), skipping fallback test');
+    }
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, JSON.stringify({ token: 'abc' }), 'utf8');
 
@@ -534,7 +555,10 @@ describe('Auth: connection file corruption', () => {
     }
   });
 
-  it('handles binary garbage in connection file', async () => {
+  it('handles binary garbage in connection file', async (t) => {
+    if (await isDefaultPortInUse()) {
+      return t.skip('Port 8765 in use (Thunderbird running), skipping fallback test');
+    }
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, Buffer.from([0x00, 0xFF, 0xFE, 0x80, 0x90]));
 

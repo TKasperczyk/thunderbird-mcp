@@ -17,9 +17,21 @@ const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
 
+const net = require('net');
+
 const BRIDGE_PATH = path.resolve(__dirname, '..', 'mcp-bridge.cjs');
 const CONN_DIR = path.join(os.tmpdir(), 'thunderbird-mcp');
 const CONN_FILE = path.join(CONN_DIR, 'connection.json');
+const DEFAULT_PORT = 8765;
+
+/** Check if the default MCP port is already in use (e.g. real Thunderbird). */
+function isDefaultPortInUse() {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ port: DEFAULT_PORT, host: '127.0.0.1' });
+    sock.on('connect', () => { sock.destroy(); resolve(true); });
+    sock.on('error', () => resolve(false));
+  });
+}
 
 /**
  * Helper: send a JSON-RPC message to the bridge and get the response.
@@ -150,13 +162,16 @@ describe('Auth: connection info file', () => {
     }
   });
 
-  it('bridge falls back to default port when connection file is missing', async () => {
+  it('bridge falls back to default port when connection file is missing', async (t) => {
+    if (await isDefaultPortInUse()) {
+      return t.skip('Port 8765 in use (Thunderbird running), skipping fallback test');
+    }
+
     // Remove connection file
     try { fs.unlinkSync(CONN_FILE); } catch { /* ignore */ }
 
     // The bridge should try port 8765 — we won't mock it, so we expect
-    // either a connection error or a response from real Thunderbird.
-    // We just verify it doesn't crash.
+    // a connection error. We just verify it doesn't crash.
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 2,
@@ -164,7 +179,7 @@ describe('Auth: connection info file', () => {
     });
 
     assert.equal(response.id, 2);
-    // Either a valid result (real Thunderbird) or an error (connection refused)
+    // Will be an error since no server on default port
     assert.ok(response.result || response.error);
   });
 });
