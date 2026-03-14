@@ -69,7 +69,13 @@ Every new tool, feature, or capability change **must** include all of the follow
 ## Key Files
 
 - `mcp-bridge.cjs` — stdio-to-HTTP bridge (Node.js)
-- `extension/mcp_server/api.js` — All tool implementations and HTTP handler
+- `extension/mcp_server/api.js` — All 32 tool implementations and HTTP handler
+- `extension/mcp_server/schema.json` — WebExtension experiment API schema
+- `extension/options.html` / `options.js` — Settings page (server status, account access)
 - `extension/manifest.json` — Extension permissions and metadata
-- `scripts/build.cjs` — Cross-platform XPI build script
-- `test/` — Automated tests (bridge, validation, auth)
+- `scripts/build.cjs` — Cross-platform XPI build script (embeds git hash + timestamp)
+- `test/` — 160 automated tests (see [TESTING.md](TESTING.md) for details)
+
+## Node.js
+
+Requires Node.js >= 18.0.0 (uses built-in test runner and modern APIs).
