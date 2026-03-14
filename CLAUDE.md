@@ -2,7 +2,20 @@
 
 ## Project Overview
 
-Thunderbird MCP exposes Thunderbird email, calendar, and contacts to AI assistants via the Model Context Protocol (MCP). Architecture: MCP Client <-> mcp-bridge.cjs (stdio<->HTTP) <-> Thunderbird extension (port 8765).
+Thunderbird MCP exposes Thunderbird email, calendar, and contacts to AI assistants via the Model Context Protocol (MCP). Architecture: MCP Client <-> mcp-bridge.cjs (stdio<->HTTP) <-> Thunderbird extension (localhost HTTP).
+
+## Security Architecture
+
+The HTTP server is secured with auto-generated bearer tokens:
+
+1. On startup, the extension generates a 32-byte random auth token
+2. Writes `{ port, token, pid }` to `<TmpD>/thunderbird-mcp/connection.json` (file: 0600, dir: 0700)
+3. The bridge reads this file to discover port and token
+4. Every HTTP request includes `Authorization: Bearer <token>`
+5. Requests with invalid/missing tokens are rejected with 403
+6. The connection file is cleaned up on shutdown
+
+The server tries ports 8765-8774, using the first available. This avoids conflicts if the default port is occupied.
 
 ## Build & Test
 
@@ -53,4 +66,4 @@ Every new tool, feature, or capability change **must** include all of the follow
 - `extension/mcp_server/api.js` — All tool implementations and HTTP handler
 - `extension/manifest.json` — Extension permissions and metadata
 - `scripts/build.cjs` — Cross-platform XPI build script
-- `test/` — Automated tests (bridge, validation)
+- `test/` — Automated tests (bridge, validation, auth)
