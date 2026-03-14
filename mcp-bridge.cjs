@@ -21,21 +21,21 @@ const CONNECTION_MAX_RETRIES = 5;
 /**
  * Read connection info (port + auth token) written by the Thunderbird extension.
  * Returns { port, token } or null if the file doesn't exist.
- * Caches the result and refreshes on connection errors.
+ * Caches the result for a short TTL to avoid hitting the filesystem on every request.
+ * Cache is cleared on connection errors (see clearConnectionCache).
  */
 let cachedConnectionInfo = null;
-let connectionInfoMtime = 0;
+let connectionCacheExpiry = 0;
+const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
 
 function readConnectionInfo() {
+  if (cachedConnectionInfo && Date.now() < connectionCacheExpiry) {
+    return cachedConnectionInfo;
+  }
   try {
-    const stat = fs.statSync(CONNECTION_FILE);
-    // Re-read if file has been modified since last read
-    if (cachedConnectionInfo && stat.mtimeMs === connectionInfoMtime) {
-      return cachedConnectionInfo;
-    }
     const data = JSON.parse(fs.readFileSync(CONNECTION_FILE, 'utf8'));
     cachedConnectionInfo = data;
-    connectionInfoMtime = stat.mtimeMs;
+    connectionCacheExpiry = Date.now() + CONNECTION_CACHE_TTL_MS;
     return data;
   } catch {
     return null;
@@ -44,7 +44,7 @@ function readConnectionInfo() {
 
 function clearConnectionCache() {
   cachedConnectionInfo = null;
-  connectionInfoMtime = 0;
+  connectionCacheExpiry = 0;
 }
 
 // Ensure stdout doesn't buffer - critical for MCP protocol
