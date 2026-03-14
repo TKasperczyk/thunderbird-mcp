@@ -212,6 +212,50 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "createContact",
+        title: "Create Contact",
+        description: "Create a new contact in an address book",
+        inputSchema: {
+          type: "object",
+          properties: {
+            email: { type: "string", description: "Primary email address" },
+            displayName: { type: "string", description: "Display name" },
+            firstName: { type: "string", description: "First name" },
+            lastName: { type: "string", description: "Last name" },
+            addressBookId: { type: "string", description: "Address book directory ID (from searchContacts results). Defaults to the first writable address book." },
+          },
+          required: ["email"],
+        },
+      },
+      {
+        name: "updateContact",
+        title: "Update Contact",
+        description: "Update an existing contact's properties",
+        inputSchema: {
+          type: "object",
+          properties: {
+            contactId: { type: "string", description: "Contact UID (from searchContacts results)" },
+            email: { type: "string", description: "New primary email address" },
+            displayName: { type: "string", description: "New display name" },
+            firstName: { type: "string", description: "New first name" },
+            lastName: { type: "string", description: "New last name" },
+          },
+          required: ["contactId"],
+        },
+      },
+      {
+        name: "deleteContact",
+        title: "Delete Contact",
+        description: "Delete a contact from its address book",
+        inputSchema: {
+          type: "object",
+          properties: {
+            contactId: { type: "string", description: "Contact UID (from searchContacts results)" },
+          },
+          required: ["contactId"],
+        },
+      },
+      {
         name: "replyToMessage",
         title: "Reply to Message",
         description: "Open a reply compose window for a specific message with proper threading",
@@ -1160,6 +1204,121 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               return results;
+            }
+
+            /**
+             * Find a contact card by UID across all address books.
+             * Returns { card, book } or { error }.
+             */
+            function findContactByUID(contactId) {
+              for (const book of MailServices.ab.directories) {
+                for (const card of book.childCards) {
+                  if (card.UID === contactId) {
+                    return { card, book };
+                  }
+                }
+              }
+              return { error: `Contact not found: ${contactId}` };
+            }
+
+            function createContact(email, displayName, firstName, lastName, addressBookId) {
+              try {
+                if (typeof email !== "string" || !email) {
+                  return { error: "email must be a non-empty string" };
+                }
+
+                // Find the target address book
+                let targetBook = null;
+                if (addressBookId) {
+                  for (const book of MailServices.ab.directories) {
+                    if (book.dirPrefId === addressBookId || book.UID === addressBookId || book.URI === addressBookId) {
+                      targetBook = book;
+                      break;
+                    }
+                  }
+                  if (!targetBook) {
+                    return { error: `Address book not found: ${addressBookId}` };
+                  }
+                } else {
+                  // Use the first writable address book
+                  for (const book of MailServices.ab.directories) {
+                    if (!book.readOnly) {
+                      targetBook = book;
+                      break;
+                    }
+                  }
+                  if (!targetBook) {
+                    return { error: "No writable address book found" };
+                  }
+                }
+
+                const card = Cc["@mozilla.org/addressbook/cardproperty;1"]
+                  .createInstance(Ci.nsIAbCard);
+                card.primaryEmail = email;
+                if (displayName) card.displayName = displayName;
+                if (firstName) card.firstName = firstName;
+                if (lastName) card.lastName = lastName;
+
+                const newCard = targetBook.addCard(card);
+                return {
+                  success: true,
+                  id: newCard.UID,
+                  email: newCard.primaryEmail,
+                  displayName: newCard.displayName,
+                  addressBook: targetBook.dirName,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function updateContact(contactId, email, displayName, firstName, lastName) {
+              try {
+                if (typeof contactId !== "string" || !contactId) {
+                  return { error: "contactId must be a non-empty string" };
+                }
+
+                const found = findContactByUID(contactId);
+                if (found.error) return found;
+                const { card, book } = found;
+
+                if (email !== undefined) card.primaryEmail = email;
+                if (displayName !== undefined) card.displayName = displayName;
+                if (firstName !== undefined) card.firstName = firstName;
+                if (lastName !== undefined) card.lastName = lastName;
+
+                book.modifyCard(card);
+                return {
+                  success: true,
+                  id: card.UID,
+                  email: card.primaryEmail,
+                  displayName: card.displayName,
+                  firstName: card.firstName,
+                  lastName: card.lastName,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function deleteContact(contactId) {
+              try {
+                if (typeof contactId !== "string" || !contactId) {
+                  return { error: "contactId must be a non-empty string" };
+                }
+
+                const found = findContactByUID(contactId);
+                if (found.error) return found;
+                const { card, book } = found;
+
+                book.deleteCards([card]);
+                return {
+                  success: true,
+                  message: `Contact "${card.displayName || card.primaryEmail}" deleted`,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
             }
 
             function listCalendars() {
@@ -3057,6 +3216,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
                   return searchContacts(args.query || "");
+                case "createContact":
+                  return createContact(args.email, args.displayName, args.firstName, args.lastName, args.addressBookId);
+                case "updateContact":
+                  return updateContact(args.contactId, args.email, args.displayName, args.firstName, args.lastName);
+                case "deleteContact":
+                  return deleteContact(args.contactId);
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
