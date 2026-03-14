@@ -27,7 +27,7 @@
   ],
   "scripts": {
     "build": "node scripts/build.cjs",
-    "test": "node --test test/"
+    "test": "node --test test/*.test.cjs"
   },
   "engines": {
     "node": ">=18.0.0"
