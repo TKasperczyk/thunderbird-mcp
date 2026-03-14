@@ -72,7 +72,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
             sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
-            flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" }
+            flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
+            offset: { type: "number", description: "Skip this many results (for pagination). When provided, response changes to { messages, totalMatches, offset, limit, hasMore }" }
           },
           required: ["query"],
         },
@@ -260,6 +261,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             maxResults: { type: "number", description: "Maximum number of results (default: 50, max: 200)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
+            offset: { type: "number", description: "Skip this many results (for pagination). When provided, response changes to { messages, totalMatches, offset, limit, hasMore }" },
           },
           required: [],
         },
@@ -623,6 +625,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return null;
             }
 
+            /**
+             * Coerce a value to boolean, handling MCP clients that send
+             * string "true"/"false" instead of native booleans.
+             * Returns undefined for undefined/null (meaning "not specified").
+             */
+            function coerceBool(val) {
+              if (val === undefined || val === null) return undefined;
+              if (typeof val === "boolean") return val;
+              if (val === "true" || val === "1") return true;
+              if (val === "false" || val === "0") return false;
+              return !!val;
+            }
+
             /** Creates an nsIFile instance for the given path. */
             function createLocalFile(path) {
               const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
@@ -922,7 +937,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, sortOrder, unreadOnly, flaggedOnly) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, sortOrder, unreadOnly, flaggedOnly, offset) {
+	              unreadOnly = coerceBool(unreadOnly);
+	              flaggedOnly = coerceBool(flaggedOnly);
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -1021,10 +1038,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
 
-              return results.slice(0, effectiveLimit).map(result => {
+              const totalMatches = results.length;
+              const parsedOffset = Number(offset);
+              const effectiveOffset = Number.isFinite(parsedOffset) && parsedOffset > 0 ? Math.floor(parsedOffset) : 0;
+              const sliced = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(result => {
                 delete result._dateTs;
                 return result;
               });
+
+              // Backward compatible: return plain array by default.
+              // When offset is explicitly provided, return structured response
+              // so callers can paginate.
+              if (offset !== undefined) {
+                return {
+                  messages: sliced,
+                  totalMatches,
+                  offset: effectiveOffset,
+                  limit: effectiveLimit,
+                  hasMore: effectiveOffset + sliced.length < totalMatches
+                };
+              }
+              return sliced;
             }
 
             function searchContacts(query) {
@@ -1081,6 +1115,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview) {
+              allDay = coerceBool(allDay);
+              skipReview = coerceBool(skipReview);
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -1489,6 +1525,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
 	            function getMessage(messageId, folderPath, saveAttachments) {
+	              saveAttachments = coerceBool(saveAttachments);
 	              return new Promise((resolve) => {
 	                try {
 	                  const found = findMessage(messageId, folderPath);
@@ -1792,6 +1829,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *    with emojis/unicode even with <meta charset="UTF-8">
              */
             function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments) {
+              isHtml = coerceBool(isHtml);
               try {
                 const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
                   .getService(Ci.nsIMsgComposeService);
@@ -1843,6 +1881,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * via the References and In-Reply-To headers.
              */
 	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments) {
+	              replyAll = coerceBool(replyAll);
+	              isHtml = coerceBool(isHtml);
 	              return new Promise((resolve) => {
 	                try {
 	                  const found = findMessage(messageId, folderPath);
@@ -1954,6 +1994,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Uses New type with manual forward quote to preserve both intro body and forwarded content.
              */
 	            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments) {
+	              isHtml = coerceBool(isHtml);
 	              return new Promise((resolve) => {
 	                try {
 	                  const found = findMessage(messageId, folderPath);
@@ -2049,7 +2090,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-            function getRecentMessages(folderPath, daysBack, maxResults, unreadOnly, flaggedOnly) {
+            function getRecentMessages(folderPath, daysBack, maxResults, unreadOnly, flaggedOnly, offset) {
+              unreadOnly = coerceBool(unreadOnly);
+              flaggedOnly = coerceBool(flaggedOnly);
               const results = [];
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
               const cutoffTs = (Date.now() - days * 86400000) * 1000; // Thunderbird uses microseconds
@@ -2119,10 +2162,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => b._dateTs - a._dateTs);
 
-              return results.slice(0, effectiveLimit).map(r => {
+              const totalMatches = results.length;
+              const parsedOffset = Number(offset);
+              const effectiveOffset = Number.isFinite(parsedOffset) && parsedOffset > 0 ? Math.floor(parsedOffset) : 0;
+              const sliced = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(r => {
                 delete r._dateTs;
                 return r;
               });
+
+              if (offset !== undefined) {
+                return {
+                  messages: sliced,
+                  totalMatches,
+                  offset: effectiveOffset,
+                  limit: effectiveLimit,
+                  hasMore: effectiveOffset + sliced.length < totalMatches
+                };
+              }
+              return sliced;
             }
 
             function deleteMessages(messageIds, folderPath) {
@@ -2811,7 +2868,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.sortOrder, args.unreadOnly, args.flaggedOnly);
+                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.offset);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
@@ -2835,7 +2892,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
                 case "getRecentMessages":
-                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.unreadOnly, args.flaggedOnly);
+                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.unreadOnly, args.flaggedOnly, args.offset);
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
