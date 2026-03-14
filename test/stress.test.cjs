@@ -1054,3 +1054,140 @@ describe('Bridge: malformed input handling', () => {
     });
   });
 });
+
+// ─── Tagging stress tests ─────────────────────────────────────────
+
+describe('Tagging: validation edge cases', () => {
+  const tagTools = [
+    {
+      name: "updateMessage",
+      inputSchema: {
+        type: "object",
+        properties: {
+          messageId: { type: "string" },
+          messageIds: { type: "array", items: { type: "string" } },
+          folderPath: { type: "string" },
+          read: { type: "boolean" },
+          flagged: { type: "boolean" },
+          addTags: { type: "array", items: { type: "string" } },
+          removeTags: { type: "array", items: { type: "string" } },
+          moveTo: { type: "string" },
+          trash: { type: "boolean" },
+        },
+        required: ["folderPath"],
+      },
+    },
+    {
+      name: "searchMessages",
+      inputSchema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+          tag: { type: "string" },
+          maxResults: { type: "number" },
+        },
+        required: ["query"],
+      },
+    },
+  ];
+  const tagValidate = createValidator(tagTools);
+
+  it('rejects addTags as object (not array)', () => {
+    const errors = tagValidate('updateMessage', {
+      folderPath: '/INBOX', addTags: { tag: '$label1' }
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects addTags as boolean', () => {
+    const errors = tagValidate('updateMessage', {
+      folderPath: '/INBOX', addTags: true
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects removeTags as string', () => {
+    const errors = tagValidate('updateMessage', {
+      folderPath: '/INBOX', removeTags: '$label1'
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('accepts empty addTags array', () => {
+    const errors = tagValidate('updateMessage', {
+      folderPath: '/INBOX', addTags: []
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts empty removeTags array', () => {
+    const errors = tagValidate('updateMessage', {
+      folderPath: '/INBOX', removeTags: []
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts addTags and removeTags simultaneously', () => {
+    const errors = tagValidate('updateMessage', {
+      folderPath: '/INBOX',
+      messageId: 'msg1',
+      addTags: ['$label1', '$label2'],
+      removeTags: ['$label3'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts large number of tags in addTags', () => {
+    const tags = Array.from({ length: 100 }, (_, i) => `custom-tag-${i}`);
+    const errors = tagValidate('updateMessage', {
+      folderPath: '/INBOX', addTags: tags
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects tag filter as array in searchMessages', () => {
+    const errors = tagValidate('searchMessages', {
+      query: 'test', tag: ['$label1']
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects tag filter as boolean in searchMessages', () => {
+    const errors = tagValidate('searchMessages', {
+      query: 'test', tag: true
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('accepts empty string tag filter', () => {
+    const errors = tagValidate('searchMessages', {
+      query: 'test', tag: ''
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('handles tags with special characters in validation', () => {
+    const errors = tagValidate('updateMessage', {
+      folderPath: '/INBOX',
+      addTags: ['tag with spaces', '$label/slash', 'tag\twith\ttabs'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('handles prototype pollution attempt via addTags', () => {
+    // Object.create(null) + hasOwnProperty prevents prototype pollution.
+    // __proto__ in object literal sets prototype (not own property),
+    // so it won't appear in Object.entries. Use Object.create instead.
+    const malicious = Object.create(null);
+    malicious.folderPath = '/INBOX';
+    malicious.addTags = ['$label1'];
+    malicious.constructor = 'attack';
+    const errors = tagValidate('updateMessage', malicious);
+    assert.ok(errors.some(e => e.includes('Unknown parameter: constructor')));
+  });
+});

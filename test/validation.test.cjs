@@ -93,6 +93,7 @@ const sampleTools = [
         maxResults: { type: "number" },
         offset: { type: "number" },
         unreadOnly: { type: "boolean" },
+        tag: { type: "string" },
       },
       required: ["query"],
     },
@@ -119,6 +120,24 @@ const sampleTools = [
         attachments: { type: "array", items: { type: "string" } },
       },
       required: ["to", "subject", "body"],
+    },
+  },
+  {
+    name: "updateMessage",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string" },
+        messageIds: { type: "array", items: { type: "string" } },
+        folderPath: { type: "string" },
+        read: { type: "boolean" },
+        flagged: { type: "boolean" },
+        addTags: { type: "array", items: { type: "string" } },
+        removeTags: { type: "array", items: { type: "string" } },
+        moveTo: { type: "string" },
+        trash: { type: "boolean" },
+      },
+      required: ["folderPath"],
     },
   },
 ];
@@ -273,5 +292,62 @@ describe('Validation: optional parameters', () => {
       unreadOnly: false,
     });
     assert.equal(errors.length, 0);
+  });
+});
+
+describe('Validation: updateMessage with tags', () => {
+  it('accepts addTags as array', () => {
+    const errors = validate('updateMessage', {
+      folderPath: '/INBOX',
+      messageId: 'msg1',
+      addTags: ['$label1', 'project-x'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts removeTags as array', () => {
+    const errors = validate('updateMessage', {
+      folderPath: '/INBOX',
+      messageId: 'msg1',
+      removeTags: ['$label1'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects addTags as string', () => {
+    const errors = validate('updateMessage', {
+      folderPath: '/INBOX',
+      messageId: 'msg1',
+      addTags: '$label1',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects removeTags as number', () => {
+    const errors = validate('updateMessage', {
+      folderPath: '/INBOX',
+      messageId: 'msg1',
+      removeTags: 123,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('accepts tag filter as string in searchMessages', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      tag: '$label1',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects tag filter as number in searchMessages', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      tag: 123,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
   });
 });

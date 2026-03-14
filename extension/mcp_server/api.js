@@ -70,7 +70,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             offset: { type: "number", description: "Number of results to skip for pagination (default 0). Use with maxResults to page through large result sets." },
             sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
-            flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" }
+            flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
+            tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." }
           },
           required: ["query"],
         },
@@ -279,7 +280,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "updateMessage",
         title: "Update Message",
-        description: "Update one or more messages' read/flagged state and optionally move them to another folder or to Trash. Supply messageId for a single message or messageIds for bulk operations.",
+        description: "Update one or more messages' read/flagged/tagged state and optionally move them. Supply messageId for a single message or messageIds for bulk operations. Tags are Thunderbird keywords (e.g. '$label1' for Important, '$label2' for Work, or any custom string).",
         inputSchema: {
           type: "object",
           properties: {
@@ -288,6 +289,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             read: { type: "boolean", description: "Set to true/false to mark read/unread (optional)" },
             flagged: { type: "boolean", description: "Set to true/false to flag/unflag (optional)" },
+            addTags: { type: "array", items: { type: "string" }, description: "Tag keywords to add (e.g. ['$label1', 'project-x']). Thunderbird built-in tags: $label1 (Important), $label2 (Work), $label3 (Personal), $label4 (To Do), $label5 (Later)" },
+            removeTags: { type: "array", items: { type: "string" }, description: "Tag keywords to remove from the message(s)" },
             moveTo: { type: "string", description: "Destination folder URI (optional). Cannot be used with trash." },
             trash: { type: "boolean", description: "Set to true to move message to Trash (optional). Cannot be used with moveTo." },
           },
@@ -954,7 +957,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag) {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -997,6 +1000,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (endDateTs !== null && msgDateTs > endDateTs) continue;
                     if (unreadOnly && msgHdr.isRead) continue;
                     if (flaggedOnly && !msgHdr.isFlagged) continue;
+                    if (tag) {
+                      const keywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/);
+                      if (!keywords.includes(tag)) continue;
+                    }
 
                     // IMPORTANT: Use mime2Decoded* properties for searching.
                     // Raw headers contain MIME encoding like "=?UTF-8?Q?...?="
@@ -1012,6 +1019,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           !ccList.includes(lowerQuery)) continue;
                     }
 
+                    const msgKeywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(Boolean);
                     results.push({
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -1023,6 +1031,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
+                      tags: msgKeywords,
                       _dateTs: msgDateTs
                     });
                   }
@@ -1619,6 +1628,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     }
 
+                    const msgTags = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(Boolean);
                     const baseResponse = {
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -1626,6 +1636,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
                       ccList: msgHdr.ccList,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+                      tags: msgTags,
                       body,
                       bodyIsHtml,
                       attachments
@@ -2111,6 +2122,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (unreadOnly && msgHdr.isRead) continue;
                     if (flaggedOnly && !msgHdr.isFlagged) continue;
 
+                    const recentKeywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(Boolean);
                     results.push({
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -2121,6 +2133,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
+                      tags: recentKeywords,
                       _dateTs: msgDateTs
                     });
                   }
@@ -2232,7 +2245,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function updateMessage(messageId, messageIds, folderPath, read, flagged, moveTo, trash) {
+            function updateMessage(messageId, messageIds, folderPath, read, flagged, addTags, removeTags, moveTo, trash) {
               try {
                 // Normalize to an array of IDs
                 if (typeof messageIds === "string") {
@@ -2257,6 +2270,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (trash !== undefined) trash = trash === true || trash === "true";
                 if (moveTo !== undefined && (typeof moveTo !== "string" || !moveTo)) {
                   return { error: "moveTo must be a non-empty string" };
+                }
+                // Coerce tag arrays (MCP clients may send JSON strings)
+                if (typeof addTags === "string") {
+                  try { addTags = JSON.parse(addTags); } catch { /* leave as-is */ }
+                }
+                if (typeof removeTags === "string") {
+                  try { removeTags = JSON.parse(removeTags); } catch { /* leave as-is */ }
+                }
+                if (addTags !== undefined && !Array.isArray(addTags)) {
+                  return { error: "addTags must be an array of tag keyword strings" };
+                }
+                if (removeTags !== undefined && !Array.isArray(removeTags)) {
+                  return { error: "removeTags must be an array of tag keyword strings" };
                 }
 
                 if (moveTo && trash === true) {
@@ -2306,6 +2332,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (flagged !== undefined) {
                   for (const hdr of foundHdrs) hdr.markFlagged(flagged);
                   actions.push({ type: "flagged", value: flagged });
+                }
+
+                if (addTags || removeTags) {
+                  const tagsToAdd = addTags || [];
+                  const tagsToRemove = new Set(removeTags || []);
+                  for (const hdr of foundHdrs) {
+                    const existing = (hdr.getStringProperty("keywords") || "").split(/\s+/).filter(Boolean);
+                    const updated = new Set(existing);
+                    for (const t of tagsToAdd) {
+                      if (typeof t === "string" && t) updated.add(t);
+                    }
+                    for (const t of tagsToRemove) {
+                      updated.delete(t);
+                    }
+                    hdr.setStringProperty("keywords", [...updated].join(" "));
+                  }
+                  if (tagsToAdd.length > 0) actions.push({ type: "addTags", value: tagsToAdd });
+                  if (tagsToRemove.size > 0) actions.push({ type: "removeTags", value: [...tagsToRemove] });
                 }
 
                 let targetFolder = null;
@@ -2902,7 +2946,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly);
+                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
@@ -2930,7 +2974,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
-                  return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.moveTo, args.trash);
+                  return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash);
                 case "createFolder":
                   return createFolder(args.parentFolderPath, args.name);
                 case "listFilters":
