@@ -25,6 +25,10 @@
     "README.md",
     "LICENSE"
   ],
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "test": "node --test test/"
+  },
   "engines": {
     "node": ">=18.0.0"
   }
