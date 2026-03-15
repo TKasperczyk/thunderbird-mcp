@@ -139,6 +139,21 @@
   </div>
 </div>
 
+<div class="section">
+  <h2>Tool Access</h2>
+  <p class="mode-note">
+    Uncheck tools to disable them. Disabled tools are hidden from MCP clients and cannot be called.
+    Infrastructure tools (listAccounts, listFolders, getAccountAccessConfig) cannot be disabled.
+  </p>
+  <ul id="toolList" class="account-list">
+    <li>Loading...</li>
+  </ul>
+  <div class="save-row">
+    <button id="saveToolsBtn" disabled>Save</button>
+    <span id="saveToolsStatus" class="save-status"></span>
+  </div>
+</div>
+
 <script src="options.js"></script>
 </body>
 </html>

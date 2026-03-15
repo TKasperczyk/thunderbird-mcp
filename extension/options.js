@@ -10,7 +10,12 @@ const accountList = document.getElementById("accountList");
 const saveBtn = document.getElementById("saveBtn");
 const saveStatus = document.getElementById("saveStatus");
 
+const toolList = document.getElementById("toolList");
+const saveToolsBtn = document.getElementById("saveToolsBtn");
+const saveToolsStatus = document.getElementById("saveToolsStatus");
+
 let currentAccounts = [];
+let currentTools = [];
 
 async function loadServerInfo() {
   try {
@@ -119,5 +124,82 @@ saveBtn.addEventListener("click", async () => {
   saveBtn.disabled = false;
 });
 
+async function loadToolAccess() {
+  try {
+    const data = await browser.mcpServer.getToolAccessConfig();
+    currentTools = data.tools || [];
+
+    if (currentTools.length === 0) {
+      toolList.innerHTML = "<li>No tools found.</li>";
+      return;
+    }
+
+    toolList.innerHTML = "";
+    for (const tool of currentTools) {
+      const li = document.createElement("li");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.id = "tool-" + tool.name;
+      checkbox.value = tool.name;
+      checkbox.checked = tool.enabled;
+      if (tool.undisableable) {
+        checkbox.disabled = true;
+      }
+      checkbox.addEventListener("change", () => {
+        saveToolsStatus.textContent = "";
+      });
+
+      const label = document.createElement("label");
+      label.htmlFor = checkbox.id;
+      label.textContent = tool.name;
+      if (tool.undisableable) {
+        const lockSpan = document.createElement("span");
+        lockSpan.className = "account-type";
+        lockSpan.textContent = "required";
+        label.appendChild(lockSpan);
+      }
+
+      li.appendChild(checkbox);
+      li.appendChild(label);
+      toolList.appendChild(li);
+    }
+
+    saveToolsBtn.disabled = false;
+    saveToolsStatus.textContent = "";
+  } catch (e) {
+    toolList.innerHTML = "<li>Error loading tools: " + e.message + "</li>";
+  }
+}
+
+saveToolsBtn.addEventListener("click", async () => {
+  saveToolsBtn.disabled = true;
+  saveToolsStatus.textContent = "";
+  saveToolsStatus.className = "save-status";
+
+  const checkboxes = toolList.querySelectorAll('input[type="checkbox"]');
+  const disabled = [];
+  for (const cb of checkboxes) {
+    if (!cb.checked && !cb.disabled) {
+      disabled.push(cb.value);
+    }
+  }
+
+  try {
+    const result = await browser.mcpServer.setToolAccess(disabled);
+    if (result.error) {
+      saveToolsStatus.textContent = result.error;
+      saveToolsStatus.className = "save-status error";
+    } else {
+      saveToolsStatus.textContent = "Saved.";
+      await loadToolAccess();
+    }
+  } catch (e) {
+    saveToolsStatus.textContent = "Error: " + e.message;
+    saveToolsStatus.className = "save-status error";
+  }
+  saveToolsBtn.disabled = false;
+});
+
 loadServerInfo();
 loadAccountAccess();
+loadToolAccess();

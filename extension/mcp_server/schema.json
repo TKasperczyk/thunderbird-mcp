@@ -25,6 +25,27 @@
         "parameters": []
       },
       {
+        "name": "getToolAccessConfig",
+        "type": "function",
+        "async": true,
+        "description": "Get the current tool access control configuration",
+        "parameters": []
+      },
+      {
+        "name": "setToolAccess",
+        "type": "function",
+        "async": true,
+        "description": "Set which tools are disabled",
+        "parameters": [
+          {
+            "name": "disabledTools",
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Array of tool names to disable. Empty array means all tools enabled."
+          }
+        ]
+      },
+      {
         "name": "setAccountAccess",
         "type": "function",
         "async": true,

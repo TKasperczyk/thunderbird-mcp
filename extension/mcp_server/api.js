@@ -30,6 +30,9 @@ let _tempFileCounter = 0;
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
+const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
+// Tools that cannot be disabled via the settings page (infrastructure tools)
+const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccessConfig"]);
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 10000;
 // Internal IMAP/Thunderbird keywords that should not appear as user-visible tags
@@ -726,6 +729,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const allowed = getAllowedAccountIds();
               if (allowed.length === 0) return true;
               return allowed.includes(accountKey);
+            }
+
+            /**
+             * Get the list of disabled tool names from preferences.
+             * Returns an empty array if no tools are disabled (all enabled).
+             * Fails closed: corrupt pref disables all tools.
+             */
+            function getDisabledTools() {
+              try {
+                const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
+                if (!pref) return [];
+                const parsed = JSON.parse(pref);
+                if (!Array.isArray(parsed)) {
+                  console.error("thunderbird-mcp: disabled tools pref is not an array, disabling all tools");
+                  return ["__all__"];
+                }
+                return parsed;
+              } catch (e) {
+                console.error("thunderbird-mcp: failed to parse disabled tools pref, disabling all tools:", e);
+                return ["__all__"];
+              }
+            }
+
+            /**
+             * Check if a tool is enabled.
+             * Undisableable tools (listAccounts, listFolders, getAccountAccessConfig) always return true.
+             */
+            function isToolEnabled(toolName) {
+              if (UNDISABLEABLE_TOOLS.has(toolName)) return true;
+              const disabled = getDisabledTools();
+              if (disabled.includes("__all__")) return false;
+              return !disabled.includes(toolName);
             }
 
             /**
@@ -3732,11 +3767,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       result = { prompts: [] };
                       break;
                     case "tools/list":
-                      result = { tools };
+                      result = { tools: tools.filter(t => isToolEnabled(t.name)) };
                       break;
                     case "tools/call":
                       if (!params?.name) {
                         throw new Error("Missing tool name");
+                      }
+                      if (!isToolEnabled(params.name)) {
+                        throw new Error(`Tool is disabled: ${params.name}`);
                       }
                       {
                         const toolArgs = coerceToolArgs(params.name, params.arguments || {});
@@ -3891,6 +3929,63 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             mode: allowed.length === 0 ? "all" : "restricted",
             allowedAccountIds: allowed,
             accounts,
+          };
+        },
+
+        getToolAccessConfig: async function() {
+          let disabled = [];
+          try {
+            const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
+            if (pref) disabled = JSON.parse(pref);
+          } catch { /* ignore */ }
+
+          // Build tool list from the tools array defined inside start()
+          // We access it indirectly through the preference state
+          const allToolNames = [
+            "listAccounts", "listFolders", "searchMessages", "getMessage",
+            "sendMail", "replyToMessage", "forwardMessage", "deleteMessages",
+            "updateMessage", "getRecentMessages", "createFolder", "renameFolder",
+            "deleteFolder", "moveFolder", "searchContacts", "createContact",
+            "updateContact", "deleteContact", "listCalendars", "createEvent",
+            "listEvents", "updateEvent", "deleteEvent", "createTask",
+            "listFilters", "createFilter", "updateFilter", "deleteFilter",
+            "reorderFilters", "applyFilters",
+          ];
+          const toolList = allToolNames.map(name => ({
+            name,
+            enabled: !disabled.includes(name),
+            undisableable: UNDISABLEABLE_TOOLS.has(name),
+          }));
+          return {
+            mode: disabled.length === 0 ? "all" : "restricted",
+            disabledTools: disabled,
+            tools: toolList,
+          };
+        },
+
+        setToolAccess: async function(disabledTools) {
+          if (!Array.isArray(disabledTools)) {
+            return { error: "disabledTools must be an array" };
+          }
+          // Validate: can't disable undisableable tools
+          const blocked = disabledTools.filter(t => UNDISABLEABLE_TOOLS.has(t));
+          if (blocked.length > 0) {
+            return { error: `Cannot disable infrastructure tools: ${blocked.join(", ")}` };
+          }
+          // Validate: all names must be strings
+          if (!disabledTools.every(t => typeof t === "string")) {
+            return { error: "All tool names must be strings" };
+          }
+
+          if (disabledTools.length === 0) {
+            try { Services.prefs.clearUserPref(PREF_DISABLED_TOOLS); } catch { /* ignore */ }
+          } else {
+            Services.prefs.setStringPref(PREF_DISABLED_TOOLS, JSON.stringify(disabledTools));
+          }
+          return {
+            success: true,
+            mode: disabledTools.length === 0 ? "all" : "restricted",
+            disabledTools,
           };
         },
 
