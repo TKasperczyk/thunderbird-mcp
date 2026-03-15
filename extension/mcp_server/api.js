@@ -752,8 +752,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
                 if (!pref) return [];
                 const parsed = JSON.parse(pref);
-                if (!Array.isArray(parsed)) {
-                  console.error("thunderbird-mcp: disabled tools pref is not an array, disabling all tools");
+                if (!Array.isArray(parsed) || !parsed.every(v => typeof v === "string")) {
+                  console.error("thunderbird-mcp: disabled tools pref is invalid, disabling all tools");
                   return ["__all__"];
                 }
                 return parsed;
