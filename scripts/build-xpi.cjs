@@ -124,6 +124,15 @@ try {
   }
   const buildInfo = JSON.stringify({ version, builtAt: new Date().toISOString() });
   fs.writeFileSync(BUILDINFO_FILE, buildInfo);
+
+  // Update manifest.json version from git tag (Thunderbird requires numeric version)
+  const MANIFEST_FILE = path.join(EXT_DIR, 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'));
+  const tagMatch = version.match(/^v?(\d+\.\d+(?:\.\d+)?)/);
+  if (tagMatch) {
+    manifest.version = tagMatch[1];
+    fs.writeFileSync(MANIFEST_FILE, JSON.stringify(manifest, null, 2) + '\n');
+  }
 } catch {
   console.warn('Warning: could not stamp buildinfo.json (git not available?)');
 }
