@@ -1275,7 +1275,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                 }
                 if (!msgComposeParams.identity) {
-                  return "no accessible identity found";
+                  return { error: "No accessible identity found -- all accounts are restricted" };
                 }
               }
               return from ? `unknown identity: ${from}, using accessible default` : "";
@@ -2412,7 +2412,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
                 msgComposeParams.composeFields = composeFields;
 
-                const identityWarning = setComposeIdentity(msgComposeParams, from, null);
+                const identityResult = setComposeIdentity(msgComposeParams, from, null);
+                if (identityResult && identityResult.error) return identityResult;
+                const identityWarning = identityResult || "";
 
                 const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
@@ -2527,7 +2529,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
                       msgComposeParams.composeFields = composeFields;
 
-                      const identityWarning = setComposeIdentity(msgComposeParams, from, folder.server);
+                      const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
+                      if (identityResult && identityResult.error) { resolve(identityResult); return; }
+                      const identityWarning = identityResult || "";
 
                       msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
@@ -2627,7 +2631,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
                       msgComposeParams.composeFields = composeFields;
 
-                      const identityWarning = setComposeIdentity(msgComposeParams, from, folder.server);
+                      const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
+                      if (identityResult && identityResult.error) { resolve(identityResult); return; }
+                      const identityWarning = identityResult || "";
 
                       msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
@@ -3215,6 +3221,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (act.value) {
                   if (typeNum === 0x01 || typeNum === 0x02) {
+                    // Move/Copy to folder -- verify target is accessible
+                    const targetCheck = getAccessibleFolder(act.value);
+                    if (targetCheck.error) throw new Error(`Filter target folder not accessible: ${act.value}`);
                     action.targetFolderUri = act.value;
                   } else if (typeNum === 0x03) {
                     action.priority = parseInt(act.value);

@@ -208,15 +208,20 @@ async function forwardToThunderbird(message, _retried) {
       if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
         return tryNext(rest);
       }
-      // On 403, clear cache and retry once with fresh connection info
-      // (Thunderbird may have restarted with a new token).
-      if (err.message && err.message.includes('403') && !_retried) {
-        clearConnectionCache();
-        return forwardToThunderbird(message, true);
+      // On 403 or connection refused, clear cache and retry once with fresh
+      // connection info (Thunderbird may have restarted on a new port/token).
+      if (!_retried) {
+        if (err.message && err.message.includes('403')) {
+          clearConnectionCache();
+          return forwardToThunderbird(message, true);
+        }
+        if (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT') {
+          clearConnectionCache();
+          return forwardToThunderbird(message, true);
+        }
       }
-      // On connection failure, clear cache so next request re-reads the file
+      // Already retried or non-recoverable error
       if (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT') {
-        clearConnectionCache();
         throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
       }
       throw err;
