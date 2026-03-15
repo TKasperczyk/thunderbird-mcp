@@ -2883,12 +2883,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const actions = [];
 
                 if (read !== undefined) {
-                  for (const hdr of foundHdrs) hdr.markRead(read);
+                  // Use folder-level API for proper IMAP sync (hdr.markRead
+                  // only updates the local DB, doesn't queue IMAP commands)
+                  folder.markMessagesRead(foundHdrs, read);
                   actions.push({ type: "read", value: read });
                 }
 
                 if (flagged !== undefined) {
-                  for (const hdr of foundHdrs) hdr.markFlagged(flagged);
+                  folder.markMessagesFlagged(foundHdrs, flagged);
                   actions.push({ type: "flagged", value: flagged });
                 }
 
