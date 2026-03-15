@@ -1184,7 +1184,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   msgComposeParams.identity = defaultAccount.defaultIdentity;
                 }
               }
-              return from ? `unknown identity: ${from}, using default` : "";
+              // If no identity was set (all fallbacks restricted), explicitly set
+              // the first accessible identity. Without this, Thunderbird's
+              // OpenComposeWindowWithParams fills identity from defaultAccount
+              // internally, bypassing account restrictions.
+              if (!msgComposeParams.identity) {
+                for (const account of getAccessibleAccounts()) {
+                  if (account.defaultIdentity) {
+                    msgComposeParams.identity = account.defaultIdentity;
+                    break;
+                  }
+                }
+                if (!msgComposeParams.identity) {
+                  return "no accessible identity found";
+                }
+              }
+              return from ? `unknown identity: ${from}, using accessible default` : "";
             }
 
 	            /**
@@ -3647,13 +3662,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            const connFilePath = writeConnectionInfo(boundPort, authToken);
             globalThis.__tbMcpServer = server;
+            let connFilePath;
+            try {
+              connFilePath = writeConnectionInfo(boundPort, authToken);
+            } catch (writeErr) {
+              // Connection file write failed -- stop the orphaned server
+              try { server.stop(() => {}); } catch {}
+              globalThis.__tbMcpServer = null;
+              throw writeErr;
+            }
             console.log(`Thunderbird MCP server listening on port ${boundPort}`);
             console.log(`Connection info written to ${connFilePath}`);
             return { success: true, port: boundPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
+            // Stop server if it was started but something else failed
+            if (globalThis.__tbMcpServer) {
+              try { globalThis.__tbMcpServer.stop(() => {}); } catch {}
+              globalThis.__tbMcpServer = null;
+            }
             // Clear cached promise so a retry can attempt to bind again
             globalThis.__tbMcpStartPromise = null;
             removeConnectionInfo();

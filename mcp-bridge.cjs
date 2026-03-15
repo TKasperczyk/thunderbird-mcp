@@ -172,7 +172,7 @@ function tryRequest(hostname, postData, port, token) {
   });
 }
 
-async function forwardToThunderbird(message) {
+async function forwardToThunderbird(message, _retried) {
   const postData = JSON.stringify(message);
 
   // Read connection info (port + auth token) from the file written by the extension.
@@ -208,8 +208,13 @@ async function forwardToThunderbird(message) {
       if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
         return tryNext(rest);
       }
+      // On 403, clear cache and retry once with fresh connection info
+      // (Thunderbird may have restarted with a new token).
+      if (err.message && err.message.includes('403') && !_retried) {
+        clearConnectionCache();
+        return forwardToThunderbird(message, true);
+      }
       // On connection failure, clear cache so next request re-reads the file
-      // (Thunderbird may have restarted on a different port with a new token).
       if (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'EAFNOSUPPORT') {
         clearConnectionCache();
         throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
