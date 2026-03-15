@@ -1,6 +1,8 @@
 "use strict";
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 
 // ── Helpers that mirror production logic ──────────────────────────────
 
@@ -52,22 +54,47 @@ function callToolGuard(toolName, prefValue) {
 
 // ── Test data ─────────────────────────────────────────────────────────
 
+// Valid metadata values (mirrors production constants)
+const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
+const VALID_CRUD = ["create", "read", "update", "delete"];
+const CRUD_ORDER = { read: 0, create: 1, update: 2, delete: 3 };
+const GROUP_ORDER = { system: 0, messages: 1, folders: 2, contacts: 3, calendar: 4, filters: 5 };
+
 const ALL_TOOLS = [
-  { name: "listAccounts" },
-  { name: "listFolders" },
-  { name: "getAccountAccess" },
-  { name: "searchMessages" },
-  { name: "getMessage" },
-  { name: "sendMail" },
-  { name: "replyToMessage" },
-  { name: "forwardMessage" },
-  { name: "deleteMessages" },
-  { name: "updateMessage" },
-  { name: "getRecentMessages" },
-  { name: "createFolder" },
-  { name: "searchContacts" },
-  { name: "createContact" },
-  { name: "deleteContact" },
+  { name: "listAccounts", group: "system", crud: "read" },
+  { name: "listFolders", group: "system", crud: "read" },
+  { name: "getAccountAccess", group: "system", crud: "read" },
+  { name: "searchMessages", group: "messages", crud: "read" },
+  { name: "getMessage", group: "messages", crud: "read" },
+  { name: "getRecentMessages", group: "messages", crud: "read" },
+  { name: "displayMessage", group: "messages", crud: "read" },
+  { name: "sendMail", group: "messages", crud: "create" },
+  { name: "replyToMessage", group: "messages", crud: "create" },
+  { name: "forwardMessage", group: "messages", crud: "create" },
+  { name: "updateMessage", group: "messages", crud: "update" },
+  { name: "deleteMessages", group: "messages", crud: "delete" },
+  { name: "createFolder", group: "folders", crud: "create" },
+  { name: "renameFolder", group: "folders", crud: "update" },
+  { name: "moveFolder", group: "folders", crud: "update" },
+  { name: "deleteFolder", group: "folders", crud: "delete" },
+  { name: "emptyTrash", group: "folders", crud: "delete" },
+  { name: "emptyJunk", group: "folders", crud: "delete" },
+  { name: "searchContacts", group: "contacts", crud: "read" },
+  { name: "createContact", group: "contacts", crud: "create" },
+  { name: "updateContact", group: "contacts", crud: "update" },
+  { name: "deleteContact", group: "contacts", crud: "delete" },
+  { name: "listCalendars", group: "calendar", crud: "read" },
+  { name: "listEvents", group: "calendar", crud: "read" },
+  { name: "createEvent", group: "calendar", crud: "create" },
+  { name: "createTask", group: "calendar", crud: "create" },
+  { name: "updateEvent", group: "calendar", crud: "update" },
+  { name: "deleteEvent", group: "calendar", crud: "delete" },
+  { name: "listFilters", group: "filters", crud: "read" },
+  { name: "createFilter", group: "filters", crud: "create" },
+  { name: "updateFilter", group: "filters", crud: "update" },
+  { name: "reorderFilters", group: "filters", crud: "update" },
+  { name: "applyFilters", group: "filters", crud: "update" },
+  { name: "deleteFilter", group: "filters", crud: "delete" },
 ];
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -381,5 +408,420 @@ describe("Tool access: setToolAccess validation", () => {
     const result = validateSetToolAccess(["sendMail", "__all__", "deleteMessages"]);
     assert.ok(result.error);
     assert.match(result.error, /__all__/);
+  });
+});
+
+// ── Tool metadata validation tests ───────────────────────────────────
+
+describe("Tool metadata: group and crud validation", () => {
+  it("every tool has a valid group", () => {
+    for (const tool of ALL_TOOLS) {
+      assert.ok(
+        VALID_GROUPS.includes(tool.group),
+        `Tool "${tool.name}" has invalid group: "${tool.group}"`
+      );
+    }
+  });
+
+  it("every tool has a valid crud type", () => {
+    for (const tool of ALL_TOOLS) {
+      assert.ok(
+        VALID_CRUD.includes(tool.crud),
+        `Tool "${tool.name}" has invalid crud: "${tool.crud}"`
+      );
+    }
+  });
+
+  it("no duplicate tool names", () => {
+    const names = ALL_TOOLS.map(t => t.name);
+    const unique = new Set(names);
+    assert.equal(names.length, unique.size, `Duplicate tool names found: ${names.filter((n, i) => names.indexOf(n) !== i)}`);
+  });
+
+  it("all undisableable tools exist in the tools array", () => {
+    const names = new Set(ALL_TOOLS.map(t => t.name));
+    for (const name of UNDISABLEABLE_TOOLS) {
+      assert.ok(names.has(name), `Undisableable tool "${name}" not found in tools array`);
+    }
+  });
+
+  it("GROUP_ORDER covers all VALID_GROUPS", () => {
+    for (const group of VALID_GROUPS) {
+      assert.ok(
+        GROUP_ORDER[group] !== undefined,
+        `GROUP_ORDER missing entry for group: "${group}"`
+      );
+    }
+  });
+
+  it("CRUD_ORDER covers all VALID_CRUD", () => {
+    for (const crud of VALID_CRUD) {
+      assert.ok(
+        CRUD_ORDER[crud] !== undefined,
+        `CRUD_ORDER missing entry for crud: "${crud}"`
+      );
+    }
+  });
+
+  it("detects tool with missing group", () => {
+    const badTool = { name: "testTool", crud: "read" };
+    assert.ok(!VALID_GROUPS.includes(badTool.group));
+  });
+
+  it("detects tool with invalid crud value", () => {
+    const badTool = { name: "testTool", group: "messages", crud: "execute" };
+    assert.ok(!VALID_CRUD.includes(badTool.crud));
+  });
+});
+
+describe("Tool metadata: getToolAccessConfig sorting", () => {
+  function sortTools(toolList) {
+    return [...toolList].sort((a, b) => {
+      const gA = GROUP_ORDER[a.group] ?? 99;
+      const gB = GROUP_ORDER[b.group] ?? 99;
+      if (gA !== gB) return gA - gB;
+      return (CRUD_ORDER[a.crud] ?? 99) - (CRUD_ORDER[b.crud] ?? 99);
+    });
+  }
+
+  it("system tools sort before all other groups", () => {
+    const sorted = sortTools(ALL_TOOLS);
+    const firstGroup = sorted[0].group;
+    assert.equal(firstGroup, "system");
+  });
+
+  it("within each group, read sorts before create before update before delete", () => {
+    const sorted = sortTools(ALL_TOOLS);
+    // Check each group's internal CRUD ordering
+    const groups = {};
+    for (const t of sorted) {
+      if (!groups[t.group]) groups[t.group] = [];
+      groups[t.group].push(t.crud);
+    }
+    for (const [group, cruds] of Object.entries(groups)) {
+      for (let i = 1; i < cruds.length; i++) {
+        assert.ok(
+          CRUD_ORDER[cruds[i]] >= CRUD_ORDER[cruds[i - 1]],
+          `Group "${group}": "${cruds[i]}" should not come before "${cruds[i - 1]}"`
+        );
+      }
+    }
+  });
+
+  it("group order is: system, messages, folders, contacts, calendar, filters", () => {
+    const sorted = sortTools(ALL_TOOLS);
+    const seenGroups = [];
+    for (const t of sorted) {
+      if (!seenGroups.includes(t.group)) seenGroups.push(t.group);
+    }
+    assert.deepStrictEqual(seenGroups, ["system", "messages", "folders", "contacts", "calendar", "filters"]);
+  });
+
+  it("unknown group sorts to end", () => {
+    const withUnknown = [...ALL_TOOLS, { name: "mystery", group: "alien", crud: "read" }];
+    const sorted = sortTools(withUnknown);
+    assert.equal(sorted[sorted.length - 1].name, "mystery");
+  });
+
+  it("unknown crud sorts to end within group", () => {
+    const withUnknown = [...ALL_TOOLS, { name: "mystery", group: "messages", crud: "execute" }];
+    const sorted = sortTools(withUnknown);
+    const msgTools = sorted.filter(t => t.group === "messages");
+    assert.equal(msgTools[msgTools.length - 1].name, "mystery");
+  });
+});
+
+describe("Tool metadata: tools/list stripping", () => {
+  /**
+   * Mirrors the production tools/list stripping logic.
+   * Input tools have internal fields; output should only have MCP-visible fields.
+   */
+  function stripForToolsList(toolsArray) {
+    return toolsArray.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
+  }
+
+  const ALLOWED_MCP_FIELDS = new Set(["name", "description", "inputSchema"]);
+
+  it("strips group, crud, and title from tools with all internal fields", () => {
+    // Create tools that HAVE internal metadata (unlike the old test which stripped first)
+    const toolsWithMetadata = ALL_TOOLS.map(t => ({
+      name: t.name,
+      description: "test description",
+      inputSchema: { type: "object" },
+      group: t.group,
+      crud: t.crud,
+      title: "Some Title",
+    }));
+
+    const stripped = stripForToolsList(toolsWithMetadata);
+
+    for (const tool of stripped) {
+      assert.ok(!("group" in tool), `tools/list leaked "group" for ${tool.name}`);
+      assert.ok(!("crud" in tool), `tools/list leaked "crud" for ${tool.name}`);
+      assert.ok(!("title" in tool), `tools/list leaked "title" for ${tool.name}`);
+    }
+  });
+
+  it("output contains only MCP-allowed fields (allowlist check)", () => {
+    const toolsWithMetadata = [{
+      name: "testTool", description: "desc", inputSchema: {},
+      group: "messages", crud: "read", title: "Test", _internal: true, sortOrder: 5,
+    }];
+
+    const stripped = stripForToolsList(toolsWithMetadata);
+    for (const tool of stripped) {
+      for (const key of Object.keys(tool)) {
+        assert.ok(ALLOWED_MCP_FIELDS.has(key), `Unexpected field "${key}" leaked in tools/list output`);
+      }
+    }
+  });
+
+  it("preserves name, description, and inputSchema values", () => {
+    const schema = { type: "object", properties: { x: { type: "string" } } };
+    const input = [{ name: "myTool", description: "my desc", inputSchema: schema, group: "system", crud: "read", title: "My" }];
+    const stripped = stripForToolsList(input);
+    assert.equal(stripped[0].name, "myTool");
+    assert.equal(stripped[0].description, "my desc");
+    assert.deepStrictEqual(stripped[0].inputSchema, schema);
+  });
+});
+
+describe("Tool access: tag keyword validation", () => {
+  // Mirrors production: allowlist of safe IMAP atom characters
+  const VALID_TAG = /^[a-zA-Z0-9_$.\-]+$/;
+  function sanitizeTags(tags) {
+    return (tags || []).filter(t => typeof t === "string" && VALID_TAG.test(t));
+  }
+
+  it("rejects tags containing spaces", () => {
+    const result = sanitizeTags(["$label1", "$label1 \\Deleted", "clean"]);
+    assert.deepStrictEqual(result, ["$label1", "clean"]);
+  });
+
+  it("rejects tags containing tabs", () => {
+    const result = sanitizeTags(["valid", "has\ttab"]);
+    assert.deepStrictEqual(result, ["valid"]);
+  });
+
+  it("rejects tags containing newlines", () => {
+    const result = sanitizeTags(["valid", "has\nnewline", "has\rnewline"]);
+    assert.deepStrictEqual(result, ["valid"]);
+  });
+
+  it("accepts valid single-token tags", () => {
+    const result = sanitizeTags(["$label1", "$label2", "project-x", "custom_tag"]);
+    assert.deepStrictEqual(result, ["$label1", "$label2", "project-x", "custom_tag"]);
+  });
+
+  it("rejects tags with IMAP special characters", () => {
+    const specials = [
+      "tag(paren", "tag)paren", "tag{brace", "tag}brace",
+      "tag*wild", "tag%wild", "tag\\backslash", 'tag"quote',
+      "tag[bracket", "tag]bracket",
+    ];
+    const result = sanitizeTags(specials);
+    assert.deepStrictEqual(result, [], "All IMAP special chars should be rejected");
+  });
+
+  it("rejects null bytes", () => {
+    const result = sanitizeTags(["valid", "has\0null"]);
+    assert.deepStrictEqual(result, ["valid"]);
+  });
+
+  it("rejects zero-width spaces and other unicode whitespace", () => {
+    const result = sanitizeTags([
+      "valid",
+      "has\u200Bzwsp",     // zero-width space (not caught by \s)
+      "has\u00A0nbsp",     // non-breaking space
+      "has\uFEFFbom",      // BOM
+    ]);
+    assert.deepStrictEqual(result, ["valid"]);
+  });
+
+  it("rejects empty strings", () => {
+    const result = sanitizeTags(["", "valid", ""]);
+    assert.deepStrictEqual(result, ["valid"]);
+  });
+
+  it("rejects non-string entries", () => {
+    const result = sanitizeTags([42, null, undefined, true, "valid", {}, []]);
+    assert.deepStrictEqual(result, ["valid"]);
+  });
+
+  it("accepts tags with dots and hyphens", () => {
+    const result = sanitizeTags(["project.v2", "work-item", "$label1", "tag_name"]);
+    assert.deepStrictEqual(result, ["project.v2", "work-item", "$label1", "tag_name"]);
+  });
+});
+
+// ── displayMessage validation tests ──────────────────────────────────
+
+describe("displayMessage: input validation", () => {
+  const VALID_DISPLAY_MODES = ["3pane", "tab", "window"];
+
+  /**
+   * Mirrors the production displayMode validation logic.
+   * Returns { error } for invalid modes, { mode } for valid ones.
+   */
+  function validateDisplayMode(displayMode) {
+    const mode = displayMode || "3pane";
+    if (!VALID_DISPLAY_MODES.includes(mode)) {
+      return { error: `Invalid displayMode: "${mode}". Must be one of: ${VALID_DISPLAY_MODES.join(", ")}` };
+    }
+    return { mode };
+  }
+
+  it("defaults to 3pane when displayMode is omitted", () => {
+    assert.deepStrictEqual(validateDisplayMode(undefined), { mode: "3pane" });
+    assert.deepStrictEqual(validateDisplayMode(null), { mode: "3pane" });
+    assert.deepStrictEqual(validateDisplayMode(""), { mode: "3pane" });
+  });
+
+  it("accepts all three valid display modes", () => {
+    for (const mode of VALID_DISPLAY_MODES) {
+      const result = validateDisplayMode(mode);
+      assert.equal(result.mode, mode);
+      assert.ok(!result.error);
+    }
+  });
+
+  it("rejects invalid displayMode values", () => {
+    const invalid = ["popup", "fullscreen", "WINDOW", "Tab", "3PANE", "anything", "3 pane"];
+    for (const mode of invalid) {
+      const result = validateDisplayMode(mode);
+      assert.ok(result.error, `Should reject displayMode: "${mode}"`);
+      assert.match(result.error, /Invalid displayMode/);
+    }
+  });
+
+  it("error message lists valid modes", () => {
+    const result = validateDisplayMode("invalid");
+    assert.match(result.error, /3pane/);
+    assert.match(result.error, /tab/);
+    assert.match(result.error, /window/);
+  });
+
+  it("displayMode is case-sensitive", () => {
+    assert.ok(validateDisplayMode("3pane").mode);
+    assert.ok(validateDisplayMode("Tab").error);
+    assert.ok(validateDisplayMode("Window").error);
+  });
+});
+
+// ── Build version parsing tests ──────────────────────────────────────
+
+describe("Build version: options.js display parsing", () => {
+  /**
+   * Mirrors the production version parsing regex from options.js.
+   * Input: git-describe string like "v0.2.0-7-g1461f1a+dirty"
+   * Output: formatted display string
+   */
+  function parseBuildVersion(buildVersion, buildDate) {
+    const m = buildVersion.match(/^(v[\d.]+)(?:-(\d+)-g([0-9a-f]+))?(\+dirty)?$/);
+    let display;
+    if (m) {
+      const [, tag, commits, hash, dirty] = m;
+      display = tag;
+      if (commits && commits !== "0") display += ` +${commits}`;
+      display += ` (${hash || tag})`;
+      if (dirty) {
+        display += " +dirty";
+        if (buildDate) {
+          display += " " + buildDate.replace("T", " ").replace(/\.\d+Z$/, " UTC");
+        }
+      }
+    } else {
+      display = buildVersion;
+    }
+    return display;
+  }
+
+  it("parses tag-only version (on exact tag)", () => {
+    const result = parseBuildVersion("v0.2.0");
+    assert.equal(result, "v0.2.0 (v0.2.0)");
+  });
+
+  it("parses tag with commits past (dev build)", () => {
+    const result = parseBuildVersion("v0.2.0-7-g1461f1a");
+    assert.equal(result, "v0.2.0 +7 (1461f1a)");
+  });
+
+  it("parses tag with zero commits past", () => {
+    const result = parseBuildVersion("v0.2.0-0-gabcdef0");
+    assert.equal(result, "v0.2.0 (abcdef0)");
+  });
+
+  it("parses dirty build without date", () => {
+    const result = parseBuildVersion("v0.2.0-3-g1461f1a+dirty");
+    assert.equal(result, "v0.2.0 +3 (1461f1a) +dirty");
+  });
+
+  it("parses dirty build with date", () => {
+    const result = parseBuildVersion("v0.2.0-3-g1461f1a+dirty", "2026-03-15T10:30:00.000Z");
+    assert.equal(result, "v0.2.0 +3 (1461f1a) +dirty 2026-03-15 10:30:00 UTC");
+  });
+
+  it("parses dirty tag-only (exact tag, dirty worktree)", () => {
+    const result = parseBuildVersion("v0.2.0+dirty");
+    assert.equal(result, "v0.2.0 (v0.2.0) +dirty");
+  });
+
+  it("falls back to raw string for non-matching format", () => {
+    assert.equal(parseBuildVersion("1461f1a"), "1461f1a");
+    assert.equal(parseBuildVersion("unknown"), "unknown");
+    assert.equal(parseBuildVersion(""), "");
+  });
+
+  it("handles multi-digit version numbers", () => {
+    const result = parseBuildVersion("v1.12.345-99-gabcdef0");
+    assert.equal(result, "v1.12.345 +99 (abcdef0)");
+  });
+});
+
+// ── Structural: ALL_TOOLS sync with production ───────────────────────
+
+describe("Structural: test data matches production source", () => {
+  it("ALL_TOOLS count matches tool definitions in api.js", () => {
+    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
+    const src = fs.readFileSync(apiPath, "utf8");
+    // Count tool name declarations in the tools array: name: "toolName"
+    // Each tool object in the `const tools = [...]` array has a name field
+    const nameMatches = src.match(/{\s*name:\s*"[a-zA-Z]+"/g);
+    assert.ok(nameMatches, "Could not find tool name declarations in api.js");
+    assert.equal(
+      ALL_TOOLS.length,
+      nameMatches.length,
+      `Test ALL_TOOLS has ${ALL_TOOLS.length} tools but api.js has ${nameMatches.length} tool definitions. ` +
+      `Update ALL_TOOLS when adding/removing tools.`
+    );
+  });
+
+  it("ALL_TOOLS names match production tool names", () => {
+    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
+    const src = fs.readFileSync(apiPath, "utf8");
+    const nameMatches = src.match(/{\s*name:\s*"([a-zA-Z]+)"/g);
+    const prodNames = nameMatches.map(m => m.match(/"([a-zA-Z]+)"/)[1]).sort();
+    const testNames = ALL_TOOLS.map(t => t.name).sort();
+    assert.deepStrictEqual(testNames, prodNames, "Test ALL_TOOLS names don't match production");
+  });
+
+  it("VALID_GROUPS matches production VALID_GROUPS", () => {
+    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
+    const src = fs.readFileSync(apiPath, "utf8");
+    const m = src.match(/const VALID_GROUPS\s*=\s*\[([^\]]+)\]/);
+    assert.ok(m, "Could not find VALID_GROUPS in api.js");
+    const prodGroups = m[1].match(/"([^"]+)"/g).map(s => s.replace(/"/g, "")).sort();
+    const testGroups = [...VALID_GROUPS].sort();
+    assert.deepStrictEqual(testGroups, prodGroups, "Test VALID_GROUPS doesn't match production");
+  });
+
+  it("VALID_CRUD matches production VALID_CRUD", () => {
+    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
+    const src = fs.readFileSync(apiPath, "utf8");
+    const m = src.match(/const VALID_CRUD\s*=\s*\[([^\]]+)\]/);
+    assert.ok(m, "Could not find VALID_CRUD in api.js");
+    const prodCrud = m[1].match(/"([^"]+)"/g).map(s => s.replace(/"/g, "")).sort();
+    const testCrud = [...VALID_CRUD].sort();
+    assert.deepStrictEqual(testCrud, prodCrud, "Test VALID_CRUD doesn't match production");
   });
 });
