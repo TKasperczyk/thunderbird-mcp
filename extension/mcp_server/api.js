@@ -87,7 +87,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
-            tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." }
+            tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." },
+            includeSubfolders: { type: "boolean", description: "If false, only search the specified folder — not its subfolders. Default: true." },
           },
           required: ["query"],
         },
@@ -321,6 +322,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 10000." },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
+            includeSubfolders: { type: "boolean", description: "If false, only return messages from the specified folder — not its subfolders. Default: true." },
           },
           required: [],
         },
@@ -1319,7 +1321,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders) {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -1404,7 +1406,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // Skip inaccessible folders
                 }
 
-                if (folder.hasSubFolders) {
+                const recurse = includeSubfolders !== false; // default true
+                if (recurse && folder.hasSubFolders) {
                   for (const subfolder of folder.subFolders) {
                     if (results.length >= SEARCH_COLLECTION_CAP) break;
                     searchFolder(subfolder);
@@ -2583,7 +2586,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-            function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly) {
+            function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
               const results = [];
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
               const cutoffTs = (Date.now() - days * 86400000) * 1000; // Thunderbird uses microseconds
@@ -2627,7 +2630,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // Skip inaccessible folders
                 }
 
-                if (folder.hasSubFolders) {
+                const recurse = includeSubfolders !== false; // default true
+                if (recurse && folder.hasSubFolders) {
                   for (const subfolder of folder.subFolders) {
                     if (results.length >= SEARCH_COLLECTION_CAP) break;
                     collectFromFolder(subfolder);
@@ -3576,7 +3580,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag);
+                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
@@ -3606,7 +3610,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
                 case "getRecentMessages":
-                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly);
+                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
