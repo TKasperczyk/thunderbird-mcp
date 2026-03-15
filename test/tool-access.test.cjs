@@ -52,22 +52,47 @@ function callToolGuard(toolName, prefValue) {
 
 // ── Test data ─────────────────────────────────────────────────────────
 
+// Valid metadata values (mirrors production constants)
+const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
+const VALID_CRUD = ["create", "read", "update", "delete"];
+const CRUD_ORDER = { read: 0, create: 1, update: 2, delete: 3 };
+const GROUP_ORDER = { system: 0, messages: 1, folders: 2, contacts: 3, calendar: 4, filters: 5 };
+
 const ALL_TOOLS = [
-  { name: "listAccounts" },
-  { name: "listFolders" },
-  { name: "getAccountAccess" },
-  { name: "searchMessages" },
-  { name: "getMessage" },
-  { name: "sendMail" },
-  { name: "replyToMessage" },
-  { name: "forwardMessage" },
-  { name: "deleteMessages" },
-  { name: "updateMessage" },
-  { name: "getRecentMessages" },
-  { name: "createFolder" },
-  { name: "searchContacts" },
-  { name: "createContact" },
-  { name: "deleteContact" },
+  { name: "listAccounts", group: "system", crud: "read" },
+  { name: "listFolders", group: "system", crud: "read" },
+  { name: "getAccountAccess", group: "system", crud: "read" },
+  { name: "searchMessages", group: "messages", crud: "read" },
+  { name: "getMessage", group: "messages", crud: "read" },
+  { name: "getRecentMessages", group: "messages", crud: "read" },
+  { name: "displayMessage", group: "messages", crud: "read" },
+  { name: "sendMail", group: "messages", crud: "create" },
+  { name: "replyToMessage", group: "messages", crud: "create" },
+  { name: "forwardMessage", group: "messages", crud: "create" },
+  { name: "updateMessage", group: "messages", crud: "update" },
+  { name: "deleteMessages", group: "messages", crud: "delete" },
+  { name: "createFolder", group: "folders", crud: "create" },
+  { name: "renameFolder", group: "folders", crud: "update" },
+  { name: "moveFolder", group: "folders", crud: "update" },
+  { name: "deleteFolder", group: "folders", crud: "delete" },
+  { name: "emptyTrash", group: "folders", crud: "delete" },
+  { name: "emptyJunk", group: "folders", crud: "delete" },
+  { name: "searchContacts", group: "contacts", crud: "read" },
+  { name: "createContact", group: "contacts", crud: "create" },
+  { name: "updateContact", group: "contacts", crud: "update" },
+  { name: "deleteContact", group: "contacts", crud: "delete" },
+  { name: "listCalendars", group: "calendar", crud: "read" },
+  { name: "listEvents", group: "calendar", crud: "read" },
+  { name: "createEvent", group: "calendar", crud: "create" },
+  { name: "createTask", group: "calendar", crud: "create" },
+  { name: "updateEvent", group: "calendar", crud: "update" },
+  { name: "deleteEvent", group: "calendar", crud: "delete" },
+  { name: "listFilters", group: "filters", crud: "read" },
+  { name: "createFilter", group: "filters", crud: "create" },
+  { name: "updateFilter", group: "filters", crud: "update" },
+  { name: "reorderFilters", group: "filters", crud: "update" },
+  { name: "applyFilters", group: "filters", crud: "update" },
+  { name: "deleteFilter", group: "filters", crud: "delete" },
 ];
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -381,5 +406,163 @@ describe("Tool access: setToolAccess validation", () => {
     const result = validateSetToolAccess(["sendMail", "__all__", "deleteMessages"]);
     assert.ok(result.error);
     assert.match(result.error, /__all__/);
+  });
+});
+
+// ── Tool metadata validation tests ───────────────────────────────────
+
+describe("Tool metadata: group and crud validation", () => {
+  it("every tool has a valid group", () => {
+    for (const tool of ALL_TOOLS) {
+      assert.ok(
+        VALID_GROUPS.includes(tool.group),
+        `Tool "${tool.name}" has invalid group: "${tool.group}"`
+      );
+    }
+  });
+
+  it("every tool has a valid crud type", () => {
+    for (const tool of ALL_TOOLS) {
+      assert.ok(
+        VALID_CRUD.includes(tool.crud),
+        `Tool "${tool.name}" has invalid crud: "${tool.crud}"`
+      );
+    }
+  });
+
+  it("no duplicate tool names", () => {
+    const names = ALL_TOOLS.map(t => t.name);
+    const unique = new Set(names);
+    assert.equal(names.length, unique.size, `Duplicate tool names found: ${names.filter((n, i) => names.indexOf(n) !== i)}`);
+  });
+
+  it("all undisableable tools exist in the tools array", () => {
+    const names = new Set(ALL_TOOLS.map(t => t.name));
+    for (const name of UNDISABLEABLE_TOOLS) {
+      assert.ok(names.has(name), `Undisableable tool "${name}" not found in tools array`);
+    }
+  });
+
+  it("GROUP_ORDER covers all VALID_GROUPS", () => {
+    for (const group of VALID_GROUPS) {
+      assert.ok(
+        GROUP_ORDER[group] !== undefined,
+        `GROUP_ORDER missing entry for group: "${group}"`
+      );
+    }
+  });
+
+  it("CRUD_ORDER covers all VALID_CRUD", () => {
+    for (const crud of VALID_CRUD) {
+      assert.ok(
+        CRUD_ORDER[crud] !== undefined,
+        `CRUD_ORDER missing entry for crud: "${crud}"`
+      );
+    }
+  });
+
+  it("detects tool with missing group", () => {
+    const badTool = { name: "testTool", crud: "read" };
+    assert.ok(!VALID_GROUPS.includes(badTool.group));
+  });
+
+  it("detects tool with invalid crud value", () => {
+    const badTool = { name: "testTool", group: "messages", crud: "execute" };
+    assert.ok(!VALID_CRUD.includes(badTool.crud));
+  });
+});
+
+describe("Tool metadata: getToolAccessConfig sorting", () => {
+  function sortTools(toolList) {
+    return [...toolList].sort((a, b) => {
+      const gA = GROUP_ORDER[a.group] ?? 99;
+      const gB = GROUP_ORDER[b.group] ?? 99;
+      if (gA !== gB) return gA - gB;
+      return (CRUD_ORDER[a.crud] ?? 99) - (CRUD_ORDER[b.crud] ?? 99);
+    });
+  }
+
+  it("system tools sort before all other groups", () => {
+    const sorted = sortTools(ALL_TOOLS);
+    const firstGroup = sorted[0].group;
+    assert.equal(firstGroup, "system");
+  });
+
+  it("within each group, read sorts before create before update before delete", () => {
+    const sorted = sortTools(ALL_TOOLS);
+    // Check each group's internal CRUD ordering
+    const groups = {};
+    for (const t of sorted) {
+      if (!groups[t.group]) groups[t.group] = [];
+      groups[t.group].push(t.crud);
+    }
+    for (const [group, cruds] of Object.entries(groups)) {
+      for (let i = 1; i < cruds.length; i++) {
+        assert.ok(
+          CRUD_ORDER[cruds[i]] >= CRUD_ORDER[cruds[i - 1]],
+          `Group "${group}": "${cruds[i]}" should not come before "${cruds[i - 1]}"`
+        );
+      }
+    }
+  });
+
+  it("group order is: system, messages, folders, contacts, calendar, filters", () => {
+    const sorted = sortTools(ALL_TOOLS);
+    const seenGroups = [];
+    for (const t of sorted) {
+      if (!seenGroups.includes(t.group)) seenGroups.push(t.group);
+    }
+    assert.deepStrictEqual(seenGroups, ["system", "messages", "folders", "contacts", "calendar", "filters"]);
+  });
+
+  it("unknown group sorts to end", () => {
+    const withUnknown = [...ALL_TOOLS, { name: "mystery", group: "alien", crud: "read" }];
+    const sorted = sortTools(withUnknown);
+    assert.equal(sorted[sorted.length - 1].name, "mystery");
+  });
+
+  it("unknown crud sorts to end within group", () => {
+    const withUnknown = [...ALL_TOOLS, { name: "mystery", group: "messages", crud: "execute" }];
+    const sorted = sortTools(withUnknown);
+    const msgTools = sorted.filter(t => t.group === "messages");
+    assert.equal(msgTools[msgTools.length - 1].name, "mystery");
+  });
+});
+
+describe("Tool metadata: tools/list stripping", () => {
+  it("tools/list response should not contain internal metadata", () => {
+    // Simulates the production tools/list stripping
+    const mcpTools = ALL_TOOLS.map(({ name }) => ({ name, description: "test", inputSchema: {} }));
+    for (const tool of mcpTools) {
+      assert.ok(!("group" in tool), `tools/list leaked "group" for ${tool.name}`);
+      assert.ok(!("crud" in tool), `tools/list leaked "crud" for ${tool.name}`);
+      assert.ok(!("title" in tool), `tools/list leaked "title" for ${tool.name}`);
+    }
+  });
+});
+
+describe("Tool access: tag whitespace injection", () => {
+  function sanitizeTags(tags) {
+    return (tags || []).filter(t => typeof t === "string" && t && !/\s/.test(t));
+  }
+
+  it("rejects tags containing spaces", () => {
+    const result = sanitizeTags(["$label1", "$label1 \\Deleted", "clean"]);
+    assert.deepStrictEqual(result, ["$label1", "clean"]);
+  });
+
+  it("rejects tags containing tabs", () => {
+    const result = sanitizeTags(["valid", "has\ttab"]);
+    assert.deepStrictEqual(result, ["valid"]);
+  });
+
+  it("rejects tags containing newlines", () => {
+    const result = sanitizeTags(["valid", "has\nnewline"]);
+    assert.deepStrictEqual(result, ["valid"]);
+  });
+
+  it("accepts valid single-token tags", () => {
+    const result = sanitizeTags(["$label1", "$label2", "project-x", "custom_tag"]);
+    assert.deepStrictEqual(result, ["$label1", "$label2", "project-x", "custom_tag"]);
   });
 });

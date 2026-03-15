@@ -3032,8 +3032,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 if (addTags || removeTags) {
-                  const tagsToAdd = (addTags || []).filter(t => typeof t === "string" && t);
-                  const tagsToRemove = (removeTags || []).filter(t => typeof t === "string" && t);
+                  // Validate: reject tags with whitespace (IMAP keywords are space-delimited)
+                  const tagsToAdd = (addTags || []).filter(t => typeof t === "string" && t && !/\s/.test(t));
+                  const tagsToRemove = (removeTags || []).filter(t => typeof t === "string" && t && !/\s/.test(t));
                   // Use folder-level keyword APIs for proper IMAP sync
                   if (tagsToAdd.length > 0) {
                     folder.addKeywordsToMessages(foundHdrs, tagsToAdd.join(" "));
@@ -4067,7 +4068,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       result = { prompts: [] };
                       break;
                     case "tools/list":
-                      result = { tools: tools.filter(t => isToolEnabled(t.name)) };
+                      // Strip internal metadata (group, crud, title) — only expose MCP-spec fields
+                      result = { tools: tools.filter(t => isToolEnabled(t.name)).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) };
                       break;
                     case "tools/call":
                       if (!params?.name) {
