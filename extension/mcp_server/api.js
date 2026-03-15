@@ -66,7 +66,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             accountId: { type: "string", description: "Optional account ID (from listAccounts) to limit results to a single account" },
-            folderPath: { type: "string", description: "Optional folder URI to list only that folder and its subfolders" },
+            folderPath: { type: "string", description: "Optional folder URI (from listFolders) to list only that folder and its subfolders" },
           },
           required: [],
         },
@@ -79,7 +79,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             query: { type: "string", description: "Text to search in subject, author, or recipients (use empty string to match all)" },
-            folderPath: { type: "string", description: "Optional folder URI to limit search to that folder and its subfolders" },
+            folderPath: { type: "string", description: "Optional folder URI (from listFolders) to limit search to that folder and its subfolders" },
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
             endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date" },
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
@@ -314,7 +314,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            folderPath: { type: "string", description: "Folder URI to list messages from (defaults to all Inboxes)" },
+            folderPath: { type: "string", description: "Folder URI (from listFolders) to list messages from. If omitted, returns messages from all Inboxes." },
             daysBack: { type: "number", description: "Only return messages from the last N days (default: 7)" },
             maxResults: { type: "number", description: "Maximum number of results (default: 50, max: 200)" },
             offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 1000." },
@@ -332,7 +332,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs to delete" },
-            folderPath: { type: "string", description: "The folder URI containing the messages" },
+            folderPath: { type: "string", description: "The folder URI containing the messages (from listFolders or searchMessages results)" },
           },
           required: ["messageIds", "folderPath"],
         },
