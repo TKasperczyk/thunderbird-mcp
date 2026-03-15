@@ -66,7 +66,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             accountId: { type: "string", description: "Optional account ID (from listAccounts) to limit results to a single account" },
-            folderPath: { type: "string", description: "Optional folder URI to list only that folder and its subfolders" },
+            folderPath: { type: "string", description: "Optional folder URI (from listFolders) to list only that folder and its subfolders" },
           },
           required: [],
         },
@@ -79,10 +79,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             query: { type: "string", description: "Text to search in subject, author, or recipients (use empty string to match all)" },
-            folderPath: { type: "string", description: "Optional folder URI to limit search to that folder and its subfolders" },
+            folderPath: { type: "string", description: "Optional folder URI (from listFolders) to limit search to that folder and its subfolders" },
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
             endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date" },
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
+            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 1000." },
             sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
@@ -313,9 +314,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            folderPath: { type: "string", description: "Folder URI to list messages from (defaults to all Inboxes)" },
+            folderPath: { type: "string", description: "Folder URI (from listFolders) to list messages from. If omitted, returns messages from all Inboxes." },
             daysBack: { type: "number", description: "Only return messages from the last N days (default: 7)" },
             maxResults: { type: "number", description: "Maximum number of results (default: 50, max: 200)" },
+            offset: { type: "number", description: "Number of results to skip for pagination (default 0). When provided, returns {messages, totalMatches, offset, limit, hasMore} instead of a plain array. Note: totalMatches is capped at 1000." },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
           },
@@ -330,7 +332,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs to delete" },
-            folderPath: { type: "string", description: "The folder URI containing the messages" },
+            folderPath: { type: "string", description: "The folder URI containing the messages (from listFolders or searchMessages results)" },
           },
           required: ["messageIds", "folderPath"],
         },
@@ -582,6 +584,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function readRequestBody(request) {
               const stream = request.bodyInputStream;
               return NetUtil.readInputStreamToString(stream, stream.available(), { charset: "UTF-8" });
+            }
+
+            /**
+             * Apply offset-based pagination to a sorted results array.
+             * Removes the internal _dateTs property from each result.
+             *
+             * Backward-compatible: when offset is undefined/null (not provided),
+             * returns a plain array. When offset is explicitly provided (even 0),
+             * returns structured { messages, totalMatches, offset, limit, hasMore }.
+             * Note: totalMatches is capped at SEARCH_COLLECTION_CAP and may underreport.
+             */
+            function paginate(results, offset, effectiveLimit) {
+              const offsetProvided = offset !== undefined && offset !== null;
+              const effectiveOffset = (offset > 0) ? Math.floor(offset) : 0;
+              const page = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(r => {
+                delete r._dateTs;
+                return r;
+              });
+              if (!offsetProvided) {
+                return page;
+              }
+              return {
+                messages: page,
+                totalMatches: results.length,
+                offset: effectiveOffset,
+                limit: effectiveLimit,
+                hasMore: effectiveOffset + effectiveLimit < results.length
+              };
             }
 
             /**
@@ -1303,7 +1333,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, sortOrder, unreadOnly, flaggedOnly, tag) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag) {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -1406,10 +1436,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
 
-              return results.slice(0, effectiveLimit).map(result => {
-                delete result._dateTs;
-                return result;
-              });
+              return paginate(results, offset, effectiveLimit);
             }
 
             function searchContacts(query) {
@@ -2551,7 +2578,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-            function getRecentMessages(folderPath, daysBack, maxResults, unreadOnly, flaggedOnly) {
+            function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly) {
               const results = [];
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
               const cutoffTs = (Date.now() - days * 86400000) * 1000; // Thunderbird uses microseconds
@@ -2623,10 +2650,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => b._dateTs - a._dateTs);
 
-              return results.slice(0, effectiveLimit).map(r => {
-                delete r._dateTs;
-                return r;
-              });
+              return paginate(results, offset, effectiveLimit);
             }
 
             function deleteMessages(messageIds, folderPath) {
@@ -3446,6 +3470,94 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            /**
+             * Build a lookup from tool name to inputSchema for fast validation.
+             */
+            const toolSchemas = Object.create(null);
+            for (const t of tools) {
+              toolSchemas[t.name] = t.inputSchema;
+            }
+
+            /**
+             * Validate tool arguments against the tool's inputSchema.
+             * Checks required fields, types (string, number, boolean, array, object),
+             * and rejects unknown properties.
+             * Returns an array of error strings (empty = valid).
+             */
+            function validateToolArgs(name, args) {
+              const schema = toolSchemas[name];
+              if (!schema) return [`Unknown tool: ${name}`];
+
+              const errors = [];
+              const props = schema.properties || {};
+              const required = schema.required || [];
+
+              // Check required fields
+              for (const key of required) {
+                if (args[key] === undefined || args[key] === null) {
+                  errors.push(`Missing required parameter: ${key}`);
+                }
+              }
+
+              // Check types and reject unknown properties
+              for (const [key, value] of Object.entries(args)) {
+                // Use hasOwnProperty to prevent inherited properties like
+                // 'constructor' or 'toString' from bypassing unknown-param checks.
+                const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
+                if (!propSchema) {
+                  errors.push(`Unknown parameter: ${key}`);
+                  continue;
+                }
+                if (value === undefined || value === null) continue;
+
+                const expectedType = propSchema.type;
+                if (expectedType === "array") {
+                  if (!Array.isArray(value)) {
+                    errors.push(`Parameter '${key}' must be an array, got ${typeof value}`);
+                  }
+                } else if (expectedType === "object") {
+                  if (typeof value !== "object" || Array.isArray(value)) {
+                    errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
+                  }
+                } else if (expectedType && typeof value !== expectedType) {
+                  errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
+                }
+              }
+
+              return errors;
+            }
+
+            /**
+             * Coerce tool arguments to match expected schema types.
+             * MCP clients may send "true"/"false" as strings for booleans,
+             * "50" as strings for numbers, or JSON-encoded arrays as strings.
+             * Mutates and returns the args object.
+             */
+            function coerceToolArgs(name, args) {
+              const schema = toolSchemas[name];
+              if (!schema) return args;
+              const props = schema.properties || {};
+              for (const [key, value] of Object.entries(args)) {
+                if (value === undefined || value === null) continue;
+                const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
+                if (!propSchema) continue;
+                const expected = propSchema.type;
+                if (expected === "boolean" && typeof value === "string") {
+                  if (value === "true") args[key] = true;
+                  else if (value === "false") args[key] = false;
+                } else if (expected === "number" && typeof value === "string") {
+                  const n = Number(value);
+                  if (Number.isFinite(n)) args[key] = n;
+                } else if (expected === "array" && typeof value === "string") {
+                  try {
+                    const parsed = JSON.parse(value);
+                    if (Array.isArray(parsed)) args[key] = parsed;
+                  } catch { /* leave as-is for validation to catch */ }
+                }
+              }
+              return args;
+            }
+
             async function callTool(name, args) {
               switch (name) {
                 case "listAccounts":
@@ -3453,7 +3565,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag);
+                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
@@ -3483,7 +3595,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "forwardMessage":
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments);
                 case "getRecentMessages":
-                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.unreadOnly, args.flaggedOnly);
+                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly);
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
@@ -3611,12 +3723,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       if (!params?.name) {
                         throw new Error("Missing tool name");
                       }
-                      result = {
-                        content: [{
-                          type: "text",
-                          text: JSON.stringify(await callTool(params.name, params.arguments || {}), null, 2)
-                        }]
-                      };
+                      {
+                        const toolArgs = coerceToolArgs(params.name, params.arguments || {});
+                        const validationErrors = validateToolArgs(params.name, toolArgs);
+                        if (validationErrors.length > 0) {
+                          throw new Error(`Invalid parameters for '${params.name}': ${validationErrors.join("; ")}`);
+                        }
+                        result = {
+                          content: [{
+                            type: "text",
+                            text: JSON.stringify(await callTool(params.name, toolArgs), null, 2)
+                          }]
+                        };
+                      }
                       break;
                     default:
                       res.setStatusLine("1.1", 200, "OK");

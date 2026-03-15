@@ -470,3 +470,467 @@ describe('Account access: validation edge cases', () => {
     assert.ok(errors.some(e => e.includes('Unknown parameter: constructor')));
   });
 });
+
+// ─── Pagination stress tests ──────────────────────────────────────
+
+/**
+ * Replicate pagination logic from api.js paginate() helper.
+ * Backward-compatible: returns plain array when offset is not provided,
+ * structured response when offset IS provided.
+ */
+function paginateResults(allResults, maxResults, offset) {
+  const MAX_RESULTS_CAP = 200;
+  const DEFAULT_MAX = 50;
+
+  const requestedLimit = Number(maxResults);
+  const effectiveLimit = Math.min(
+    Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.floor(requestedLimit) : DEFAULT_MAX,
+    MAX_RESULTS_CAP
+  );
+  const offsetProvided = offset !== undefined && offset !== null;
+  // Matches production paginate() offset logic exactly
+  const effectiveOffset = (offset > 0) ? Math.floor(offset) : 0;
+
+  const page = allResults.slice(effectiveOffset, effectiveOffset + effectiveLimit);
+
+  if (!offsetProvided) {
+    return page;
+  }
+  return {
+    messages: page,
+    totalMatches: allResults.length,
+    offset: effectiveOffset,
+    limit: effectiveLimit,
+    hasMore: effectiveOffset + effectiveLimit < allResults.length
+  };
+}
+
+describe('Pagination: boundary conditions', () => {
+  const mockData = Array.from({ length: 500 }, (_, i) => ({ id: `msg-${i}`, subject: `Message ${i}` }));
+
+  it('offset=0 returns structured response', () => {
+    const result = paginateResults(mockData, 50, 0);
+    assert.equal(result.messages.length, 50);
+    assert.equal(result.offset, 0);
+    assert.equal(result.totalMatches, 500);
+    assert.equal(result.hasMore, true);
+    assert.equal(result.messages[0].id, 'msg-0');
+  });
+
+  it('offset at exact page boundary works', () => {
+    const result = paginateResults(mockData, 50, 50);
+    assert.equal(result.messages.length, 50);
+    assert.equal(result.offset, 50);
+    assert.equal(result.messages[0].id, 'msg-50');
+    assert.equal(result.hasMore, true);
+  });
+
+  it('offset near end returns partial page', () => {
+    const result = paginateResults(mockData, 50, 480);
+    assert.equal(result.messages.length, 20);
+    assert.equal(result.offset, 480);
+    assert.equal(result.hasMore, false);
+  });
+
+  it('offset exactly at end returns empty page', () => {
+    const result = paginateResults(mockData, 50, 500);
+    assert.equal(result.messages.length, 0);
+    assert.equal(result.offset, 500);
+    assert.equal(result.hasMore, false);
+    assert.equal(result.totalMatches, 500);
+  });
+
+  it('offset beyond end returns empty page', () => {
+    const result = paginateResults(mockData, 50, 9999);
+    assert.equal(result.messages.length, 0);
+    assert.equal(result.offset, 9999);
+    assert.equal(result.hasMore, false);
+  });
+
+  it('negative offset is treated as 0', () => {
+    const result = paginateResults(mockData, 50, -10);
+    assert.equal(result.offset, 0);
+    assert.equal(result.messages.length, 50);
+    assert.equal(result.messages[0].id, 'msg-0');
+  });
+
+  it('non-numeric offset is treated as 0', () => {
+    const result = paginateResults(mockData, 50, "abc");
+    assert.equal(result.offset, 0);
+    assert.equal(result.messages.length, 50);
+  });
+
+  it('NaN offset is treated as 0', () => {
+    const result = paginateResults(mockData, 50, NaN);
+    assert.equal(result.offset, 0);
+  });
+
+  it('Infinity offset returns empty page (not valid JSON, cannot arrive via MCP)', () => {
+    const result = paginateResults(mockData, 50, Infinity);
+    assert.equal(result.offset, Infinity);
+    assert.deepStrictEqual(result.messages, []);
+  });
+
+  it('fractional offset is floored', () => {
+    const result = paginateResults(mockData, 50, 10.7);
+    assert.equal(result.offset, 10);
+    assert.equal(result.messages[0].id, 'msg-10');
+  });
+});
+
+describe('Pagination: backward compatibility', () => {
+  const mockData = Array.from({ length: 100 }, (_, i) => ({ id: `msg-${i}` }));
+
+  it('returns plain array when offset is undefined', () => {
+    const result = paginateResults(mockData, 50, undefined);
+    assert.ok(Array.isArray(result));
+    assert.equal(result.length, 50);
+  });
+
+  it('returns plain array when offset is null', () => {
+    const result = paginateResults(mockData, 50, null);
+    assert.ok(Array.isArray(result));
+    assert.equal(result.length, 50);
+  });
+
+  it('returns structured response when offset is 0', () => {
+    const result = paginateResults(mockData, 50, 0);
+    assert.ok(!Array.isArray(result));
+    assert.ok(Array.isArray(result.messages));
+    assert.equal(result.offset, 0);
+    assert.equal(result.totalMatches, 100);
+  });
+
+  it('returns structured response when offset is positive', () => {
+    const result = paginateResults(mockData, 50, 25);
+    assert.ok(!Array.isArray(result));
+    assert.equal(result.messages.length, 50);
+    assert.equal(result.offset, 25);
+  });
+});
+
+describe('Pagination: maxResults edge cases', () => {
+  const mockData = Array.from({ length: 300 }, (_, i) => ({ id: `msg-${i}` }));
+
+  it('maxResults=0 uses default (50)', () => {
+    const result = paginateResults(mockData, 0, 0);
+    assert.equal(result.limit, 50);
+    assert.equal(result.messages.length, 50);
+  });
+
+  it('maxResults=-1 uses default (50)', () => {
+    const result = paginateResults(mockData, -1, 0);
+    assert.equal(result.limit, 50);
+  });
+
+  it('maxResults=1 returns single result', () => {
+    const result = paginateResults(mockData, 1, 0);
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.limit, 1);
+    assert.equal(result.hasMore, true);
+  });
+
+  it('maxResults exceeding cap is clamped to 200', () => {
+    const result = paginateResults(mockData, 999, 0);
+    assert.equal(result.limit, 200);
+    assert.equal(result.messages.length, 200);
+  });
+
+  it('maxResults=200 (at cap) works', () => {
+    const result = paginateResults(mockData, 200, 0);
+    assert.equal(result.limit, 200);
+    assert.equal(result.messages.length, 200);
+    assert.equal(result.hasMore, true);
+  });
+
+  it('maxResults as string is treated as default', () => {
+    const result = paginateResults(mockData, "fifty", 0);
+    assert.equal(result.limit, 50);
+  });
+
+  it('maxResults=NaN uses default', () => {
+    const result = paginateResults(mockData, NaN, 0);
+    assert.equal(result.limit, 50);
+  });
+
+  it('empty results with pagination returns correct metadata', () => {
+    const result = paginateResults([], 50, 0);
+    assert.equal(result.messages.length, 0);
+    assert.equal(result.totalMatches, 0);
+    assert.equal(result.hasMore, false);
+    assert.equal(result.offset, 0);
+  });
+
+  it('single result with offset=0 has hasMore=false', () => {
+    const result = paginateResults([{ id: 'only' }], 50, 0);
+    assert.equal(result.messages.length, 1);
+    assert.equal(result.hasMore, false);
+  });
+});
+
+describe('Pagination: sequential page traversal', () => {
+  const mockData = Array.from({ length: 137 }, (_, i) => ({ id: `msg-${i}` }));
+
+  it('can traverse all pages without gaps or duplicates', () => {
+    const pageSize = 25;
+    const allCollected = [];
+    let offset = 0;
+    let pages = 0;
+
+    while (true) {
+      const result = paginateResults(mockData, pageSize, offset);
+      allCollected.push(...result.messages);
+      pages++;
+
+      if (!result.hasMore) break;
+      offset += pageSize;
+
+      if (pages > 100) throw new Error('Pagination infinite loop detected');
+    }
+
+    assert.equal(allCollected.length, 137);
+    const ids = new Set(allCollected.map(m => m.id));
+    assert.equal(ids.size, 137);
+    assert.equal(pages, 6);
+  });
+
+  it('page traversal with maxResults=1 (worst case) collects all items', () => {
+    const smallData = Array.from({ length: 10 }, (_, i) => ({ id: `msg-${i}` }));
+    const allCollected = [];
+    let offset = 0;
+    let pages = 0;
+
+    while (true) {
+      const result = paginateResults(smallData, 1, offset);
+      allCollected.push(...result.messages);
+      pages++;
+      if (!result.hasMore) break;
+      offset += 1;
+      if (pages > 100) throw new Error('Infinite loop');
+    }
+
+    assert.equal(allCollected.length, 10);
+    assert.equal(pages, 10);
+  });
+});
+
+// ─── Validation adversarial tests ─────────────────────────────────
+
+describe('Validation: adversarial and edge-case inputs', () => {
+  const advTools = [
+    { name: "searchMessages", inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" }, folderPath: { type: "string" },
+        maxResults: { type: "number" }, offset: { type: "number" },
+        unreadOnly: { type: "boolean" },
+      },
+      required: ["query"],
+    }},
+    { name: "getMessage", inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string" }, folderPath: { type: "string" },
+        saveAttachments: { type: "boolean" },
+      },
+      required: ["messageId", "folderPath"],
+    }},
+    { name: "sendMail", inputSchema: {
+      type: "object",
+      properties: {
+        to: { type: "string" }, subject: { type: "string" }, body: { type: "string" },
+        attachments: { type: "array", items: { type: "string" } },
+      },
+      required: ["to", "subject", "body"],
+    }},
+  ];
+  const advValidate = createValidator(advTools);
+
+  it('handles empty string for required string param', () => {
+    const errors = advValidate('getMessage', {
+      messageId: '',
+      folderPath: '',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects constructor pollution attempt', () => {
+    const errors = advValidate('searchMessages', {
+      query: 'test',
+      constructor: 'evil',
+    });
+    assert.ok(errors.some(e => e.includes('Unknown parameter: constructor')));
+  });
+
+  it('handles very long parameter names gracefully', () => {
+    const longKey = 'x'.repeat(10000);
+    const args = { query: 'test', [longKey]: 'value' };
+    const errors = advValidate('searchMessages', args);
+    assert.ok(errors.some(e => e.includes('Unknown parameter')));
+  });
+
+  it('handles very long parameter values', () => {
+    const longValue = 'x'.repeat(100000);
+    const errors = advValidate('searchMessages', { query: longValue });
+    assert.equal(errors.length, 0);
+  });
+
+  it('handles deeply nested object where string expected', () => {
+    const errors = advValidate('searchMessages', {
+      query: { nested: { deep: { very: 'deep' } } },
+    });
+    assert.ok(errors.some(e => e.includes('must be string')));
+  });
+
+  it('handles array where string expected', () => {
+    const errors = advValidate('getMessage', {
+      messageId: ['id1', 'id2'],
+      folderPath: '/INBOX',
+    });
+    assert.ok(errors.some(e => e.includes('must be string')));
+  });
+
+  it('handles 0 as valid number', () => {
+    const errors = advValidate('searchMessages', { query: 'test', maxResults: 0 });
+    assert.equal(errors.length, 0);
+  });
+
+  it('handles boolean false as valid required field type check', () => {
+    const errors = advValidate('getMessage', {
+      messageId: false,
+      folderPath: '/INBOX',
+    });
+    assert.ok(errors.some(e => e.includes('must be string')));
+  });
+
+  it('handles massive number of unknown parameters', () => {
+    const args = { query: 'test' };
+    for (let i = 0; i < 100; i++) {
+      args[`unknown_param_${i}`] = `value_${i}`;
+    }
+    const errors = advValidate('searchMessages', args);
+    assert.equal(errors.length, 100);
+  });
+
+  it('handles all required params wrong type simultaneously', () => {
+    const errors = advValidate('sendMail', {
+      to: 123,
+      subject: true,
+      body: ['not', 'a', 'string'],
+    });
+    assert.equal(errors.length, 3);
+  });
+});
+
+// ─── Coercion tests ──────────────────────────────────────────────
+
+describe('Coercion: string-to-type conversion', () => {
+  /**
+   * Replicate coerceToolArgs from api.js.
+   */
+  function coerceToolArgs(name, args, toolSchemas) {
+    const schema = toolSchemas[name];
+    if (!schema) return args;
+    const props = schema.properties || {};
+    for (const [key, value] of Object.entries(args)) {
+      if (value === undefined || value === null) continue;
+      const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
+      if (!propSchema) continue;
+      const expected = propSchema.type;
+      if (expected === "boolean" && typeof value === "string") {
+        if (value === "true") args[key] = true;
+        else if (value === "false") args[key] = false;
+      } else if (expected === "number" && typeof value === "string") {
+        const n = Number(value);
+        if (Number.isFinite(n)) args[key] = n;
+      } else if (expected === "array" && typeof value === "string") {
+        try {
+          const parsed = JSON.parse(value);
+          if (Array.isArray(parsed)) args[key] = parsed;
+        } catch { /* leave as-is */ }
+      }
+    }
+    return args;
+  }
+
+  const schemas = {
+    searchMessages: {
+      properties: {
+        query: { type: "string" },
+        maxResults: { type: "number" },
+        offset: { type: "number" },
+        unreadOnly: { type: "boolean" },
+      },
+      required: ["query"],
+    },
+    sendMail: {
+      properties: {
+        to: { type: "string" },
+        subject: { type: "string" },
+        body: { type: "string" },
+        attachments: { type: "array" },
+      },
+      required: ["to", "subject", "body"],
+    },
+  };
+
+  it('coerces "true" string to boolean true', () => {
+    const args = { query: 'test', unreadOnly: 'true' };
+    coerceToolArgs('searchMessages', args, schemas);
+    assert.strictEqual(args.unreadOnly, true);
+  });
+
+  it('coerces "false" string to boolean false', () => {
+    const args = { query: 'test', unreadOnly: 'false' };
+    coerceToolArgs('searchMessages', args, schemas);
+    assert.strictEqual(args.unreadOnly, false);
+  });
+
+  it('leaves non-boolean strings unchanged for boolean fields', () => {
+    const args = { query: 'test', unreadOnly: 'yes' };
+    coerceToolArgs('searchMessages', args, schemas);
+    assert.strictEqual(args.unreadOnly, 'yes');
+  });
+
+  it('coerces numeric string to number', () => {
+    const args = { query: 'test', maxResults: '50' };
+    coerceToolArgs('searchMessages', args, schemas);
+    assert.strictEqual(args.maxResults, 50);
+  });
+
+  it('coerces "0" string to number 0', () => {
+    const args = { query: 'test', offset: '0' };
+    coerceToolArgs('searchMessages', args, schemas);
+    assert.strictEqual(args.offset, 0);
+  });
+
+  it('leaves non-numeric strings unchanged for number fields', () => {
+    const args = { query: 'test', maxResults: 'fifty' };
+    coerceToolArgs('searchMessages', args, schemas);
+    assert.strictEqual(args.maxResults, 'fifty');
+  });
+
+  it('coerces JSON array string to array', () => {
+    const args = { to: 'a@b.com', subject: 's', body: 'b', attachments: '["file1.pdf","file2.pdf"]' };
+    coerceToolArgs('sendMail', args, schemas);
+    assert.deepStrictEqual(args.attachments, ['file1.pdf', 'file2.pdf']);
+  });
+
+  it('leaves invalid JSON string unchanged for array fields', () => {
+    const args = { to: 'a@b.com', subject: 's', body: 'b', attachments: 'not-json' };
+    coerceToolArgs('sendMail', args, schemas);
+    assert.strictEqual(args.attachments, 'not-json');
+  });
+
+  it('does not coerce JSON object string to array', () => {
+    const args = { to: 'a@b.com', subject: 's', body: 'b', attachments: '{"key":"val"}' };
+    coerceToolArgs('sendMail', args, schemas);
+    assert.strictEqual(args.attachments, '{"key":"val"}');
+  });
+
+  it('does not touch unknown parameters', () => {
+    const args = { query: 'test', unknown: 'true' };
+    coerceToolArgs('searchMessages', args, schemas);
+    assert.strictEqual(args.unknown, 'true');
+  });
+});

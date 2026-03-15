@@ -15,3 +15,7 @@ async function init() {
 
 browser.runtime.onInstalled.addListener(init);
 browser.runtime.onStartup.addListener(init);
+
+// Also call init() directly — the event listeners above don't fire when
+// a user disables and re-enables the extension.
+init();

@@ -75,6 +75,7 @@ const sampleTools = [
         query: { type: "string" },
         folderPath: { type: "string" },
         maxResults: { type: "number" },
+        offset: { type: "number" },
         unreadOnly: { type: "boolean" },
         tag: { type: "string" },
       },
@@ -240,6 +241,42 @@ describe('Validation: updateMessage with tags', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must be string/);
+  });
+});
+
+describe('Validation: pagination parameters', () => {
+  it('accepts offset as number', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      offset: 50,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects offset as string', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      offset: 'fifty',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be number/);
+  });
+
+  it('accepts offset=0', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      offset: 0,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts offset with maxResults', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      offset: 100,
+      maxResults: 50,
+    });
+    assert.equal(errors.length, 0);
   });
 });
 
