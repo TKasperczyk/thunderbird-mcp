@@ -21,11 +21,22 @@ const resProto = Cc[
 const MCP_PORT = 8765;
 // Keep references to active attach timers to prevent GC before they fire.
 const _attachTimers = new Set();
+// Track temp files created for inline base64 attachments (cleaned up on shutdown).
+const _tempAttachFiles = new Set();
+const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
+let _tempFileCounter = 0;
 // Delay before injecting attachments into a newly opened compose window.
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 1000;
+// Internal IMAP/Thunderbird keywords that should not appear as user-visible tags
+const INTERNAL_KEYWORDS = new Set([
+  "junk", "notjunk", "$forwarded", "$replied",
+  "\\seen", "\\answered", "\\flagged", "\\deleted", "\\draft", "\\recent",
+  // Some IMAP servers store flags without the backslash prefix
+  "seen", "answered", "flagged", "deleted", "draft", "recent",
+]);
 
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
@@ -72,7 +83,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             maxResults: { type: "number", description: "Maximum number of results to return (default 50, max 200)" },
             sortOrder: { type: "string", description: "Date sort order: asc (oldest first) or desc (newest first, default)" },
             unreadOnly: { type: "boolean", description: "Only return unread messages (default: false)" },
-            flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" }
+            flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
+            tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." }
           },
           required: ["query"],
         },
@@ -105,7 +117,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", items: { type: "string" }, description: "Array of file paths to attach" },
+            attachments: { type: "array", description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
           },
           required: ["to", "subject", "body"],
         },
@@ -208,6 +220,50 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "createContact",
+        title: "Create Contact",
+        description: "Create a new contact in an address book",
+        inputSchema: {
+          type: "object",
+          properties: {
+            email: { type: "string", description: "Primary email address" },
+            displayName: { type: "string", description: "Display name" },
+            firstName: { type: "string", description: "First name" },
+            lastName: { type: "string", description: "Last name" },
+            addressBookId: { type: "string", description: "Address book directory ID (from searchContacts results). Defaults to the first writable address book." },
+          },
+          required: ["email"],
+        },
+      },
+      {
+        name: "updateContact",
+        title: "Update Contact",
+        description: "Update an existing contact's properties",
+        inputSchema: {
+          type: "object",
+          properties: {
+            contactId: { type: "string", description: "Contact UID (from searchContacts results)" },
+            email: { type: "string", description: "New primary email address" },
+            displayName: { type: "string", description: "New display name" },
+            firstName: { type: "string", description: "New first name" },
+            lastName: { type: "string", description: "New last name" },
+          },
+          required: ["contactId"],
+        },
+      },
+      {
+        name: "deleteContact",
+        title: "Delete Contact",
+        description: "Delete a contact from its address book",
+        inputSchema: {
+          type: "object",
+          properties: {
+            contactId: { type: "string", description: "Contact UID (from searchContacts results)" },
+          },
+          required: ["contactId"],
+        },
+      },
+      {
         name: "replyToMessage",
         title: "Reply to Message",
         description: "Open a reply compose window for a specific message with proper threading",
@@ -223,7 +279,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", items: { type: "string" }, description: "Array of file paths to attach" },
+            attachments: { type: "array", description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
           },
           required: ["messageId", "folderPath", "body"],
         },
@@ -243,7 +299,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", items: { type: "string" }, description: "Array of additional file paths to attach" },
+            attachments: { type: "array", description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
           },
           required: ["messageId", "folderPath", "to"],
         },
@@ -280,7 +336,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "updateMessage",
         title: "Update Message",
-        description: "Update one or more messages' read/flagged state and optionally move them to another folder or to Trash. Supply messageId for a single message or messageIds for bulk operations.",
+        description: "Update one or more messages' read/flagged/tagged state and optionally move them. Supply messageId for a single message or messageIds for bulk operations. Tags are Thunderbird keywords (e.g. '$label1' for Important, '$label2' for Work, or any custom string).",
         inputSchema: {
           type: "object",
           properties: {
@@ -289,6 +345,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             read: { type: "boolean", description: "Set to true/false to mark read/unread (optional)" },
             flagged: { type: "boolean", description: "Set to true/false to flag/unflag (optional)" },
+            addTags: { type: "array", items: { type: "string" }, description: "Tag keywords to add (e.g. ['$label1', 'project-x']). Thunderbird built-in tags: $label1 (Important), $label2 (Work), $label3 (Personal), $label4 (To Do), $label5 (Later)" },
+            removeTags: { type: "array", items: { type: "string" }, description: "Tag keywords to remove from the message(s)" },
             moveTo: { type: "string", description: "Destination folder URI (optional). Cannot be used with trash." },
             trash: { type: "boolean", description: "Set to true to move message to Trash (optional). Cannot be used with moveTo." },
           },
@@ -298,7 +356,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       {
         name: "createFolder",
         title: "Create Folder",
-        description: "Create a new mail subfolder under an existing folder",
+        description: "Create a new mail subfolder under an existing folder. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
         inputSchema: {
           type: "object",
           properties: {
@@ -306,6 +364,44 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             name: { type: "string", description: "Name for the new subfolder" },
           },
           required: ["parentFolderPath", "name"],
+        },
+      },
+      {
+        name: "renameFolder",
+        title: "Rename Folder",
+        description: "Rename an existing mail folder. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "URI of the folder to rename (from listFolders)" },
+            newName: { type: "string", description: "New name for the folder" },
+          },
+          required: ["folderPath", "newName"],
+        },
+      },
+      {
+        name: "deleteFolder",
+        title: "Delete Folder",
+        description: "Delete a mail folder and all its contents. Moves to Trash, or permanently deletes if already in Trash. Note: permanent deletion may prompt the user for confirmation. On IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "URI of the folder to delete (from listFolders)" },
+          },
+          required: ["folderPath"],
+        },
+      },
+      {
+        name: "moveFolder",
+        title: "Move Folder",
+        description: "Move a mail folder to a new parent folder within the same account. Note: on IMAP accounts, server-side completion is asynchronous; verify with listFolders.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "URI of the folder to move (from listFolders)" },
+            newParentPath: { type: "string", description: "URI of the destination parent folder (from listFolders)" },
+          },
+          required: ["folderPath", "newParentPath"],
         },
       },
       {
@@ -630,24 +726,101 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return file;
             }
 
+            /** Returns user-visible tag keywords from a message header, filtering out internal IMAP flags. */
+            function getUserTags(msgHdr) {
+              return (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
+            }
+
             /**
-             * Converts local file paths to attachment descriptors, validating existence upfront.
-             * Returns { descs: [{url, name, size}], failed: string[] }
+             * Converts attachment entries to attachment descriptors.
+             * Each entry can be:
+             *   - A string (file path) — resolved from disk
+             *   - An object { name, contentType, base64 } — decoded and written
+             *     to a temp file under <TmpD>/thunderbird-mcp/attachments/
+             * Returns { descs: [{url, name, size, contentType?}], failed: string[] }
              */
             function filePathsToAttachDescs(filePaths) {
               const descs = [];
               const failed = [];
               if (!filePaths || !Array.isArray(filePaths)) return { descs, failed };
-              for (const filePath of filePaths) {
+              for (const entry of filePaths) {
                 try {
-                  const file = createLocalFile(filePath);
-                  if (file.exists()) {
-                    descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: file.fileSize });
+                  if (typeof entry === "string") {
+                    // File path attachment
+                    const file = createLocalFile(entry);
+                    if (file.exists()) {
+                      descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: file.fileSize });
+                    } else {
+                      failed.push(entry);
+                    }
+                  } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
+                    // Inline base64 attachment — decode and write to temp file
+                    const b64Data = entry.base64 || entry.content;
+                    if (b64Data.length > MAX_BASE64_SIZE) {
+                      failed.push(`${entry.name} (exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB size limit)`);
+                      continue;
+                    }
+                    // Decode base64 to binary bytes
+                    let bytes;
+                    try {
+                      // Use the global atob when available, otherwise fall back
+                      const raw = typeof atob === "function" ? atob(b64Data) : ChromeUtils.base64Decode(b64Data);
+                      bytes = new Uint8Array(raw.length);
+                      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+                    } catch {
+                      // Fallback: manual base64 decode (atob may not be available in XPCOM context)
+                      try {
+                        const lookup = new Uint8Array(256);
+                        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                        for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
+                        const clean = b64Data.replace(/[^A-Za-z0-9+/]/g, "");
+                        const len = clean.length;
+                        const outLen = (len * 3) >> 2;
+                        bytes = new Uint8Array(outLen);
+                        let p = 0;
+                        for (let i = 0; i < len; i += 4) {
+                          const a = lookup[clean.charCodeAt(i)];
+                          const b = lookup[clean.charCodeAt(i + 1)];
+                          const c = lookup[clean.charCodeAt(i + 2)];
+                          const d = lookup[clean.charCodeAt(i + 3)];
+                          bytes[p++] = (a << 2) | (b >> 4);
+                          if (i + 2 < len) bytes[p++] = ((b & 15) << 4) | (c >> 2);
+                          if (i + 3 < len) bytes[p++] = ((c & 3) << 6) | d;
+                        }
+                        bytes = bytes.subarray(0, p);
+                      } catch {
+                        failed.push(`${entry.name} (invalid base64 data)`);
+                        continue;
+                      }
+                    }
+                    const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+                    tmpDir.append("thunderbird-mcp");
+                    tmpDir.append("attachments");
+                    if (!tmpDir.exists()) {
+                      tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+                    }
+                    const tmpFile = tmpDir.clone();
+                    const safeName = (entry.name || entry.filename || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
+                    tmpFile.append(`${Date.now()}_${++_tempFileCounter}_${safeName}`);
+                    // Write via XPCOM binary stream
+                    const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                      .createInstance(Ci.nsIFileOutputStream);
+                    ostream.init(tmpFile, 0x02 | 0x08 | 0x20, 0o600, 0);
+                    const bstream = Cc["@mozilla.org/binaryoutputstream;1"]
+                      .createInstance(Ci.nsIBinaryOutputStream);
+                    bstream.setOutputStream(ostream);
+                    bstream.writeByteArray(bytes, bytes.length);
+                    bstream.close();
+                    ostream.close();
+                    _tempAttachFiles.add(tmpFile.path);
+                    const desc = { url: Services.io.newFileURI(tmpFile).spec, name: entry.name || entry.filename, size: tmpFile.fileSize };
+                    if (entry.contentType) desc.contentType = entry.contentType;
+                    descs.push(desc);
                   } else {
-                    failed.push(filePath);
+                    failed.push(typeof entry === "object" ? JSON.stringify(entry) : String(entry));
                   }
-                } catch {
-                  failed.push(filePath);
+                } catch (e) {
+                  failed.push(typeof entry === "object" ? (entry.name || JSON.stringify(entry)) : String(entry));
                 }
               }
               return { descs, failed };
@@ -922,7 +1095,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, sortOrder, unreadOnly, flaggedOnly) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, sortOrder, unreadOnly, flaggedOnly, tag) {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -965,6 +1138,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (endDateTs !== null && msgDateTs > endDateTs) continue;
                     if (unreadOnly && msgHdr.isRead) continue;
                     if (flaggedOnly && !msgHdr.isFlagged) continue;
+                    if (tag) {
+                      const keywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/);
+                      if (!keywords.includes(tag)) continue;
+                    }
 
                     // IMPORTANT: Use mime2Decoded* properties for searching.
                     // Raw headers contain MIME encoding like "=?UTF-8?Q?...?="
@@ -980,6 +1157,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           !ccList.includes(lowerQuery)) continue;
                     }
 
+                    const msgTags = getUserTags(msgHdr);
                     results.push({
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -991,6 +1169,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
+                      tags: msgTags,
                       _dateTs: msgDateTs
                     });
                   }
@@ -1060,6 +1239,121 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               return results;
+            }
+
+            /**
+             * Find a contact card by UID across all address books.
+             * Returns { card, book } or { error }.
+             */
+            function findContactByUID(contactId) {
+              for (const book of MailServices.ab.directories) {
+                for (const card of book.childCards) {
+                  if (card.UID === contactId) {
+                    return { card, book };
+                  }
+                }
+              }
+              return { error: `Contact not found: ${contactId}` };
+            }
+
+            function createContact(email, displayName, firstName, lastName, addressBookId) {
+              try {
+                if (typeof email !== "string" || !email) {
+                  return { error: "email must be a non-empty string" };
+                }
+
+                // Find the target address book
+                let targetBook = null;
+                if (addressBookId) {
+                  for (const book of MailServices.ab.directories) {
+                    if (book.dirPrefId === addressBookId || book.UID === addressBookId || book.URI === addressBookId) {
+                      targetBook = book;
+                      break;
+                    }
+                  }
+                  if (!targetBook) {
+                    return { error: `Address book not found: ${addressBookId}` };
+                  }
+                } else {
+                  // Use the first writable address book
+                  for (const book of MailServices.ab.directories) {
+                    if (!book.readOnly) {
+                      targetBook = book;
+                      break;
+                    }
+                  }
+                  if (!targetBook) {
+                    return { error: "No writable address book found" };
+                  }
+                }
+
+                const card = Cc["@mozilla.org/addressbook/cardproperty;1"]
+                  .createInstance(Ci.nsIAbCard);
+                card.primaryEmail = email;
+                if (displayName) card.displayName = displayName;
+                if (firstName) card.firstName = firstName;
+                if (lastName) card.lastName = lastName;
+
+                const newCard = targetBook.addCard(card);
+                return {
+                  success: true,
+                  id: newCard.UID,
+                  email: newCard.primaryEmail,
+                  displayName: newCard.displayName,
+                  addressBook: targetBook.dirName,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function updateContact(contactId, email, displayName, firstName, lastName) {
+              try {
+                if (typeof contactId !== "string" || !contactId) {
+                  return { error: "contactId must be a non-empty string" };
+                }
+
+                const found = findContactByUID(contactId);
+                if (found.error) return found;
+                const { card, book } = found;
+
+                if (email !== undefined) card.primaryEmail = email;
+                if (displayName !== undefined) card.displayName = displayName;
+                if (firstName !== undefined) card.firstName = firstName;
+                if (lastName !== undefined) card.lastName = lastName;
+
+                book.modifyCard(card);
+                return {
+                  success: true,
+                  id: card.UID,
+                  email: card.primaryEmail,
+                  displayName: card.displayName,
+                  firstName: card.firstName,
+                  lastName: card.lastName,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function deleteContact(contactId) {
+              try {
+                if (typeof contactId !== "string" || !contactId) {
+                  return { error: "contactId must be a non-empty string" };
+                }
+
+                const found = findContactByUID(contactId);
+                if (found.error) return found;
+                const { card, book } = found;
+
+                book.deleteCards([card]);
+                return {
+                  success: true,
+                  message: `Contact "${card.displayName || card.primaryEmail}" deleted`,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
             }
 
             function listCalendars() {
@@ -1590,6 +1884,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     }
 
+                    const msgTags = getUserTags(msgHdr);
                     const baseResponse = {
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -1597,6 +1892,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
                       ccList: msgHdr.ccList,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+                      tags: msgTags,
                       body,
                       bodyIsHtml,
                       attachments
@@ -2074,6 +2370,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (unreadOnly && msgHdr.isRead) continue;
                     if (flaggedOnly && !msgHdr.isFlagged) continue;
 
+                    const msgTags = getUserTags(msgHdr);
                     results.push({
                       id: msgHdr.messageId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
@@ -2084,6 +2381,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       folderPath: folder.URI,
                       read: msgHdr.isRead,
                       flagged: msgHdr.isFlagged,
+                      tags: msgTags,
                       _dateTs: msgDateTs
                     });
                   }
@@ -2198,7 +2496,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function updateMessage(messageId, messageIds, folderPath, read, flagged, moveTo, trash) {
+            function updateMessage(messageId, messageIds, folderPath, read, flagged, addTags, removeTags, moveTo, trash) {
               try {
                 // Normalize to an array of IDs
                 if (typeof messageIds === "string") {
@@ -2223,6 +2521,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (trash !== undefined) trash = trash === true || trash === "true";
                 if (moveTo !== undefined && (typeof moveTo !== "string" || !moveTo)) {
                   return { error: "moveTo must be a non-empty string" };
+                }
+                // Coerce tag arrays (MCP clients may send JSON strings)
+                if (typeof addTags === "string") {
+                  try { addTags = JSON.parse(addTags); } catch { /* leave as-is */ }
+                }
+                if (typeof removeTags === "string") {
+                  try { removeTags = JSON.parse(removeTags); } catch { /* leave as-is */ }
+                }
+                if (addTags !== undefined && !Array.isArray(addTags)) {
+                  return { error: "addTags must be an array of tag keyword strings" };
+                }
+                if (removeTags !== undefined && !Array.isArray(removeTags)) {
+                  return { error: "removeTags must be an array of tag keyword strings" };
                 }
 
                 if (moveTo && trash === true) {
@@ -2272,6 +2583,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (flagged !== undefined) {
                   for (const hdr of foundHdrs) hdr.markFlagged(flagged);
                   actions.push({ type: "flagged", value: flagged });
+                }
+
+                if (addTags || removeTags) {
+                  const tagsToAdd = (addTags || []).filter(t => typeof t === "string" && t);
+                  const tagsToRemove = (removeTags || []).filter(t => typeof t === "string" && t);
+                  // Use folder-level keyword APIs for proper IMAP sync
+                  if (tagsToAdd.length > 0) {
+                    folder.addKeywordsToMessages(foundHdrs, tagsToAdd.join(" "));
+                    actions.push({ type: "addTags", value: tagsToAdd });
+                  }
+                  if (tagsToRemove.length > 0) {
+                    folder.removeKeywordsFromMessages(foundHdrs, tagsToRemove.join(" "));
+                    actions.push({ type: "removeTags", value: tagsToRemove });
+                  }
                 }
 
                 let targetFolder = null;
@@ -2343,6 +2668,116 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: `Folder "${name}" already exists under this parent` };
                 }
                 return { error: msg };
+              }
+            }
+
+            function renameFolder(folderPath, newName) {
+              try {
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
+                }
+                if (typeof newName !== "string" || !newName) {
+                  return { error: "newName must be a non-empty string" };
+                }
+
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+
+                folder.rename(newName, null);
+                return {
+                  success: true,
+                  message: `Folder renamed to "${newName}"`,
+                  oldPath: folderPath,
+                };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function deleteFolder(folderPath) {
+              try {
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
+                }
+
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+                const folderName = folder.prettyName || folder.name || folderPath;
+
+                const parent = folder.parent;
+                if (!parent) {
+                  return { error: "Cannot delete a root folder" };
+                }
+
+                // Check if folder is already in Trash — if so, permanently delete
+                const TRASH_FLAG = 0x00000100;
+                let inTrash = false;
+                let ancestor = folder;
+                while (ancestor) {
+                  try {
+                    if (ancestor.getFlag && ancestor.getFlag(TRASH_FLAG)) {
+                      inTrash = true;
+                      break;
+                    }
+                  } catch { /* ignore */ }
+                  ancestor = ancestor.parent;
+                }
+
+                if (inTrash) {
+                  // Permanently delete — deleteSelf requires a msgWindow
+                  const win = Services.wm.getMostRecentWindow("mail:3pane");
+                  folder.deleteSelf(win?.msgWindow ?? null);
+                  return { success: true, message: `Folder "${folderName}" permanently deleted` };
+                } else {
+                  // Move to trash
+                  const trashFolder = findTrashFolder(folder);
+                  if (!trashFolder) {
+                    return { error: "Trash folder not found" };
+                  }
+                  MailServices.copy.copyFolder(folder, trashFolder, true, null, null);
+                  return { success: true, message: `Folder "${folderName}" moved to Trash` };
+                }
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function moveFolder(folderPath, newParentPath) {
+              try {
+                if (typeof folderPath !== "string" || !folderPath) {
+                  return { error: "folderPath must be a non-empty string" };
+                }
+                if (typeof newParentPath !== "string" || !newParentPath) {
+                  return { error: "newParentPath must be a non-empty string" };
+                }
+
+                const folder = MailServices.folderLookup.getFolderForURL(folderPath);
+                if (!folder) {
+                  return { error: `Folder not found: ${folderPath}` };
+                }
+                const folderName = folder.prettyName || folder.name || folderPath;
+
+                const newParent = MailServices.folderLookup.getFolderForURL(newParentPath);
+                if (!newParent) {
+                  return { error: `Destination folder not found: ${newParentPath}` };
+                }
+                const parentName = newParent.prettyName || newParent.name || newParentPath;
+
+                if (folder.parent && folder.parent.URI === newParentPath) {
+                  return { error: "Folder is already under this parent" };
+                }
+
+                MailServices.copy.copyFolder(folder, newParent, true, null, null);
+                return {
+                  success: true,
+                  message: `Folder "${folderName}" moved to "${parentName}"`,
+                };
+              } catch (e) {
+                return { error: e.toString() };
               }
             }
 
@@ -2811,11 +3246,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.sortOrder, args.unreadOnly, args.flaggedOnly);
+                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments);
                 case "searchContacts":
                   return searchContacts(args.query || "");
+                case "createContact":
+                  return createContact(args.email, args.displayName, args.firstName, args.lastName, args.addressBookId);
+                case "updateContact":
+                  return updateContact(args.contactId, args.email, args.displayName, args.firstName, args.lastName);
+                case "deleteContact":
+                  return deleteContact(args.contactId);
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
@@ -2839,9 +3280,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
-                  return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.moveTo, args.trash);
+                  return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash);
                 case "createFolder":
                   return createFolder(args.parentFolderPath, args.name);
+                case "renameFolder":
+                  return renameFolder(args.folderPath, args.newName);
+                case "deleteFolder":
+                  return deleteFolder(args.folderPath);
+                case "moveFolder":
+                  return moveFolder(args.folderPath, args.newParentPath);
                 case "listFilters":
                   return listFilters(args.accountId);
                 case "createFilter":
@@ -2989,6 +3436,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   }
 
   onShutdown(isAppShutdown) {
+    // Always clean up temp attachment files (even on app shutdown) to avoid
+    // leaving sensitive decoded attachments on disk.
+    for (const tmpPath of _tempAttachFiles) {
+      try {
+        const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+        f.initWithPath(tmpPath);
+        if (f.exists()) f.remove(false);
+      } catch {}
+    }
+    _tempAttachFiles.clear();
     if (isAppShutdown) return;
     resProto.setSubstitution("thunderbird-mcp", null);
     Services.obs.notifyObservers(null, "startupcache-invalidate");
