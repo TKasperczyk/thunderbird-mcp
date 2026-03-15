@@ -92,7 +92,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Text to search in subject, author, or recipients (use empty string to match all)" },
+            query: { type: "string", description: "Text to search in subject, author, recipients, or body preview (use empty string to match all)" },
             folderPath: { type: "string", description: "Optional folder URI (from listFolders) to limit search to that folder and its subfolders" },
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
             endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date. Date-only strings (e.g. '2024-01-15') include the full day." },
@@ -1436,20 +1436,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // IMPORTANT: Use mime2Decoded* properties for searching.
                     // Raw headers contain MIME encoding like "=?UTF-8?Q?...?="
                     // which won't match plain text searches.
+                    const preview = msgHdr.getStringProperty("preview") || "";
                     if (hasQuery) {
                       const subject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
                       const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
                       const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
                       const ccList = (msgHdr.ccList || "").toLowerCase();
+                      // Search headers first, then body preview (first ~200 chars stored in DB)
                       if (!subject.includes(lowerQuery) &&
                           !author.includes(lowerQuery) &&
                           !recipients.includes(lowerQuery) &&
-                          !ccList.includes(lowerQuery)) continue;
+                          !ccList.includes(lowerQuery) &&
+                          !preview.toLowerCase().includes(lowerQuery)) continue;
                     }
 
                     const msgTags = getUserTags(msgHdr);
-                    results.push({
+                    const result = {
                       id: msgHdr.messageId,
+                      threadId: msgHdr.threadId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
                       author: msgHdr.mime2DecodedAuthor || msgHdr.author,
                       recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
@@ -1461,7 +1465,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       flagged: msgHdr.isFlagged,
                       tags: msgTags,
                       _dateTs: msgDateTs
-                    });
+                    };
+                    if (preview) result.preview = preview;
+                    results.push(result);
                   }
                 } catch {
                   // Skip inaccessible folders
@@ -2680,8 +2686,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (flaggedOnly && !msgHdr.isFlagged) continue;
 
                     const msgTags = getUserTags(msgHdr);
-                    results.push({
+                    const preview = msgHdr.getStringProperty("preview") || "";
+                    const result = {
                       id: msgHdr.messageId,
+                      threadId: msgHdr.threadId,
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
                       author: msgHdr.mime2DecodedAuthor || msgHdr.author,
                       recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
@@ -2692,7 +2700,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       flagged: msgHdr.isFlagged,
                       tags: msgTags,
                       _dateTs: msgDateTs
-                    });
+                    };
+                    if (preview) result.preview = preview;
+                    results.push(result);
                   }
                 } catch {
                   // Skip inaccessible folders
