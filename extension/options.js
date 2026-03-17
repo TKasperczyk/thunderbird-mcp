@@ -17,14 +17,8 @@ const saveToolsStatus = document.getElementById("saveToolsStatus");
 let currentAccounts = [];
 let currentTools = [];
 
-const TOOL_GROUPS = [
-  { label: "Messages", tools: ["searchMessages", "getMessage", "getRecentMessages", "sendMail", "replyToMessage", "forwardMessage", "updateMessage", "deleteMessages"] },
-  { label: "Folders", tools: ["createFolder", "renameFolder", "moveFolder", "deleteFolder"] },
-  { label: "Contacts", tools: ["searchContacts", "createContact", "updateContact", "deleteContact"] },
-  { label: "Calendar", tools: ["listCalendars", "listEvents", "createEvent", "updateEvent", "deleteEvent", "createTask"] },
-  { label: "Filters", tools: ["listFilters", "createFilter", "updateFilter", "deleteFilter", "reorderFilters", "applyFilters"] },
-  { label: "System", tools: ["listAccounts", "listFolders", "getAccountAccess"] },
-];
+// CRUD labels for sub-group headers
+const CRUD_LABELS = { read: "Read", create: "Create", update: "Update", delete: "Delete" };
 
 async function loadServerInfo() {
   try {
@@ -40,9 +34,25 @@ async function loadServerInfo() {
       serverPort.textContent = "--";
       connFile.textContent = "--";
     }
-    if (info.buildCommit) {
-      const date = info.buildDate ? " (" + info.buildDate.replace("T", " ").replace(/\.\d+Z$/, " UTC") + ")" : "";
-      buildInfo.textContent = info.buildCommit + date;
+    if (info.buildVersion) {
+      // Parse git describe: "v0.2.0-7-g1461f1a+dirty" → tag, commits, hash, dirty
+      const m = info.buildVersion.match(/^(v[\d.]+)(?:-(\d+)-g([0-9a-f]+))?(\+dirty)?$/);
+      let display;
+      if (m) {
+        const [, tag, commits, hash, dirty] = m;
+        display = tag;
+        if (commits && commits !== "0") display += ` +${commits}`;
+        display += ` (${hash || tag})`;
+        if (dirty) {
+          display += " +dirty";
+          if (info.buildDate) {
+            display += " " + info.buildDate.replace("T", " ").replace(/\.\d+Z$/, " UTC");
+          }
+        }
+      } else {
+        display = info.buildVersion;
+      }
+      buildInfo.textContent = display;
     } else {
       buildInfo.textContent = "--";
     }
@@ -137,58 +147,69 @@ async function loadToolAccess() {
   try {
     const data = await browser.mcpServer.getToolAccessConfig();
     currentTools = data.tools || [];
+    const groupLabels = data.groups || {};
 
     if (currentTools.length === 0) {
       toolList.innerHTML = "<li>No tools found.</li>";
       return;
     }
 
-    // Index tools by name for quick lookup
-    const toolMap = {};
-    for (const tool of currentTools) {
-      toolMap[tool.name] = tool;
-    }
-
     toolList.innerHTML = "";
-    for (const group of TOOL_GROUPS) {
-      // Group header
-      const header = document.createElement("li");
-      header.className = "tool-group-header";
-      header.textContent = group.label;
-      toolList.appendChild(header);
 
-      // Tools in this group
-      for (const toolName of group.tools) {
-        const tool = toolMap[toolName];
-        if (!tool) continue;
+    // Tools arrive pre-sorted by group then CRUD order from the server.
+    // Build grouped structure from tool metadata.
+    let currentGroup = null;
+    let currentCrud = null;
 
-        const li = document.createElement("li");
-        const checkbox = document.createElement("input");
-        checkbox.type = "checkbox";
-        checkbox.id = "tool-" + tool.name;
-        checkbox.value = tool.name;
-        checkbox.checked = tool.enabled;
-        if (tool.undisableable) {
-          checkbox.disabled = true;
-        }
-        checkbox.addEventListener("change", () => {
-          saveToolsStatus.textContent = "";
-        });
+    for (const tool of currentTools) {
+      const group = tool.group || "other";
+      const crud = tool.crud || "other";
 
-        const label = document.createElement("label");
-        label.htmlFor = checkbox.id;
-        label.textContent = tool.name;
-        if (tool.undisableable) {
-          const lockSpan = document.createElement("span");
-          lockSpan.className = "account-type";
-          lockSpan.textContent = "required";
-          label.appendChild(lockSpan);
-        }
-
-        li.appendChild(checkbox);
-        li.appendChild(label);
-        toolList.appendChild(li);
+      // New group header
+      if (group !== currentGroup) {
+        currentGroup = group;
+        currentCrud = null;
+        const header = document.createElement("li");
+        header.className = "tool-group-header";
+        header.textContent = groupLabels[group] || group.charAt(0).toUpperCase() + group.slice(1);
+        toolList.appendChild(header);
       }
+
+      // New CRUD sub-header within group
+      if (crud !== currentCrud) {
+        currentCrud = crud;
+        const subHeader = document.createElement("li");
+        subHeader.className = "tool-crud-header";
+        subHeader.textContent = CRUD_LABELS[crud] || crud.charAt(0).toUpperCase() + crud.slice(1);
+        toolList.appendChild(subHeader);
+      }
+
+      const li = document.createElement("li");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.id = "tool-" + tool.name;
+      checkbox.value = tool.name;
+      checkbox.checked = tool.enabled;
+      if (tool.undisableable) {
+        checkbox.disabled = true;
+      }
+      checkbox.addEventListener("change", () => {
+        saveToolsStatus.textContent = "";
+      });
+
+      const label = document.createElement("label");
+      label.htmlFor = checkbox.id;
+      label.textContent = tool.name;
+      if (tool.undisableable) {
+        const lockSpan = document.createElement("span");
+        lockSpan.className = "account-type";
+        lockSpan.textContent = "required";
+        label.appendChild(lockSpan);
+      }
+
+      li.appendChild(checkbox);
+      li.appendChild(label);
+      toolList.appendChild(li);
     }
 
     saveToolsBtn.disabled = false;
