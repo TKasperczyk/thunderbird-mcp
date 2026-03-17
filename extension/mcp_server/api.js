@@ -2765,9 +2765,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: `Invalid displayMode: "${mode}". Must be one of: ${VALID_DISPLAY_MODES.join(", ")}` };
               }
 
-              const win = Services.wm.getMostRecentWindow("mail:3pane");
-              if (!win) return { error: "No Thunderbird mail window found" };
-
               try {
                 const { MailUtils } = ChromeUtils.importESModule(
                   "resource:///modules/MailUtils.sys.mjs"
@@ -2775,6 +2772,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 switch (mode) {
                   case "tab": {
+                    const win = Services.wm.getMostRecentWindow("mail:3pane");
+                    if (!win) return { error: "No Thunderbird mail window found (required for tab mode)" };
                     const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
                     const tabmail = win.document.getElementById("tabmail");
                     if (!tabmail) return { error: "Could not access tabmail interface" };
@@ -2782,6 +2781,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     break;
                   }
                   case "window":
+                    // openMessageInNewWindow doesn't need an existing 3pane window
                     MailUtils.openMessageInNewWindow(msgHdr);
                     break;
                   case "3pane":
@@ -3040,9 +3040,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 if (addTags || removeTags) {
-                  // Validate: only allow safe IMAP keyword characters (RFC 3501 atom chars)
-                  // Blocks whitespace, null bytes, parens, braces, wildcards, quotes, backslash
-                  const VALID_TAG = /^[a-zA-Z0-9_$.\-]+$/;
+                  // Validate: allow IMAP atom chars per RFC 3501 plus & for modified UTF-7
+                  // tag keys that Thunderbird generates for non-ASCII labels.
+                  // Blocks whitespace, null bytes, parens, braces, wildcards, quotes, backslash.
+                  const VALID_TAG = /^[a-zA-Z0-9_$.\-&+!']+$/;
                   const tagsToAdd = (addTags || []).filter(t => typeof t === "string" && VALID_TAG.test(t));
                   const tagsToRemove = (removeTags || []).filter(t => typeof t === "string" && VALID_TAG.test(t));
                   // Use folder-level keyword APIs for proper IMAP sync
