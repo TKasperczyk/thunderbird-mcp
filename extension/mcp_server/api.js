@@ -135,7 +135,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
+            attachments: {
+              type: "array",
+              description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
+              items: {
+                oneOf: [
+                  { type: "string", description: "Absolute file path to attach" },
+                  {
+                    type: "object",
+                    properties: {
+                      name: { type: "string", description: "Attachment filename" },
+                      contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
+                      base64: { type: "string", description: "Base64-encoded file content" },
+                    },
+                    required: ["name", "contentType", "base64"],
+                    additionalProperties: false,
+                  },
+                ],
+              },
+            },
           },
           required: ["to", "subject", "body"],
         },
@@ -309,7 +327,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
+            attachments: {
+              type: "array",
+              description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
+              items: {
+                oneOf: [
+                  { type: "string", description: "Absolute file path to attach" },
+                  {
+                    type: "object",
+                    properties: {
+                      name: { type: "string", description: "Attachment filename" },
+                      contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
+                      base64: { type: "string", description: "Base64-encoded file content" },
+                    },
+                    required: ["name", "contentType", "base64"],
+                    additionalProperties: false,
+                  },
+                ],
+              },
+            },
           },
           required: ["messageId", "folderPath", "body"],
         },
@@ -330,7 +366,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            attachments: { type: "array", description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})" },
+            attachments: {
+              type: "array",
+              description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})",
+              items: {
+                oneOf: [
+                  { type: "string", description: "Absolute file path to attach" },
+                  {
+                    type: "object",
+                    properties: {
+                      name: { type: "string", description: "Attachment filename" },
+                      contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
+                      base64: { type: "string", description: "Base64-encoded file content" },
+                    },
+                    required: ["name", "contentType", "base64"],
+                    additionalProperties: false,
+                  },
+                ],
+              },
+            },
           },
           required: ["messageId", "folderPath", "to"],
         },
@@ -556,10 +610,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             conditions: {
               type: "array",
               description: "Replace all conditions (optional, same format as createFilter)",
+              items: {
+                type: "object",
+                properties: {
+                  attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, body, date, priority, status, size, ageInDays, hasAttachment, junkStatus, tag, otherHeader" },
+                  op: { type: "string", description: "Operator: contains, doesntContain, is, isnt, isEmpty, beginsWith, endsWith, isGreaterThan, isLessThan, isBefore, isAfter, matches, doesntMatch" },
+                  value: { type: "string", description: "Value to match against" },
+                  booleanAnd: { type: "boolean", description: "true=AND with previous, false=OR (default: true)" },
+                  header: { type: "string", description: "Custom header name (only when attrib is otherHeader)" },
+                },
+              },
             },
             actions: {
               type: "array",
               description: "Replace all actions (optional, same format as createFilter)",
+              items: {
+                type: "object",
+                properties: {
+                  type: { type: "string", description: "Action: moveToFolder, copyToFolder, markRead, markUnread, markFlagged, addTag, changePriority, delete, stopExecution, forward, reply" },
+                  value: { type: "string", description: "Action parameter (folder URI for move/copy, tag name for addTag, priority for changePriority, email for forward)" },
+                },
+              },
             },
           },
           required: ["accountId", "filterIndex"],

@@ -90,7 +90,7 @@ const sampleTools = [
         to: { type: "string" },
         subject: { type: "string" },
         body: { type: "string" },
-        attachments: { type: "array" },
+        attachments: { type: "array", items: { oneOf: [{ type: "string" }, { type: "object" }] } },
       },
       required: ["to", "subject", "body"],
     },
