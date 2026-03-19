@@ -1,6 +1,6 @@
 # Thunderbird MCP
 
-[![Tools](https://img.shields.io/badge/35_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/36_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -17,9 +17,9 @@ Give your AI assistant full access to Thunderbird — search mail, compose messa
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 35 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 36 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
-Compose tools open a review window before sending. **Nothing gets sent without your approval.**
+Compose tools open a review window before sending by default. Set `skipReview` to send directly when you've already approved the content upstream. **Nothing gets sent without your approval.**
 
 ---
 
@@ -44,7 +44,7 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | `listAccounts` | List all email accounts and their identities |
 | `listFolders` | Browse folder tree with message counts — filter by account or subtree |
 | `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. |
-| `getMessage` | Read full email content with optional attachment saving -- includes inline CID images |
+| `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Optional attachment saving. Includes inline CID images. |
 | `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
 | `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
 | `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move between folders, or trash -- supports bulk via `messageIds` |
@@ -60,11 +60,11 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 
 | Tool | Description |
 |------|-------------|
-| `sendMail` | Open a compose window with pre-filled recipients, subject, and body |
-| `replyToMessage` | Reply with quoted original and proper threading |
-| `forwardMessage` | Forward with all original attachments preserved |
+| `sendMail` | Compose a new email -- opens a review window, or set `skipReview` to send directly |
+| `replyToMessage` | Reply with quoted original and proper threading -- supports `skipReview` |
+| `forwardMessage` | Forward with all original attachments preserved -- supports `skipReview` |
 
-All compose tools open a window for you to review and edit before sending. Attachments can be file paths or inline base64 objects.
+All compose tools open a window for you to review and edit before sending by default. Set `skipReview: true` to send directly when you've already approved the content. Attachments can be file paths or inline base64 objects.
 
 ### Filters
 
