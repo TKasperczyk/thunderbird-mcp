@@ -1292,17 +1292,41 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /**
              * Sends a message directly via nsIMsgSend without opening a compose window.
              * Used by composeMail, replyToMessage, forwardMessage when skipReview=true.
+             *
+             * Handles two createAndSendMessage signatures:
+             * - TB 102-127 (C++): 18 args, includes aAttachments + aPreloadedAttachments
+             * - TB 128+   (JS):  16 args, attachments via composeFields only
+             * Attachments are always added to composeFields (works in both).
+             * We try the modern 16-arg call first; if TB throws
+             * NS_ERROR_XPC_NOT_ENOUGH_ARGS, fall back to the legacy 18-arg call.
              */
             function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType) {
+              if (!identity) {
+                return Promise.resolve({ error: "No identity available for direct send" });
+              }
+
+              const SEND_TIMEOUT_MS = 120000; // 2 min safety timeout
+
               return new Promise((resolve) => {
+                let settled = false;
+                const settle = (result) => {
+                  if (!settled) {
+                    settled = true;
+                    resolve(result);
+                  }
+                };
+
+                // Safety timeout -- if neither listener callback nor error fires
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                timer.initWithCallback({
+                  notify() { settle({ error: "Send timed out after " + (SEND_TIMEOUT_MS / 1000) + "s" }); }
+                }, SEND_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+
                 try {
                   const msgSend = Cc["@mozilla.org/messengercompose/send;1"]
                     .createInstance(Ci.nsIMsgSend);
 
-                  // Build nsIMutableArray of nsIMsgAttachment
-                  const attachArray = Cc["@mozilla.org/array;1"]
-                    .createInstance(Ci.nsIMutableArray);
-
+                  // Add attachments to composeFields (works in all TB versions)
                   for (const desc of attachDescs) {
                     try {
                       const att = Cc["@mozilla.org/messengercompose/attachment;1"]
@@ -1311,7 +1335,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       att.name = desc.name;
                       if (desc.size != null) att.size = desc.size;
                       if (desc.contentType) att.contentType = desc.contentType;
-                      attachArray.appendElement(att);
+                      composeFields.addAttachment(att);
                     } catch {}
                   }
 
@@ -1336,24 +1360,29 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     QueryInterface: ChromeUtils.generateQI(["nsIMsgSendListener"]),
                     onStartSending() {},
                     onProgress() {},
+                    onSendProgress() {},
                     onStatus() {},
                     onStopSending(msgID, status) {
+                      timer.cancel();
                       if (Components.isSuccessCode(status)) {
-                        resolve({ success: true, message: "Message sent" });
+                        settle({ success: true, message: "Message sent" });
                       } else {
-                        resolve({ error: `Send failed (status: 0x${status.toString(16)})` });
+                        settle({ error: `Send failed (status: 0x${status.toString(16)})` });
                       }
                     },
                     onGetDraftFolderURI() {},
                     onSendNotPerformed(msgID, status) {
-                      resolve({ error: "Send was not performed" });
+                      timer.cancel();
+                      settle({ error: "Send was not performed" });
                     },
                     onTransportSecurityError(msgID, status, secInfo, location) {
-                      resolve({ error: `Transport security error${location ? ": " + location : ""}` });
+                      timer.cancel();
+                      settle({ error: `Transport security error${location ? ": " + location : ""}` });
                     },
                   };
 
-                  msgSend.createAndSendMessage(
+                  // Common args shared by both signatures (positions 1-10)
+                  const commonArgs = [
                     null,                           // editor
                     identity,                       // identity
                     accountKey,                     // account key
@@ -1364,17 +1393,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     null,                           // msgToReplace
                     "text/html",                    // body type
                     body,                           // body
-                    attachArray,                    // attachments
-                    null,                           // preloaded attachments
+                  ];
+
+                  // Tail args shared by both (parentWindow..compType)
+                  const tailArgs = [
                     null,                           // parent window
                     null,                           // progress
                     listener,                       // listener
                     "",                             // password
                     originalMsgURI || "",           // original msg URI
-                    compType                        // compose type
-                  );
+                    compType,                       // compose type
+                  ];
+
+                  // Try modern 16-arg signature first (TB 128+).
+                  // On TB 102-127 this throws NS_ERROR_XPC_NOT_ENOUGH_ARGS,
+                  // so we fall back to legacy 18-arg with null attachment params
+                  // (attachments already on composeFields).
+                  try {
+                    msgSend.createAndSendMessage(...commonArgs, ...tailArgs);
+                  } catch {
+                    msgSend.createAndSendMessage(...commonArgs, null, null, ...tailArgs);
+                  }
                 } catch (e) {
-                  resolve({ error: e.toString() });
+                  timer.cancel();
+                  settle({ error: e.toString() });
                 }
               });
             }
@@ -1492,6 +1534,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function setComposeIdentity(msgComposeParams, from, fallbackServer) {
               const identity = findIdentity(from);
+              let isRestricted = false;
               if (identity) {
                 // Verify the identity's account is accessible
                 for (const account of MailServices.accounts.accounts) {
@@ -1499,14 +1542,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   for (let i = 0; i < identities.length; i++) {
                     if (identities[i].key === identity.key) {
                       if (!isAccountAllowed(account.key)) {
-                        return `identity ${from} belongs to restricted account, using default`;
+                        isRestricted = true;
                       }
                       break;
                     }
                   }
                 }
-                msgComposeParams.identity = identity;
-                return "";
+                if (!isRestricted) {
+                  msgComposeParams.identity = identity;
+                  return "";
+                }
+                // Restricted -- fall through to default identity resolution
               }
               // Fallback to default identity for the account
               if (fallbackServer) {
@@ -1535,6 +1581,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "No accessible identity found -- all accounts are restricted" };
                 }
               }
+              if (isRestricted) return `identity ${from} belongs to restricted account, using default`;
               return from ? `unknown identity: ${from}, using accessible default` : "";
             }
 
