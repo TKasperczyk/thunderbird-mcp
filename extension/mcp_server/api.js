@@ -252,6 +252,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "listTasks",
+        group: "calendar", crud: "read",
+        title: "List Tasks",
+        description: "List tasks/to-dos from Thunderbird calendars, optionally filtered by completion status or due date",
+        inputSchema: {
+          type: "object",
+          properties: {
+            calendarId: { type: "string", description: "Calendar ID to query (from listCalendars). If omitted, queries all task-capable calendars." },
+            completed: { type: "boolean", description: "Filter by completion status. true = completed only, false = outstanding only. Omit for all tasks." },
+            dueBefore: { type: "string", description: "Return tasks due before this ISO 8601 date" },
+            maxResults: { type: "integer", description: "Maximum number of tasks to return (default: 100, max: 500)" },
+          },
+          required: [],
+        },
+      },
+      {
         name: "searchContacts",
         group: "contacts", crud: "read",
         title: "Search Contacts",
@@ -2332,6 +2348,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return result;
             }
 
+            function formatTask(item, calendar) {
+              const completed = item.isCompleted || (item.percentComplete === 100);
+              const priority = item.priority || 0; // 0=undefined, 1=high, 5=normal, 9=low per iCal
+              return {
+                id: item.id,
+                calendarId: calendar.id,
+                calendarName: calendar.name,
+                title: item.title || "",
+                dueDate: calDateToISO(item.dueDate),
+                startDate: calDateToISO(item.entryDate),
+                completedDate: calDateToISO(item.completedDate),
+                completed,
+                percentComplete: item.percentComplete || 0,
+                priority,
+                description: item.getProperty("DESCRIPTION") || "",
+              };
+            }
+
             async function listEvents(calendarId, startDate, endDate, maxResults) {
               if (!cal) {
                 return { error: "Calendar not available" };
@@ -2397,6 +2431,89 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 results.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+                return results.slice(0, limit);
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function listTasks(calendarId, completed, dueBefore, maxResults) {
+              if (!cal) return { error: "Calendar not available" };
+              try {
+                const calendars = cal.manager.getCalendars();
+                let targets = calendars.filter(c =>
+                  c.getProperty("capabilities.tasks.supported") !== false
+                );
+                if (calendarId) {
+                  const found = calendars.find(c => c.id === calendarId);
+                  if (!found) return { error: `Calendar not found: ${calendarId}` };
+                  if (found.getProperty("capabilities.tasks.supported") === false) {
+                    return { error: `Calendar "${found.name}" does not support tasks` };
+                  }
+                  targets = [found];
+                }
+
+                let dueBeforeDt = null;
+                if (dueBefore) {
+                  const js = new Date(dueBefore);
+                  if (isNaN(js.getTime())) return { error: `Invalid dueBefore: ${dueBefore}` };
+                  dueBeforeDt = js;
+                }
+
+                const limit = Math.min(Math.max(maxResults || 100, 1), 500);
+                // Thunderbird calICalendar filter bits:
+                // TYPE_TODO = 1<<2, COMPLETED_YES = 1<<0, COMPLETED_NO = 1<<1
+                const FILTER_TODO = 1 << 2;
+                const COMPLETED_YES = 1 << 0;
+                const COMPLETED_NO = 1 << 1;
+                let itemFilter = FILTER_TODO;
+                if (completed === true) {
+                  itemFilter |= COMPLETED_YES;
+                } else if (completed === false) {
+                  itemFilter |= COMPLETED_NO;
+                } else {
+                  itemFilter |= COMPLETED_YES | COMPLETED_NO;
+                }
+                const TASK_COLLECTION_CAP = limit * 10;
+                const results = [];
+
+                for (const calendar of targets) {
+                  let items;
+                  try {
+                    if (typeof calendar.getItemsAsArray === "function") {
+                      items = await calendar.getItemsAsArray(itemFilter, 0, null, null);
+                    } else {
+                      items = [];
+                      const stream = cal.iterate.streamValues(calendar.getItems(itemFilter, 0, null, null));
+                      for await (const chunk of stream) {
+                        for (const i of chunk) items.push(i);
+                      }
+                    }
+                  } catch {
+                    continue; // Skip calendars that fail to query
+                  }
+
+                  for (const item of items) {
+                    if (results.length >= TASK_COLLECTION_CAP) break;
+                    // Filter by due date -- exclude undated tasks when dueBefore is set
+                    if (dueBeforeDt) {
+                      if (!item.dueDate) continue;
+                      try {
+                        const due = new Date(item.dueDate.nativeTime / 1000);
+                        if (due >= dueBeforeDt) continue;
+                      } catch { /* include if we can't parse */ }
+                    }
+                    results.push(formatTask(item, calendar));
+                  }
+                }
+
+                // Sort by dueDate (nulls last), then title
+                results.sort((a, b) => {
+                  if (a.dueDate && b.dueDate) return new Date(a.dueDate) - new Date(b.dueDate);
+                  if (a.dueDate) return -1;
+                  if (b.dueDate) return 1;
+                  return (a.title || "").localeCompare(b.title || "");
+                });
                 return results.slice(0, limit);
               } catch (e) {
                 return { error: e.toString() };
@@ -4354,6 +4471,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await deleteEvent(args.eventId, args.calendarId);
                 case "createTask":
                   return createTask(args.title, args.dueDate, args.calendarId);
+                case "listTasks":
+                  return await listTasks(args.calendarId, args.completed, args.dueBefore, args.maxResults);
                 case "sendMail":
                   return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
                 case "replyToMessage":
