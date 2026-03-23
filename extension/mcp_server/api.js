@@ -101,6 +101,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." },
             includeSubfolders: { type: "boolean", description: "If false, only search the specified folder — not its subfolders. Default: true." },
             countOnly: { type: "boolean", description: "If true, return only the match count instead of full results. Much faster for 'how many unread?' queries." },
+            searchBody: { type: "boolean", description: "If true, search full message bodies using Thunderbird's Gloda index (slower but finds text beyond the ~200 char preview). Requires query. IMAP accounts need offline sync enabled for body indexing." },
           },
           required: ["query"],
         },
@@ -773,6 +774,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               CalTodo = CT;
             } catch {
               // Calendar not available
+            }
+
+            let GlodaMsgSearcher = null;
+            try {
+              const glodaModule = ChromeUtils.importESModule(
+                "resource:///modules/gloda/GlodaMsgSearcher.sys.mjs"
+              );
+              GlodaMsgSearcher = glodaModule.GlodaMsgSearcher;
+            } catch {
+              // Gloda not available
             }
 
             /**
@@ -1863,7 +1874,119 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              return { msgHdr, folder, db };
 	            }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly) {
+            /**
+             * Full-text body search using Thunderbird's Gloda index via
+             * GlodaMsgSearcher. Searches subject, body, and attachment
+             * names. Returns a Promise resolving to the same format as
+             * searchMessages. IMAP accounts need offline sync for body
+             * indexing; without it only headers are searched.
+             */
+            function glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly) {
+              const requestedLimit = Number(maxResults);
+              const effectiveLimit = Math.min(
+                Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.floor(requestedLimit) : DEFAULT_MAX_RESULTS,
+                MAX_SEARCH_RESULTS_CAP
+              );
+              const normalizedSortOrder = sortOrder === "asc" ? "asc" : "desc";
+              const parsedStartDate = startDate ? new Date(startDate).getTime() : null;
+              const parsedEndDate = endDate ? new Date(endDate).getTime() : null;
+              if (parsedStartDate !== null && isNaN(parsedStartDate)) return { error: `Invalid startDate: ${startDate}` };
+              if (parsedEndDate !== null && isNaN(parsedEndDate)) return { error: `Invalid endDate: ${endDate}` };
+
+              // Resolve folder filter upfront
+              let folderFilter = null;
+              if (folderPath) {
+                const result = getAccessibleFolder(folderPath);
+                if (result.error) return result;
+                folderFilter = result.folder;
+              }
+
+              return new Promise((resolve) => {
+                try {
+                  const listener = {
+                    onItemsAdded() {},
+                    onItemsModified() {},
+                    onItemsRemoved() {},
+                    onQueryCompleted(collection) {
+                      try {
+                        const results = [];
+                        for (const glodaMsg of collection.items) {
+                          if (results.length >= SEARCH_COLLECTION_CAP) break;
+                          // Get the underlying msgHdr
+                          let msgHdr;
+                          try {
+                            msgHdr = glodaMsg.folderMessage;
+                          } catch { continue; }
+                          if (!msgHdr) continue;
+
+                          // Account access control
+                          const folder = msgHdr.folder;
+                          if (!folder) continue;
+                          if (!isFolderAccessible(folder)) continue;
+
+                          // Folder filter
+                          if (folderFilter && folder.URI !== folderFilter.URI) continue;
+
+                          // Date filters
+                          const msgDateTs = msgHdr.date || 0;
+                          if (parsedStartDate !== null && msgDateTs < parsedStartDate * 1000) continue;
+                          if (parsedEndDate !== null && msgDateTs > parsedEndDate * 1000) continue;
+
+                          // Boolean filters
+                          if (unreadOnly && msgHdr.isRead) continue;
+                          if (flaggedOnly && !msgHdr.isFlagged) continue;
+                          if (tag) {
+                            const keywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/);
+                            if (!keywords.includes(tag)) continue;
+                          }
+
+                          const msgTags = getUserTags(msgHdr);
+                          const preview = msgHdr.getStringProperty("preview") || "";
+                          const result = {
+                            id: msgHdr.messageId,
+                            threadId: msgHdr.threadId,
+                            subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
+                            author: msgHdr.mime2DecodedAuthor || msgHdr.author,
+                            recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                            ccList: msgHdr.ccList,
+                            date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+                            folder: folder.prettyName,
+                            folderPath: folder.URI,
+                            read: msgHdr.isRead,
+                            flagged: msgHdr.isFlagged,
+                            tags: msgTags,
+                            _dateTs: msgDateTs
+                          };
+                          if (preview) result.preview = preview;
+                          results.push(result);
+                        }
+
+                        if (countOnly) {
+                          resolve({ count: results.length });
+                          return;
+                        }
+                        results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
+                        resolve(paginate(results, offset, effectiveLimit));
+                      } catch (e) {
+                        resolve({ error: e.toString() });
+                      }
+                    }
+                  };
+                  const searcher = new GlodaMsgSearcher(listener, query);
+                  searcher.getCollection();
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody) {
+	              // Gloda full-body search path (async)
+	              if (searchBody) {
+	                if (!GlodaMsgSearcher) return { error: "Gloda full-text index is not available" };
+	                if (!query) return { error: "searchBody requires a non-empty query" };
+	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly);
+	              }
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -4448,7 +4571,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath);
                 case "searchMessages":
-                  return searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly);
+                  return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat);
                 case "searchContacts":
