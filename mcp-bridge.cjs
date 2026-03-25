@@ -19,10 +19,69 @@ const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
 
 /**
+ * Detect the Thunderbird Snap tmp directory.
+ *
+ * When Thunderbird is installed via Snap, the sandbox redirects TMPDIR to a
+ * user-writable location (e.g. ~/Downloads/thunderbird.tmp). The extension
+ * writes its connection file there, but this bridge runs outside the sandbox
+ * so os.tmpdir() returns the system /tmp instead.
+ *
+ * We detect the Snap install by looking for ~/snap/thunderbird and then check
+ * the running Thunderbird process's TMPDIR via /proc/<pid>/environ.
+ * Falls back to well-known Snap tmp paths if /proc isn't available.
+ */
+function detectSnapTmpDir() {
+  const home = os.homedir();
+  if (!home) return null;
+
+  const snapDir = path.join(home, 'snap', 'thunderbird');
+  try {
+    fs.accessSync(snapDir, fs.constants.F_OK);
+  } catch {
+    return null; // Not a Snap install
+  }
+
+  // Try to read TMPDIR from the running Thunderbird Snap process via /proc.
+  try {
+    const procDirs = fs.readdirSync('/proc').filter((d) => /^\d+$/.test(d));
+    for (const pid of procDirs) {
+      try {
+        const cmdline = fs.readFileSync(path.join('/proc', pid, 'cmdline'), 'utf8');
+        if (!cmdline.includes('thunderbird')) continue;
+        const environ = fs.readFileSync(path.join('/proc', pid, 'environ'), 'utf8');
+        const match = environ.split('\0').find((e) => e.startsWith('TMPDIR='));
+        if (match) return match.slice('TMPDIR='.length);
+      } catch {
+        // Permission denied or process exited — skip
+      }
+    }
+  } catch {
+    // /proc not available (non-Linux)
+  }
+
+  // Fallback: check well-known Snap tmp locations
+  const candidates = [
+    path.join(home, 'Downloads', 'thunderbird.tmp'),
+  ];
+  for (const dir of candidates) {
+    try {
+      fs.accessSync(path.join(dir, 'thunderbird-mcp', 'connection.json'), fs.constants.R_OK);
+      return dir;
+    } catch {
+      // Not here
+    }
+  }
+
+  return null;
+}
+
+/**
  * Read connection info (port + auth token) written by the Thunderbird extension.
  * Returns { port, token } or null if the file doesn't exist.
  * Caches the result for a short TTL to avoid hitting the filesystem on every request.
  * Cache is cleared on connection errors (see clearConnectionCache).
+ *
+ * Tries the standard tmp path first, then falls back to Snap-specific paths.
  */
 let cachedConnectionInfo = null;
 let connectionCacheExpiry = 0;
@@ -32,14 +91,32 @@ function readConnectionInfo() {
   if (cachedConnectionInfo && Date.now() < connectionCacheExpiry) {
     return cachedConnectionInfo;
   }
+
+  // Try the standard path first (works for native installs)
   try {
     const data = JSON.parse(fs.readFileSync(CONNECTION_FILE, 'utf8'));
     cachedConnectionInfo = data;
     connectionCacheExpiry = Date.now() + CONNECTION_CACHE_TTL_MS;
     return data;
   } catch {
-    return null;
+    // Not found at default location — check for Snap install
   }
+
+  // Detect Snap and try its tmp directory
+  const snapTmp = detectSnapTmpDir();
+  if (snapTmp) {
+    try {
+      const snapConnFile = path.join(snapTmp, 'thunderbird-mcp', 'connection.json');
+      const data = JSON.parse(fs.readFileSync(snapConnFile, 'utf8'));
+      cachedConnectionInfo = data;
+      connectionCacheExpiry = Date.now() + CONNECTION_CACHE_TTL_MS;
+      return data;
+    } catch {
+      // Snap detected but connection file not found
+    }
+  }
+
+  return null;
 }
 
 function clearConnectionCache() {
@@ -189,7 +266,8 @@ async function forwardToThunderbird(message, _retried) {
     if (!connInfo) {
       throw new Error(
         'Connection file not found. Is Thunderbird running with the MCP extension? ' +
-        'The extension must be started first to create the connection file.'
+        'The extension must be started first to create the connection file. ' +
+        'If Thunderbird is installed via Snap, ensure the snap is running.'
       );
     }
   }
