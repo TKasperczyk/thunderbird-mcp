@@ -14,10 +14,36 @@ const os = require('os');
 
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
-const CONNECTION_FILE = process.env.THUNDERBIRD_MCP_CONNECTION_FILE
-  || path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json');
+const DEFAULT_CONNECTION_FILE = path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json');
 const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
+
+function resolveConnectionFile() {
+  const envFile = process.env.THUNDERBIRD_MCP_CONNECTION_FILE;
+  if (envFile) {
+    return envFile;
+  }
+
+  const runtimeDir = process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`;
+  const flatpakPath = path.join(
+    runtimeDir,
+    'app',
+    'org.mozilla.Thunderbird',
+    'thunderbird-mcp',
+    'connection.json'
+  );
+  if (fs.existsSync(flatpakPath)) {
+    return flatpakPath;
+  }
+
+  if (fs.existsSync(DEFAULT_CONNECTION_FILE)) {
+    return DEFAULT_CONNECTION_FILE;
+  }
+
+  return DEFAULT_CONNECTION_FILE;
+}
+
+const CONNECTION_FILE = resolveConnectionFile();
 
 /**
  * Read connection info (port + auth token) written by the Thunderbird extension.

@@ -137,6 +137,29 @@ Add to your MCP client config (e.g. `~/.claude.json` for Claude Code):
 }
 ```
 
+### Flatpak Installation
+
+Flatpak users of Thunderbird don't need to tweak anything: the bridge now looks for the Flatpak runtime connection file under `~/.var/app/org.mozilla.Thunderbird/.thunderbird/.../thunderbird-mcp/connection.json` before falling back to the standard temporary directory. If you prefer to control the file directly (for example when the runtime directory is non-standard), set the `THUNDERBIRD_MCP_CONNECTION_FILE` environment variable to the JSON file path.
+
+Claude Code (~/.claude.json):
+```json
+"thunderbird-mail": {
+  "command": "node",
+  "args": ["/path/to/mcp-bridge.cjs"],
+  "env": {
+    "THUNDERBIRD_MCP_CONNECTION_FILE": "/run/user/1000/app/org.mozilla.Thunderbird/thunderbird-mcp/connection.json"
+  }
+}
+```
+
+Codex (~/.codex/config.toml):
+```toml
+[mcp_servers.thunderbird-mail]
+command = "node"
+args = ["/path/to/mcp-bridge.cjs"]
+env = { THUNDERBIRD_MCP_CONNECTION_FILE = "/run/user/1000/app/org.mozilla.Thunderbird/thunderbird-mcp/connection.json" }
+```
+
 That's it. Your AI can now access Thunderbird.
 
 ---

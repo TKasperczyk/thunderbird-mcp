@@ -10,9 +10,16 @@ XPI_FILE="$DIST_DIR/thunderbird-mcp.xpi"
 
 # Find Thunderbird profile directory
 find_profile() {
-    local profiles_dir="$HOME/.thunderbird"
-    if [[ ! -d "$profiles_dir" ]]; then
-        echo "Error: Thunderbird profiles directory not found at $profiles_dir" >&2
+    local flatpak_profiles_dir="$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird"
+    local standard_profiles_dir="$HOME/.thunderbird"
+    local profiles_dir
+
+    if [[ -d "$flatpak_profiles_dir" ]]; then
+        profiles_dir="$flatpak_profiles_dir"
+    elif [[ -d "$standard_profiles_dir" ]]; then
+        profiles_dir="$standard_profiles_dir"
+    else
+        echo "Error: Thunderbird profiles directory not found (checked $flatpak_profiles_dir and $standard_profiles_dir)" >&2
         exit 1
     fi
 
@@ -23,7 +30,7 @@ find_profile() {
     fi
 
     if [[ -z "$profile" ]]; then
-        echo "Error: No Thunderbird profile found" >&2
+        echo "Error: No Thunderbird profile found in $profiles_dir" >&2
         exit 1
     fi
 
