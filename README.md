@@ -139,7 +139,7 @@ Add to your MCP client config (e.g. `~/.claude.json` for Claude Code):
 
 ### Flatpak Installation
 
-Flatpak users of Thunderbird don't need to tweak anything: the bridge now looks for the Flatpak runtime connection file under `~/.var/app/org.mozilla.Thunderbird/.thunderbird/.../thunderbird-mcp/connection.json` before falling back to the standard temporary directory. If you prefer to control the file directly (for example when the runtime directory is non-standard), set the `THUNDERBIRD_MCP_CONNECTION_FILE` environment variable to the JSON file path.
+Flatpak users of Thunderbird don't need to tweak anything: the bridge now automatically detects the Flatpak runtime connection file at `$XDG_RUNTIME_DIR/app/org.mozilla.Thunderbird/thunderbird-mcp/connection.json` before falling back to the standard temporary directory. If you prefer to control the file directly (for example when the runtime directory is non-standard), set the `THUNDERBIRD_MCP_CONNECTION_FILE` environment variable to the JSON file path.
 
 Claude Code (~/.claude.json):
 ```json
