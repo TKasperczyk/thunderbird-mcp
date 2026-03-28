@@ -842,11 +842,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /**
              * Write connection info (port + auth token) to a well-known file
              * so the bridge can discover how to connect.
-             * File: <TmpD>/thunderbird-mcp/connection.json
+             * File: <Home>/.thunderbird-mcp/connection.json
              */
             function writeConnectionInfo(port, token) {
-              const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-              tmpDir.append("thunderbird-mcp");
+              const tmpDir = Services.dirsvc.get("Home", Ci.nsIFile);
+              tmpDir.append(".thunderbird-mcp");
               if (!tmpDir.exists()) {
                 tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
               }
@@ -876,8 +876,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function removeConnectionInfo() {
               try {
-                const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-                tmpDir.append("thunderbird-mcp");
+                const tmpDir = Services.dirsvc.get("Home", Ci.nsIFile);
+                tmpDir.append(".thunderbird-mcp");
                 const connFile = tmpDir.clone();
                 connFile.append("connection.json");
                 if (connFile.exists()) {
@@ -4885,10 +4885,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             buildDate = bi.builtAt || null;
           } catch { /* build info not available */ }
 
-          // Read connection info from temp file using XPCOM file I/O
+          // Read connection info from home dir using XPCOM file I/O
           try {
-            const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-            tmpDir.append("thunderbird-mcp");
+            const tmpDir = Services.dirsvc.get("Home", Ci.nsIFile);
+            tmpDir.append(".thunderbird-mcp");
             const connFile = tmpDir.clone();
             connFile.append("connection.json");
             connectionFile = connFile.path;
@@ -5061,8 +5061,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     // Always clean up the connection info file so stale tokens don't linger
     // (Inlined here because removeConnectionInfo() is scoped inside start())
     try {
-      const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-      tmpDir.append("thunderbird-mcp");
+      const tmpDir = Services.dirsvc.get("Home", Ci.nsIFile);
+      tmpDir.append(".thunderbird-mcp");
       const connFile = tmpDir.clone();
       connFile.append("connection.json");
       if (connFile.exists()) {

@@ -14,7 +14,7 @@ const os = require('os');
 
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
-const CONNECTION_FILE = path.join(os.tmpdir(), 'thunderbird-mcp', 'connection.json');
+const CONNECTION_FILE = path.join(os.homedir(), '.thunderbird-mcp', 'connection.json');
 const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
 
@@ -188,8 +188,9 @@ async function forwardToThunderbird(message, _retried) {
     }
     if (!connInfo) {
       throw new Error(
-        'Connection file not found. Is Thunderbird running with the MCP extension? ' +
-        'The extension must be started first to create the connection file.'
+        `Bridge error: Connection file not found at ${CONNECTION_FILE}. ` +
+        `Is Thunderbird running with the MCP extension? ` +
+        `TMPDIR=${process.env.TMPDIR || '(not set)'}, os.tmpdir()=${os.tmpdir()}`
       );
     }
   }
