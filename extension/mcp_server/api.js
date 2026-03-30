@@ -2817,9 +2817,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    try {
 	                      const folder = msgHdr.folder;
 	                      stream = folder.getMsgInputStream(msgHdr, {});
-	                      const messageSize = folder.hasMsgOffline(msgHdr.messageKey)
+	                      let messageSize = folder.hasMsgOffline(msgHdr.messageKey)
 	                        ? msgHdr.offlineMessageSize
 	                        : msgHdr.messageSize;
+	                      // For local folders (mbox), messageSize can be 0 or
+	                      // inaccurate for imported messages. Fall back to reading
+	                      // whatever is available in the stream.
+	                      if (!messageSize || messageSize <= 0) {
+	                        messageSize = stream.available();
+	                      }
+	                      if (!messageSize || messageSize <= 0) {
+	                        resolve({ error: "Message has zero size - cannot read raw source" });
+	                        return;
+	                      }
 	                      // No charset specified -- defaults to Latin-1 which
 	                      // preserves raw bytes. UTF-8 would corrupt messages
 	                      // with 8-bit content.
@@ -2850,6 +2860,56 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const fmt = extractFormattedBody(aMimeMsg, bodyFormat || "markdown");
                     let body = fmt.body;
                     let bodyIsHtml = fmt.bodyIsHtml;
+                    // If structured MIME extraction failed, try raw stream
+                    // fallback for local mbox folders where MsgHdrToMimeMessage
+                    // returns empty body parts.
+                    if (!body) {
+                      try {
+                        const rawFolder = msgHdr.folder;
+                        const rawStream = rawFolder.getMsgInputStream(msgHdr, {});
+                        let rawSize = msgHdr.messageSize;
+                        if (!rawSize || rawSize <= 0) rawSize = rawStream.available();
+                        if (rawSize > 0) {
+                          const rawContent = NetUtil.readInputStreamToString(rawStream, rawSize);
+                          rawStream.close();
+                          // Split headers from body at first blank line
+                          const blankLineIdx = rawContent.indexOf("\r\n\r\n");
+                          const altIdx = rawContent.indexOf("\n\n");
+                          const splitIdx = blankLineIdx >= 0
+                            ? (altIdx >= 0 ? Math.min(blankLineIdx, altIdx) : blankLineIdx)
+                            : altIdx;
+                          if (splitIdx >= 0) {
+                            let rawBody = rawContent.substring(splitIdx).trim();
+                            // Basic quoted-printable decode
+                            if (rawContent.toLowerCase().includes("content-transfer-encoding: quoted-printable")) {
+                              rawBody = rawBody.replace(/=\r?\n/g, "");
+                              rawBody = rawBody.replace(/=([0-9A-Fa-f]{2})/g, (_, hex) =>
+                                String.fromCharCode(parseInt(hex, 16))
+                              );
+                            }
+                            // Basic base64 decode
+                            if (rawContent.toLowerCase().includes("content-transfer-encoding: base64")) {
+                              try {
+                                rawBody = atob(rawBody.replace(/\s/g, ""));
+                              } catch { /* leave as-is */ }
+                            }
+                            // Strip HTML tags if HTML content
+                            if (rawContent.toLowerCase().includes("content-type: text/html")) {
+                              rawBody = rawBody.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "");
+                              rawBody = rawBody.replace(/<[^>]+>/g, " ");
+                              rawBody = rawBody.replace(/&nbsp;/gi, " ");
+                              rawBody = rawBody.replace(/&amp;/gi, "&");
+                              rawBody = rawBody.replace(/&lt;/gi, "<");
+                              rawBody = rawBody.replace(/&gt;/gi, ">");
+                              rawBody = rawBody.replace(/&#\d+;/g, "");
+                              rawBody = rawBody.replace(/\s{2,}/g, " ").trim();
+                              bodyIsHtml = false;
+                            }
+                            if (rawBody) body = rawBody;
+                          }
+                        }
+                      } catch { /* raw fallback failed, continue with empty body */ }
+                    }
                     if (!body) body = "(Could not extract body text)";
 
                     // Always collect attachment metadata
