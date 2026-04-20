@@ -2995,9 +2995,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const rangeEnd = cal.dtz.jsDateToDateTime(endJs, cal.dtz.defaultTimezone);
                 const limit = Math.min(Math.max(maxResults || 100, 1), 500);
 
-                // Query with date range and occurrence expansion
+                // Query with date range and occurrence expansion.
+                // Filter bits per calICalendar.idl: TYPE_EVENT = 1<<3,
+                // CLASS_OCCURRENCES = 1<<16 (NOT 1<<4 which is TYPE_JOURNAL).
                 const FILTER_EVENT = 1 << 3;
-                const FILTER_OCCURRENCES = 1 << 4;
+                const FILTER_OCCURRENCES = 1 << 16;
                 const results = [];
                 for (const calendar of targets) {
                   let items;
@@ -3012,23 +3014,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         for (const i of chunk) items.push(i);
                       }
                     }
-                  } catch {
-                    // Fallback: fetch without occurrence expansion, expand manually
+                  } catch (e) {
+                    console.warn(`[thunderbird-mcp] listEvents: occurrence-expanded query failed for "${calendar.name}", falling back to manual expansion:`, e);
                     items = await getCalendarItems(calendar, rangeStart, rangeEnd);
                   }
 
                   const EVENT_COLLECTION_CAP = limit * 10; // Safety cap for recurring event expansion
                   for (const item of items) {
                     if (results.length >= EVENT_COLLECTION_CAP) break;
-                    // If we got base recurring events (fallback path), expand them
+                    // If we got base recurring events (fallback path, or provider
+                    // that returned masters despite FILTER_OCCURRENCES), expand them.
+                    // getOccurrences(start, end, maxCount) -- pass the collection cap
+                    // so infinite recurrences (e.g. daily standup) are bounded.
                     if (item.recurrenceInfo) {
                       try {
-                        const occurrences = item.recurrenceInfo.getOccurrences(rangeStart, rangeEnd, 0);
-                        for (const occ of occurrences) {
-                          if (results.length >= EVENT_COLLECTION_CAP) break;
-                          results.push(formatEvent(occ, calendar));
+                        const occurrences = item.recurrenceInfo.getOccurrences(rangeStart, rangeEnd, EVENT_COLLECTION_CAP);
+                        if (occurrences && occurrences.length) {
+                          for (const occ of occurrences) {
+                            if (results.length >= EVENT_COLLECTION_CAP) break;
+                            results.push(formatEvent(occ, calendar));
+                          }
+                        } else {
+                          results.push(formatEvent(item, calendar));
                         }
-                      } catch {
+                      } catch (e) {
+                        console.warn(`[thunderbird-mcp] listEvents: getOccurrences failed for "${item.title}" on "${calendar.name}":`, e);
                         results.push(formatEvent(item, calendar));
                       }
                     } else {
