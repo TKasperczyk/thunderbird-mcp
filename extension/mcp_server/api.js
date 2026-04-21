@@ -92,7 +92,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "Text to search in subject, author, recipients, or body preview (use empty string to match all)" },
+            query: { type: "string", description: "Text to search. Multi-word queries are AND-of-tokens: every word must appear somewhere across subject/author/recipients/ccList/preview (or inside the selected field when an operator is used). Prefix with 'from:', 'subject:', 'to:', or 'cc:' to restrict matching to one field (e.g. 'from:Alice Smith' requires both tokens in the author field). Use empty string to match all." },
             folderPath: { type: "string", description: "Optional folder URI (from listFolders) to limit search to that folder and its subfolders" },
             startDate: { type: "string", description: "Filter messages on or after this ISO 8601 date" },
             endDate: { type: "string", description: "Filter messages on or before this ISO 8601 date. Date-only strings (e.g. '2024-01-15') include the full day." },
@@ -2024,11 +2024,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              // Parse optional field-operator prefix and split into AND tokens.
 	              // Supports: from:Name, subject:Text, to:Email, cc:Email
 	              // Without an operator, every token must appear somewhere across all fields.
-	              const _OPERATOR_RE = /^(from|subject|to|cc):\s*/;
+	              const OPERATOR_RE = /^(from|subject|to|cc):\s*/;
 	              let fieldTarget = null;
 	              let queryTokens = [];
 	              if (hasQuery) {
-	                const opMatch = lowerQuery.match(_OPERATOR_RE);
+	                const opMatch = lowerQuery.match(OPERATOR_RE);
 	                if (opMatch) {
 	                  const opMap = { from: 'author', subject: 'subject', to: 'recipients', cc: 'ccList' };
 	                  fieldTarget = opMap[opMatch[1]];
@@ -2037,6 +2037,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  queryTokens = lowerQuery.split(/\s+/).filter(Boolean);
 	                }
 	              }
+	              // Treat whitespace-only queries and bare field operators (e.g. "from:"
+	              // with nothing after) as failed queries that match nothing, rather
+	              // than silently matching every message. The documented way to match
+	              // all messages is to pass an empty string, which keeps hasQuery=false.
+	              const failedQuery = hasQuery && queryTokens.length === 0;
 	              const parsedStartDate = startDate ? new Date(startDate).getTime() : NaN;
               const parsedEndDate = endDate ? new Date(endDate).getTime() : NaN;
               const startDateTs = Number.isFinite(parsedStartDate) ? parsedStartDate * 1000 : null;
@@ -2088,6 +2093,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // Raw headers contain MIME encoding like "=?UTF-8?Q?...?="
                     // which won't match plain text searches.
                     const preview = msgHdr.getStringProperty("preview") || "";
+                    if (failedQuery) continue;
                     if (hasQuery) {
                       const subject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
                       const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
@@ -2096,9 +2102,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       // AND-of-tokens: every token must appear somewhere across the fields.
                       // If a field operator (from:, subject:, to:, cc:) was given,
                       // restrict matching to that specific field only.
-                      const _fieldValues = { subject, author, recipients, ccList };
-                      const _matches = fieldTarget
-                        ? queryTokens.every(t => (_fieldValues[fieldTarget] || "").includes(t))
+                      const fieldValues = { subject, author, recipients, ccList };
+                      const matches = fieldTarget
+                        ? queryTokens.every(t => (fieldValues[fieldTarget] || "").includes(t))
                         : queryTokens.every(t =>
                             subject.includes(t) ||
                             author.includes(t) ||
@@ -2106,7 +2112,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             ccList.includes(t) ||
                             preview.toLowerCase().includes(t)
                           );
-                      if (!_matches) continue;
+                      if (!matches) continue;
                     }
 
                     const msgTags = getUserTags(msgHdr);
