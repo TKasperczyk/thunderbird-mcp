@@ -1499,8 +1499,9 @@ RequestReader.prototype = {
         dumpn("_processHeaders, Content-length=" + this._contentLength);
 
         // Reject oversized request bodies before buffering into memory.
-        // 10 MB is generous for JSON-RPC MCP requests.
-        if (this._contentLength > 10 * 1024 * 1024) {
+        // 32 MB accommodates MAX_BASE64_SIZE (25 MB) inline attachments
+        // plus JSON-RPC framing overhead. Aligned with api.js MAX_REQUEST_BODY.
+        if (this._contentLength > 32 * 1024 * 1024) {
           throw HTTP_413;
         }
 
@@ -2306,7 +2307,7 @@ function maybeAddInformationalResponse(file, metadata, response) {
 /**
  * An object which handles requests for a server, executing default and
  * overridden behaviors as instructed by the code which uses and manipulates it.
- * Default behavior includes the paths / and /trace (diagnostics), with some
+ * Default behavior includes the path / (diagnostics), with some
  * support for HTTP error pages for various codes and fallback to HTTP 500 if
  * those codes fail for any reason.
  *

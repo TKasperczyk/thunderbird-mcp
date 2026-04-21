@@ -25,7 +25,9 @@ const _attachTimers = new Set();
 // Track temp files created for inline base64 attachments (cleaned up on shutdown).
 const _tempAttachFiles = new Set();
 const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
-const MAX_REQUEST_BODY = 10 * 1024 * 1024; // 10 MB limit for incoming HTTP request bodies
+// Must be large enough to carry MAX_BASE64_SIZE plus JSON-RPC framing overhead.
+// The httpd.sys.mjs pre-buffer cap uses the same value.
+const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP request bodies
 let _tempFileCounter = 0;
 // Delay before injecting attachments into a newly opened compose window.
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
