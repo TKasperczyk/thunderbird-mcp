@@ -147,6 +147,41 @@ describe('Bridge discovery', () => {
     assert.equal(connInfo.token, 'snap-token');
   });
 
+  it('snap detection ignores decoy processes with thunderbird only as a file arg', () => {
+    const options = makeTestOptions(root, {
+      platform: 'linux',
+      procRoot: path.join(root, 'proc'),
+    });
+
+    fs.mkdirSync(path.join(options.homeDir, 'snap', 'thunderbird'), { recursive: true });
+
+    // Decoy: a text editor opened on "thunderbird.txt". argv[0] is /usr/bin/vim,
+    // argv[1] contains 'thunderbird' as a substring. Must NOT be picked up.
+    const decoyPid = '9999';
+    fs.mkdirSync(path.join(options.procRoot, decoyPid), { recursive: true });
+    fs.writeFileSync(
+      path.join(options.procRoot, decoyPid, 'cmdline'),
+      '/usr/bin/vim\0/home/user/thunderbird.txt\0',
+      'utf8'
+    );
+    const decoyTmpDir = path.join(root, 'decoy-tmp');
+    fs.writeFileSync(
+      path.join(options.procRoot, decoyPid, 'environ'),
+      `TMPDIR=${decoyTmpDir}\0`,
+      'utf8'
+    );
+    // If the decoy was picked up, the bridge would read this file and succeed.
+    writeConnectionFile(path.join(decoyTmpDir, 'thunderbird-mcp', 'connection.json'), {
+      port: 29999,
+      token: 'attacker-token',
+    });
+
+    const connInfo = readConnectionInfo(options);
+    // No real Thunderbird process in our mocked /proc -> discovery returns null.
+    // Critically, the decoy's TMPDIR file is NOT selected.
+    assert.equal(connInfo, null);
+  });
+
   it('flatpak scan finds a runtime connection file', () => {
     const options = makeTestOptions(root, {
       platform: 'linux',

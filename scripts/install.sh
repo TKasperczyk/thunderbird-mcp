@@ -10,11 +10,14 @@ XPI_FILE="$DIST_DIR/thunderbird-mcp.xpi"
 
 # Find Thunderbird profile directory
 find_profile() {
+    # Native profile is preferred when multiple install types coexist --
+    # vestigial Flatpak profile dirs from prior experiments must not
+    # hijack a native install that is actually in use.
     local profile_roots=(
+        "$HOME/.thunderbird"
         "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird"
         "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird"
         "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
-        "$HOME/.thunderbird"
     )
     local profiles_dir=""
     local profile=""

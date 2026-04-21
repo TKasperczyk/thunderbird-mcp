@@ -233,7 +233,12 @@ function findSnapConnectionCandidates(context) {
     for (const pid of procDirs) {
       try {
         const cmdline = fsImpl.readFileSync(pathImpl.join(procRoot, pid, 'cmdline'), 'utf8');
-        if (!cmdline.includes('thunderbird')) {
+        // Match argv[0] basename precisely -- not any occurrence of 'thunderbird'
+        // in argv. A text editor opened on 'thunderbird.txt' would have the
+        // substring in argv[1], and we do NOT want to read its TMPDIR.
+        const argv0 = cmdline.split('\0')[0] || '';
+        const argv0Basename = pathImpl.basename(argv0);
+        if (!/^(thunderbird|betterbird)(-.+)?$/.test(argv0Basename)) {
           continue;
         }
 
