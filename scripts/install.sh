@@ -10,20 +10,35 @@ XPI_FILE="$DIST_DIR/thunderbird-mcp.xpi"
 
 # Find Thunderbird profile directory
 find_profile() {
-    local profiles_dir="$HOME/.thunderbird"
-    if [[ ! -d "$profiles_dir" ]]; then
-        echo "Error: Thunderbird profiles directory not found at $profiles_dir" >&2
+    local profile_roots=(
+        "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird"
+        "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird"
+        "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
+        "$HOME/.thunderbird"
+    )
+    local profiles_dir=""
+    local profile=""
+
+    for candidate in "${profile_roots[@]}"; do
+        if [[ -d "$candidate" ]]; then
+            profiles_dir="$candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$profiles_dir" ]]; then
+        echo "Error: Thunderbird profiles directory not found (checked ${profile_roots[*]})" >&2
         exit 1
     fi
 
     # Look for default-release profile first, then any .default profile
-    local profile=$(ls -d "$profiles_dir"/*.default-release 2>/dev/null | head -1)
+    profile=$(ls -d "$profiles_dir"/*.default-release 2>/dev/null | head -1)
     if [[ -z "$profile" ]]; then
         profile=$(ls -d "$profiles_dir"/*.default 2>/dev/null | head -1)
     fi
 
     if [[ -z "$profile" ]]; then
-        echo "Error: No Thunderbird profile found" >&2
+        echo "Error: No Thunderbird profile found in $profiles_dir" >&2
         exit 1
     fi
 

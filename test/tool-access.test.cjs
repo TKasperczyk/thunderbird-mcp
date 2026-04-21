@@ -88,6 +88,7 @@ const ALL_TOOLS = [
   { name: "createEvent", group: "calendar", crud: "create" },
   { name: "createTask", group: "calendar", crud: "create" },
   { name: "listTasks", group: "calendar", crud: "read" },
+  { name: "updateTask", group: "calendar", crud: "update" },
   { name: "updateEvent", group: "calendar", crud: "update" },
   { name: "deleteEvent", group: "calendar", crud: "delete" },
   { name: "listFilters", group: "filters", crud: "read" },
