@@ -192,6 +192,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             description: { type: "string", description: "Event description" },
             calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable calendar)" },
             allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
+            status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
             skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
           },
           required: ["title", "startDate"],
@@ -228,6 +229,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             endDate: { type: "string", description: "New end date/time in ISO 8601 format (optional)" },
             location: { type: "string", description: "New event location (optional)" },
             description: { type: "string", description: "New event description (optional)" },
+            status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
           },
           required: ["eventId", "calendarId"],
         },
@@ -2615,7 +2617,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview) {
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -2702,6 +2704,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (location) event.setProperty("LOCATION", location);
                 if (description) event.setProperty("DESCRIPTION", description);
+                if (status !== undefined && status !== null && status !== "") {
+                  const normalized = normalizeEventStatus(status);
+                  if (!normalized) {
+                    return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
+                  }
+                  event.setProperty("STATUS", normalized);
+                }
 
                 // Find target calendar
                 const calendars = cal.manager.getCalendars();
@@ -2771,6 +2780,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               catch { return dt.icalString || null; }
             }
 
+            // VEVENT STATUS values per iCal RFC 5545 § 3.8.1.11.
+            const VEVENT_STATUS_MAP = {
+              tentative: "TENTATIVE",
+              confirmed: "CONFIRMED",
+              cancelled: "CANCELLED",
+              canceled: "CANCELLED",
+            };
+            function normalizeEventStatus(status) {
+              if (status === undefined || status === null) return null;
+              return VEVENT_STATUS_MAP[String(status).trim().toLowerCase()] || null;
+            }
+
             function formatEvent(item, calendar) {
               const allDay = item.startDate ? item.startDate.isDate : false;
               // For all-day events, iCal DTEND is exclusive. Convert to inclusive
@@ -2792,6 +2813,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 endDate: endDateISO,
                 location: item.getProperty("LOCATION") || "",
                 description: item.getProperty("DESCRIPTION") || "",
+                // VEVENT STATUS (tentative/confirmed/cancelled). Empty string
+                // when the event has no explicit status (iCal spec treats this
+                // as implicit -- Thunderbird renders it like confirmed).
+                status: (item.getProperty("STATUS") || "").toLowerCase(),
                 allDay,
                 isRecurring: !!item.recurrenceInfo,
               };
@@ -3086,7 +3111,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -3146,6 +3171,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (location !== undefined) { newItem.setProperty("LOCATION", location); changes.push("location"); }
                 if (description !== undefined) { newItem.setProperty("DESCRIPTION", description); changes.push("description"); }
+                if (status !== undefined) {
+                  if (status === null || status === "") {
+                    newItem.deleteProperty("STATUS");
+                  } else {
+                    const normalized = normalizeEventStatus(status);
+                    if (!normalized) {
+                      return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
+                    }
+                    newItem.setProperty("STATUS", normalized);
+                  }
+                  changes.push("status");
+                }
 
                 if (changes.length === 0) return { error: "No changes specified" };
 
@@ -5218,11 +5255,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId);
                 case "createTask":
