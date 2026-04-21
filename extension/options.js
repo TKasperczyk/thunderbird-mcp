@@ -99,7 +99,10 @@ async function loadAccountAccess() {
     saveBtn.disabled = false;
     saveStatus.textContent = "";
   } catch (e) {
-    accountList.innerHTML = "<li>Error loading accounts: " + e.message + "</li>";
+    accountList.innerHTML = "";
+    const li = document.createElement("li");
+    li.textContent = "Error loading accounts: " + e.message;
+    accountList.appendChild(li);
   }
 }
 
@@ -215,7 +218,10 @@ async function loadToolAccess() {
     saveToolsBtn.disabled = false;
     saveToolsStatus.textContent = "";
   } catch (e) {
-    toolList.innerHTML = "<li>Error loading tools: " + e.message + "</li>";
+    toolList.innerHTML = "";
+    const li = document.createElement("li");
+    li.textContent = "Error loading tools: " + e.message;
+    toolList.appendChild(li);
   }
 }
 

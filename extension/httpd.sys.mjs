@@ -1498,6 +1498,13 @@ RequestReader.prototype = {
           : 0;
         dumpn("_processHeaders, Content-length=" + this._contentLength);
 
+        // Reject oversized request bodies before buffering into memory.
+        // 32 MB accommodates MAX_BASE64_SIZE (25 MB) inline attachments
+        // plus JSON-RPC framing overhead. Aligned with api.js MAX_REQUEST_BODY.
+        if (this._contentLength > 32 * 1024 * 1024) {
+          throw HTTP_413;
+        }
+
         this._state = READER_IN_BODY;
       }
       return done;
@@ -2300,7 +2307,7 @@ function maybeAddInformationalResponse(file, metadata, response) {
 /**
  * An object which handles requests for a server, executing default and
  * overridden behaviors as instructed by the code which uses and manipulates it.
- * Default behavior includes the paths / and /trace (diagnostics), with some
+ * Default behavior includes the path / (diagnostics), with some
  * support for HTTP error pages for various codes and fallback to HTTP 500 if
  * those codes fail for any reason.
  *
@@ -3435,6 +3442,9 @@ ServerHandler.prototype = {
   /**
    * Contains handlers for the default set of URIs contained in this server.
    */
+  // /trace endpoint removed — it echoed all request headers (including
+  // Authorization tokens) without authentication, enabling token leakage
+  // to any local process.
   _defaultPaths: {
     "/": function (metadata, response) {
       response.setStatusLine(metadata.httpVersion, 200, "OK");
@@ -3450,39 +3460,6 @@ ServerHandler.prototype = {
                         files!</p>\
                     </body>\
                   </html>";
-
-      response.bodyOutputStream.write(body, body.length);
-    },
-
-    "/trace": function (metadata, response) {
-      response.setStatusLine(metadata.httpVersion, 200, "OK");
-      response.setHeader("Content-Type", "text/plain;charset=utf-8", false);
-
-      var body =
-        "Request-URI: " +
-        metadata.scheme +
-        "://" +
-        metadata.host +
-        ":" +
-        metadata.port +
-        metadata.path +
-        "\n\n";
-      body += "Request (semantically equivalent, slightly reformatted):\n\n";
-      body += metadata.method + " " + metadata.path;
-
-      if (metadata.queryString) {
-        body += "?" + metadata.queryString;
-      }
-
-      body += " HTTP/" + metadata.httpVersion + "\r\n";
-
-      var headEnum = metadata.headers;
-      while (headEnum.hasMoreElements()) {
-        var fieldName = headEnum
-          .getNext()
-          .QueryInterface(Ci.nsISupportsString).data;
-        body += fieldName + ": " + metadata.getHeader(fieldName) + "\r\n";
-      }
 
       response.bodyOutputStream.write(body, body.length);
     },

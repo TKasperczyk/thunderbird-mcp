@@ -50,7 +50,5 @@
     "accountsFolders",
     "compose"
   ],
-  "web_accessible_resources": [
-    "httpd.sys.mjs"
-  ]
+  "web_accessible_resources": []
 }

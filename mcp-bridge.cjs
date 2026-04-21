@@ -499,10 +499,13 @@ function buildConnectionDiscoveryErrorMessage() {
 function sanitizeJson(data) {
   // Remove control chars except \n, \r, \t
   let sanitized = data.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
-  // Escape raw newlines/carriage returns/tabs that aren't already escaped
-  sanitized = sanitized.replace(/(?<!\\)\r/g, '\\r');
-  sanitized = sanitized.replace(/(?<!\\)\n/g, '\\n');
-  sanitized = sanitized.replace(/(?<!\\)\t/g, '\\t');
+  // Escape raw newlines/carriage returns/tabs that aren't already escaped.
+  // Match an even number of backslashes (including zero) before the control
+  // char so we don't double-escape already-escaped sequences like \n, but
+  // do escape after literal backslash pairs like \\\n (escaped-backslash + raw newline).
+  sanitized = sanitized.replace(/((?:^|[^\\])(?:\\\\)*)\r/gm, '$1\\r');
+  sanitized = sanitized.replace(/((?:^|[^\\])(?:\\\\)*)\n/gm, '$1\\n');
+  sanitized = sanitized.replace(/((?:^|[^\\])(?:\\\\)*)\t/gm, '$1\\t');
   return sanitized;
 }
 
@@ -613,6 +616,9 @@ async function forwardToThunderbird(message, _retried) {
 
   if (!connInfo.port || !connInfo.token) {
     throw new Error('Invalid connection file: missing port or token');
+  }
+  if (typeof connInfo.port !== 'number' || connInfo.port < 1 || connInfo.port > 65535 || !Number.isInteger(connInfo.port)) {
+    throw new Error('Invalid connection file: port must be an integer between 1 and 65535');
   }
 
   const { port, token } = connInfo;

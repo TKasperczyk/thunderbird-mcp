@@ -25,6 +25,9 @@ const _attachTimers = new Set();
 // Track temp files created for inline base64 attachments (cleaned up on shutdown).
 const _tempAttachFiles = new Set();
 const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
+// Must be large enough to carry MAX_BASE64_SIZE plus JSON-RPC framing overhead.
+// The httpd.sys.mjs pre-buffer cap uses the same value.
+const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP request bodies
 let _tempFileCounter = 0;
 // Delay before injecting attachments into a newly opened compose window.
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
@@ -869,6 +872,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               tmpDir.append("thunderbird-mcp");
               if (!tmpDir.exists()) {
                 tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+              } else if (tmpDir.isSymlink()) {
+                throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
               }
               const connFile = tmpDir.clone();
               connFile.append("connection.json");
@@ -1508,7 +1513,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             function escapeHtml(s) {
-              return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+              return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
             }
 
             function stripHtml(html) {
@@ -3097,7 +3102,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       const root = Services.dirsvc.get("TmpD", Ci.nsIFile);
                       root.append("thunderbird-mcp");
                       try {
-                        root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+                        root.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
                       } catch (e) {
                         if (!root.exists() || !root.isDirectory()) throw e;
                         // already exists, fine
@@ -3105,7 +3110,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       const dir = root.clone();
                       dir.append(sanitizedId);
                       try {
-                        dir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o755);
+                        dir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
                       } catch (e) {
                         if (!dir.exists() || !dir.isDirectory()) throw e;
                         // already exists, fine
@@ -3152,7 +3157,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           file.append(safeName);
 
                           try {
-                            file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o644);
+                            file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
                           } catch (e) {
                             info.error = `Failed to create file: ${e}`;
                             done();
@@ -4821,19 +4826,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             server.registerPathHandler("/", (req, res) => {
               res.processAsync();
 
-              if (req.method !== "POST") {
-                res.setStatusLine("1.1", 200, "OK");
-                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
-                res.write(JSON.stringify({
-                  jsonrpc: "2.0",
-                  id: null,
-                  error: { code: -32600, message: "Invalid Request" }
-                }));
-                res.finish();
-                return;
-              }
-
-              // Verify auth token from Authorization header
+              // Verify auth token on ALL requests (including non-POST) to
+              // prevent unauthenticated probing of the server.
               let reqToken = "";
               try {
                 reqToken = req.getHeader("Authorization") || "";
@@ -4847,6 +4841,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   jsonrpc: "2.0",
                   id: null,
                   error: { code: -32600, message: "Invalid or missing auth token" }
+                }));
+                res.finish();
+                return;
+              }
+
+              if (req.method !== "POST") {
+                res.setStatusLine("1.1", 405, "Method Not Allowed");
+                res.setHeader("Allow", "POST", false);
+                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                res.write(JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32600, message: "Method not allowed" }
+                }));
+                res.finish();
+                return;
+              }
+
+              // Reject oversized request bodies to prevent memory exhaustion
+              let contentLength = 0;
+              try {
+                contentLength = parseInt(req.getHeader("Content-Length"), 10) || 0;
+              } catch {
+                // Header missing — will be 0
+              }
+              if (contentLength > MAX_REQUEST_BODY) {
+                res.setStatusLine("1.1", 413, "Payload Too Large");
+                res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                res.write(JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: null,
+                  error: { code: -32600, message: "Request body too large" }
                 }));
                 res.finish();
                 return;
