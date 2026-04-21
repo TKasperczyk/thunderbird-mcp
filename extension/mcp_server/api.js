@@ -2021,6 +2021,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
+	              // Parse optional field-operator prefix and split into AND tokens.
+	              // Supports: from:Name, subject:Text, to:Email, cc:Email
+	              // Without an operator, every token must appear somewhere across all fields.
+	              const _OPERATOR_RE = /^(from|subject|to|cc):\s*/;
+	              let fieldTarget = null;
+	              let queryTokens = [];
+	              if (hasQuery) {
+	                const opMatch = lowerQuery.match(_OPERATOR_RE);
+	                if (opMatch) {
+	                  const opMap = { from: 'author', subject: 'subject', to: 'recipients', cc: 'ccList' };
+	                  fieldTarget = opMap[opMatch[1]];
+	                  queryTokens = lowerQuery.slice(opMatch[0].length).trim().split(/\s+/).filter(Boolean);
+	                } else {
+	                  queryTokens = lowerQuery.split(/\s+/).filter(Boolean);
+	                }
+	              }
 	              const parsedStartDate = startDate ? new Date(startDate).getTime() : NaN;
               const parsedEndDate = endDate ? new Date(endDate).getTime() : NaN;
               const startDateTs = Number.isFinite(parsedStartDate) ? parsedStartDate * 1000 : null;
@@ -2077,12 +2093,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
                       const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
                       const ccList = (msgHdr.ccList || "").toLowerCase();
-                      // Search headers first, then body preview (first ~200 chars stored in DB)
-                      if (!subject.includes(lowerQuery) &&
-                          !author.includes(lowerQuery) &&
-                          !recipients.includes(lowerQuery) &&
-                          !ccList.includes(lowerQuery) &&
-                          !preview.toLowerCase().includes(lowerQuery)) continue;
+                      // AND-of-tokens: every token must appear somewhere across the fields.
+                      // If a field operator (from:, subject:, to:, cc:) was given,
+                      // restrict matching to that specific field only.
+                      const _fieldValues = { subject, author, recipients, ccList };
+                      const _matches = fieldTarget
+                        ? queryTokens.every(t => (_fieldValues[fieldTarget] || "").includes(t))
+                        : queryTokens.every(t =>
+                            subject.includes(t) ||
+                            author.includes(t) ||
+                            recipients.includes(t) ||
+                            ccList.includes(t) ||
+                            preview.toLowerCase().includes(t)
+                          );
+                      if (!_matches) continue;
                     }
 
                     const msgTags = getUserTags(msgHdr);
