@@ -137,13 +137,41 @@ Add to your MCP client config (e.g. `~/.claude.json` for Claude Code):
 }
 ```
 
+### Sandbox-aware connection discovery
+
+The bridge re-discovers `connection.json` on every cache miss. It tries these locations in order:
+
+1. `THUNDERBIRD_MCP_CONNECTION_FILE`, if set
+2. Native temp dir: `<os.tmpdir()>/thunderbird-mcp/connection.json`
+3. macOS fallback: `/var/folders/*/*/T/thunderbird-mcp/connection.json` owned by the current user
+4. Linux Snap: Thunderbird's live `TMPDIR` from `/proc/<pid>/environ`, plus the official snap fallback under `~/Downloads/thunderbird.tmp`
+5. Linux Flatpak / Betterbird Flatpak: `$XDG_RUNTIME_DIR/app/*/thunderbird-mcp/connection.json`
+
+This covers native installs, the official Thunderbird snap, Thunderbird Flatpak, Thunderbird Beta Flatpak, and Betterbird Flatpak without changing the extension side. If multiple sandbox candidates exist at once, the bridge tries the newest file first. Set `THUNDERBIRD_MCP_CONNECTION_FILE` to force a single explicit path.
+
+Example override:
+
+```json
+{
+  "mcpServers": {
+    "thunderbird-mail": {
+      "command": "node",
+      "args": ["/absolute/path/to/thunderbird-mcp/mcp-bridge.cjs"],
+      "env": {
+        "THUNDERBIRD_MCP_CONNECTION_FILE": "/absolute/path/to/connection.json"
+      }
+    }
+  }
+}
+```
+
 That's it. Your AI can now access Thunderbird.
 
 ---
 
 ## Security
 
-- **Auth tokens**: The HTTP server requires a session-scoped bearer token. Generated on startup, written to `<TmpD>/thunderbird-mcp/connection.json` with 0600 permissions. The bridge reads this automatically.
+- **Auth tokens**: The HTTP server requires a session-scoped bearer token. Generated on startup, written to `<TmpD>/thunderbird-mcp/connection.json` with 0600 permissions. The bridge re-discovers that file automatically across native installs, Snap, Flatpak, Betterbird Flatpak, and macOS temp directories.
 - **Dynamic port**: Tries ports 8765-8774, records the actual port in the connection file. No hardcoded port dependency.
 - **Account access control**: Restrict which email accounts are visible to MCP clients via the settings page. Changes take effect immediately.
 - **Tool access control**: Disable specific tools via the settings page. Disabled tools are hidden from `tools/list` and blocked at dispatch.
@@ -157,6 +185,7 @@ That's it. Your AI can now access Thunderbird.
 |---------|-----|
 | Extension not loading | Check Tools > Add-ons and Themes. Errors: Tools > Developer Tools > Error Console |
 | Connection refused | Make sure Thunderbird is running and the extension is enabled |
+| Bridge can't find `connection.json` | Set `THUNDERBIRD_MCP_CONNECTION_FILE` explicitly if your environment uses a non-standard temp/runtime path |
 | Missing recent emails | IMAP folders can be stale. Click the folder in Thunderbird to sync, or right-click > Properties > Repair Folder |
 | Tool not found after update | Reconnect MCP (`/mcp` in Claude Code) to pick up new tools |
 | `searchBody` returns no results | IMAP accounts need offline sync enabled for Gloda to index message bodies |
@@ -173,9 +202,12 @@ That's it. Your AI can now access Thunderbird.
 # Test via the bridge (handles auth automatically)
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | node mcp-bridge.cjs
 
-# Test the HTTP API directly (requires auth token from connection file)
-TOKEN=$(cat /tmp/thunderbird-mcp/connection.json | jq -r .token)
-PORT=$(cat /tmp/thunderbird-mcp/connection.json | jq -r .port)
+# Test the HTTP API directly.
+# On Snap / Flatpak / Betterbird Flatpak / macOS, point CONN_FILE at the
+# real file or export THUNDERBIRD_MCP_CONNECTION_FILE first.
+CONN_FILE="${THUNDERBIRD_MCP_CONNECTION_FILE:-/tmp/thunderbird-mcp/connection.json}"
+TOKEN=$(jq -r .token "$CONN_FILE")
+PORT=$(jq -r .port "$CONN_FILE")
 curl -X POST http://127.0.0.1:$PORT \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
