@@ -45,7 +45,7 @@ echo "Installing to profile: $PROFILE_DIR"
 mkdir -p "$EXTENSIONS_DIR"
 
 # Copy extension
-cp "$XPI_FILE" "$EXTENSIONS_DIR/thunderbird-mcp@luthriel.dev.xpi"
+cp "$XPI_FILE" "$EXTENSIONS_DIR/thunderbird-mcp@tkasperczyk.dev.xpi"
 
 echo "Installed! Restart Thunderbird to activate."
 echo ""
