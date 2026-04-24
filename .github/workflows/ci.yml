@@ -85,22 +85,26 @@ jobs:
           - 3465:3465   # SMTPS (unused here)
           - 3993:3993   # IMAPS (unused here)
         env:
-          # CRITICAL: -Dgreenmail.hostname=0.0.0.0 is required or greenmail
-          # binds to container-localhost, docker port-forwarding SYN-
-          # accepts but RSTs on first byte ("SMTP closed early at step 0").
-          # The image's baked-in default ENV already includes this, so
-          # overriding GREENMAIL_OPTS at all means we must re-specify it.
-          #   setup.test.all   -> enable smtp/smtps/pop3/pop3s/imap/imaps
-          #   auth.disabled    -> accept any credentials (headless TB cant prompt)
-          #   hostname=0.0.0.0 -> see note above
-          #   verbose          -> log mail activity to stdout (visible in
-          #                       service logs on failure for debugging)
-          # Explicit users= pre-creates the mailbox keyed by test@ci.local
-          # so RCPT TO deliveries land in the same mailbox TB authenticates
-          # into. Without it, greenmail auto-creates mailboxes on first
-          # delivery, and the key used can differ from the login username
-          # in subtle ways (esp. with @-addresses).
-          GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.auth.disabled -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=test@ci.local:test -Dgreenmail.verbose"
+          # Two things this config has to get right for TB 128 to actually
+          # sync mail:
+          #
+          # 1. hostname=0.0.0.0 -- without it greenmail binds to the
+          #    container's localhost, docker-proxy SYN-accepts but RSTs
+          #    on the first byte ("SMTP closed early at step 0").
+          #
+          # 2. DO NOT set auth.disabled. It looks attractive ("accept any
+          #    credentials") but it also makes greenmail strip AUTH=
+          #    mechanisms from the IMAP CAPABILITY response. TB 128's
+          #    IMAP client refuses to send LOGIN against a server that
+          #    doesn't advertise any AUTH mechanism, and closes the
+          #    session silently -- sync stays at 0 messages forever.
+          #    Instead we rely on users= to seed the credentials TB will
+          #    send (matching the plaintext entry in profile logins.json).
+          #
+          # setup.test.all enables smtp/smtps/pop3/pop3s/imap/imaps on
+          # default ports. verbose logs the IMAP/SMTP wire traffic --
+          # that's what surfaced the missing-AUTH diagnosis.
+          GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=test@ci.local:test -Dgreenmail.verbose"
         # No in-container healthcheck: greenmail/standalone is a slim JRE
         # image without nc/curl. The "Wait for greenmail" step below polls
         # the exposed ports from the runner instead.
