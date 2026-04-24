@@ -161,42 +161,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // Gloda not available
             }
 
-            /**
-             * CRITICAL: Must specify { charset: "UTF-8" } or emojis/special chars
-             * will be corrupted. NetUtil defaults to Latin-1.
-             */
-            function readRequestBody(request) {
-              const stream = request.bodyInputStream;
-              return NetUtil.readInputStreamToString(stream, stream.available(), { charset: "UTF-8" });
-            }
 
-            /**
-             * Apply offset-based pagination to a sorted results array.
-             * Removes the internal _dateTs property from each result.
-             *
-             * Backward-compatible: when offset is undefined/null (not provided),
-             * returns a plain array. When offset is explicitly provided (even 0),
-             * returns structured { messages, totalMatches, offset, limit, hasMore }.
-             * Note: totalMatches is capped at SEARCH_COLLECTION_CAP and may underreport.
-             */
-            function paginate(results, offset, effectiveLimit) {
-              const offsetProvided = offset !== undefined && offset !== null;
-              const effectiveOffset = (offset > 0) ? Math.floor(offset) : 0;
-              const page = results.slice(effectiveOffset, effectiveOffset + effectiveLimit).map(r => {
-                delete r._dateTs;
-                return r;
-              });
-              if (!offsetProvided) {
-                return page;
-              }
-              return {
-                messages: page,
-                totalMatches: results.length,
-                offset: effectiveOffset,
-                limit: effectiveLimit,
-                hasMore: effectiveOffset + effectiveLimit < results.length
-              };
-            }
 
             // Auth + connection-info plumbing. Factory takes the XPCOM
             // globals (which are sandbox-only in api.js, not available
@@ -328,572 +293,71 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             });
 
 
+            // Compose: sendMail / replyToMessage / forwardMessage. The
+            // deepest closure -- attachment timers, compose-window observers,
+            // sendMessageDirectly with TB version-fallback for nsIMsgSend.
+            const { makeCompose } = ChromeUtils.importESModule(
+              "resource://thunderbird-mcp/mcp_server/lib/compose.sys.mjs"
+            );
+            const {
+              composeMail, replyToMessage, forwardMessage,
+            } = makeCompose({
+              Services, Cc, Ci, MailServices,
+              isFolderAccessible, isSkipReviewBlocked,
+              findIdentity, findIdentityIn, getIdentityAutoRecipientHeader,
+              openFolder,
+              findMessage, markMessageDispositionState,
+              _attachTimers, _claimedReplyComposeWindows, _tempAttachFiles,
+              MAX_BASE64_SIZE, COMPOSE_WINDOW_LOAD_DELAY_MS,
+            });
+
+            // Dispatch: validateToolArgs / coerceToolArgs / callTool plus a
+            // few HTTP-handler helpers (readRequestBody, paginate). The HTTP
+            // request handler closure stays inline below because it captures
+            // res / server which are not worth threading through a factory.
+            const { makeDispatch } = ChromeUtils.importESModule(
+              "resource://thunderbird-mcp/mcp_server/lib/dispatch.sys.mjs"
+            );
+            const toolHandlers = {
+              listAccounts, findIdentity, findIdentityIn, getIdentityAutoRecipientHeader,
+              searchContacts, createContact, updateContact, deleteContact,
+              listFolders, openFolder, createFolder, renameFolder, deleteFolder,
+              moveFolder, emptyTrash, emptyJunk,
+              listCalendars, createEvent, listEvents, updateEvent, deleteEvent,
+              createTask, listTasks, updateTask,
+              listFilters, createFilter, updateFilter, deleteFilter,
+              reorderFilters, applyFilters,
+              searchMessages, getMessage, getRecentMessages, displayMessage,
+              deleteMessages, updateMessage, findMessage,
+              composeMail, replyToMessage, forwardMessage,
+              getAccountAccess,
+            };
+            const {
+              readRequestBody, validateToolArgs, coerceToolArgs, callTool,
+            } = makeDispatch({ NetUtil, tools, toolHandlers });
 
 
 
 
-            /** Creates an nsIFile instance for the given path. */
-            function createLocalFile(path) {
-              const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
-              file.initWithPath(path);
-              return file;
-            }
 
 
-            /**
-             * Converts attachment entries to attachment descriptors.
-             * Each entry can be:
-             *   - A string (file path) — resolved from disk
-             *   - An object { name, contentType, base64 } — decoded and written
-             *     to a temp file under <TmpD>/thunderbird-mcp/attachments/
-             * Returns { descs: [{url, name, size, contentType?}], failed: string[] }
-             */
-            function filePathsToAttachDescs(filePaths) {
-              const descs = [];
-              const failed = [];
-              if (!filePaths || !Array.isArray(filePaths)) return { descs, failed };
-              for (const entry of filePaths) {
-                try {
-                  if (typeof entry === "string") {
-                    // File path attachment
-                    const file = createLocalFile(entry);
-                    if (file.exists()) {
-                      descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: file.fileSize });
-                    } else {
-                      failed.push(entry);
-                    }
-                  } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
-                    // Inline base64 attachment — decode and write to temp file
-                    const b64Data = entry.base64 || entry.content;
-                    if (b64Data.length > MAX_BASE64_SIZE) {
-                      failed.push(`${entry.name} (exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB size limit)`);
-                      continue;
-                    }
-                    // Decode base64 to binary bytes
-                    let bytes;
-                    try {
-                      // Use the global atob when available, otherwise fall back
-                      const raw = typeof atob === "function" ? atob(b64Data) : ChromeUtils.base64Decode(b64Data);
-                      bytes = new Uint8Array(raw.length);
-                      for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-                    } catch {
-                      // Fallback: manual base64 decode (atob may not be available in XPCOM context)
-                      try {
-                        const lookup = new Uint8Array(256);
-                        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                        for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
-                        const clean = b64Data.replace(/[^A-Za-z0-9+/]/g, "");
-                        const len = clean.length;
-                        const outLen = (len * 3) >> 2;
-                        bytes = new Uint8Array(outLen);
-                        let p = 0;
-                        for (let i = 0; i < len; i += 4) {
-                          const a = lookup[clean.charCodeAt(i)];
-                          const b = lookup[clean.charCodeAt(i + 1)];
-                          const c = lookup[clean.charCodeAt(i + 2)];
-                          const d = lookup[clean.charCodeAt(i + 3)];
-                          bytes[p++] = (a << 2) | (b >> 4);
-                          if (i + 2 < len) bytes[p++] = ((b & 15) << 4) | (c >> 2);
-                          if (i + 3 < len) bytes[p++] = ((c & 3) << 6) | d;
-                        }
-                        bytes = bytes.subarray(0, p);
-                      } catch {
-                        failed.push(`${entry.name} (invalid base64 data)`);
-                        continue;
-                      }
-                    }
-                    const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-                    tmpDir.append("thunderbird-mcp");
-                    tmpDir.append("attachments");
-                    if (!tmpDir.exists()) {
-                      tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
-                    }
-                    const tmpFile = tmpDir.clone();
-                    let safeName = (entry.name || entry.filename || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_");
-                    if (!safeName || safeName === "." || safeName === "..") safeName = "attachment";
-                    tmpFile.append(`${Date.now()}_${++_tempFileCounter}_${safeName}`);
-                    // Write via XPCOM binary stream
-                    const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
-                      .createInstance(Ci.nsIFileOutputStream);
-                    ostream.init(tmpFile, 0x02 | 0x08 | 0x20, 0o600, 0);
-                    const bstream = Cc["@mozilla.org/binaryoutputstream;1"]
-                      .createInstance(Ci.nsIBinaryOutputStream);
-                    bstream.setOutputStream(ostream);
-                    bstream.writeByteArray(bytes, bytes.length);
-                    bstream.close();
-                    ostream.close();
-                    _tempAttachFiles.add(tmpFile.path);
-                    const desc = { url: Services.io.newFileURI(tmpFile).spec, name: entry.name || entry.filename, size: tmpFile.fileSize };
-                    if (entry.contentType) desc.contentType = entry.contentType;
-                    descs.push(desc);
-                  } else {
-                    failed.push(typeof entry === "object" ? JSON.stringify(entry) : String(entry));
-                  }
-                } catch (e) {
-                  failed.push(typeof entry === "object" ? (entry.name || JSON.stringify(entry)) : String(entry));
-                }
-              }
-              return { descs, failed };
-            }
-
-            /**
-             * Injects attachment descriptors into the most recently opened compose window.
-             * Uses nsITimer so the window has time to finish loading before injection.
-             * Each call gets its own timer stored in _attachTimers to prevent GC.
-             *
-             * Known limitation: uses getMostRecentWindow("msgcompose") which is a race
-             * if two compose operations happen within COMPOSE_WINDOW_LOAD_DELAY_MS --
-             * attachments from the first may land on the second window.
-             * OpenComposeWindowWithParams doesn't return a window handle, so there's
-             * no reliable way to target a specific window. Injection failures are
-             * silent (callers report success based on pre-validated descriptor counts).
-             */
-            /**
-             * Converts attachment descriptors to nsIMsgAttachment objects.
-             * Shared by injectAttachmentsAsync (compose window) and
-             * sendMessageDirectly (headless send).
-             */
-            function descsToMsgAttachments(attachDescs) {
-              const result = [];
-              for (const desc of attachDescs) {
-                try {
-                  const att = Cc["@mozilla.org/messengercompose/attachment;1"]
-                    .createInstance(Ci.nsIMsgAttachment);
-                  att.url = desc.url;
-                  att.name = desc.name;
-                  if (desc.size != null) att.size = desc.size;
-                  if (desc.contentType) att.contentType = desc.contentType;
-                  result.push(att);
-                } catch {}
-              }
-              return result;
-            }
-
-            function addAttachmentsToComposeWindow(composeWin, attachDescs) {
-              if (!composeWin) {
-                console.warn("thunderbird-mcp: skipping attachment add — no compose window");
-                return;
-              }
-              if (typeof composeWin.AddAttachments !== "function") {
-                console.warn("thunderbird-mcp: skipping attachment add — composeWin.AddAttachments not a function");
-                return;
-              }
-              const attachList = descsToMsgAttachments(attachDescs);
-              if (attachList.length > 0) {
-                // Caller's try/catch (or fire-and-forget caller) is responsible for
-                // surfacing failures — do not swallow here.
-                composeWin.AddAttachments(attachList);
-              }
-            }
-
-            function injectAttachmentsAsync(attachDescs) {
-              if (!attachDescs || attachDescs.length === 0) return;
-              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-              _attachTimers.add(timer);
-              timer.initWithCallback({
-                notify() {
-                  _attachTimers.delete(timer);
-                  try {
-                    const composeWin = Services.wm.getMostRecentWindow("msgcompose");
-                    addAttachmentsToComposeWindow(composeWin, attachDescs);
-                  } catch (e) {
-                    // Fire-and-forget timer — no client to error back to.
-                    // Log loudly so users can find the cause in the Error Console
-                    // when an "email sent without attachments" report comes in.
-                    console.error("thunderbird-mcp: injectAttachmentsAsync failed:", e);
-                  }
-                }
-              }, COMPOSE_WINDOW_LOAD_DELAY_MS, Ci.nsITimer.TYPE_ONE_SHOT);
-            }
-
-            function splitAddressHeader(header) {
-              return (header || "").match(/(?:[^,"]|"[^"]*")+/g) || [];
-            }
-
-            function extractAddressEmail(address) {
-              return (address.match(/<([^>]+)>/)?.[1] || address.trim()).toLowerCase();
-            }
-
-            function mergeAddressHeaders(...headers) {
-              const seen = new Set();
-              const merged = [];
-              for (const header of headers) {
-                for (const raw of splitAddressHeader(header)) {
-                  const address = raw.trim();
-                  if (!address) continue;
-                  const email = extractAddressEmail(address);
-                  if (seen.has(email)) continue;
-                  seen.add(email);
-                  merged.push(address);
-                }
-              }
-              return merged.join(", ");
-            }
-
-            function getReplyAllCcRecipients(msgHdr, folder) {
-              const ownAccount = MailServices.accounts.findAccountForServer(folder.server);
-              const ownEmails = new Set();
-              if (ownAccount) {
-                for (const identity of ownAccount.identities) {
-                  if (identity.email) ownEmails.add(identity.email.toLowerCase());
-                }
-              }
-
-              const allRecipients = [
-                ...splitAddressHeader(msgHdr.recipients),
-                ...splitAddressHeader(msgHdr.ccList)
-              ]
-                .map(r => r.trim())
-                .filter(r => r && (ownEmails.size === 0 || !ownEmails.has(extractAddressEmail(r))));
-
-              const seen = new Set();
-              const uniqueRecipients = allRecipients.filter(r => {
-                const email = extractAddressEmail(r);
-                if (seen.has(email)) return false;
-                seen.add(email);
-                return true;
-              });
-
-              return uniqueRecipients.join(", ");
-            }
 
 
-            function applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc) {
-              if (!composeWin) return;
-              const overrides = { identityKey: null };
-              if (to) overrides.to = to;
-              if (cc) overrides.cc = mergeAddressHeaders(getIdentityAutoRecipientHeader(identity, "cc"), cc);
-              if (bcc) overrides.bcc = mergeAddressHeaders(getIdentityAutoRecipientHeader(identity, "bcc"), bcc);
-              if (Object.keys(overrides).length === 1) return;
-
-              if (typeof composeWin.SetComposeDetails === "function") {
-                composeWin.SetComposeDetails(overrides);
-                return;
-              }
-
-              const fields = composeWin.gMsgCompose?.compFields;
-              if (!fields) return;
-              if (Object.prototype.hasOwnProperty.call(overrides, "to")) fields.to = overrides.to;
-              if (Object.prototype.hasOwnProperty.call(overrides, "cc")) fields.cc = overrides.cc;
-              if (Object.prototype.hasOwnProperty.call(overrides, "bcc")) fields.bcc = overrides.bcc;
-              if (typeof composeWin.CompFields2Recipients === "function") {
-                composeWin.CompFields2Recipients(fields);
-              }
-            }
-
-            function formatBodyFragmentHtml(body, isHtml) {
-              const formatted = formatBodyHtml(body, isHtml);
-              if (!isHtml) return formatted;
-              if (!formatted) return "";
-
-              const needsParsing = /<(?:html|body|head)\b/i.test(formatted) || /\bmoz-signature\b/i.test(formatted);
-              if (!needsParsing) return formatted;
-
-              try {
-                const doc = new DOMParser().parseFromString(formatted, "text/html");
-                for (const node of doc.querySelectorAll("div.moz-signature, pre.moz-signature")) {
-                  node.remove();
-                }
-                return doc.body ? doc.body.innerHTML : formatted;
-              } catch {
-                return formatted;
-              }
-            }
-
-            function insertReplyBodyIntoComposeWindow(composeWin, body, isHtml) {
-              if (!composeWin || !body) return;
-              const fragment = formatBodyFragmentHtml(body, isHtml);
-              if (!fragment) return;
-
-              const browser = typeof composeWin.getBrowser === "function" ? composeWin.getBrowser() : null;
-              const editorDoc = browser?.contentDocument;
-              if (editorDoc && typeof editorDoc.execCommand === "function") {
-                editorDoc.execCommand("insertHTML", false, fragment);
-              } else {
-                const editor = typeof composeWin.GetCurrentEditor === "function" ? composeWin.GetCurrentEditor() : null;
-                if (editor && typeof editor.insertHTML === "function") {
-                  editor.insertHTML(fragment);
-                }
-              }
-
-              if (composeWin.gMsgCompose) {
-                composeWin.gMsgCompose.bodyModified = true;
-              }
-              if ("gContentChanged" in composeWin) {
-                composeWin.gContentChanged = true;
-              }
-            }
-
-            function openReplyComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs) {
-              return new Promise((resolve) => {
-                const OPEN_TIMEOUT_MS = 15000;
-                let settled = false;
-                let matchedWindow = null;
-                let pendingStateListener = null;
-                let pendingStateCompose = null;
-
-                const finish = (result) => {
-                  if (settled) return;
-                  settled = true;
-                  try { Services.ww.unregisterNotification(windowObserver); } catch {}
-                  try { timeout.cancel(); } catch {}
-                  // Unregister any dangling state listener so a late
-                  // NotifyComposeBodyReady cannot mutate the compose window
-                  // after we have already resolved (e.g. after a timeout).
-                  if (pendingStateListener && pendingStateCompose) {
-                    try { pendingStateCompose.UnregisterStateListener(pendingStateListener); } catch {}
-                  }
-                  pendingStateListener = null;
-                  pendingStateCompose = null;
-                  resolve(result);
-                };
-
-                const timeout = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                timeout.initWithCallback({
-                  notify() {
-                    finish({ error: "Timed out waiting for reply compose window" });
-                  }
-                }, OPEN_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
-
-                const maybeCustomizeWindow = (composeWin) => {
-                  try {
-                    if (!composeWin || composeWin === matchedWindow) return;
-                    if (composeWin.document?.documentElement?.getAttribute("windowtype") !== "msgcompose") return;
-                    if (!composeWin.gMsgCompose) return;
-                    if (composeWin.gMsgCompose.originalMsgURI !== originalMsgURI) return;
-                    if (composeWin.gComposeType !== compType) return;
-                    // When two callers reply to the same message concurrently,
-                    // both observers see both compose windows. Skip any window
-                    // that has already been claimed by a prior observer so each
-                    // call binds to exactly one compose window.
-                    if (_claimedReplyComposeWindows.has(composeWin)) return;
-                    _claimedReplyComposeWindows.add(composeWin);
-
-                    matchedWindow = composeWin;
-                    try { Services.ww.unregisterNotification(windowObserver); } catch {}
-
-                    const stateListener = {
-                      QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
-                      NotifyComposeFieldsReady() {},
-                      ComposeProcessDone() {},
-                      SaveInFolderDone() {},
-                      NotifyComposeBodyReady() {
-                        // Guard against a late body-ready firing after the
-                        // caller already timed out -- don't mutate the compose
-                        // window once the promise is settled.
-                        if (settled) {
-                          try { composeWin.gMsgCompose.UnregisterStateListener(stateListener); } catch {}
-                          return;
-                        }
-
-                        try {
-                          composeWin.gMsgCompose.UnregisterStateListener(stateListener);
-                        } catch {}
-                        pendingStateListener = null;
-                        pendingStateCompose = null;
-
-                        try {
-                          applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc);
-                          insertReplyBodyIntoComposeWindow(composeWin, body, isHtml);
-                          addAttachmentsToComposeWindow(composeWin, attachDescs);
-                          finish({ success: true });
-                        } catch (e) {
-                          finish({ error: e.toString() });
-                        }
-                      },
-                    };
-
-                    pendingStateListener = stateListener;
-                    pendingStateCompose = composeWin.gMsgCompose;
-                    composeWin.gMsgCompose.RegisterStateListener(stateListener);
-                  } catch (e) {
-                    finish({ error: e.toString() });
-                  }
-                };
-
-                const windowObserver = {
-                  observe(subject, topic) {
-                    if (topic !== "domwindowopened") return;
-                    const composeWin = subject;
-                    if (!composeWin || typeof composeWin.addEventListener !== "function") return;
-
-                    // Thunderbird dispatches a non-bubbling compose-window-init event
-                    // from MsgComposeCommands.js after gMsgCompose is initialized and
-                    // the built-in state listener is registered, but before editor
-                    // creation begins. Capturing it on the window lets us register our
-                    // own ComposeBodyReady listener for the specific reply window
-                    // without relying on getMostRecentWindow("msgcompose").
-                    composeWin.addEventListener("compose-window-init", () => {
-                      maybeCustomizeWindow(composeWin);
-                    }, { once: true, capture: true });
-                  },
-                };
-
-                try {
-                  Services.ww.registerNotification(windowObserver);
-                  const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                    .getService(Ci.nsIMsgComposeService);
-                  msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-                } catch (e) {
-                  finish({ error: e.toString() });
-                }
-              });
-            }
 
 
-            /**
-             * Sends a message directly via nsIMsgSend without opening a compose window.
-             * Used by composeMail, replyToMessage, forwardMessage when skipReview=true.
-             *
-             * Handles two createAndSendMessage signatures:
-             * - TB 102-127 (C++): 18 args, includes aAttachments + aPreloadedAttachments
-             * - TB 128+   (JS):  16 args, attachments via composeFields only
-             * Attachments are always added to composeFields (works in both).
-             * We try the modern 16-arg call first; if TB throws
-             * NS_ERROR_XPC_NOT_ENOUGH_ARGS, fall back to the legacy 18-arg call.
-             */
-            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType) {
-              if (!identity) {
-                return Promise.resolve({ error: "No identity available for direct send" });
-              }
 
-              const SEND_TIMEOUT_MS = 120000; // 2 min safety timeout
 
-              return new Promise((resolve) => {
-                let settled = false;
-                const settle = (result) => {
-                  if (!settled) {
-                    settled = true;
-                    resolve(result);
-                  }
-                };
 
-                // Safety timeout -- if neither listener callback nor error fires
-                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                timer.initWithCallback({
-                  notify() { settle({ error: "Send timed out after " + (SEND_TIMEOUT_MS / 1000) + "s" }); }
-                }, SEND_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
 
-                try {
-                  const msgSend = Cc["@mozilla.org/messengercompose/send;1"]
-                    .createInstance(Ci.nsIMsgSend);
 
-                  // Populate sender fields from identity (normally done by compose window)
-                  if (identity.email) {
-                    const name = identity.fullName || "";
-                    composeFields.from = name
-                      ? `"${name}" <${identity.email}>`
-                      : identity.email;
-                  }
-                  if (identity.organization) {
-                    composeFields.organization = identity.organization;
-                  }
 
-                  // Add attachments to composeFields (works in all TB versions)
-                  for (const att of descsToMsgAttachments(attachDescs)) {
-                    composeFields.addAttachment(att);
-                  }
 
-                  // Extract body -- createAndSendMessage takes it as a separate param
-                  const body = composeFields.body || "";
 
-                  // Resolve account key from identity
-                  let accountKey = "";
-                  try {
-                    for (const account of MailServices.accounts.accounts) {
-                      for (let i = 0; i < account.identities.length; i++) {
-                        if (account.identities[i].key === identity.key) {
-                          accountKey = account.key;
-                          break;
-                        }
-                      }
-                      if (accountKey) break;
-                    }
-                  } catch {}
 
-                  const listener = {
-                    QueryInterface: ChromeUtils.generateQI(["nsIMsgSendListener"]),
-                    onStartSending() {},
-                    onProgress() {},
-                    onSendProgress() {},
-                    onStatus() {},
-                    onStopSending(msgID, status) {
-                      timer.cancel();
-                      if (Components.isSuccessCode(status)) {
-                        settle({ success: true, message: "Message sent" });
-                      } else {
-                        settle({ error: `Send failed (status: 0x${status.toString(16)})` });
-                      }
-                    },
-                    onGetDraftFolderURI() {},
-                    onSendNotPerformed(msgID, status) {
-                      timer.cancel();
-                      settle({ error: "Send was not performed" });
-                    },
-                    onTransportSecurityError(msgID, status, secInfo, location) {
-                      timer.cancel();
-                      settle({ error: `Transport security error${location ? ": " + location : ""}` });
-                    },
-                  };
 
-                  // Common args shared by both signatures (positions 1-10)
-                  const commonArgs = [
-                    null,                           // editor
-                    identity,                       // identity
-                    accountKey,                     // account key
-                    composeFields,                  // fields
-                    false,                          // isDigest
-                    false,                          // dontDeliver
-                    Ci.nsIMsgCompDeliverMode.Now,   // deliver mode
-                    null,                           // msgToReplace
-                    "text/html",                    // body type
-                    body,                           // body
-                  ];
 
-                  // Tail args shared by both (parentWindow..compType)
-                  const tailArgs = [
-                    null,                           // parent window
-                    null,                           // progress
-                    listener,                       // listener
-                    "",                             // password
-                    originalMsgURI || "",           // original msg URI
-                    compType,                       // compose type
-                  ];
 
-                  // Try modern 16-arg signature first (TB 128+).
-                  // On TB 102-127, XPCOM throws NS_ERROR_XPC_NOT_ENOUGH_ARGS
-                  // (0x80570001), so we fall back to legacy 18-arg with null
-                  // attachment params (attachments already on composeFields).
-                  // Modern TB may return a Promise -- catch async rejections.
-                  let sendResult;
-                  try {
-                    sendResult = msgSend.createAndSendMessage(...commonArgs, ...tailArgs);
-                  } catch (e) {
-                    const isArgError = (e && e.result === 0x80570001) ||
-                      String(e).includes("Not enough arguments");
-                    if (isArgError) {
-                      sendResult = msgSend.createAndSendMessage(...commonArgs, null, null, ...tailArgs);
-                    } else {
-                      throw e;
-                    }
-                  }
-                  // Handle async Promise from modern TB (128+)
-                  if (sendResult && typeof sendResult.catch === "function") {
-                    sendResult.catch(e => {
-                      timer.cancel();
-                      settle({ error: e.toString() });
-                    });
-                  }
-                } catch (e) {
-                  timer.cancel();
-                  settle({ error: e.toString() });
-                }
-              });
-            }
 
-            function escapeHtml(s) {
-              return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-            }
 
             function stripHtml(html) {
               if (!html) return "";
@@ -1113,668 +577,63 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { body: htmlToMarkdown(text), bodyIsHtml: false };
             }
 
-            /**
-             * Converts body text to HTML for compose fields.
-             * Handles both HTML input (entity-encodes non-ASCII) and plain text.
-             */
-            function formatBodyHtml(body, isHtml) {
-              if (isHtml) {
-                let text = (body || "").replace(/\n/g, '');
-                text = [...text].map(c => c.codePointAt(0) > 127 ? `&#${c.codePointAt(0)};` : c).join('');
-                return text;
-              }
-              return escapeHtml(body || "").replace(/\n/g, '<br>');
-            }
-
-            /**
-             * Sets compose identity from `from` param or falls back to default.
-             * Returns "" on success, or { error } if `from` was explicitly
-             * provided but not found / restricted.  Fallback to default only
-             * applies when `from` is omitted.
-             */
-            function setComposeIdentity(msgComposeParams, from, fallbackServer) {
-              if (from) {
-                // Explicit `from` -- must resolve or fail, never silently substitute
-                const identity = findIdentity(from);
-                if (identity) {
-                  // findIdentity searches accessible accounts, so this is safe
-                  msgComposeParams.identity = identity;
-                  return "";
-                }
-                // Not found in accessible accounts -- check ALL accounts to
-                // distinguish "restricted" from "genuinely unknown"
-                if (findIdentityIn(MailServices.accounts.accounts, from)) {
-                  return { error: `identity ${from} belongs to a restricted account` };
-                }
-                return { error: `unknown identity: ${from} -- no matching account configured in Thunderbird` };
-              }
-              // No explicit `from` -- fall back to contextual default
-              if (fallbackServer) {
-                const account = MailServices.accounts.findAccountForServer(fallbackServer);
-                if (account && isAccountAllowed(account.key)) {
-                  msgComposeParams.identity = account.defaultIdentity;
-                }
-              } else {
-                const defaultAccount = MailServices.accounts.defaultAccount;
-                if (defaultAccount && isAccountAllowed(defaultAccount.key)) {
-                  msgComposeParams.identity = defaultAccount.defaultIdentity;
-                }
-              }
-              // If no identity was set (all fallbacks restricted), explicitly set
-              // the first accessible identity. Without this, Thunderbird's
-              // OpenComposeWindowWithParams fills identity from defaultAccount
-              // internally, bypassing account restrictions.
-              if (!msgComposeParams.identity) {
-                for (const account of getAccessibleAccounts()) {
-                  if (account.defaultIdentity) {
-                    msgComposeParams.identity = account.defaultIdentity;
-                    break;
-                  }
-                }
-                if (!msgComposeParams.identity) {
-                  return { error: "No accessible identity found -- all accounts are restricted" };
-                }
-              }
-              return "";
-            }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-            // VEVENT STATUS values per iCal RFC 5545 § 3.8.1.11.
-            const VEVENT_STATUS_MAP = {
-              tentative: "TENTATIVE",
-              confirmed: "CONFIRMED",
-              cancelled: "CANCELLED",
-              canceled: "CANCELLED",
-            };
-
-
-
-
-
-
-
-
-
-
-            /**
-             * Composes a new email. Opens a compose window for review, or sends
-             * directly when skipReview is true.
-             *
-             * HTML body handling quirks:
-             * 1. Strip newlines from HTML - Thunderbird adds <br> for each \n
-             * 2. Encode non-ASCII as HTML entities - compose window has charset issues
-             *    with emojis/unicode even with <meta charset="UTF-8">
-             */
-            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview) {
-              try {
-                if (skipReview && isSkipReviewBlocked()) {
-                  return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
-                }
-                const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
-                  .createInstance(Ci.nsIMsgComposeParams);
-
-                const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
-                  .createInstance(Ci.nsIMsgCompFields);
-
-                composeFields.to = to || "";
-                composeFields.cc = cc || "";
-                composeFields.bcc = bcc || "";
-                composeFields.subject = subject || "";
-
-                const formatted = formatBodyHtml(body, isHtml);
-                if (isHtml && formatted.includes('<html')) {
-                  composeFields.body = formatted;
-                } else {
-                  composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
-                }
-
-                msgComposeParams.type = Ci.nsIMsgCompType.New;
-                msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
-                msgComposeParams.composeFields = composeFields;
-
-                const identityResult = setComposeIdentity(msgComposeParams, from, null);
-                if (identityResult && identityResult.error) return identityResult;
-
-                const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
-
-                if (skipReview) {
-                  return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New).then(result => {
-                    if (result.success) {
-                      let msg = "Message sent";
-                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-                      result.message = msg;
-                    }
-                    return result;
-                  });
-                }
-
-                const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                  .getService(Ci.nsIMsgComposeService);
-                msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-
-                injectAttachmentsAsync(fileDescs);
-
-                let msg = "Compose window opened";
-                if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-                return { success: true, message: msg };
-              } catch (e) {
-                return { error: e.toString() };
-              }
-            }
-
-            /**
-             * Replies to a message with quoted original. Opens a compose window
-             * for review, or sends directly when skipReview is true.
-             *
-             * Review path uses Thunderbird's native reply compose flow so it can
-             * build the quoted original, place the identity signature according
-             * to user preferences, and set threading headers/disposition flags.
-             * skipReview still uses direct send, so it keeps a manual quoted body
-             * and manually marks the original as replied after a successful send.
-             */
-	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview) {
-	              return new Promise((resolve) => {
-	                try {
-	                  if (skipReview && isSkipReviewBlocked()) {
-	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
-	                    return;
-	                  }
-	                  const found = findMessage(messageId, folderPath);
-	                  if (found.error) {
-	                    resolve({ error: found.error });
-	                    return;
-	                  }
-	                  const { msgHdr, folder } = found;
-	                  const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
-	                  const msgURI = folder.getUriForMsg(msgHdr);
-	                  const compType = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
-
-	                  const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
-	                    .createInstance(Ci.nsIMsgComposeParams);
-
-	                  const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
-	                    .createInstance(Ci.nsIMsgCompFields);
-
-	                  msgComposeParams.type = compType;
-	                  msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
-	                  msgComposeParams.originalMsgURI = msgURI;
-	                  msgComposeParams.composeFields = composeFields;
-
-	                  try {
-	                    msgComposeParams.origMsgHdr = msgHdr;
-	                  } catch {}
-
-	                  const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
-	                  if (identityResult && identityResult.error) {
-	                    resolve(identityResult);
-	                    return;
-	                  }
-
-	                  // Pass through only the fields the caller explicitly provided.
-	                  // Any field left undefined is filled in by Thunderbird's native
-	                  // reply/reply-all machinery (including proper Reply-To,
-	                  // Mail-Followup-To, mailing-list handling, and self-filtering
-	                  // against the selected identity). Our old custom
-	                  // getReplyAllCcRecipients path bypassed all of that.
-	                  const reviewTo = to;
-	                  const reviewCc = cc;
-
-	                  if (skipReview) {
-	                    const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-	                      "resource:///modules/gloda/MimeMessage.sys.mjs"
-                      );
-
-	                    MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
-	                      try {
-	                        const originalBody = extractPlainTextBody(aMimeMsg);
-
-	                        if (replyAll) {
-	                          composeFields.to = to || msgHdr.author;
-	                          if (cc) {
-	                            composeFields.cc = cc;
-	                          } else {
-	                            const replyAllCc = getReplyAllCcRecipients(msgHdr, folder);
-	                            if (replyAllCc) composeFields.cc = replyAllCc;
-	                          }
-	                        } else {
-	                          composeFields.to = to || msgHdr.author;
-	                          if (cc) composeFields.cc = cc;
-	                        }
-
-	                        composeFields.bcc = bcc || "";
-
-	                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-	                        composeFields.subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`;
-	                        composeFields.references = `<${messageId}>`;
-	                        composeFields.setHeader("In-Reply-To", `<${messageId}>`);
-
-	                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
-	                        const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-	                        const quotedLines = originalBody.split('\n').map(line =>
-	                          `&gt; ${escapeHtml(line)}`
-	                        ).join('<br>');
-	                        const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
-	                        const quoteBlock = isHtml
-	                          ? `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<blockquote type="cite">${quotedHtml}</blockquote>`
-	                          : `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<br>${quotedLines}`;
-
-	                        // Direct send goes through nsIMsgSend, not nsIMsgCompose, so
-	                        // it still uses a hand-built quoted body and cannot place the
-	                        // identity signature according to reply preferences.
-	                        composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
-
-	                        sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType).then(result => {
-	                          if (result.success) {
-	                            let repliedDisposition = null;
-	                            try {
-	                              repliedDisposition = Ci.nsIMsgFolder.nsMsgDispositionState_Replied;
-	                            } catch {}
-	                            markMessageDispositionState(msgHdr, repliedDisposition);
-
-	                            let msg = "Reply sent";
-	                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-	                            result.message = msg;
-	                          }
-	                          resolve(result);
-	                        });
-	                      } catch (e) {
-	                        resolve({ error: e.toString() });
-	                      }
-	                    }, true, { examineEncryptedParts: true });
-	                    return;
-	                  }
-
-	                  openReplyComposeWindowWithCustomizations(
-	                    msgComposeParams,
-	                    msgURI,
-	                    compType,
-	                    msgComposeParams.identity,
-	                    body,
-	                    isHtml,
-	                    reviewTo,
-	                    reviewCc,
-	                    bcc,
-	                    fileDescs
-	                  ).then(result => {
-	                    if (result.success) {
-	                      let msg = "Reply window opened";
-	                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-	                      result.message = msg;
-	                    }
-	                    resolve(result);
-	                  });
-
-	                } catch (e) {
-	                  resolve({ error: e.toString() });
-	                }
-	              });
-            }
-
-            /**
-             * Forwards a message with original content and attachments. Opens a
-             * compose window for review, or sends directly when skipReview is true.
-             * Uses New type with manual forward quote to preserve both intro body and forwarded content.
-             */
-	            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
-	              return new Promise((resolve) => {
-	                try {
-	                  if (skipReview && isSkipReviewBlocked()) {
-	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
-	                    return;
-	                  }
-	                  const found = findMessage(messageId, folderPath);
-	                  if (found.error) {
-	                    resolve({ error: found.error });
-	                    return;
-	                  }
-	                  const { msgHdr, folder } = found;
-
-	                  // Get attachments and body from original message
-	                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
-	                    "resource:///modules/gloda/MimeMessage.sys.mjs"
-                  );
-
-                  MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
-                    try {
-                      const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
-                        .createInstance(Ci.nsIMsgComposeParams);
-
-                      const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
-                        .createInstance(Ci.nsIMsgCompFields);
-
-                      composeFields.to = to;
-                      composeFields.cc = cc || "";
-                      composeFields.bcc = bcc || "";
-
-                      const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-                      composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
-
-                      // Get original body
-                      const originalBody = extractPlainTextBody(aMimeMsg);
-
-                      // Build forward header block
-                      const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
-                      const fwdAuthor = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-                      const fwdSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-                      const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
-                      const escapedBody = escapeHtml(originalBody).replace(/\n/g, '<br>');
-
-                      const forwardBlock = `-------- Forwarded Message --------<br>` +
-                        `Subject: ${escapeHtml(fwdSubject)}<br>` +
-                        `Date: ${dateStr}<br>` +
-                        `From: ${escapeHtml(fwdAuthor)}<br>` +
-                        `To: ${escapeHtml(fwdRecipients)}<br><br>` +
-                        escapedBody;
-
-                      // Combine intro body + forward block
-                      const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
-
-                      composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
-
-                      // Collect original message attachments as descriptors
-                      const origDescs = [];
-                      if (aMimeMsg && aMimeMsg.allUserAttachments) {
-                        for (const att of aMimeMsg.allUserAttachments) {
-                          try {
-                            origDescs.push({ url: att.url, name: att.name, contentType: att.contentType });
-                          } catch {
-                            // Skip unreadable original attachments
-                          }
-                        }
-                      }
-
-                      // Validate user-specified file attachments
-                      const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
-
-                      // Use New type - we build forward quote manually
-                      msgComposeParams.type = Ci.nsIMsgCompType.New;
-                      msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
-                      msgComposeParams.composeFields = composeFields;
-
-                      const identityResult = setComposeIdentity(msgComposeParams, from, folder.server);
-                      if (identityResult && identityResult.error) { resolve(identityResult); return; }
-
-                      const allDescs = [...origDescs, ...fileDescs];
-
-                      if (skipReview) {
-                        const msgURI = folder.getUriForMsg(msgHdr);
-                        sendMessageDirectly(composeFields, msgComposeParams.identity, allDescs, msgURI, Ci.nsIMsgCompType.ForwardInline).then(result => {
-                          if (result.success) {
-                            let msg = `Forward sent with ${allDescs.length} attachment(s)`;
-                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-                            result.message = msg;
-                          }
-                          resolve(result);
-                        });
-                        return;
-                      }
-
-                      const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
-                        .getService(Ci.nsIMsgComposeService);
-                      msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-
-                      injectAttachmentsAsync(allDescs);
-
-                      let msg = `Forward window opened with ${allDescs.length} attachment(s)`;
-                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
-                      resolve({ success: true, message: msg });
-                    } catch (e) {
-                      resolve({ error: e.toString() });
-                    }
-                  }, true, { examineEncryptedParts: true });
-
-                } catch (e) {
-                  resolve({ error: e.toString() });
-                }
-              });
-            }
-
-
-
-
-
-
-
-
-
-
-
-
-
-            // ── Filter constant maps ──
-
-            const ATTRIB_MAP = {
-              subject: 0, from: 1, body: 2, date: 3, priority: 4,
-              status: 5, to: 6, cc: 7, toOrCc: 8, allAddresses: 9,
-              ageInDays: 10, size: 11, tag: 12, hasAttachment: 13,
-              junkStatus: 14, junkPercent: 15, otherHeader: 16,
-            };
-            const ATTRIB_NAMES = Object.fromEntries(Object.entries(ATTRIB_MAP).map(([k, v]) => [v, k]));
-
-            const OP_MAP = {
-              contains: 0, doesntContain: 1, is: 2, isnt: 3, isEmpty: 4,
-              isBefore: 5, isAfter: 6, isHigherThan: 7, isLowerThan: 8,
-              beginsWith: 9, endsWith: 10, isInAB: 11, isntInAB: 12,
-              isGreaterThan: 13, isLessThan: 14, matches: 15, doesntMatch: 16,
-            };
-            const OP_NAMES = Object.fromEntries(Object.entries(OP_MAP).map(([k, v]) => [v, k]));
-
-            const ACTION_MAP = {
-              moveToFolder: 0x01, copyToFolder: 0x02, changePriority: 0x03,
-              delete: 0x04, markRead: 0x05, killThread: 0x06,
-              watchThread: 0x07, markFlagged: 0x08, label: 0x09,
-              reply: 0x0A, forward: 0x0B, stopExecution: 0x0C,
-              deleteFromServer: 0x0D, leaveOnServer: 0x0E, junkScore: 0x0F,
-              fetchBody: 0x10, addTag: 0x11, deleteBody: 0x12,
-              markUnread: 0x14, custom: 0x15,
-            };
-            const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
-
-
-
-
-
-
-
-
-
-
-
-            /**
-             * Build a lookup from tool name to inputSchema for fast validation.
-             */
-            const toolSchemas = Object.create(null);
-            for (const t of tools) {
-              toolSchemas[t.name] = t.inputSchema;
-            }
-
-            /**
-             * Validate tool arguments against the tool's inputSchema.
-             * Checks required fields, types (string, number, boolean, array, object),
-             * and rejects unknown properties.
-             * Returns an array of error strings (empty = valid).
-             */
-            function validateToolArgs(name, args) {
-              const schema = toolSchemas[name];
-              if (!schema) return [`Unknown tool: ${name}`];
-
-              const errors = [];
-              const props = schema.properties || {};
-              const required = schema.required || [];
-
-              // Check required fields
-              for (const key of required) {
-                if (args[key] === undefined || args[key] === null) {
-                  errors.push(`Missing required parameter: ${key}`);
-                }
-              }
-
-              // Check types and reject unknown properties
-              for (const [key, value] of Object.entries(args)) {
-                // Use hasOwnProperty to prevent inherited properties like
-                // 'constructor' or 'toString' from bypassing unknown-param checks.
-                const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
-                if (!propSchema) {
-                  errors.push(`Unknown parameter: ${key}`);
-                  continue;
-                }
-                if (value === undefined || value === null) continue;
-
-                const expectedType = propSchema.type;
-                if (expectedType === "array") {
-                  if (!Array.isArray(value)) {
-                    errors.push(`Parameter '${key}' must be an array, got ${typeof value}`);
-                  }
-                } else if (expectedType === "object") {
-                  if (typeof value !== "object" || Array.isArray(value)) {
-                    errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
-                  }
-                } else if (expectedType === "integer") {
-                  // JSON Schema "integer" is a whole number. typeof reports
-                  // "number" for both integers and floats, so check explicitly.
-                  if (typeof value !== "number" || !Number.isInteger(value)) {
-                    errors.push(`Parameter '${key}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
-                  }
-                } else if (expectedType && typeof value !== expectedType) {
-                  errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
-                }
-              }
-
-              return errors;
-            }
-
-            /**
-             * Coerce tool arguments to match expected schema types.
-             * MCP clients may send "true"/"false" as strings for booleans,
-             * "50" as strings for numbers, or JSON-encoded arrays as strings.
-             * Mutates and returns the args object.
-             */
-            function coerceToolArgs(name, args) {
-              const schema = toolSchemas[name];
-              if (!schema) return args;
-              const props = schema.properties || {};
-              for (const [key, value] of Object.entries(args)) {
-                if (value === undefined || value === null) continue;
-                const propSchema = Object.prototype.hasOwnProperty.call(props, key) ? props[key] : undefined;
-                if (!propSchema) continue;
-                const expected = propSchema.type;
-                if (expected === "boolean" && typeof value === "string") {
-                  if (value === "true") args[key] = true;
-                  else if (value === "false") args[key] = false;
-                } else if (expected === "number" && typeof value === "string") {
-                  // Reject blank/whitespace strings -- Number("") is 0 which
-                  // would silently coerce empty input into a valid number.
-                  if (value.trim() === "") continue;
-                  const n = Number(value);
-                  if (Number.isFinite(n)) args[key] = n;
-                } else if (expected === "integer" && typeof value === "string") {
-                  if (value.trim() === "") continue;
-                  const n = Number(value);
-                  if (Number.isFinite(n) && Number.isInteger(n)) args[key] = n;
-                } else if (expected === "array" && typeof value === "string") {
-                  try {
-                    const parsed = JSON.parse(value);
-                    if (Array.isArray(parsed)) args[key] = parsed;
-                  } catch (e) {
-                    // Leave value as-is so validator surfaces a typed error to the client.
-                    console.warn(`thunderbird-mcp: coerceToolArgs JSON.parse failed for key=${key}:`, e.message);
-                  }
-                }
-              }
-              return args;
-            }
-
-            async function callTool(name, args) {
-              switch (name) {
-                case "listAccounts":
-                  return listAccounts();
-                case "listFolders":
-                  return listFolders(args.accountId, args.folderPath);
-                case "searchMessages":
-                  return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
-                case "getMessage":
-                  return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
-                case "searchContacts":
-                  return searchContacts(args.query || "", args.maxResults);
-                case "createContact":
-                  return createContact(args.email, args.displayName, args.firstName, args.lastName, args.addressBookId);
-                case "updateContact":
-                  return updateContact(args.contactId, args.email, args.displayName, args.firstName, args.lastName);
-                case "deleteContact":
-                  return deleteContact(args.contactId);
-                case "listCalendars":
-                  return listCalendars();
-                case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status);
-                case "listEvents":
-                  return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
-                case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status);
-                case "deleteEvent":
-                  return await deleteEvent(args.eventId, args.calendarId);
-                case "createTask":
-                  return createTask(args.title, args.dueDate, args.calendarId);
-                case "listTasks":
-                  return await listTasks(args.calendarId, args.completed, args.dueBefore, args.maxResults);
-                case "updateTask":
-                  return await updateTask(args.taskId, args.calendarId, args.title, args.dueDate, args.description, args.completed, args.percentComplete, args.priority);
-                case "sendMail":
-                  return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
-                case "replyToMessage":
-                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
-                case "forwardMessage":
-                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
-                case "getRecentMessages":
-                  return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
-                case "displayMessage":
-                  return displayMessage(args.messageId, args.folderPath, args.displayMode);
-                case "deleteMessages":
-                  return deleteMessages(args.messageIds, args.folderPath);
-                case "updateMessage":
-                  return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash);
-                case "createFolder":
-                  return createFolder(args.parentFolderPath, args.name);
-                case "renameFolder":
-                  return renameFolder(args.folderPath, args.newName);
-                case "deleteFolder":
-                  return deleteFolder(args.folderPath);
-                case "emptyTrash":
-                  return emptyTrash(args.accountId);
-                case "emptyJunk":
-                  return emptyJunk(args.accountId);
-                case "moveFolder":
-                  return moveFolder(args.folderPath, args.newParentPath);
-                case "listFilters":
-                  return listFilters(args.accountId);
-                case "createFilter":
-                  return createFilter(args.accountId, args.name, args.enabled, args.type, args.conditions, args.actions, args.insertAtIndex);
-                case "updateFilter":
-                  return updateFilter(args.accountId, args.filterIndex, args.name, args.enabled, args.type, args.conditions, args.actions);
-                case "deleteFilter":
-                  return deleteFilter(args.accountId, args.filterIndex);
-                case "reorderFilters":
-                  return reorderFilters(args.accountId, args.fromIndex, args.toIndex);
-                case "applyFilters":
-                  return applyFilters(args.accountId, args.folderPath);
-                case "getAccountAccess":
-                  return getAccountAccess();
-                default:
-                  throw new Error(`Unknown tool: ${name}`);
-              }
-            }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
             const server = new HttpServer();
 
