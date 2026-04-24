@@ -15,11 +15,15 @@ export function makeDispatch({
   NetUtil,
   tools,
   toolHandlers,
-  permissions,    // optional fine-grained permission engine; if absent only the legacy
-                  // isToolEnabled check from access-control gates calls
-  isToolEnabled,  // optional Level-1 enable/disable check (still used as the
-                  // pre-permissions sandbox floor in callers that haven't yet
-                  // adopted the engine; kept for backward-compat)
+  permissions,        // optional fine-grained permission engine; if absent only the legacy
+                      // isToolEnabled check from access-control gates calls
+  isToolEnabled,      // optional Level-1 enable/disable check (still used as the
+                      // pre-permissions sandbox floor in callers that haven't yet
+                      // adopted the engine; kept for backward-compat)
+  registryHandlers,   // optional map: toolName -> handler(args) from
+                      // lib/tool-registry.sys.mjs. callTool checks this
+                      // first; if a registry entry wins, we skip the legacy
+                      // switch entirely. Enables one-file-per-tool migration.
 }) {
   // Pre-build a name -> inputSchema map for fast lookup at validate time.
   const toolSchemas = Object.create(null);
@@ -174,6 +178,12 @@ export function makeDispatch({
       }
       args = decision.args;
     }
+    // Registry-driven tools: one file per tool under lib/tools/, handler
+    // takes the args object directly. If the name is registered here we
+    // skip the legacy switch entirely. See lib/tool-registry.sys.mjs.
+    if (registryHandlers && registryHandlers[name]) {
+      return await registryHandlers[name](args);
+    }
     switch (name) {
       case "listAccounts":
         return toolHandlers.listAccounts();
@@ -247,21 +257,8 @@ export function makeDispatch({
         return toolHandlers.applyFilters(args.accountId, args.folderPath, args.dry_run);
       case "getAccountAccess":
         return toolHandlers.getAccountAccess();
-      case "inbox_inventory":
-        return toolHandlers.inboxInventory(
-          args.query || "",
-          args.folderPath,
-          args.groupBy,
-          args.startDate,
-          args.endDate,
-          args.unreadOnly,
-          args.flaggedOnly,
-          args.tag,
-          args.includeSubfolders,
-          args.maxGroups,
-          args.samplesPerGroup,
-          args.collectAllIds
-        );
+      // inbox_inventory migrated to the auto-registry; registryHandlers[name]
+      // catches it before this switch runs (see callTool prologue).
       case "bulk_move_by_query":
         return toolHandlers.bulkMoveByQuery(
           args.query || "",

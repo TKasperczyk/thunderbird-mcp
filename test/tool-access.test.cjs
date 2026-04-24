@@ -787,28 +787,41 @@ describe("Build version: options.js display parsing", () => {
 // ── Structural: ALL_TOOLS sync with production ───────────────────────
 
 describe("Structural: test data matches production source", () => {
-  // After the modular split, tool schemas live in lib/tools-schema.sys.mjs
-  // and the validator constants live in lib/constants.sys.mjs. Scanning
-  // api.js for these would always come up empty.
+  // Tools are declared in two places now:
+  //   (a) lib/tools-schema.sys.mjs                     legacy bulk list
+  //   (b) lib/tools/*.sys.mjs (export const tool={...}) registry-migrated
+  // Structural tests union-scan both so ALL_TOOLS stays in sync.
   const TOOLS_SCHEMA_PATH = path.join(__dirname, "..", "extension", "mcp_server", "lib", "tools-schema.sys.mjs");
+  const TOOLS_DIR = path.join(__dirname, "..", "extension", "mcp_server", "lib", "tools");
   const CONSTANTS_PATH = path.join(__dirname, "..", "extension", "mcp_server", "lib", "constants.sys.mjs");
 
-  it("ALL_TOOLS count matches tool definitions in tools-schema.sys.mjs", () => {
-    const src = fs.readFileSync(TOOLS_SCHEMA_PATH, "utf8");
-    const nameMatches = src.match(/{\s*name:\s*"[a-zA-Z_]+"/g);
-    assert.ok(nameMatches, "Could not find tool name declarations in tools-schema.sys.mjs");
+  function collectProductionToolNames() {
+    const names = new Set();
+    const bulkSrc = fs.readFileSync(TOOLS_SCHEMA_PATH, "utf8");
+    for (const m of bulkSrc.matchAll(/{\s*name:\s*"([a-zA-Z_]+)"/g)) names.add(m[1]);
+    if (fs.existsSync(TOOLS_DIR)) {
+      for (const entry of fs.readdirSync(TOOLS_DIR, { withFileTypes: true })) {
+        if (!entry.isFile() || entry.name.startsWith("_") || !entry.name.endsWith(".sys.mjs")) continue;
+        const src = fs.readFileSync(path.join(TOOLS_DIR, entry.name), "utf8");
+        const m = src.match(/export\s+const\s+tool\s*=\s*{[\s\S]*?name:\s*"([a-zA-Z_]+)"/);
+        if (m) names.add(m[1]);
+      }
+    }
+    return [...names].sort();
+  }
+
+  it("ALL_TOOLS count matches tool definitions across schema + registry", () => {
+    const prodNames = collectProductionToolNames();
+    assert.ok(prodNames.length > 0, "Could not find any tool name declarations");
     assert.equal(
       ALL_TOOLS.length,
-      nameMatches.length,
-      `Test ALL_TOOLS has ${ALL_TOOLS.length} tools but tools-schema.sys.mjs has ${nameMatches.length} tool definitions. ` +
-      `Update ALL_TOOLS when adding/removing tools.`
+      prodNames.length,
+      `Test ALL_TOOLS has ${ALL_TOOLS.length} tools but production has ${prodNames.length}. Update ALL_TOOLS.`
     );
   });
 
   it("ALL_TOOLS names match production tool names", () => {
-    const src = fs.readFileSync(TOOLS_SCHEMA_PATH, "utf8");
-    const nameMatches = src.match(/{\s*name:\s*"([a-zA-Z_]+)"/g);
-    const prodNames = nameMatches.map(m => m.match(/"([a-zA-Z_]+)"/)[1]).sort();
+    const prodNames = collectProductionToolNames();
     const testNames = ALL_TOOLS.map(t => t.name).sort();
     assert.deepStrictEqual(testNames, prodNames, "Test ALL_TOOLS names don't match production");
   });

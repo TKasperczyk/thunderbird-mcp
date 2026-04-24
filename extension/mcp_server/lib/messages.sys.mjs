@@ -1781,5 +1781,11 @@ export function makeMessages({
     markMessageDispositionState,
     inboxInventory,
     bulkMoveByQuery,
+    // Shared primitives exposed so registry-driven tool files under
+    // lib/tools/ can do their own folder walks without duplicating the
+    // searchMessages filter-compilation logic.
+    _compileMessageFilter,
+    _walkFolderMessages,
+    _groupKeyFor,
   };
 }

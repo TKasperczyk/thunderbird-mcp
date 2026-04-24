@@ -285,6 +285,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               deleteMessages, updateMessage, findMessage,
               getUserTags, markMessageDispositionState,
               inboxInventory, bulkMoveByQuery,
+              _compileMessageFilter, _walkFolderMessages, _groupKeyFor,
             } = makeMessages({
               MailServices, NetUtil, Services, Cc, Ci,
               GlodaMsgSearcher,
@@ -337,6 +338,76 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               makeJsonPrefStore,
             });
 
+            // Auto-registry: tools under lib/tools/*.sys.mjs are picked up
+            // via the build-time manifest (see scripts/build-xpi.cjs). The
+            // shared deps bag is the same set of XPCOM globals and access-
+            // control helpers the legacy factories destructure. Any tool
+            // that only needs deps from this bag can skip the four-place
+            // wiring (tools-schema + domain factory + dispatch switch +
+            // toolHandlers bag) and live as one file.
+            const { makeToolRegistry } = ChromeUtils.importESModule(
+              "resource://thunderbird-mcp/mcp_server/lib/tool-registry.sys.mjs"
+            );
+            const registry = makeToolRegistry({
+              ChromeUtils,
+              moduleBasePath: "resource://thunderbird-mcp/mcp_server/lib/tools/",
+              manifestPath: "resource://thunderbird-mcp/mcp_server/lib/tools/_manifest.sys.mjs",
+              deps: {
+                // XPCOM globals
+                Services, Cc, Ci, MailServices, NetUtil,
+                ChromeUtils,
+                // State singletons
+                _attachTimers, _tempAttachFiles, _claimedReplyComposeWindows,
+                // Access-control
+                isAccountAllowed, isFolderAccessible,
+                getAccessibleFolder, getAccessibleAccounts,
+                isToolEnabled, isSkipReviewBlocked,
+                getAccountAccess,
+                // Accounts
+                findIdentity, findIdentityIn, getIdentityAutoRecipientHeader,
+                listAccounts,
+                // Folders
+                openFolder, listFolders, createFolder, renameFolder,
+                deleteFolder, moveFolder, emptyTrash, emptyJunk,
+                // Messages + shared scan helpers
+                findMessage, getUserTags, markMessageDispositionState,
+                searchMessages, getMessage, getRecentMessages, displayMessage,
+                deleteMessages, updateMessage,
+                inboxInventory, bulkMoveByQuery,
+                _compileMessageFilter, _walkFolderMessages, _groupKeyFor,
+                // Compose
+                composeMail, replyToMessage, forwardMessage, createDrafts,
+                // Calendar + tasks
+                listCalendars, createEvent, listEvents, updateEvent, deleteEvent,
+                createTask, listTasks, updateTask,
+                // Contacts
+                searchContacts, createContact, updateContact, deleteContact,
+                // Filters
+                listFilters, createFilter, updateFilter, deleteFilter,
+                reorderFilters, applyFilters,
+                // Permissions engine
+                permissions,
+                // Constants
+                MAX_BASE64_SIZE, MAX_REQUEST_BODY, COMPOSE_WINDOW_LOAD_DELAY_MS,
+                DEFAULT_MAX_RESULTS, MAX_SEARCH_RESULTS_CAP, SEARCH_COLLECTION_CAP,
+                INTERNAL_KEYWORDS,
+                PREF_ALLOWED_ACCOUNTS, PREF_DISABLED_TOOLS,
+                PREF_BLOCK_SKIPREVIEW, PREF_PERMISSIONS,
+                UNDISABLEABLE_TOOLS, DEFAULT_DISABLED_TOOLS,
+                VALID_GROUPS, VALID_CRUD, CRUD_ORDER,
+                MCP_SUPPORTED_PROTOCOL_VERSIONS, MCP_LATEST_PROTOCOL_VERSION,
+              },
+            });
+
+            // Registry tools win on name conflict. Legacy entries keep
+            // working until they are migrated one at a time. tools/list
+            // should advertise both.
+            const registeredNames = registry.names;
+            const mergedTools = [
+              ...registry.tools,
+              ...tools.filter(t => !registeredNames.has(t.name)),
+            ];
+
             // Dispatch: validateToolArgs / coerceToolArgs / callTool plus a
             // few HTTP-handler helpers (readRequestBody, paginate). The HTTP
             // request handler closure stays inline below because it captures
@@ -355,13 +426,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               reorderFilters, applyFilters,
               searchMessages, getMessage, getRecentMessages, displayMessage,
               deleteMessages, updateMessage, findMessage,
-              inboxInventory, bulkMoveByQuery,
+              bulkMoveByQuery,
               composeMail, replyToMessage, forwardMessage, createDrafts,
               getAccountAccess,
             };
             const {
               readRequestBody, validateToolArgs, coerceToolArgs, callTool,
-            } = makeDispatch({ NetUtil, tools, toolHandlers, permissions, isToolEnabled });
+            } = makeDispatch({
+              NetUtil, tools: mergedTools, toolHandlers, permissions, isToolEnabled,
+              registryHandlers: registry.handlers,
+            });
 
 
 
@@ -783,7 +857,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       break;
                     case "tools/list":
                       // Strip internal metadata (group, crud, title) — only expose MCP-spec fields
-                      result = { tools: tools.filter(t => isToolEnabled(t.name)).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) };
+                      result = { tools: mergedTools.filter(t => isToolEnabled(t.name)).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) };
                       break;
                     case "tools/call":
                       if (!params?.name) {
@@ -1017,7 +1091,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             // Build tool list with group/crud metadata, sorted by group then CRUD order
-            const toolList = tools
+            // Use the merged list so the Tool Access page surfaces registry-driven
+            // tools alongside the legacy tools-schema entries.
+            const toolList = mergedTools
               .map(t => ({
                 name: t.name,
                 group: t.group,

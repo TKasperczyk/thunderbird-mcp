@@ -683,30 +683,9 @@ export const tools = [
     description: "Get the current account access control list. Shows which accounts the MCP server can access. Account access is configured by the user in the extension settings page (Tools > Add-ons > Thunderbird MCP > Options) and cannot be changed via MCP tools.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
-  {
-    name: "inbox_inventory",
-    group: "messages", crud: "read",
-    title: "Inventory Messages",
-    description: "Aggregate messages by a key (from_domain, from_address, subject_prefix, tag, day) and return grouped counts + sample IDs + sample subjects instead of raw headers. Same filter syntax as searchMessages (query, folderPath, date range, unreadOnly, flaggedOnly, tag, includeSubfolders). Use this for \"what's in the inbox?\" questions on large folders -- a 25k-message inbox becomes ~50 groups and fits in <2k tokens instead of 80k+. Set collectAllIds=true to get the full ID lists for use with bulk_move_by_query.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Text to search. Same tokens and prefixes as searchMessages. Empty string = all messages." },
-        folderPath: { type: "string", description: "Optional folder URI to scope the scan" },
-        groupBy: { type: "string", enum: ["from_domain", "from_address", "subject_prefix", "tag", "day"], description: "Aggregation key (default: from_domain). subject_prefix strips Re:/Fwd: and caps at 30 chars. day buckets by ISO date (YYYY-MM-DD)." },
-        startDate: { type: "string", description: "Only count messages on or after this ISO date" },
-        endDate: { type: "string", description: "Only count messages on or before this ISO date. Date-only strings include the full day." },
-        unreadOnly: { type: "boolean" },
-        flaggedOnly: { type: "boolean" },
-        tag: { type: "string", description: "Filter by tag keyword (e.g. $label1)" },
-        includeSubfolders: { type: "boolean", description: "Default true" },
-        maxGroups: { type: "integer", description: "Cap the number of groups returned (default 50, max 500). Groups sorted by count descending." },
-        samplesPerGroup: { type: "integer", description: "Number of sample message IDs + subjects per group (default 3, max 20)" },
-        collectAllIds: { type: "boolean", description: "If true, include the FULL message-id list in each group (to hand off to bulk_move_by_query). Omit by default to keep responses small. Capped at 5000 ids per group." }
-      },
-      required: []
-    }
-  },
+  // inbox_inventory was migrated to the auto-registry pattern; its schema
+  // + handler now live in lib/tools/inbox-inventory.sys.mjs and come in
+  // through makeToolRegistry() in api.js.
   {
     name: "bulk_move_by_query",
     group: "messages", crud: "update",
