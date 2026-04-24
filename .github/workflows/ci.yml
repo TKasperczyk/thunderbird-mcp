@@ -20,7 +20,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          # No cache: npm -- package-lock.json is gitignored, so setup-node
+          # has nothing to key a cache against. Install is fast anyway
+          # (only acorn as a dev dep).
 
       - name: Install dev deps
         run: npm install --no-audit --no-fund
@@ -49,7 +51,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          # No cache: npm -- package-lock.json is gitignored, so setup-node
+          # has nothing to key a cache against. Install is fast anyway
+          # (only acorn as a dev dep).
       - run: npm install --no-audit --no-fund
       - run: node scripts/build-xpi.cjs
       - uses: actions/upload-artifact@v4
@@ -100,7 +104,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          # No cache: npm -- package-lock.json is gitignored, so setup-node
+          # has nothing to key a cache against. Install is fast anyway
+          # (only acorn as a dev dep).
 
       - name: Install runtime deps for Thunderbird
         # Same package list as docker/integration.Dockerfile. Kept inline
@@ -128,8 +134,9 @@ jobs:
           thunderbird --version
           thunderbird --headless --version
 
-      - name: Install npm deps
-        run: npm install --no-audit --no-fund
+      # No `npm install` -- smoke.cjs + seed-greenmail.cjs + run.sh are
+      # all zero-dep Node. The XPI is pulled from the build-xpi artifact
+      # below so we don't need acorn here either.
 
       - name: Download XPI artifact
         uses: actions/download-artifact@v4
