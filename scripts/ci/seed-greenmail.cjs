@@ -89,7 +89,11 @@ function sendOne(msg) {
       ),
       () => `QUIT\r\n`,
     ];
-    const expect = [/^220 /, /^250-/, /^250 /, /^250 /, /^354 /, /^250 /, /^221 /];
+    // EHLO response can be multi-line: `250-foo\r\n250 bar\r\n`. Match both
+    // continuation ("250-") and final ("250 ") with a char class. The loop
+    // below uses `line.startsWith("250-")` to decide whether to stay on
+    // this step or advance.
+    const expect = [/^220 /, /^250[- ]/, /^250 /, /^250 /, /^354 /, /^250 /, /^221 /];
 
     socket.on("data", (chunk) => {
       buf += chunk.toString("utf8");
