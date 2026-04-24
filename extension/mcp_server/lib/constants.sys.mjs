@@ -62,14 +62,22 @@ export const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getA
 //
 // Policy: any tool that sends mail off the machine OR irreversibly destroys
 // user data is opt-in. read/list/search/update tools stay enabled by default
-// because they're either safe or recoverable. Create tools also stay enabled
-// because creating clutter is annoying but not destructive.
+// because they're either safe or recoverable. Create tools for single items
+// (createContact, createEvent, ...) stay enabled because creating clutter is
+// annoying but not destructive.
+//
+// Big-hammer batch tools are also opt-in even when their individual actions
+// would be default-enabled -- a mistake scales from "one bad move" to "all
+// messages in a folder moved to the wrong place" or "40 duplicate drafts".
 export const DEFAULT_DISABLED_TOOLS = new Set([
   // send: leaves the machine, can't be undone
   "sendMail", "replyToMessage", "forwardMessage",
   // delete: irreversible (or near-irreversible: trash gets emptied eventually)
   "deleteContact", "deleteEvent", "deleteFilter", "deleteMessages",
   "deleteFolder", "emptyTrash", "emptyJunk",
+  // batch / bulk: dry_run=true default caps the first call, but once the caller
+  // flips it to false it affects an unbounded number of user objects. Opt-in.
+  "bulk_move_by_query", "createDrafts",
 ]);
 
 // Internal IMAP/Thunderbird keywords that should not appear as user-visible tags.

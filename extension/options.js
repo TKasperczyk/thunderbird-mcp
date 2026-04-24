@@ -176,7 +176,8 @@ async function loadToolAccess() {
       const banner = document.createElement("li");
       banner.className = "tool-defaults-banner";
       banner.textContent =
-        "Safe defaults active: send/forward/reply and all delete tools are off. " +
+        "Safe defaults active: send/forward/reply, all delete tools, and " +
+        "batch tools (bulk_move_by_query, createDrafts) are off. " +
         "Check the boxes below for the ones you want to allow, then Save.";
       toolList.appendChild(banner);
     }
@@ -338,6 +339,7 @@ const PERMISSION_PRESETS = {
       createFolder: { enabled: false }, renameFolder: { enabled: false }, deleteFolder: { enabled: false },
       moveFolder: { enabled: false }, emptyTrash: { enabled: false }, emptyJunk: { enabled: false },
       updateMessage: { enabled: false }, deleteMessages: { enabled: false },
+      bulk_move_by_query: { enabled: false }, createDrafts: { enabled: false },
     },
     accounts: {}, folders: {}
   },
