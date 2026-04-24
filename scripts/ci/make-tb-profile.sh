@@ -113,6 +113,18 @@ user_pref("calendar.timezone.useSystemTimezone", true);
 // ── Offline/online behavior ────────────────────────────────────────────
 user_pref("offline.autoDetect", false);
 user_pref("network.online", true);
+
+// ── Thunderbird MCP: expose every tool in CI ───────────────────────────
+// The extension defaults DEFAULT_DISABLED_TOOLS (bulk_move_by_query,
+// createDrafts, sendMail, deleteMessages, emptyTrash, ...) to hidden
+// because they're destructive/irreversible and production users should
+// opt in via the options page. In CI we are the user and we want the
+// full API surface covered, so set the pref to the empty JSON array.
+// prefHasUserValue flips to true, getDisabledTools() returns [], and
+// tools/list advertises everything. UNDISABLEABLE_TOOLS still govern
+// what can actually be called, and account-level access control still
+// applies -- this only removes the safety hiding.
+user_pref("extensions.thunderbird-mcp.disabledTools", "[]");
 PREFS
 
 # Passwords: TB reads logins from logins.json rather than prefs.js on
