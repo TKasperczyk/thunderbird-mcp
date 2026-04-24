@@ -289,7 +289,7 @@ saveSkipReviewBtn.addEventListener("click", async () => {
   saveSkipReviewBtn.disabled = false;
 });
 
-loadServerInfo();
-loadAccountAccess();
-loadToolAccess();
-loadSkipReviewPref();
+loadServerInfo().catch(e => console.error("thunderbird-mcp options:", "loadServerInfo failed:", e));
+loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAccountAccess failed:", e));
+loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
+loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));

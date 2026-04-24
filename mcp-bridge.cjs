@@ -7,7 +7,6 @@
  */
 
 const http = require('http');
-const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -22,6 +21,38 @@ const DEFAULT_PROC_ROOT = '/proc';
 const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
 const CONNECTION_FILE_BASENAME = 'connection.json';
+
+// MCP protocol versions the bridge knows how to speak. Per lifecycle spec the
+// server MUST respond with the requested version if it supports it, otherwise
+// with the latest version it supports. The bridge is a transparent JSON-RPC
+// relay -- behavior never changes by version -- so it accepts every published
+// version, but it does NOT echo unknown future versions back as if it knew them.
+const SUPPORTED_PROTOCOL_VERSIONS = new Set([
+  '2024-11-05',
+  '2025-03-26',
+  '2025-06-18',
+  '2025-11-25',
+]);
+const LATEST_PROTOCOL_VERSION = '2025-11-25';
+const BRIDGE_VERSION = (() => {
+  try {
+    return require('./package.json').version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+const SERVER_INFO = Object.freeze({
+  name: 'thunderbird-mcp',
+  version: BRIDGE_VERSION,
+});
+
+const DEBUG = !!process.env.THUNDERBIRD_MCP_DEBUG;
+
+function debugLog(message) {
+  if (DEBUG) {
+    process.stderr.write('[thunderbird-mcp] ' + message + '\n');
+  }
+}
 
 let cachedConnectionInfo = null;
 let connectionCacheExpiry = 0;
@@ -523,16 +554,21 @@ async function handleMessage(line) {
   // Handle MCP lifecycle methods locally so the bridge can complete
   // handshake even when Thunderbird isn't running yet.
   switch (message.method) {
-    case 'initialize':
+    case 'initialize': {
+      const requested = message.params?.protocolVersion;
+      const negotiated = (typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.has(requested))
+        ? requested
+        : LATEST_PROTOCOL_VERSION;
       return {
         jsonrpc: '2.0',
         id: message.id,
         result: {
-          protocolVersion: '2024-11-05',
+          protocolVersion: negotiated,
           capabilities: { tools: {} },
-          serverInfo: { name: 'thunderbird-mcp', version: '0.1.0' }
-        }
+          serverInfo: SERVER_INFO,
+        },
       };
+    }
     case 'ping':
       return { jsonrpc: '2.0', id: message.id, result: {} };
     case 'resources/list':
@@ -655,16 +691,14 @@ async function forwardToThunderbird(message, _retried) {
 }
 
 function startBridge() {
-  // Ensure stdout doesn't buffer - critical for MCP protocol
-  if (process.stdout._handle?.setBlocking) {
-    process.stdout._handle.setBlocking(true);
-  }
-
   let pendingRequests = 0;
   let stdinClosed = false;
 
+  debugLog(`startup version=${BRIDGE_VERSION} pid=${process.pid} platform=${process.platform}`);
+
   function checkExit() {
     if (stdinClosed && pendingRequests === 0) {
+      debugLog('shutdown stdin-closed and no pending requests, exiting 0');
       process.exit(0);
     }
   }
@@ -679,29 +713,33 @@ function startBridge() {
     });
   }
 
-  // Process stdin as JSON-RPC messages
-  const rl = readline.createInterface({ input: process.stdin, terminal: false });
-
-  rl.on('line', (line) => {
+  function dispatch(line) {
     if (!line.trim()) {
       return;
     }
 
     let messageId = null;
+    let messageMethod = null;
     try {
-      messageId = JSON.parse(line).id ?? null;
+      const parsed = JSON.parse(line);
+      messageId = parsed.id ?? null;
+      messageMethod = parsed.method ?? null;
     } catch {
       // Leave as null when request cannot be parsed
     }
+
+    debugLog(`recv method=${messageMethod} id=${messageId}`);
 
     pendingRequests++;
     handleMessage(line)
       .then(async (response) => {
         if (response !== null) {
           await writeOutput(JSON.stringify(response) + '\n');
+          debugLog(`send id=${messageId} method=${messageMethod}`);
         }
       })
       .catch(async (err) => {
+        debugLog(`error id=${messageId} method=${messageMethod} message=${err.message}`);
         await writeOutput(JSON.stringify({
           jsonrpc: '2.0',
           id: messageId,
@@ -712,9 +750,31 @@ function startBridge() {
         pendingRequests--;
         checkExit();
       });
-  });
+  }
 
-  rl.on('close', () => {
+  // Manual newline-delimited JSON parsing on raw stdin. The previous
+  // readline-based implementation lost the initialize response under
+  // Claude Desktop's Electron-spawned Node on Windows -- writes from
+  // promise callbacks never made it back through the pipe. Reading raw
+  // 'data' events with explicit utf8 encoding matches what the official
+  // @modelcontextprotocol/sdk stdio transport does and works reliably.
+  process.stdin.setEncoding('utf8');
+  let buffer = '';
+  process.stdin.on('data', (chunk) => {
+    buffer += chunk;
+    let idx;
+    while ((idx = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, idx).replace(/\r$/, '');
+      buffer = buffer.slice(idx + 1);
+      dispatch(line);
+    }
+  });
+  process.stdin.on('end', () => {
+    if (buffer.length > 0) {
+      const tail = buffer.replace(/\r$/, '');
+      buffer = '';
+      dispatch(tail);
+    }
     stdinClosed = true;
     checkExit();
   });

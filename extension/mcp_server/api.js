@@ -20,6 +20,42 @@ const resProto = Cc[
 
 const MCP_DEFAULT_PORT = 8765;
 const MCP_MAX_PORT_ATTEMPTS = 10;
+
+// Versions of the MCP protocol this server understands. Behavior never depends
+// on the negotiated version inside Thunderbird (the bridge intercepts initialize
+// for clients), but for the rare case a client talks directly to the HTTP server
+// we still need a spec-compliant negotiated value. Keep in sync with mcp-bridge.cjs.
+const MCP_SUPPORTED_PROTOCOL_VERSIONS = new Set([
+  "2024-11-05",
+  "2025-03-26",
+  "2025-06-18",
+  "2025-11-25",
+]);
+const MCP_LATEST_PROTOCOL_VERSION = "2025-11-25";
+
+// Bridged into serverInfo.version on initialize. Resolved lazily from the
+// extension manifest so a single bump in extension/manifest.json propagates here.
+let _cachedExtVersion = null;
+function getExtVersion() {
+  if (_cachedExtVersion) return _cachedExtVersion;
+  try {
+    const uri = Services.io.newURI("resource://thunderbird-mcp/manifest.json");
+    const channel = Services.io.newChannelFromURI(uri, null,
+      Services.scriptSecurityManager.getSystemPrincipal(), null,
+      Ci.nsILoadInfo.SEC_ALLOW_CROSS_ORIGIN_SEC_CONTEXT_IS_NULL,
+      Ci.nsIContentPolicy.TYPE_OTHER);
+    const sis = Cc["@mozilla.org/scriptableinputstream;1"]
+      .createInstance(Ci.nsIScriptableInputStream);
+    sis.init(channel.open());
+    const text = sis.read(sis.available());
+    sis.close();
+    _cachedExtVersion = JSON.parse(text).version || "0.0.0";
+  } catch (e) {
+    console.warn("thunderbird-mcp: could not read extension manifest version:", e);
+    _cachedExtVersion = "0.0.0";
+  }
+  return _cachedExtVersion;
+}
 // Keep references to active attach timers to prevent GC before they fire.
 const _attachTimers = new Set();
 // Track temp files created for inline base64 attachments (cleaned up on shutdown).
@@ -1367,9 +1403,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             function addAttachmentsToComposeWindow(composeWin, attachDescs) {
-              if (!composeWin || typeof composeWin.AddAttachments !== "function") return;
+              if (!composeWin) {
+                console.warn("thunderbird-mcp: skipping attachment add — no compose window");
+                return;
+              }
+              if (typeof composeWin.AddAttachments !== "function") {
+                console.warn("thunderbird-mcp: skipping attachment add — composeWin.AddAttachments not a function");
+                return;
+              }
               const attachList = descsToMsgAttachments(attachDescs);
               if (attachList.length > 0) {
+                // Caller's try/catch (or fire-and-forget caller) is responsible for
+                // surfacing failures — do not swallow here.
                 composeWin.AddAttachments(attachList);
               }
             }
@@ -1384,7 +1429,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   try {
                     const composeWin = Services.wm.getMostRecentWindow("msgcompose");
                     addAttachmentsToComposeWindow(composeWin, attachDescs);
-                  } catch {}
+                  } catch (e) {
+                    // Fire-and-forget timer — no client to error back to.
+                    // Log loudly so users can find the cause in the Error Console
+                    // when an "email sent without attachments" report comes in.
+                    console.error("thunderbird-mcp: injectAttachmentsAsync failed:", e);
+                  }
                 }
               }, COMPOSE_WINDOW_LOAD_DELAY_MS, Ci.nsITimer.TYPE_ONE_SHOT);
             }
@@ -4578,7 +4628,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     count += hdrs.length;
                   }
                 }
-              } catch {}
+              } catch (e) {
+                // Continue traversal; log per-folder failures so partial empties are visible.
+                console.error("thunderbird-mcp: deleteMessages failed for folder", folder?.URI || folder?.name, ":", e);
+              }
               if (folder.hasSubFolders) {
                 for (const sub of folder.subFolders) {
                   count += deleteAllMessagesRecursive(sub);
@@ -5255,7 +5308,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   try {
                     const parsed = JSON.parse(value);
                     if (Array.isArray(parsed)) args[key] = parsed;
-                  } catch { /* leave as-is for validation to catch */ }
+                  } catch (e) {
+                    // Leave value as-is so validator surfaces a typed error to the client.
+                    console.warn(`thunderbird-mcp: coerceToolArgs JSON.parse failed for key=${key}:`, e.message);
+                  }
                 }
               }
               return args;
@@ -5437,13 +5493,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   let result;
                   switch (method) {
-                    case "initialize":
+                    case "initialize": {
+                      // Per MCP lifecycle: respond with the requested version if
+                      // we support it, otherwise the latest version we know.
+                      // Behavior never depends on the version inside Thunderbird,
+                      // so we accept any well-known protocol version.
+                      const requested = params?.protocolVersion;
+                      const negotiated = (typeof requested === "string" && MCP_SUPPORTED_PROTOCOL_VERSIONS.has(requested))
+                        ? requested
+                        : MCP_LATEST_PROTOCOL_VERSION;
                       result = {
-                        protocolVersion: "2024-11-05",
+                        protocolVersion: negotiated,
                         capabilities: { tools: {} },
-                        serverInfo: { name: "thunderbird-mcp", version: "0.1.0" }
+                        serverInfo: { name: "thunderbird-mcp", version: getExtVersion() }
                       };
                       break;
+                    }
                     case "resources/list":
                       result = { resources: [] };
                       break;
@@ -5500,7 +5565,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }));
                 }
                 res.finish();
-              })();
+              })().catch((e) => {
+                console.error("thunderbird-mcp: unhandled dispatch error:", e);
+                try { res.finish(); } catch {}
+              });
             });
 
             // Try the default port first, then fall back to nearby ports
@@ -5525,7 +5593,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               connFilePath = writeConnectionInfo(boundPort, authToken);
             } catch (writeErr) {
               // Connection file write failed -- stop the orphaned server
-              try { server.stop(() => {}); } catch {}
+              try { server.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
               globalThis.__tbMcpServer = null;
               throw writeErr;
             }
@@ -5536,7 +5604,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             console.error("Failed to start MCP server:", e);
             // Stop server if it was started but something else failed
             if (globalThis.__tbMcpServer) {
-              try { globalThis.__tbMcpServer.stop(() => {}); } catch {}
+              try { globalThis.__tbMcpServer.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
               globalThis.__tbMcpServer = null;
             }
             // Clear cached promise so a retry can attempt to bind again
@@ -5571,7 +5639,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const bi = JSON.parse(text);
             buildVersion = bi.version || bi.commit || null;
             buildDate = bi.builtAt || null;
-          } catch { /* build info not available */ }
+          } catch (e) {
+            // buildinfo.json may legitimately be absent in dev builds; surface anything else.
+            if (e?.name !== "NS_ERROR_FILE_NOT_FOUND") {
+              console.warn("thunderbird-mcp: read buildinfo failed:", e);
+            }
+          }
 
           // Read connection info from temp file using XPCOM file I/O
           try {
@@ -5592,7 +5665,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const data = JSON.parse(text);
               port = data.port || null;
             }
-          } catch { /* ignore */ }
+          } catch (e) {
+            // Connection file is absent before the server first binds; log other faults.
+            if (e?.name !== "NS_ERROR_FILE_NOT_FOUND") {
+              console.warn("thunderbird-mcp: read connection info failed:", e);
+            }
+          }
 
           return {
             running: !!globalThis.__tbMcpStartPromise,
@@ -5611,7 +5689,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           try {
             const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
             if (pref) allowed = JSON.parse(pref);
-          } catch { /* ignore */ }
+          } catch (e) {
+            // Falls back to "all accounts allowed"; surface the corruption.
+            console.warn("thunderbird-mcp: account-access pref is not valid JSON:", e.message);
+          }
 
           const accounts = [];
           for (const account of MailServices.accounts.accounts) {
