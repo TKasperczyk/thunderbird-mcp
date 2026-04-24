@@ -1,31 +1,34 @@
 #!/usr/bin/env node
 /**
  * Tail of the structured-trace SQLite emitted by extension/mcp_server/
- * lib/trace.sys.mjs. Used by the CI workflow on failure to surface
- * the most recent N events as readable text without forcing a
- * better-sqlite3 dependency on the runner.
+ * lib/trace.sys.mjs (and trace-write.cjs from any Node-side scripts).
+ * Used by the CI workflow on failure to surface the most recent N
+ * events in human-readable form, but also useful locally during
+ * development.
  *
- * Strategy: shell out to the sqlite3 CLI (already installed on the CI
- * runner alongside our other apt packages). Falls back to printing
- * the JSONL file if the SQLite read fails -- keeping parity with the
- * trace module's own SQLite-or-JSONL fallback.
+ * Reads via better-sqlite3 (devDep) -- no shell-out to the sqlite3
+ * CLI. Falls back to printing the JSONL co-file if the SQLite read
+ * fails (matches trace.sys.mjs's own SQLite-or-JSONL behaviour).
  *
  * Usage:
  *   node scripts/trace-dump.cjs [--db=PATH] [--jsonl=PATH] [--limit=N]
  *                               [--scenario=GLOB] [--min-level=N]
+ *                               [--trace-id=ID]
  *
- * Defaults match the extension's defaults:
+ * Defaults:
  *   --db=/tmp/thunderbird-mcp-trace.sqlite
  *   --jsonl=/tmp/thunderbird-mcp-trace.jsonl
  *   --limit=200
  *   --min-level=2     (info+; flip to 1 for debug+, 0 for trace+)
  *
- * Exits 0 even if the trace file is missing -- the script is purely
- * diagnostic and shouldn't fail a CI step on its own.
+ * --trace-id pins to a single span correlation across extension and
+ *  Node-side events; useful for debugging a specific tool call.
+ *
+ * Exits 0 even if the trace file is missing -- this is purely a
+ * diagnostic tool and should never gate CI on its own.
  */
 
 const fs = require("fs");
-const { spawnSync } = require("child_process");
 
 const args = Object.fromEntries(
   process.argv.slice(2)
@@ -40,46 +43,66 @@ const dbPath    = args.db    || "/tmp/thunderbird-mcp-trace.sqlite";
 const jsonlPath = args.jsonl || "/tmp/thunderbird-mcp-trace.jsonl";
 const limit     = parseInt(args.limit || "200", 10);
 const minLevel  = parseInt(args["min-level"] || "2", 10);
-const scenario  = args.scenario || "%";  // SQL LIKE glob
+const scenarioGlob = args.scenario || "%";
+const traceId   = args["trace-id"] || null;
 
-function ts(usStr) {
+const LVL_NAME = ["TRACE", "DEBUG", "INFO ", "WARN ", "ERROR"];
+
+function fmtTs(usStr) {
   const ms = Math.floor(Number(usStr) / 1000);
   return new Date(ms).toISOString();
 }
 
+function fmtRow({ ts_us, level, scenario, event, ctx_json, trace_id }) {
+  const lvl = LVL_NAME[Number(level)] || `L${level}`;
+  const tid = trace_id ? ` trace=${trace_id}` : "";
+  let ctxOut = "";
+  if (ctx_json) {
+    try { ctxOut = " " + JSON.stringify(JSON.parse(ctx_json)); }
+    catch { ctxOut = " " + ctx_json; }
+  }
+  return `${fmtTs(ts_us)} ${lvl} ${scenario}/${event}${tid}${ctxOut}`;
+}
+
 function dumpFromSqlite() {
   if (!fs.existsSync(dbPath)) return false;
-  const sql = `
-    SELECT ts_us, level, scenario, event, ctx_json, COALESCE(trace_id, '')
-    FROM events
-    WHERE level >= ${minLevel}
-      AND scenario LIKE '${scenario.replace(/'/g, "''")}'
-    ORDER BY id DESC
-    LIMIT ${Math.max(1, limit)}
-  `;
-  const r = spawnSync("sqlite3", ["-separator", "\x1f", dbPath, sql], { encoding: "utf8" });
-  if (r.status !== 0) {
-    process.stderr.write(`sqlite3 read failed (status=${r.status}): ${r.stderr || ""}\n`);
+  let Database;
+  try { Database = require("better-sqlite3"); }
+  catch (e) {
+    process.stderr.write(`trace-dump: better-sqlite3 not installed (${e.message}); skip SQLite path\n`);
     return false;
   }
-  const rows = (r.stdout || "").split("\n").filter(Boolean).reverse();  // oldest first for readability
+  let db;
+  try { db = new Database(dbPath, { readonly: true, fileMustExist: true }); }
+  catch (e) {
+    process.stderr.write(`trace-dump: SQLite open failed: ${e.message}\n`);
+    return false;
+  }
+  let sql = `
+    SELECT ts_us, level, scenario, event, ctx_json, trace_id
+    FROM events
+    WHERE level >= ? AND scenario LIKE ?
+  `;
+  const params = [minLevel, scenarioGlob];
+  if (traceId) { sql += ` AND trace_id = ?`; params.push(traceId); }
+  sql += ` ORDER BY id DESC LIMIT ?`;
+  params.push(Math.max(1, limit));
+  let rows;
+  try { rows = db.prepare(sql).all(...params); }
+  catch (e) {
+    process.stderr.write(`trace-dump: query failed: ${e.message}\n`);
+    db.close();
+    return false;
+  }
+  db.close();
+  rows.reverse();  // oldest first for readability
+  const filterDesc = `level>=${minLevel} scenario LIKE '${scenarioGlob}'${traceId ? ` trace_id=${traceId}` : ""}`;
   if (rows.length === 0) {
-    console.log(`(no trace events match level>=${minLevel} scenario LIKE '${scenario}')`);
+    console.log(`(no trace events match ${filterDesc})`);
     return true;
   }
-  const lvlName = ["TRACE", "DEBUG", "INFO ", "WARN ", "ERROR"];
-  console.log(`# trace events from ${dbPath} (newest ${limit}, oldest first)`);
-  for (const line of rows) {
-    const [tsUs, level, scen, event, ctxJson, traceId] = line.split("\x1f");
-    const lvl = lvlName[Number(level)] || `L${level}`;
-    const tid = traceId ? ` trace=${traceId}` : "";
-    let ctxOut = "";
-    if (ctxJson) {
-      try { ctxOut = " " + JSON.stringify(JSON.parse(ctxJson)); }
-      catch { ctxOut = " " + ctxJson; }
-    }
-    console.log(`${ts(tsUs)} ${lvl} ${scen}/${event}${tid}${ctxOut}`);
-  }
+  console.log(`# ${rows.length} trace events from ${dbPath} (${filterDesc}, oldest first)`);
+  for (const r of rows) console.log(fmtRow(r));
   return true;
 }
 
@@ -87,14 +110,24 @@ function dumpFromJsonl() {
   if (!fs.existsSync(jsonlPath)) return false;
   console.log(`# trace events from ${jsonlPath} (jsonl fallback)`);
   const lines = fs.readFileSync(jsonlPath, "utf8").split("\n").filter(Boolean);
+  let printed = 0;
   for (const line of lines.slice(-limit)) {
     try {
       const r = JSON.parse(line);
       if (r.level < minLevel) continue;
-      const ctx = r.ctx ? " " + JSON.stringify(r.ctx) : "";
-      console.log(`${ts(r.ts_us)} ${(r.level_name || r.level).toUpperCase().padEnd(5)} ${r.scenario}/${r.event}${ctx}`);
+      if (traceId && r.trace_id !== traceId) continue;
+      // Reuse the same formatter -- jsonl rows have ctx as object, sql
+      // rows have ctx_json as string. Normalize.
+      const ctxStr = r.ctx === undefined ? null : (r.ctx === null ? null : JSON.stringify(r.ctx));
+      console.log(fmtRow({
+        ts_us: r.ts_us, level: r.level,
+        scenario: r.scenario, event: r.event,
+        ctx_json: ctxStr, trace_id: r.trace_id,
+      }));
+      printed++;
     } catch { /* skip malformed */ }
   }
+  if (printed === 0) console.log(`(no trace events in JSONL fallback match filters)`);
   return true;
 }
 

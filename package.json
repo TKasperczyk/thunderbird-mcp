@@ -29,6 +29,7 @@
     "node": ">=18.0.0"
   },
   "devDependencies": {
-    "acorn": "^8.16.0"
+    "acorn": "^8.16.0",
+    "better-sqlite3": "^11.10.0"
   }
 }

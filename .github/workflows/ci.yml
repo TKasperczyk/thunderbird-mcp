@@ -162,9 +162,12 @@ jobs:
           thunderbird --version
           thunderbird --headless --version
 
-      # No `npm install` -- smoke.cjs + seed-greenmail.cjs + run.sh are
-      # all zero-dep Node. The XPI is pulled from the build-xpi artifact
-      # below so we don't need acorn here either.
+      - name: Install npm deps (better-sqlite3 for trace-dump)
+        # smoke.cjs + seed-greenmail.cjs + run.sh stay zero-dep; the
+        # only reason for this step is scripts/trace-dump.cjs which
+        # uses better-sqlite3 to read the structured-trace artifact
+        # on failure. Cheap install, builds in <30s.
+        run: npm install --no-audit --no-fund
 
       - name: Download XPI artifact
         uses: actions/download-artifact@v8
@@ -187,12 +190,7 @@ jobs:
       - name: Run integration suite
         run: SKIP_BUILD=1 bash test/integration/run.sh
 
-      - name: Install sqlite3 CLI for trace dump
-        if: failure()
-        run: |
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends sqlite3 || true
-
-      - name: Dump structured trace on failure (info+)
+      - name: Dump structured trace on failure (debug+)
         if: failure()
         run: |
           echo "=== /tmp/thunderbird-mcp-trace.sqlite ==="
