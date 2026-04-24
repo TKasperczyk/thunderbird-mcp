@@ -4628,7 +4628,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     count += hdrs.length;
                   }
                 }
-              } catch {}
+              } catch (e) {
+                // Continue traversal; log per-folder failures so partial empties are visible.
+                console.error("thunderbird-mcp: deleteMessages failed for folder", folder?.URI || folder?.name, ":", e);
+              }
               if (folder.hasSubFolders) {
                 for (const sub of folder.subFolders) {
                   count += deleteAllMessagesRecursive(sub);
@@ -5305,7 +5308,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   try {
                     const parsed = JSON.parse(value);
                     if (Array.isArray(parsed)) args[key] = parsed;
-                  } catch { /* leave as-is for validation to catch */ }
+                  } catch (e) {
+                    // Leave value as-is so validator surfaces a typed error to the client.
+                    console.warn(`thunderbird-mcp: coerceToolArgs JSON.parse failed for key=${key}:`, e.message);
+                  }
                 }
               }
               return args;
@@ -5559,7 +5565,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }));
                 }
                 res.finish();
-              })();
+              })().catch((e) => {
+                console.error("thunderbird-mcp: unhandled dispatch error:", e);
+                try { res.finish(); } catch {}
+              });
             });
 
             // Try the default port first, then fall back to nearby ports
@@ -5584,7 +5593,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               connFilePath = writeConnectionInfo(boundPort, authToken);
             } catch (writeErr) {
               // Connection file write failed -- stop the orphaned server
-              try { server.stop(() => {}); } catch {}
+              try { server.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
               globalThis.__tbMcpServer = null;
               throw writeErr;
             }
@@ -5595,7 +5604,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             console.error("Failed to start MCP server:", e);
             // Stop server if it was started but something else failed
             if (globalThis.__tbMcpServer) {
-              try { globalThis.__tbMcpServer.stop(() => {}); } catch {}
+              try { globalThis.__tbMcpServer.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
               globalThis.__tbMcpServer = null;
             }
             // Clear cached promise so a retry can attempt to bind again
@@ -5630,7 +5639,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const bi = JSON.parse(text);
             buildVersion = bi.version || bi.commit || null;
             buildDate = bi.builtAt || null;
-          } catch { /* build info not available */ }
+          } catch (e) {
+            // buildinfo.json may legitimately be absent in dev builds; surface anything else.
+            if (e?.name !== "NS_ERROR_FILE_NOT_FOUND") {
+              console.warn("thunderbird-mcp: read buildinfo failed:", e);
+            }
+          }
 
           // Read connection info from temp file using XPCOM file I/O
           try {
@@ -5651,7 +5665,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const data = JSON.parse(text);
               port = data.port || null;
             }
-          } catch { /* ignore */ }
+          } catch (e) {
+            // Connection file is absent before the server first binds; log other faults.
+            if (e?.name !== "NS_ERROR_FILE_NOT_FOUND") {
+              console.warn("thunderbird-mcp: read connection info failed:", e);
+            }
+          }
 
           return {
             running: !!globalThis.__tbMcpStartPromise,
@@ -5670,7 +5689,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           try {
             const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
             if (pref) allowed = JSON.parse(pref);
-          } catch { /* ignore */ }
+          } catch (e) {
+            // Falls back to "all accounts allowed"; surface the corruption.
+            console.warn("thunderbird-mcp: account-access pref is not valid JSON:", e.message);
+          }
 
           const accounts = [];
           for (const account of MailServices.accounts.accounts) {
