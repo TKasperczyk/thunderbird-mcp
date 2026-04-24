@@ -132,6 +132,67 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               "resource:///modules/MailServices.sys.mjs"
             );
 
+            // ── CI-only credential injection ────────────────────────
+            //
+            // Headless Thunderbird running in our integration Dockerfile
+            // can't NSS-encrypt logins.json from outside the app, and
+            // writing plaintext entries is rejected silently by TB 128's
+            // LoginStore -- verified via MOZ_LOG=IMAP:5,Login:5 which
+            // caught TB choosing "old-style IMAP login" (authMethod=2 ->
+            // 0x4) then stalling 26s waiting on a nsIAuthPrompt2 prompt
+            // that can never fire in headless mode.
+            //
+            // Fix: let the extension itself populate nsILoginManager on
+            // startup, driven by a pref the CI profile sets to a JSON
+            // array of { origin, httpRealm, formActionOrigin, username,
+            // password } entries. TB encrypts them via NSS as normal.
+            // Production installs have the pref unset, so this is a
+            // no-op everywhere except under the CI profile.
+            //
+            // Pref name: extensions.thunderbird-mcp.ciInjectLogins
+            try {
+              const PREF_CI_LOGINS = "extensions.thunderbird-mcp.ciInjectLogins";
+              if (Services.prefs.prefHasUserValue(PREF_CI_LOGINS)) {
+                const raw = Services.prefs.getStringPref(PREF_CI_LOGINS, "");
+                if (raw) {
+                  const entries = JSON.parse(raw);
+                  if (Array.isArray(entries)) {
+                    for (const e of entries) {
+                      if (!e || typeof e !== "object") continue;
+                      if (!e.origin || !e.username || !e.password) continue;
+                      // Deduplicate: skip if a login already exists for
+                      // the same origin+username. Important because this
+                      // runs on every TB startup and addLogin would
+                      // throw on duplicate.
+                      try {
+                        const existing = Services.logins.findLogins(e.origin, "", e.httpRealm || null);
+                        if (existing && existing.some(l => l.username === e.username)) continue;
+                      } catch { /* findLogins missing in older TB -- fall through */ }
+                      const info = Cc["@mozilla.org/login-manager/loginInfo;1"]
+                        .createInstance(Ci.nsILoginInfo);
+                      info.init(
+                        e.origin,
+                        e.formActionOrigin || null,
+                        e.httpRealm || null,
+                        e.username,
+                        e.password,
+                        e.usernameField || "",
+                        e.passwordField || ""
+                      );
+                      try {
+                        Services.logins.addLogin(info);
+                        console.info(`thunderbird-mcp: injected CI login for ${e.origin} user=${e.username}`);
+                      } catch (ex) {
+                        console.warn(`thunderbird-mcp: CI login injection for ${e.origin} failed:`, ex && ex.message);
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn("thunderbird-mcp: CI login injection skipped:", e && e.message);
+            }
+
             let cal = null;
             let CalEvent = null;
             let CalTodo = null;

@@ -136,92 +136,48 @@ user_pref("network.online", true);
 // what can actually be called, and account-level access control still
 // applies -- this only removes the safety hiding.
 user_pref("extensions.thunderbird-mcp.disabledTools", "[]");
+
+// ── CI-only credential injection for IMAP/SMTP ─────────────────────────
+// Handed to api.js's CI login injector block. Cannot use logins.json
+// directly: TB 128's LoginStore silently rejects plaintext (encType=0)
+// entries, and we have no way to NSS-encrypt from a shell script.
+// api.js calls nsILoginManager.addLogin with these entries at startup,
+// TB does the NSS encryption, and subsequent IMAP login attempts find
+// the stored credential instead of stalling 26s on a phantom UI prompt.
+// Four entries for belt-and-suspenders URL matching (with and without
+// port, for both IMAP and SMTP).
+user_pref("extensions.thunderbird-mcp.ciInjectLogins", "[{\"origin\":\"imap://localhost\",\"httpRealm\":null,\"formActionOrigin\":null,\"username\":\"test@ci.local\",\"password\":\"test\"},{\"origin\":\"imap://localhost:3143\",\"httpRealm\":null,\"formActionOrigin\":null,\"username\":\"test@ci.local\",\"password\":\"test\"},{\"origin\":\"smtp://localhost\",\"httpRealm\":null,\"formActionOrigin\":null,\"username\":\"test@ci.local\",\"password\":\"test\"},{\"origin\":\"smtp://localhost:3025\",\"httpRealm\":null,\"formActionOrigin\":null,\"username\":\"test@ci.local\",\"password\":\"test\"}]");
+
+// ── Defer IMAP login until something triggers it ───────────────────────
+// With login_at_startup=true, TB tries to open an authenticated IMAP
+// session before our extension has finished loading (and before it has
+// had a chance to inject credentials). Setting this to false means the
+// account is idle until the first URL submission (which, in the smoke
+// test, comes well after the extension has populated the login
+// manager), avoiding the startup race.
+user_pref("mail.server.server1.login_at_startup", false);
 PREFS
 
-# Passwords: TB's login manager reads logins.json on modern versions.
-# Schema notes for TB 128:
-#   - Use `origin` (renamed from `hostname` circa TB 68, old key silently
-#     ignored in 128).
-#   - Use `formActionOrigin` (renamed from `formSubmitURL`, same story).
-#   - encType=0 = plaintext in `encryptedPassword` / `encryptedUsername`.
-#     Storage returns it as-is without NSS decryption.
-#   - Mail servers are keyed in the login manager by the full socket URL
-#     INCLUDING the port. Duplicate entries with and without port cover
-#     both lookup shapes TB has used across versions (belt and suspenders).
-cat > "$PROFILE_DIR/logins.json" <<'LOGINS'
-{
-  "nextId": 5,
-  "logins": [
-    {
-      "id": 1,
-      "origin": "imap://localhost",
-      "httpRealm": null,
-      "formActionOrigin": null,
-      "usernameField": "",
-      "passwordField": "",
-      "encryptedUsername": "test@ci.local",
-      "encryptedPassword": "test",
-      "guid": "{00000000-0000-0000-0000-000000000001}",
-      "encType": 0,
-      "timeCreated": 0,
-      "timeLastUsed": 0,
-      "timePasswordChanged": 0,
-      "timesUsed": 1
-    },
-    {
-      "id": 2,
-      "origin": "imap://localhost:3143",
-      "httpRealm": null,
-      "formActionOrigin": null,
-      "usernameField": "",
-      "passwordField": "",
-      "encryptedUsername": "test@ci.local",
-      "encryptedPassword": "test",
-      "guid": "{00000000-0000-0000-0000-000000000002}",
-      "encType": 0,
-      "timeCreated": 0,
-      "timeLastUsed": 0,
-      "timePasswordChanged": 0,
-      "timesUsed": 1
-    },
-    {
-      "id": 3,
-      "origin": "smtp://localhost",
-      "httpRealm": null,
-      "formActionOrigin": null,
-      "usernameField": "",
-      "passwordField": "",
-      "encryptedUsername": "test@ci.local",
-      "encryptedPassword": "test",
-      "guid": "{00000000-0000-0000-0000-000000000003}",
-      "encType": 0,
-      "timeCreated": 0,
-      "timeLastUsed": 0,
-      "timePasswordChanged": 0,
-      "timesUsed": 1
-    },
-    {
-      "id": 4,
-      "origin": "smtp://localhost:3025",
-      "httpRealm": null,
-      "formActionOrigin": null,
-      "usernameField": "",
-      "passwordField": "",
-      "encryptedUsername": "test@ci.local",
-      "encryptedPassword": "test",
-      "guid": "{00000000-0000-0000-0000-000000000004}",
-      "encType": 0,
-      "timeCreated": 0,
-      "timeLastUsed": 0,
-      "timePasswordChanged": 0,
-      "timesUsed": 1
-    }
-  ],
-  "potentiallyVulnerablePasswords": [],
-  "dismissedBreachAlertsByLoginGUID": {},
-  "version": 3
-}
-LOGINS
+# Intentionally NOT writing logins.json here.
+#
+# TB 128's LoginStore (toolkit/components/passwordmgr/LoginStore.sys.mjs)
+# expects on-disk entries with:
+#   - `hostname`, `formSubmitURL` (legacy keys, still on-disk; the
+#     `origin` / `formActionOrigin` rename was only applied to the
+#     in-memory nsILoginInfo API)
+#   - `encType: 1` with NSS-encrypted values in encryptedUsername /
+#     encryptedPassword (encrypted with the profile's key4.db key)
+#   - An example IMAP entry has `httpRealm` set to the server URI
+# Source: https://renenyffenegger.ch/notes/Linux/fhs/home/username/
+#         _thunderbird/abcd5678_default/logins_json
+#
+# Plaintext encType=0 simply doesn't work in TB 128, and NSS-encrypting
+# from outside TB would require running the browser's own NSS tooling.
+# Instead we let the extension itself inject credentials via
+# nsILoginManager.addLogin() at startup (it already has chrome access),
+# driven by extensions.thunderbird-mcp.ciInjectLogins below. TB handles
+# the NSS encryption internally as part of addLogin(); no out-of-band
+# tooling required.
 
 # profiles.ini at the parent level so `thunderbird --profile <dir>` just works.
 # Some TB versions require the explicit sentinel to accept an external profile.
