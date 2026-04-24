@@ -528,7 +528,11 @@ async function handleMessage(line) {
         jsonrpc: '2.0',
         id: message.id,
         result: {
-          protocolVersion: '2024-11-05',
+          // Echo whatever the client requested — the bridge is a transparent
+          // relay and supports any JSON-RPC version Thunderbird's API speaks.
+          // Claude Desktop disconnects silently when negotiated to an older
+          // version, so always agree.
+          protocolVersion: message.params?.protocolVersion || '2024-11-05',
           capabilities: { tools: {} },
           serverInfo: { name: 'thunderbird-mcp', version: '0.1.0' }
         }
