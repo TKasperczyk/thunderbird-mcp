@@ -89,9 +89,14 @@ mkdir -p "$(dirname "$CONNECTION_INFO_PATH")"
 
 log "launching Thunderbird headless (profile=$TB_PROFILE_DIR)"
 # MOZ_LOG writes IMAP wire traffic + account manager decisions to
-# /tmp/tb-moz.log. Set to level 4 (Info) which logs commands + responses
-# without message bodies. Useful when "0 messages after sync" shows up.
-export MOZ_LOG="IMAP:4,MsgDB:3,timestamp"
+# /tmp/tb-moz.log. Level 5 (Verbose) includes per-command line details.
+# The `sync` module forces a write-through flush on every log call -- last
+# run's file was truncated at 8 KB when TB got SIGTERM'd during cleanup
+# before the default buffered writer flushed. Without `sync` we lose the
+# last ~4s of log, which is exactly when the interesting thing happens.
+# rotate:1000 caps per-file size at ~1000 MB so verbose logs don't
+# exhaust disk if run.sh hangs somewhere.
+export MOZ_LOG="IMAP:5,MsgDB:4,timestamp,sync,rotate:1000"
 export MOZ_LOG_FILE=/tmp/tb-moz.log
 thunderbird \
   --headless \

@@ -85,7 +85,18 @@ user_pref("mail.server.server1.userName", "test@ci.local");
 user_pref("mail.server.server1.realhostname", "localhost");
 user_pref("mail.server.server1.realuserName", "test@ci.local");
 user_pref("mail.server.server1.socketType", 0);           // plaintext, no TLS
-user_pref("mail.server.server1.authMethod", 3);           // plain password
+// authMethod values (nsMsgAuthMethod.idl):
+//   1 = none, 2 = old (bare IMAP4 LOGIN), 3 = passwordCleartext (AUTH=PLAIN/LOGIN),
+//   4 = passwordEncrypted (CRAM-MD5), 5 = GSSAPI, 6 = NTLM, 7 = External,
+//   8 = anySecure, 9 = any, 10 = OAuth2.
+// Greenmail 2.1.2's IMAP CAPABILITY response is hardcoded to:
+//   * CAPABILITY IMAP4rev1 LITERAL+ UIDPLUS SORT IDLE MOVE QUOTA
+// Note the absence of AUTH=PLAIN / AUTH=LOGIN. TB 128 with authMethod=3
+// waits to see one of those advertised and silently closes the session
+// when none appears. authMethod=2 ("old") skips the AUTH= negotiation
+// and sends the bare IMAP4 LOGIN command unconditionally, which
+// greenmail handles fine.
+user_pref("mail.server.server1.authMethod", 2);           // old-style LOGIN
 user_pref("mail.server.server1.directory-rel", "[ProfD]ImapMail/localhost");
 user_pref("mail.server.server1.login_at_startup", true);
 user_pref("mail.server.server1.check_new_mail", false);   // manual IMAP fetch
