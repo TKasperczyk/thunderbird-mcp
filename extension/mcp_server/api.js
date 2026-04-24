@@ -154,33 +154,62 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // Gated on extensions.thunderbird-mcp.ciInjectLogins. Empty
             // in production -> entire block is a no-op.
             //
-            // Three-channel logging so at least one survives whatever
-            // prefs/build flags TB has:
-            //   1. dump()  -- stderr IF browser.dom.window.dump.enabled=true
-            //   2. Services.console.logStringMessage -- Error Console,
-            //      captured by MOZ_LOG=console:5 in the log file
-            //   3. Plain file at /tmp/thunderbird-mcp-inject.log --
-            //      always works, always captured by our failure artifact
-            //      upload. The only strictly reliable signal.
-            const _ciInjectLog = (msg) => {
-              try { dump(`thunderbird-mcp: ${msg}\n`); } catch {}
-              try { Services.console.logStringMessage(`thunderbird-mcp: ${msg}`); } catch {}
-              try {
-                const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
-                f.initWithPath("/tmp/thunderbird-mcp-inject.log");
-                const fos = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(Ci.nsIFileOutputStream);
-                // PR_WRONLY | PR_CREATE_FILE | PR_APPEND = 0x02 | 0x08 | 0x10
-                fos.init(f, 0x02 | 0x08 | 0x10, 0o644, 0);
-                const cos = Cc["@mozilla.org/intl/converter-output-stream;1"].createInstance(Ci.nsIConverterOutputStream);
-                cos.init(fos, "UTF-8");
-                cos.writeString(new Date().toISOString() + " " + msg + "\n");
-                cos.close();
-              } catch {}
-            };
+            // ── Structured tracing (Sqlite.sys.mjs-backed) ─────────
+            // All observability in this code path flows through one
+            // module, lib/trace.sys.mjs, so we end up with a queryable
+            // SQLite of events (scenario, event, level, ctx, trace_id)
+            // instead of free-form log lines. The file fallback kicks
+            // in automatically if Sqlite.sys.mjs isn't available.
+            //
+            // Sink path comes from a pref so CI and prod can route
+            // differently; default is /tmp/thunderbird-mcp-trace.sqlite
+            // which matches the CI artifact upload. JSONL fallback is
+            // always co-located for visibility-parity on sqlite-open
+            // failure (disk full / permission).
+            const { makeTrace } = ChromeUtils.importESModule(
+              "resource://thunderbird-mcp/mcp_server/lib/trace.sys.mjs"
+            );
+            const tracePath = Services.prefs.getStringPref(
+              "extensions.thunderbird-mcp.tracePath",
+              "/tmp/thunderbird-mcp-trace.sqlite"
+            );
+            const traceFallback = Services.prefs.getStringPref(
+              "extensions.thunderbird-mcp.traceFallbackPath",
+              "/tmp/thunderbird-mcp-trace.jsonl"
+            );
+            let tracer;
+            try {
+              tracer = await makeTrace({
+                ChromeUtils,
+                dbPath: tracePath,
+                fallbackPath: traceFallback,
+                minLevel: 1,  // debug and up
+              });
+            } catch (e) {
+              // makeTrace is designed never to throw; if it did, fall
+              // back to a no-op shape so callers are still safe.
+              tracer = {
+                emit: () => {}, trace: () => {}, debug: () => {},
+                info: () => {}, warn: () => {}, error: () => {},
+                span: async (_s, _e, _c, fn) => (typeof _c === "function") ? _c() : fn(),
+                flush: async () => {}, close: async () => {},
+                newTraceId: () => "noop",
+              };
+            }
+            // Export so onShutdown can flush + close cleanly. Also
+            // makes it reachable from callbacks set up outside start:'s
+            // closure (permissions editor, getToolAccessConfig, etc).
+            globalThis.__tbMcpTracer = tracer;
             try {
               const PREF_CI_LOGINS = "extensions.thunderbird-mcp.ciInjectLogins";
               const hasValue = Services.prefs.prefHasUserValue(PREF_CI_LOGINS);
-              _ciInjectLog(`CI login injection block entered, pref-set=${hasValue}`);
+              const span_trace = tracer.newTraceId();
+              tracer.info("auth.inject", "block.entered", {
+                trace_id: span_trace,
+                pref_set: hasValue,
+                trace_mode: tracer.mode,
+                trace_path: tracePath,
+              });
               if (hasValue) {
                 const raw = Services.prefs.getStringPref(PREF_CI_LOGINS, "");
                 if (raw) {
@@ -190,15 +219,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     for (const e of entries) {
                       if (!e || typeof e !== "object") continue;
                       if (!e.origin || !e.username || !e.password) continue;
+                      let existingFound = false;
                       try {
                         const existing = Services.logins.findLogins(e.origin, "", e.httpRealm || null);
                         if (existing && existing.some(l => l.username === e.username)) {
-                          _ciInjectLog(`CI login for ${e.origin} user=${e.username} already present, skip`);
-                          continue;
+                          existingFound = true;
+                          tracer.debug("auth.inject", "login.duplicate_skip", {
+                            trace_id: span_trace, origin: e.origin, username: e.username,
+                          });
                         }
                       } catch (fe) {
-                        _ciInjectLog(`findLogins threw for ${e.origin}: ${fe && fe.message}`);
+                        tracer.warn("auth.inject", "login.findLogins_threw", {
+                          trace_id: span_trace, origin: e.origin, err: fe && fe.message,
+                        });
                       }
+                      if (existingFound) continue;
                       const info = Cc["@mozilla.org/login-manager/loginInfo;1"]
                         .createInstance(Ci.nsILoginInfo);
                       info.init(
@@ -212,9 +247,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       );
                       try {
                         Services.logins.addLogin(info);
-                        _ciInjectLog(`injected CI login for ${e.origin} user=${e.username}`);
+                        tracer.info("auth.inject", "login.added", {
+                          trace_id: span_trace, origin: e.origin, username: e.username,
+                        });
                       } catch (ex) {
-                        _ciInjectLog(`CI login injection for ${e.origin} FAILED: ${ex && ex.message}`);
+                        tracer.error("auth.inject", "login.addLogin_failed", {
+                          trace_id: span_trace, origin: e.origin, err: ex && ex.message,
+                        });
                       }
                     }
                     // (2) In-memory server password: walk every account
@@ -237,15 +276,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           if (server.type === scheme && server.hostName === host && server.username === e.username) {
                             try {
                               server.password = e.password;
-                              _ciInjectLog(`set in-memory password on ${scheme}://${host} (server.key=${server.key})`);
+                              tracer.info("auth.inject", "server.password_set", {
+                                trace_id: span_trace, scheme, host, server_key: server.key,
+                              });
                             } catch (sex) {
-                              _ciInjectLog(`server.password set FAILED on ${scheme}://${host}: ${sex && sex.message}`);
+                              tracer.error("auth.inject", "server.password_failed", {
+                                trace_id: span_trace, scheme, host, err: sex && sex.message,
+                              });
                             }
                           }
                         }
                       }
-                      // Same treatment for SMTP servers (different
-                      // iteration path -- MailServices.outgoingServer).
+                      // Same treatment for SMTP servers.
                       if (MailServices.outgoingServer && MailServices.outgoingServer.servers) {
                         for (const smtp of MailServices.outgoingServer.servers) {
                           if (!smtp) continue;
@@ -254,28 +296,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             const m = e.origin.match(/^smtp:\/\/([^:/]+)/i);
                             if (!m) continue;
                             const host = m[1];
-                            // nsIMsgOutgoingServer shape varies; poke at
-                            // whichever property exists.
                             const smtpHost = smtp.serverURI ? smtp.serverURI.host : (smtp.hostname || "");
                             if (smtpHost === host) {
                               try {
                                 if ("password" in smtp) smtp.password = e.password;
-                                _ciInjectLog(`set SMTP in-memory password on ${host} (key=${smtp.key || "?"})`);
+                                tracer.info("auth.inject", "smtp.password_set", {
+                                  trace_id: span_trace, host, smtp_key: smtp.key || null,
+                                });
                               } catch (sex) {
-                                _ciInjectLog(`SMTP password set FAILED on ${host}: ${sex && sex.message}`);
+                                tracer.error("auth.inject", "smtp.password_failed", {
+                                  trace_id: span_trace, host, err: sex && sex.message,
+                                });
                               }
                             }
                           }
                         }
                       }
                     } catch (ie) {
-                      _ciInjectLog(`in-memory server password loop FAILED: ${ie && ie.message}`);
+                      tracer.error("auth.inject", "server_loop.threw", {
+                        trace_id: span_trace, err: ie && ie.message,
+                      });
                     }
                   }
                 }
               }
+              tracer.info("auth.inject", "block.complete", { trace_id: span_trace });
             } catch (e) {
-              _ciInjectLog(`CI login injection block THREW: ${e && e.message}`);
+              tracer.error("auth.inject", "block.threw", { err: e && e.message });
             }
 
             let cal = null;

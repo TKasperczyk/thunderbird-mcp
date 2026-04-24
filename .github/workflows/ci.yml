@@ -187,16 +187,32 @@ jobs:
       - name: Run integration suite
         run: SKIP_BUILD=1 bash test/integration/run.sh
 
-      - name: Dump injection log on failure
+      - name: Install sqlite3 CLI for trace dump
         if: failure()
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends sqlite3 || true
+
+      - name: Dump structured trace on failure (info+)
+        if: failure()
+        run: |
+          echo "=== /tmp/thunderbird-mcp-trace.sqlite ==="
+          ls -la /tmp/thunderbird-mcp-trace.sqlite 2>&1 || true
+          ls -la /tmp/thunderbird-mcp-trace.jsonl 2>&1 || true
+          node scripts/trace-dump.cjs --limit=400 --min-level=1 || true
+          echo "=== end trace ==="
+
+      - name: Dump legacy injection log on failure
+        if: failure()
+        # Kept around as a third-tier fallback during the trace-module
+        # rollout. Once the SQLite trace is reliably populated this
+        # step can go.
         run: |
           if [ -s /tmp/thunderbird-mcp-inject.log ]; then
             echo "=== /tmp/thunderbird-mcp-inject.log ==="
             cat /tmp/thunderbird-mcp-inject.log
             echo "=== end ==="
           else
-            echo "injection log is empty or missing -- the block never ran or fs write failed"
-            ls -la /tmp/thunderbird-mcp-inject.log 2>&1 || true
+            echo "(legacy injection log empty/missing)"
           fi
 
       - name: Capture greenmail logs on failure
@@ -225,6 +241,8 @@ jobs:
             /tmp/tb-stderr.log
             /tmp/tb-moz.log*
             /tmp/greenmail.log
+            /tmp/thunderbird-mcp-trace.sqlite
+            /tmp/thunderbird-mcp-trace.jsonl
             /tmp/thunderbird-mcp-inject.log
             /tmp/thunderbird-mcp/connection.json
           if-no-files-found: ignore
