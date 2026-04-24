@@ -452,6 +452,7 @@ clearPermissionsBtn.addEventListener("click", async () => {
     }
     permissionsJson.value = JSON.stringify(PERMISSION_PRESETS.empty, null, 2);
     savePermissionsStatus.textContent = "Cleared.";
+    savePermissionsBtn.disabled = false;
   } catch (e) {
     savePermissionsStatus.textContent = "Error: " + e.message;
     savePermissionsStatus.className = "save-status error";
@@ -465,6 +466,12 @@ document.querySelectorAll(".preset-btn").forEach(btn => {
       permissionsJson.value = JSON.stringify(preset, null, 2);
       savePermissionsStatus.textContent = "Preset loaded -- click Save policy to apply.";
       savePermissionsStatus.className = "save-status";
+      // Re-enable Save regardless of prior state. If the initial
+      // loadPermissionsConfig() errored and left the button disabled,
+      // the user still needs to be able to commit the preset they just
+      // picked -- the preset is local data, not dependent on a
+      // successful load round-trip.
+      savePermissionsBtn.disabled = false;
     }
   });
 });
