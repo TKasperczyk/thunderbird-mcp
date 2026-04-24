@@ -75,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tb_version: ["128.18.0esr"]
+        tb_version: ["128.14.0esr"]
     services:
       greenmail:
         image: greenmail/standalone:2.1.2
@@ -111,11 +111,12 @@ jobs:
       - name: Install runtime deps for Thunderbird
         # Same package list as docker/integration.Dockerfile. Kept inline
         # so the GH job doesn't have to pull our image (saves 10 min per
-        # run vs. `docker build`).
+        # run vs. `docker build`). bzip2 is required for TB tarball
+        # extraction.
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates curl bzip2 xz-utils \
+            ca-certificates curl bzip2 \
             libgtk-3-0 libasound2t64 libx11-xcb1 libxcomposite1 libxdamage1 \
             libxext6 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libpangocairo-1.0-0 \
             libnss3 libnspr4 libcups2 libdrm2 libxkbcommon0 libatk1.0-0 \
@@ -123,13 +124,17 @@ jobs:
             dbus dbus-x11 netcat-openbsd jq
 
       - name: Install Thunderbird ${{ matrix.tb_version }}
+        # Mozilla ships TB Linux builds as .tar.bz2 (unlike Firefox which
+        # uses .tar.xz). If this URL ever 404s, the first check is whether
+        # Mozilla switched back to xz or whether the pinned version was
+        # EOL'd -- see https://ftp.mozilla.org/pub/thunderbird/releases/
         run: |
           set -euxo pipefail
           sudo mkdir -p /opt/thunderbird
           curl -fsSL \
-            "https://ftp.mozilla.org/pub/thunderbird/releases/${ESR_VERSION}/linux-x86_64/en-US/thunderbird-${ESR_VERSION}.tar.xz" \
-            -o /tmp/tb.tar.xz
-          sudo tar -xJf /tmp/tb.tar.xz -C /opt/thunderbird --strip-components=1
+            "https://ftp.mozilla.org/pub/thunderbird/releases/${ESR_VERSION}/linux-x86_64/en-US/thunderbird-${ESR_VERSION}.tar.bz2" \
+            -o /tmp/tb.tar.bz2
+          sudo tar -xjf /tmp/tb.tar.bz2 -C /opt/thunderbird --strip-components=1
           sudo ln -sf /opt/thunderbird/thunderbird /usr/local/bin/thunderbird
           thunderbird --version
           thunderbird --headless --version

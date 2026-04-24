@@ -16,7 +16,7 @@ FROM ubuntu:24.04
 # Thunderbird ESR tarball pin. Matches strict_max_version="150.*" in our
 # extension/manifest.json. Change ESR_VERSION to rebuild against a
 # different release; the tarball URL scheme is stable across versions.
-ARG ESR_VERSION=128.18.0esr
+ARG ESR_VERSION=128.14.0esr
 ARG ESR_LOCALE=en-US
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -43,12 +43,16 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - \
     && rm -rf /var/lib/apt/lists/*
 
 # Thunderbird tarball (Mozilla release CDN, no apt dependency)
+# NOTE: Mozilla ships Linux Thunderbird as .tar.bz2 (NOT .tar.xz -- that's
+# Firefox). Keep both bzip2 and xz-utils in the apt list above: bzip2 is
+# what we actually need for extraction, xz-utils is kept for future
+# proofing in case Mozilla switches formats.
 RUN curl -fsSL \
-      "https://ftp.mozilla.org/pub/thunderbird/releases/${ESR_VERSION}/linux-x86_64/${ESR_LOCALE}/thunderbird-${ESR_VERSION}.tar.xz" \
-      -o /tmp/thunderbird.tar.xz \
+      "https://ftp.mozilla.org/pub/thunderbird/releases/${ESR_VERSION}/linux-x86_64/${ESR_LOCALE}/thunderbird-${ESR_VERSION}.tar.bz2" \
+      -o /tmp/thunderbird.tar.bz2 \
     && mkdir -p "${TB_HOME}" \
-    && tar -xJf /tmp/thunderbird.tar.xz -C "${TB_HOME}" --strip-components=1 \
-    && rm /tmp/thunderbird.tar.xz \
+    && tar -xjf /tmp/thunderbird.tar.bz2 -C "${TB_HOME}" --strip-components=1 \
+    && rm /tmp/thunderbird.tar.bz2 \
     && ln -s "${TB_HOME}/thunderbird" /usr/local/bin/thunderbird \
     && thunderbird --version
 
