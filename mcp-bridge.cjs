@@ -22,18 +22,27 @@ const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
 const CONNECTION_FILE_BASENAME = 'connection.json';
 
-// MCP protocol versions the bridge knows how to speak. Per lifecycle spec the
-// server MUST respond with the requested version if it supports it, otherwise
-// with the latest version it supports. The bridge is a transparent JSON-RPC
-// relay -- behavior never changes by version -- so it accepts every published
-// version, but it does NOT echo unknown future versions back as if it knew them.
+// MCP protocol versions the bridge negotiates. This list intentionally tracks
+// the bundled @modelcontextprotocol/sdk inside Claude Desktop, NOT the latest
+// published spec. The new 2025-11-25 spec exists, but Claude Desktop's
+// client-side SDK was pinned at LATEST_PROTOCOL_VERSION='2025-06-18' before
+// that spec landed; if we echo "2025-11-25" back the client SDK's validator
+// silently rejects the negotiated version and we sit at a 60-second timeout.
+// Filesystem MCP returns "2025-06-18" against the same client and attaches
+// fine -- we mirror that.
+//
+// Authoritative reference (from the SDK bundled with Anthropic's Filesystem
+// MCP extension):
+//   LATEST_PROTOCOL_VERSION = '2025-06-18';
+//   SUPPORTED_PROTOCOL_VERSIONS =
+//     ['2025-06-18','2025-03-26','2024-11-05','2024-10-07'];
 const SUPPORTED_PROTOCOL_VERSIONS = new Set([
+  '2024-10-07',
   '2024-11-05',
   '2025-03-26',
   '2025-06-18',
-  '2025-11-25',
 ]);
-const LATEST_PROTOCOL_VERSION = '2025-11-25';
+const LATEST_PROTOCOL_VERSION = '2025-06-18';
 const BRIDGE_VERSION = (() => {
   try {
     return require('./package.json').version || '0.0.0';

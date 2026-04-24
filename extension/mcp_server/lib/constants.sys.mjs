@@ -11,17 +11,20 @@
 export const MCP_DEFAULT_PORT = 8765;
 export const MCP_MAX_PORT_ATTEMPTS = 10;
 
-// Versions of the MCP protocol this server understands. Behavior never depends
-// on the negotiated version inside Thunderbird (the bridge intercepts initialize
-// for clients), but for the rare case a client talks directly to the HTTP server
-// we still need a spec-compliant negotiated value.
+// MCP protocol versions this server negotiates. This list tracks the bundled
+// @modelcontextprotocol/sdk inside Claude Desktop, NOT the latest published
+// spec. See mcp-bridge.cjs for the full reasoning -- echoing "2025-11-25"
+// back to a client SDK that was pinned at LATEST_PROTOCOL_VERSION='2025-06-18'
+// before the November spec landed makes the client silently reject the
+// negotiated version and time out at 60 seconds. Filesystem MCP returns
+// "2025-06-18" and attaches fine -- we mirror that.
 export const MCP_SUPPORTED_PROTOCOL_VERSIONS = new Set([
+  "2024-10-07",
   "2024-11-05",
   "2025-03-26",
   "2025-06-18",
-  "2025-11-25",
 ]);
-export const MCP_LATEST_PROTOCOL_VERSION = "2025-11-25";
+export const MCP_LATEST_PROTOCOL_VERSION = "2025-06-18";
 
 // 25 MB limit for inline base64 data (encoded).
 export const MAX_BASE64_SIZE = 25 * 1024 * 1024;
