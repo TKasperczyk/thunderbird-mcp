@@ -95,7 +95,12 @@ jobs:
           #   hostname=0.0.0.0 -> see note above
           #   verbose          -> log mail activity to stdout (visible in
           #                       service logs on failure for debugging)
-          GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.auth.disabled -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.verbose"
+          # Explicit users= pre-creates the mailbox keyed by test@ci.local
+          # so RCPT TO deliveries land in the same mailbox TB authenticates
+          # into. Without it, greenmail auto-creates mailboxes on first
+          # delivery, and the key used can differ from the login username
+          # in subtle ways (esp. with @-addresses).
+          GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.auth.disabled -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=test@ci.local:test -Dgreenmail.verbose"
         # No in-container healthcheck: greenmail/standalone is a slim JRE
         # image without nc/curl. The "Wait for greenmail" step below polls
         # the exposed ports from the runner instead.
@@ -170,7 +175,23 @@ jobs:
       - name: Run integration suite
         run: SKIP_BUILD=1 bash test/integration/run.sh
 
-      - name: Upload TB logs on failure
+      - name: Capture greenmail logs on failure
+        if: failure()
+        # docker logs is how we reach a GH Actions service container's
+        # stdout. Container name is <svc>_<random> but the image name is
+        # stable enough to grep.
+        run: |
+          docker ps -a
+          CID=$(docker ps -a --filter "ancestor=greenmail/standalone:2.1.2" --format '{{.ID}}' | head -1)
+          if [ -n "$CID" ]; then
+            docker logs "$CID" > /tmp/greenmail.log 2>&1 || true
+            echo "--- greenmail last 60 lines ---"
+            tail -60 /tmp/greenmail.log || true
+          else
+            echo "no greenmail container found"
+          fi
+
+      - name: Upload TB + greenmail logs on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
@@ -178,6 +199,8 @@ jobs:
           path: |
             /tmp/tb-stdout.log
             /tmp/tb-stderr.log
+            /tmp/tb-moz.log*
+            /tmp/greenmail.log
             /tmp/thunderbird-mcp/connection.json
           if-no-files-found: ignore
           retention-days: 7

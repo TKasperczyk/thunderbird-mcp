@@ -88,6 +88,11 @@ rm -f "$CONNECTION_INFO_PATH" 2>/dev/null || true
 mkdir -p "$(dirname "$CONNECTION_INFO_PATH")"
 
 log "launching Thunderbird headless (profile=$TB_PROFILE_DIR)"
+# MOZ_LOG writes IMAP wire traffic + account manager decisions to
+# /tmp/tb-moz.log. Set to level 4 (Info) which logs commands + responses
+# without message bodies. Useful when "0 messages after sync" shows up.
+export MOZ_LOG="IMAP:4,MsgDB:3,timestamp"
+export MOZ_LOG_FILE=/tmp/tb-moz.log
 thunderbird \
   --headless \
   --profile "$TB_PROFILE_DIR" \
