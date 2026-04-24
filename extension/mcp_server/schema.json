@@ -94,9 +94,8 @@
         "parameters": [
           {
             "name": "policy",
-            "type": "object",
-            "additionalProperties": true,
-            "description": "Permission policy document. Stored as JSON in PREF_PERMISSIONS."
+            "type": "any",
+            "description": "Permission policy document. Validated by permissions.savePolicy(); stored as JSON in PREF_PERMISSIONS. Using 'any' because the experiment-API schema validator rejects nested policy shapes under strict 'object' -- our own validator in lib/permissions.sys.mjs handles structure."
           }
         ]
       },
