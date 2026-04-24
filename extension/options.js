@@ -151,6 +151,7 @@ async function loadToolAccess() {
     const data = await browser.mcpServer.getToolAccessConfig();
     currentTools = data.tools || [];
     const groupLabels = data.groups || {};
+    const usingDefaults = !!data.usingDefaults;
 
     if (currentTools.length === 0) {
       toolList.innerHTML = "<li>No tools found.</li>";
@@ -159,8 +160,18 @@ async function loadToolAccess() {
 
     toolList.innerHTML = "";
 
+    // Banner at the top when the user is still on the safety defaults --
+    // destructive ops (send, delete) are off until the user opts in.
+    if (usingDefaults) {
+      const banner = document.createElement("li");
+      banner.className = "tool-defaults-banner";
+      banner.textContent =
+        "Safe defaults active: send/forward/reply and all delete tools are off. " +
+        "Check the boxes below for the ones you want to allow, then Save.";
+      toolList.appendChild(banner);
+    }
+
     // Tools arrive pre-sorted by group then CRUD order from the server.
-    // Build grouped structure from tool metadata.
     let currentGroup = null;
     let currentCrud = null;
 
@@ -168,7 +179,6 @@ async function loadToolAccess() {
       const group = tool.group || "other";
       const crud = tool.crud || "other";
 
-      // New group header
       if (group !== currentGroup) {
         currentGroup = group;
         currentCrud = null;
@@ -178,7 +188,6 @@ async function loadToolAccess() {
         toolList.appendChild(header);
       }
 
-      // New CRUD sub-header within group
       if (crud !== currentCrud) {
         currentCrud = crud;
         const subHeader = document.createElement("li");
@@ -188,6 +197,9 @@ async function loadToolAccess() {
       }
 
       const li = document.createElement("li");
+      if (tool.defaultDisabled) {
+        li.classList.add("tool-default-off");
+      }
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.id = "tool-" + tool.name;
@@ -208,6 +220,11 @@ async function loadToolAccess() {
         lockSpan.className = "account-type";
         lockSpan.textContent = "required";
         label.appendChild(lockSpan);
+      } else if (tool.defaultDisabled) {
+        const defSpan = document.createElement("span");
+        defSpan.className = "account-type tool-default-off-badge";
+        defSpan.textContent = "off by default";
+        label.appendChild(defSpan);
       }
 
       li.appendChild(checkbox);
@@ -289,7 +306,133 @@ saveSkipReviewBtn.addEventListener("click", async () => {
   saveSkipReviewBtn.disabled = false;
 });
 
+// ── Advanced Permissions ─────────────────────────────────────────────────
+
+const permissionsJson = document.getElementById("permissionsJson");
+const savePermissionsBtn = document.getElementById("savePermissionsBtn");
+const clearPermissionsBtn = document.getElementById("clearPermissionsBtn");
+const savePermissionsStatus = document.getElementById("savePermissionsStatus");
+
+const PERMISSION_PRESETS = {
+  empty: { version: 1, tools: {}, accounts: {}, folders: {} },
+  readOnly: {
+    version: 1,
+    tools: {
+      "*": { enabled: false }, // not honored by engine but documents intent
+      sendMail: { enabled: false }, replyToMessage: { enabled: false }, forwardMessage: { enabled: false },
+      createContact: { enabled: false }, updateContact: { enabled: false }, deleteContact: { enabled: false },
+      createEvent: { enabled: false }, updateEvent: { enabled: false }, deleteEvent: { enabled: false },
+      createTask: { enabled: false }, updateTask: { enabled: false },
+      createFilter: { enabled: false }, updateFilter: { enabled: false }, deleteFilter: { enabled: false },
+      reorderFilters: { enabled: false }, applyFilters: { enabled: false },
+      createFolder: { enabled: false }, renameFolder: { enabled: false }, deleteFolder: { enabled: false },
+      moveFolder: { enabled: false }, emptyTrash: { enabled: false }, emptyJunk: { enabled: false },
+      updateMessage: { enabled: false }, deleteMessages: { enabled: false },
+    },
+    accounts: {}, folders: {}
+  },
+  sendDomain: {
+    version: 1,
+    tools: {
+      sendMail:        { enabled: true, alwaysReview: true, argRules: { to: { anyOf: ["*@example.com"] }, cc: { anyOf: ["*@example.com"] }, bcc: { anyOf: ["*@example.com"] } } },
+      replyToMessage:  { enabled: true, alwaysReview: true, argRules: { to: { anyOf: ["*@example.com"] }, cc: { anyOf: ["*@example.com"] }, bcc: { anyOf: ["*@example.com"] } } },
+      forwardMessage:  { enabled: true, alwaysReview: true, argRules: { to: { anyOf: ["*@example.com"] }, cc: { anyOf: ["*@example.com"] }, bcc: { anyOf: ["*@example.com"] } } }
+    },
+    accounts: {}, folders: {}
+  },
+  trashFolderOnly: {
+    version: 1,
+    tools: {
+      deleteMessages: { enabled: false },
+      deleteFolder:   { enabled: false }
+    },
+    accounts: {},
+    folders: {
+      "imap://user%40example.com@imap.example.com/Trash": {
+        tools: {
+          deleteMessages: { enabled: true, maxBatchSize: 500 }
+        }
+      }
+    }
+  }
+};
+
+async function loadPermissionsConfig() {
+  try {
+    const data = await browser.mcpServer.getPermissionsConfig();
+    if (data.error) {
+      savePermissionsStatus.textContent = "Error: " + data.error;
+      savePermissionsStatus.className = "save-status error";
+      return;
+    }
+    permissionsJson.value = JSON.stringify(data.policy, null, 2);
+    savePermissionsBtn.disabled = false;
+    savePermissionsStatus.textContent = "";
+  } catch (e) {
+    savePermissionsStatus.textContent = "Error loading: " + e.message;
+    savePermissionsStatus.className = "save-status error";
+  }
+}
+
+savePermissionsBtn.addEventListener("click", async () => {
+  savePermissionsBtn.disabled = true;
+  savePermissionsStatus.textContent = "Saving...";
+  savePermissionsStatus.className = "save-status";
+  let parsed;
+  try {
+    parsed = JSON.parse(permissionsJson.value || "{}");
+  } catch (e) {
+    savePermissionsStatus.textContent = "Invalid JSON: " + e.message;
+    savePermissionsStatus.className = "save-status error";
+    savePermissionsBtn.disabled = false;
+    return;
+  }
+  try {
+    const res = await browser.mcpServer.setPermissionsConfig(parsed);
+    if (res.error) {
+      savePermissionsStatus.textContent = "Error: " + res.error;
+      savePermissionsStatus.className = "save-status error";
+    } else {
+      savePermissionsStatus.textContent = "Saved.";
+      permissionsJson.value = JSON.stringify(res.policy, null, 2);
+    }
+  } catch (e) {
+    savePermissionsStatus.textContent = "Error: " + e.message;
+    savePermissionsStatus.className = "save-status error";
+  }
+  savePermissionsBtn.disabled = false;
+});
+
+clearPermissionsBtn.addEventListener("click", async () => {
+  savePermissionsStatus.textContent = "";
+  try {
+    const res = await browser.mcpServer.clearPermissionsConfig();
+    if (res.error) {
+      savePermissionsStatus.textContent = "Error: " + res.error;
+      savePermissionsStatus.className = "save-status error";
+      return;
+    }
+    permissionsJson.value = JSON.stringify(PERMISSION_PRESETS.empty, null, 2);
+    savePermissionsStatus.textContent = "Cleared.";
+  } catch (e) {
+    savePermissionsStatus.textContent = "Error: " + e.message;
+    savePermissionsStatus.className = "save-status error";
+  }
+});
+
+document.querySelectorAll(".preset-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const preset = PERMISSION_PRESETS[btn.dataset.preset];
+    if (preset) {
+      permissionsJson.value = JSON.stringify(preset, null, 2);
+      savePermissionsStatus.textContent = "Preset loaded -- click Save policy to apply.";
+      savePermissionsStatus.className = "save-status";
+    }
+  });
+});
+
 loadServerInfo().catch(e => console.error("thunderbird-mcp options:", "loadServerInfo failed:", e));
 loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAccountAccess failed:", e));
 loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
 loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
+loadPermissionsConfig().catch(e => console.error("thunderbird-mcp options:", "loadPermissionsConfig failed:", e));

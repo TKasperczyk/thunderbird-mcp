@@ -72,6 +72,21 @@
       text-transform: uppercase;
       margin-left: 4px;
     }
+    .tool-defaults-banner {
+      background: #fff3d4;
+      border: 1px solid #d9b94a;
+      border-radius: 4px;
+      padding: 8px 12px;
+      margin: 8px 0;
+      font-size: 13px;
+      color: #5b3e00;
+    }
+    .tool-default-off-badge {
+      color: #b34a00;
+    }
+    .tool-default-off label {
+      color: #5b5b66;
+    }
     .mode-note {
       color: #5b5b66;
       font-size: 13px;
@@ -192,6 +207,32 @@
   <div class="save-row">
     <button id="saveSkipReviewBtn" disabled>Save</button>
     <span id="saveSkipReviewStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Advanced Permissions</h2>
+  <p class="mode-note">
+    Fine-grained policy on top of the per-tool checkboxes above. Sets per-tool
+    constraints (force review window, max batch size, require folder argument),
+    per-account / per-folder rules, and argument whitelists (regex / glob).
+    Schema documented in <code>lib/permissions.sys.mjs</code>.
+    Empty = no extra rules; the tool checkboxes above still apply.
+  </p>
+  <p class="mode-note">
+    <strong>Presets:</strong>
+    <button type="button" class="preset-btn" data-preset="empty">Clear</button>
+    <button type="button" class="preset-btn" data-preset="readOnly">Read-only (block all writes)</button>
+    <button type="button" class="preset-btn" data-preset="sendDomain">Send only to one domain</button>
+    <button type="button" class="preset-btn" data-preset="trashFolderOnly">Allow deletes in Trash only</button>
+  </p>
+  <textarea id="permissionsJson" rows="14" spellcheck="false"
+    style="width:100%; font-family:Consolas,Menlo,monospace; font-size:12px; padding:8px; box-sizing:border-box;"
+    placeholder='{ "version": 1, "tools": {}, "accounts": {}, "folders": {} }'></textarea>
+  <div class="save-row">
+    <button id="savePermissionsBtn" disabled>Save policy</button>
+    <button id="clearPermissionsBtn" type="button" style="margin-left:8px;">Clear policy</button>
+    <span id="savePermissionsStatus" class="save-status"></span>
   </div>
 </div>
 

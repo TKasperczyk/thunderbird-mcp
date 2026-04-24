@@ -46,8 +46,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       MCP_SUPPORTED_PROTOCOL_VERSIONS, MCP_LATEST_PROTOCOL_VERSION,
       MAX_BASE64_SIZE, MAX_REQUEST_BODY, COMPOSE_WINDOW_LOAD_DELAY_MS,
       DEFAULT_MAX_RESULTS,
-      PREF_ALLOWED_ACCOUNTS, PREF_DISABLED_TOOLS, PREF_BLOCK_SKIPREVIEW,
-      VALID_GROUPS, VALID_CRUD, CRUD_ORDER, UNDISABLEABLE_TOOLS,
+      PREF_ALLOWED_ACCOUNTS, PREF_DISABLED_TOOLS, PREF_BLOCK_SKIPREVIEW, PREF_PERMISSIONS,
+      VALID_GROUPS, VALID_CRUD, CRUD_ORDER,
+      UNDISABLEABLE_TOOLS, DEFAULT_DISABLED_TOOLS,
       MAX_SEARCH_RESULTS_CAP, SEARCH_COLLECTION_CAP, INTERNAL_KEYWORDS,
     } = ChromeUtils.importESModule("resource://thunderbird-mcp/mcp_server/lib/constants.sys.mjs");
 
@@ -202,6 +203,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               PREF_DISABLED_TOOLS,
               PREF_BLOCK_SKIPREVIEW,
               UNDISABLEABLE_TOOLS,
+              DEFAULT_DISABLED_TOOLS,
             });
 
             // Account / identity helpers (depends on access-control + MailServices).
@@ -311,6 +313,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               MAX_BASE64_SIZE, COMPOSE_WINDOW_LOAD_DELAY_MS,
             });
 
+            // Fine-grained permission engine. Sits in front of dispatch so
+            // every tool call is policy-checked against the per-tool /
+            // per-account / per-folder rules in PREF_PERMISSIONS, with the
+            // sandbox default (DEFAULT_DISABLED_TOOLS) as the floor. See
+            // lib/permissions.sys.mjs for the full schema.
+            const { makePermissions } = ChromeUtils.importESModule(
+              "resource://thunderbird-mcp/mcp_server/lib/permissions.sys.mjs"
+            );
+            const permissions = makePermissions({
+              Services, MailServices,
+              PREF_PERMISSIONS,
+              UNDISABLEABLE_TOOLS, DEFAULT_DISABLED_TOOLS,
+            });
+
             // Dispatch: validateToolArgs / coerceToolArgs / callTool plus a
             // few HTTP-handler helpers (readRequestBody, paginate). The HTTP
             // request handler closure stays inline below because it captures
@@ -334,7 +350,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             };
             const {
               readRequestBody, validateToolArgs, coerceToolArgs, callTool,
-            } = makeDispatch({ NetUtil, tools, toolHandlers });
+            } = makeDispatch({ NetUtil, tools, toolHandlers, permissions, isToolEnabled });
 
 
 
@@ -951,22 +967,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         getToolAccessConfig: async function() {
-          // Use same fail-closed parsing as getDisabledTools() so the UI
-          // accurately reflects the server's actual state on corrupt prefs
+          // First-run state: pref never user-set means we are still serving the
+          // sandbox default (DEFAULT_DISABLED_TOOLS). The UI surfaces this so
+          // users see "X is off by default for safety" rather than thinking
+          // they explicitly disabled something they never touched.
+          let prefIsUserSet = false;
+          try {
+            prefIsUserSet = !!Services.prefs.prefHasUserValue(PREF_DISABLED_TOOLS);
+          } catch { /* fall through to corrupt path */ }
+
           let disabled = [];
           let corrupt = false;
-          try {
-            const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
-            if (pref) {
-              const parsed = JSON.parse(pref);
-              if (!Array.isArray(parsed)) {
-                corrupt = true;
-              } else {
-                disabled = parsed;
+          if (!prefIsUserSet) {
+            disabled = [...DEFAULT_DISABLED_TOOLS];
+          } else {
+            try {
+              const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
+              if (pref) {
+                const parsed = JSON.parse(pref);
+                if (!Array.isArray(parsed)) {
+                  corrupt = true;
+                } else {
+                  disabled = parsed;
+                }
               }
+            } catch {
+              corrupt = true;
             }
-          } catch {
-            corrupt = true;
           }
 
           // Build tool list with group/crud metadata, sorted by group then CRUD order
@@ -977,6 +1004,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               crud: t.crud,
               enabled: corrupt ? UNDISABLEABLE_TOOLS.has(t.name) : !disabled.includes(t.name),
               undisableable: UNDISABLEABLE_TOOLS.has(t.name),
+              defaultDisabled: DEFAULT_DISABLED_TOOLS.has(t.name),
             }))
             .sort((a, b) => {
               const gA = GROUP_ORDER[a.group] ?? 99;
@@ -987,6 +1015,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           const result = {
             mode: corrupt ? "error" : (disabled.length === 0 ? "all" : "restricted"),
             disabledTools: disabled,
+            usingDefaults: !prefIsUserSet && !corrupt,
             groups: GROUP_LABELS,
             tools: toolList,
           };
@@ -1072,6 +1101,35 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             try { Services.prefs.clearUserPref(PREF_BLOCK_SKIPREVIEW); } catch { /* ignore */ }
           }
           return { success: true, blockSkipReview };
+        },
+
+        // Fine-grained permission policy (Levels 2-4: per-tool constraints,
+        // per-account / per-folder rules, argument whitelists). The schema is
+        // documented in lib/permissions.sys.mjs. Stored as a single JSON
+        // document in PREF_PERMISSIONS.
+        getPermissionsConfig: async function() {
+          try {
+            const policy = permissions.loadPolicy();
+            return { policy };
+          } catch (e) {
+            return { error: e.toString() };
+          }
+        },
+        setPermissionsConfig: async function(policy) {
+          try {
+            const normalized = permissions.savePolicy(policy);
+            return { success: true, policy: normalized };
+          } catch (e) {
+            return { error: e.toString() };
+          }
+        },
+        clearPermissionsConfig: async function() {
+          try {
+            permissions.clearPolicy();
+            return { success: true };
+          } catch (e) {
+            return { error: e.toString() };
+          }
         },
       }
     };

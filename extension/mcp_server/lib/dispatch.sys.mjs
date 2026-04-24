@@ -15,6 +15,11 @@ export function makeDispatch({
   NetUtil,
   tools,
   toolHandlers,
+  permissions,    // optional fine-grained permission engine; if absent only the legacy
+                  // isToolEnabled check from access-control gates calls
+  isToolEnabled,  // optional Level-1 enable/disable check (still used as the
+                  // pre-permissions sandbox floor in callers that haven't yet
+                  // adopted the engine; kept for backward-compat)
 }) {
   // Pre-build a name -> inputSchema map for fast lookup at validate time.
   const toolSchemas = Object.create(null);
@@ -156,6 +161,19 @@ export function makeDispatch({
   }
 
   async function callTool(name, args) {
+    // Permission gate: evaluate before doing any work. May mutate args
+    // (e.g. force compose tools off skipReview when policy says alwaysReview).
+    if (permissions && typeof permissions.evaluate === "function") {
+      // Sandbox floor: pass baseAllowed=true if isToolEnabled accepts the
+      // tool, false otherwise. The engine then applies explicit policy
+      // overrides on top.
+      const baseAllowed = (typeof isToolEnabled === "function") ? !!isToolEnabled(name) : true;
+      const decision = permissions.evaluate(name, args, baseAllowed);
+      if (!decision.allow) {
+        throw new Error(decision.reason || `Tool '${name}' denied by permission policy`);
+      }
+      args = decision.args;
+    }
     switch (name) {
       case "listAccounts":
         return toolHandlers.listAccounts();

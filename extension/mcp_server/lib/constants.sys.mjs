@@ -42,6 +42,8 @@ export const SEARCH_COLLECTION_CAP = 10000;
 export const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 export const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
 export const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
+// Fine-grained permission policy (JSON document, see lib/permissions.sys.mjs).
+export const PREF_PERMISSIONS = "extensions.thunderbird-mcp.permissions";
 
 // Valid group and CRUD values for tool metadata validation.
 export const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
@@ -51,6 +53,24 @@ export const CRUD_ORDER = { read: 0, create: 1, update: 2, delete: 3 };
 
 // Tools that cannot be disabled via the settings page (infrastructure tools).
 export const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccess"]);
+
+// Tools that ship DISABLED by default. The user has to explicitly opt-in via
+// the settings page before AI can call them. Only applies when the user has
+// NEVER touched the pref -- once they save any tool-access choice (even an
+// empty disabled list = "I want everything enabled"), this default no longer
+// overrides their explicit choice.
+//
+// Policy: any tool that sends mail off the machine OR irreversibly destroys
+// user data is opt-in. read/list/search/update tools stay enabled by default
+// because they're either safe or recoverable. Create tools also stay enabled
+// because creating clutter is annoying but not destructive.
+export const DEFAULT_DISABLED_TOOLS = new Set([
+  // send: leaves the machine, can't be undone
+  "sendMail", "replyToMessage", "forwardMessage",
+  // delete: irreversible (or near-irreversible: trash gets emptied eventually)
+  "deleteContact", "deleteEvent", "deleteFilter", "deleteMessages",
+  "deleteFolder", "emptyTrash", "emptyJunk",
+]);
 
 // Internal IMAP/Thunderbird keywords that should not appear as user-visible tags.
 export const INTERNAL_KEYWORDS = new Set([

@@ -78,6 +78,34 @@
             "description": "When true, send/reply/forward tools reject skipReview=true and require the review window."
           }
         ]
+      },
+      {
+        "name": "getPermissionsConfig",
+        "type": "function",
+        "async": true,
+        "description": "Get the fine-grained permission policy (per-tool / per-account / per-folder rules + arg whitelists). Returns { policy } or { error }.",
+        "parameters": []
+      },
+      {
+        "name": "setPermissionsConfig",
+        "type": "function",
+        "async": true,
+        "description": "Save the fine-grained permission policy. Schema documented in lib/permissions.sys.mjs.",
+        "parameters": [
+          {
+            "name": "policy",
+            "type": "object",
+            "additionalProperties": true,
+            "description": "Permission policy document. Stored as JSON in PREF_PERMISSIONS."
+          }
+        ]
+      },
+      {
+        "name": "clearPermissionsConfig",
+        "type": "function",
+        "async": true,
+        "description": "Clear the permission policy (returns to sandbox defaults).",
+        "parameters": []
       }
     ]
   }

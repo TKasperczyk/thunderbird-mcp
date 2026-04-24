@@ -22,6 +22,7 @@ export function makeAccessControl({
   PREF_DISABLED_TOOLS,
   PREF_BLOCK_SKIPREVIEW,
   UNDISABLEABLE_TOOLS,
+  DEFAULT_DISABLED_TOOLS,
 }) {
   /**
    * Return the list of allowed account IDs from the pref. Empty array
@@ -63,10 +64,30 @@ export function makeAccessControl({
   }
 
   /**
-   * Disabled tool names from the pref. Returns ["__all__"] sentinel on
-   * any failure so isToolEnabled denies everything except undisableables.
+   * Disabled tool names from the pref. Three return paths:
+   *   - pref never user-set      -> [...DEFAULT_DISABLED_TOOLS] (sandbox default,
+   *                                  destructive ops require explicit opt-in)
+   *   - pref present + valid     -> the parsed array (user's explicit choice,
+   *                                  even an empty array means "I want everything
+   *                                  enabled and I made that choice deliberately")
+   *   - pref present but corrupt -> ["__all__"] sentinel so isToolEnabled denies
+   *                                  everything except UNDISABLEABLE_TOOLS
    */
   function getDisabledTools() {
+    // First-run / never-touched: apply the safe default. As soon as the user
+    // saves any value via the options page, prefHasUserValue flips to true
+    // and we honor their explicit list (which lets them turn destructive ops
+    // on without re-applying the default on every restart).
+    let prefIsUserSet = false;
+    try {
+      prefIsUserSet = !!Services.prefs.prefHasUserValue(PREF_DISABLED_TOOLS);
+    } catch {
+      // If even prefHasUserValue throws, we're in a bad state -- fall through
+      // to the parse path which will fail closed.
+    }
+    if (!prefIsUserSet) {
+      return DEFAULT_DISABLED_TOOLS ? [...DEFAULT_DISABLED_TOOLS] : [];
+    }
     try {
       const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
       if (!pref) return [];
