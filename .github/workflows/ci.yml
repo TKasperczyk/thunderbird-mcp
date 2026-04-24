@@ -210,20 +210,6 @@ jobs:
           node scripts/trace-dump.cjs --limit=400 --min-level=1 || true
           echo "=== end trace ==="
 
-      - name: Dump legacy injection log on failure
-        if: failure()
-        # Kept around as a third-tier fallback during the trace-module
-        # rollout. Once the SQLite trace is reliably populated this
-        # step can go.
-        run: |
-          if [ -s /tmp/thunderbird-mcp-inject.log ]; then
-            echo "=== /tmp/thunderbird-mcp-inject.log ==="
-            cat /tmp/thunderbird-mcp-inject.log
-            echo "=== end ==="
-          else
-            echo "(legacy injection log empty/missing)"
-          fi
-
       - name: Capture greenmail logs on failure
         if: failure()
         # docker logs is how we reach a GH Actions service container's
@@ -252,7 +238,6 @@ jobs:
             /tmp/greenmail.log
             /tmp/thunderbird-mcp-trace.sqlite
             /tmp/thunderbird-mcp-trace.jsonl
-            /tmp/thunderbird-mcp-inject.log
             /tmp/thunderbird-mcp/connection.json
           if-no-files-found: ignore
           retention-days: 7
