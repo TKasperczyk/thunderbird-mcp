@@ -1131,6 +1131,13 @@ export function makeCompose({
     if (drafts.length > 50) {
       return { error: "batch limit is 50 drafts per call" };
     }
+    const tracer = globalThis.__tbMcpTracer;  // optional
+    const batchTraceId = tracer ? tracer.newTraceId() : null;
+    if (tracer) {
+      tracer.info("create_drafts", "batch.start", {
+        trace_id: batchTraceId, count: drafts.length,
+      });
+    }
     const results = [];
     for (const spec of drafts) {
       try {
@@ -1173,19 +1180,51 @@ export function makeCompose({
 
         const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
+        if (tracer) {
+          tracer.debug("create_drafts", "save.dispatch", {
+            trace_id: batchTraceId, to, subject,
+            identity_email: msgComposeParams.identity && msgComposeParams.identity.email,
+            attachments: fileDescs.length,
+          });
+        }
         const saveResult = await saveAsDraftDirectly(composeFields, msgComposeParams.identity, fileDescs);
         if (saveResult && saveResult.success) {
           const entry = { success: true, draftFolderURI: saveResult.draftFolderURI, messageId: saveResult.messageId, to, subject };
           if (failedPaths.length > 0) entry.failedAttachments = failedPaths;
           results.push(entry);
+          if (tracer) {
+            tracer.info("create_drafts", "save.success", {
+              trace_id: batchTraceId, to, subject,
+              draftFolderURI: saveResult.draftFolderURI,
+              messageId: saveResult.messageId,
+            });
+          }
         } else {
-          results.push(saveResult || { error: "unknown draft save failure" });
+          const errResult = saveResult || { error: "unknown draft save failure" };
+          results.push(errResult);
+          if (tracer) {
+            tracer.error("create_drafts", "save.failed", {
+              trace_id: batchTraceId, to, subject,
+              err: errResult.error,
+            });
+          }
         }
       } catch (e) {
         results.push({ error: e.toString() });
+        if (tracer) {
+          tracer.error("create_drafts", "save.threw", {
+            trace_id: batchTraceId, err: e && e.message,
+          });
+        }
       }
     }
     const successCount = results.filter(r => r && r.success).length;
+    if (tracer) {
+      tracer.info("create_drafts", "batch.end", {
+        trace_id: batchTraceId,
+        total: drafts.length, succeeded: successCount, failed: drafts.length - successCount,
+      });
+    }
     return { total: drafts.length, succeeded: successCount, failed: drafts.length - successCount, drafts: results };
   }
 
