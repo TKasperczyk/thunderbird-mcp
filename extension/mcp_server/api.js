@@ -245,10 +245,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         e.usernameField || "",
                         e.passwordField || ""
                       );
+                      // TB 128 deprecated the sync addLogin() -- it
+                      // throws 'JavaScript component does not have a
+                      // method named: "addLogin"'. addLoginAsync is
+                      // the modern replacement and returns a promise.
+                      // Try async first, fall back to sync for older
+                      // TB versions in case anyone runs this CI
+                      // harness against ESR 102 etc.
                       try {
-                        Services.logins.addLogin(info);
+                        if (typeof Services.logins.addLoginAsync === "function") {
+                          await Services.logins.addLoginAsync(info);
+                        } else {
+                          Services.logins.addLogin(info);
+                        }
                         tracer.info("auth.inject", "login.added", {
                           trace_id: span_trace, origin: e.origin, username: e.username,
+                          api: typeof Services.logins.addLoginAsync === "function" ? "addLoginAsync" : "addLogin",
                         });
                       } catch (ex) {
                         tracer.error("auth.inject", "login.addLogin_failed", {
