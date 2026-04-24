@@ -219,6 +219,26 @@ curl -X POST http://127.0.0.1:$PORT \
 
 After changing extension code: remove from Thunderbird, restart, reinstall the XPI, restart again. Thunderbird caches aggressively.
 
+### Integration tests (headless TB + Greenmail)
+
+Unit tests (`node --test test/*.test.cjs`) cover the bridge, auth, and the permission engine without ever launching Thunderbird. The integration suite goes further: it boots a real headless Thunderbird against a [Greenmail](https://greenmail-mail-test.github.io/greenmail/) IMAP/SMTP mock, seeds ~20 fixture messages, and drives MCP tool calls through the actual bridge. That's what catches "the tool responded" vs. "the tool actually moved a message on the server" regressions.
+
+Run it locally (Linux; the Docker image bundles Thunderbird 128 ESR):
+
+```bash
+# 1. start greenmail
+docker run --rm -d --name greenmail --network host \
+  -e GREENMAIL_OPTS="-Dgreenmail.setup.test.smtp -Dgreenmail.setup.test.imap -Dgreenmail.users=test@ci.local:test -Dgreenmail.auth.disabled" \
+  greenmail/standalone:2.1.2
+
+# 2. either use the integration container or run on the host
+docker build -f docker/integration.Dockerfile -t thunderbird-mcp-ci .
+docker run --rm --network host -v "$PWD:/work" -w /work thunderbird-mcp-ci \
+  bash test/integration/run.sh
+```
+
+In CI both jobs run on every push/PR — see `.github/workflows/ci.yml`.
+
 ---
 
 ## Project structure
@@ -236,10 +256,20 @@ thunderbird-mcp/
 │   └── mcp_server/
 │       ├── api.js              # All 36 MCP tools + auth + access control
 │       └── schema.json
-├── test/                       # Test suite (node:test, zero dependencies)
+├── test/
+│   ├── *.test.cjs              # Unit tests (node:test, zero deps)
+│   └── integration/
+│       ├── smoke.cjs           # End-to-end MCP smoke suite
+│       └── run.sh              # Boot TB + greenmail + run smoke
+├── docker/
+│   └── integration.Dockerfile  # Ubuntu + pinned TB ESR tarball + Node
+├── .github/workflows/ci.yml    # Unit + integration jobs
 └── scripts/
     ├── build.sh
-    └── install.sh
+    ├── install.sh
+    └── ci/
+        ├── make-tb-profile.sh  # Build TB profile pointed at greenmail
+        └── seed-greenmail.cjs  # Zero-dep SMTP seeder
 ```
 
 ## Known issues

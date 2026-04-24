@@ -1,0 +1,165 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, "refactor/**", "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ─── Tier 1: Unit tests ──────────────────────────────────────────────
+  # Pure-Node tests of mcp-bridge, auth, permissions, tool-access,
+  # validation, stress, json-pref-store. No Thunderbird, no network.
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dev deps
+        run: npm install --no-audit --no-fund
+
+      - name: Import-graph validation
+        run: node scripts/check-imports.cjs
+
+      - name: Run unit tests
+        run: |
+          node --test \
+            test/auth.test.cjs \
+            test/json-pref-store.test.cjs \
+            test/mcp-bridge.test.cjs \
+            test/permissions.test.cjs \
+            test/stress.test.cjs \
+            test/tool-access.test.cjs \
+            test/validation.test.cjs
+
+  # ─── Build XPI (reused by integration + release) ─────────────────────
+  build-xpi:
+    name: Build XPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install --no-audit --no-fund
+      - run: node scripts/build-xpi.cjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: thunderbird-mcp-xpi
+          path: dist/thunderbird-mcp.xpi
+          if-no-files-found: error
+          retention-days: 14
+
+  # ─── Tier 2: Integration ─────────────────────────────────────────────
+  # Real Thunderbird (pinned ESR tarball) ↔ Greenmail (service container)
+  # ↔ our MCP bridge ↔ smoke.cjs. Asserts tools actually do the work
+  # against a live IMAP server.
+  integration:
+    name: Integration (TB ${{ matrix.tb_version }} + Greenmail)
+    runs-on: ubuntu-latest
+    needs: [unit, build-xpi]
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        tb_version: ["128.18.0esr"]
+    services:
+      greenmail:
+        image: greenmail/standalone:2.1.2
+        ports:
+          - 3025:3025   # SMTP
+          - 3143:3143   # IMAP
+          - 3465:3465   # SMTPS (unused here)
+          - 3993:3993   # IMAPS (unused here)
+        env:
+          # greenmail/standalone reads GREENMAIL_OPTS and passes it to the JVM.
+          # - setup.test.smtp/imap: bind the plaintext listeners on 3025/3143
+          # - users: seed the mailbox TB will authenticate to
+          # - auth.disabled: accept any credentials (headless TB can't prompt)
+          GREENMAIL_OPTS: "-Dgreenmail.setup.test.smtp -Dgreenmail.setup.test.imap -Dgreenmail.users=test@ci.local:test -Dgreenmail.auth.disabled -Dgreenmail.verbose"
+        # No in-container healthcheck: greenmail/standalone is a slim JRE
+        # image without nc/curl. The "Wait for greenmail" step below polls
+        # the exposed ports from the runner instead.
+    env:
+      ESR_VERSION: ${{ matrix.tb_version }}
+      GREENMAIL_HOST: localhost
+      GREENMAIL_IMAP_PORT: "3143"
+      GREENMAIL_SMTP_PORT: "3025"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install runtime deps for Thunderbird
+        # Same package list as docker/integration.Dockerfile. Kept inline
+        # so the GH job doesn't have to pull our image (saves 10 min per
+        # run vs. `docker build`).
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl bzip2 xz-utils \
+            libgtk-3-0 libasound2t64 libx11-xcb1 libxcomposite1 libxdamage1 \
+            libxext6 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libpangocairo-1.0-0 \
+            libnss3 libnspr4 libcups2 libdrm2 libxkbcommon0 libatk1.0-0 \
+            libatk-bridge2.0-0 libatspi2.0-0 libdbus-glib-1-2 libxtst6 \
+            dbus dbus-x11 netcat-openbsd jq
+
+      - name: Install Thunderbird ${{ matrix.tb_version }}
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /opt/thunderbird
+          curl -fsSL \
+            "https://ftp.mozilla.org/pub/thunderbird/releases/${ESR_VERSION}/linux-x86_64/en-US/thunderbird-${ESR_VERSION}.tar.xz" \
+            -o /tmp/tb.tar.xz
+          sudo tar -xJf /tmp/tb.tar.xz -C /opt/thunderbird --strip-components=1
+          sudo ln -sf /opt/thunderbird/thunderbird /usr/local/bin/thunderbird
+          thunderbird --version
+          thunderbird --headless --version
+
+      - name: Install npm deps
+        run: npm install --no-audit --no-fund
+
+      - name: Download XPI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: thunderbird-mcp-xpi
+          path: dist/
+
+      - name: Wait for greenmail
+        run: |
+          for i in $(seq 1 30); do
+            if nc -z localhost 3143 && nc -z localhost 3025; then
+              echo "greenmail up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "greenmail never came up" >&2
+          exit 1
+
+      - name: Run integration suite
+        run: SKIP_BUILD=1 bash test/integration/run.sh
+
+      - name: Upload TB logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tb-logs-${{ matrix.tb_version }}
+          path: |
+            /tmp/tb-stdout.log
+            /tmp/tb-stderr.log
+            /tmp/thunderbird-mcp/connection.json
+          if-no-files-found: ignore
+          retention-days: 7
