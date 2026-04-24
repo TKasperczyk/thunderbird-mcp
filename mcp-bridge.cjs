@@ -700,17 +700,7 @@ async function forwardToThunderbird(message, _retried) {
 }
 
 function startBridge() {
-  let pendingRequests = 0;
-  let stdinClosed = false;
-
   debugLog(`startup version=${BRIDGE_VERSION} pid=${process.pid} platform=${process.platform}`);
-
-  function checkExit() {
-    if (stdinClosed && pendingRequests === 0) {
-      debugLog('shutdown stdin-closed and no pending requests, exiting 0');
-      process.exit(0);
-    }
-  }
 
   function writeOutput(data) {
     return new Promise((resolve) => {
@@ -739,7 +729,6 @@ function startBridge() {
 
     debugLog(`recv method=${messageMethod} id=${messageId}`);
 
-    pendingRequests++;
     handleMessage(line)
       .then(async (response) => {
         if (response !== null) {
@@ -754,19 +743,18 @@ function startBridge() {
           id: messageId,
           error: { code: -32700, message: `Bridge error: ${err.message}` }
         }) + '\n');
-      })
-      .finally(() => {
-        pendingRequests--;
-        checkExit();
       });
   }
 
-  // Manual newline-delimited JSON parsing on raw stdin. The previous
-  // readline-based implementation lost the initialize response under
-  // Claude Desktop's Electron-spawned Node on Windows -- writes from
-  // promise callbacks never made it back through the pipe. Reading raw
-  // 'data' events with explicit utf8 encoding matches what the official
-  // @modelcontextprotocol/sdk stdio transport does and works reliably.
+  // Manual newline-delimited JSON parsing on raw stdin. Matches what the
+  // official @modelcontextprotocol/sdk stdio transport does.
+  //
+  // We deliberately do NOT call process.exit on stdin 'end' or on signals.
+  // Claude Desktop closes stdin as a normal teardown signal but may still
+  // be waiting for an in-flight stdout response to come back. Exiting on
+  // 'end' races against the response write on Windows pipes (where 'end'
+  // can fire in the same tick as 'data') and silently drops the response.
+  // Let the host kill us when it's actually done.
   process.stdin.setEncoding('utf8');
   let buffer = '';
   process.stdin.on('data', (chunk) => {
@@ -784,15 +772,34 @@ function startBridge() {
       buffer = '';
       dispatch(tail);
     }
-    stdinClosed = true;
-    checkExit();
   });
-
-  process.on('SIGINT', () => process.exit(0));
-  process.on('SIGTERM', () => process.exit(0));
 }
 
-if (require.main === module) {
+// Decide whether to auto-start the bridge.
+//
+// The standard `require.main === module` guard works when the bridge is
+// invoked as `node mcp-bridge.cjs`, but Claude Desktop's "built-in Node.js"
+// loader (verified via runtime trace: `require.main` points to
+// app.asar/.vite/build/mcp-runtime/nodeHost.js) wraps the script such that
+// `require.main !== module` even though the bridge IS the entry point.
+// Without the argv fallback, top-level constants get evaluated, the file
+// is loaded, but startBridge() never runs and the client sits at a
+// 60-second initialize timeout because no stdin listener is ever installed.
+//
+// Fall back to an argv heuristic: if argv[1] basename matches the bridge
+// script, we are running as the entry script no matter what require.main
+// reports. Tests that `require('../mcp-bridge.cjs')` use a different
+// argv[1] (the test file or the test runner) and correctly skip auto-start.
+const _autoStart = (() => {
+  if (require.main === module) return true;
+  try {
+    const entry = (process.argv && process.argv[1]) || '';
+    if (entry && path.basename(entry) === 'mcp-bridge.cjs') return true;
+  } catch { /* fall through */ }
+  return false;
+})();
+
+if (_autoStart) {
   startBridge();
 }
 

@@ -783,24 +783,26 @@ describe("Build version: options.js display parsing", () => {
 // ── Structural: ALL_TOOLS sync with production ───────────────────────
 
 describe("Structural: test data matches production source", () => {
-  it("ALL_TOOLS count matches tool definitions in api.js", () => {
-    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
-    const src = fs.readFileSync(apiPath, "utf8");
-    // Count tool name declarations in the tools array: name: "toolName"
-    // Each tool object in the `const tools = [...]` array has a name field
+  // After the modular split, tool schemas live in lib/tools-schema.sys.mjs
+  // and the validator constants live in lib/constants.sys.mjs. Scanning
+  // api.js for these would always come up empty.
+  const TOOLS_SCHEMA_PATH = path.join(__dirname, "..", "extension", "mcp_server", "lib", "tools-schema.sys.mjs");
+  const CONSTANTS_PATH = path.join(__dirname, "..", "extension", "mcp_server", "lib", "constants.sys.mjs");
+
+  it("ALL_TOOLS count matches tool definitions in tools-schema.sys.mjs", () => {
+    const src = fs.readFileSync(TOOLS_SCHEMA_PATH, "utf8");
     const nameMatches = src.match(/{\s*name:\s*"[a-zA-Z]+"/g);
-    assert.ok(nameMatches, "Could not find tool name declarations in api.js");
+    assert.ok(nameMatches, "Could not find tool name declarations in tools-schema.sys.mjs");
     assert.equal(
       ALL_TOOLS.length,
       nameMatches.length,
-      `Test ALL_TOOLS has ${ALL_TOOLS.length} tools but api.js has ${nameMatches.length} tool definitions. ` +
+      `Test ALL_TOOLS has ${ALL_TOOLS.length} tools but tools-schema.sys.mjs has ${nameMatches.length} tool definitions. ` +
       `Update ALL_TOOLS when adding/removing tools.`
     );
   });
 
   it("ALL_TOOLS names match production tool names", () => {
-    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
-    const src = fs.readFileSync(apiPath, "utf8");
+    const src = fs.readFileSync(TOOLS_SCHEMA_PATH, "utf8");
     const nameMatches = src.match(/{\s*name:\s*"([a-zA-Z]+)"/g);
     const prodNames = nameMatches.map(m => m.match(/"([a-zA-Z]+)"/)[1]).sort();
     const testNames = ALL_TOOLS.map(t => t.name).sort();
@@ -808,20 +810,18 @@ describe("Structural: test data matches production source", () => {
   });
 
   it("VALID_GROUPS matches production VALID_GROUPS", () => {
-    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
-    const src = fs.readFileSync(apiPath, "utf8");
-    const m = src.match(/const VALID_GROUPS\s*=\s*\[([^\]]+)\]/);
-    assert.ok(m, "Could not find VALID_GROUPS in api.js");
+    const src = fs.readFileSync(CONSTANTS_PATH, "utf8");
+    const m = src.match(/export const VALID_GROUPS\s*=\s*\[([^\]]+)\]/);
+    assert.ok(m, "Could not find VALID_GROUPS in constants.sys.mjs");
     const prodGroups = m[1].match(/"([^"]+)"/g).map(s => s.replace(/"/g, "")).sort();
     const testGroups = [...VALID_GROUPS].sort();
     assert.deepStrictEqual(testGroups, prodGroups, "Test VALID_GROUPS doesn't match production");
   });
 
   it("VALID_CRUD matches production VALID_CRUD", () => {
-    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
-    const src = fs.readFileSync(apiPath, "utf8");
-    const m = src.match(/const VALID_CRUD\s*=\s*\[([^\]]+)\]/);
-    assert.ok(m, "Could not find VALID_CRUD in api.js");
+    const src = fs.readFileSync(CONSTANTS_PATH, "utf8");
+    const m = src.match(/export const VALID_CRUD\s*=\s*\[([^\]]+)\]/);
+    assert.ok(m, "Could not find VALID_CRUD in constants.sys.mjs");
     const prodCrud = m[1].match(/"([^"]+)"/g).map(s => s.replace(/"/g, "")).sort();
     const testCrud = [...VALID_CRUD].sort();
     assert.deepStrictEqual(testCrud, prodCrud, "Test VALID_CRUD doesn't match production");
