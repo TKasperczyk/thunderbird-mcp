@@ -198,199 +198,46 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               };
             }
 
-            /**
-             * Generate a cryptographically random auth token (hex string).
-             * Used to authenticate bridge requests to the HTTP server.
-             */
-            function generateAuthToken() {
-              const bytes = new Uint8Array(32);
-              // crypto.getRandomValues is not available in Thunderbird experiment API scope;
-              // use the XPCOM random generator instead.
-              const rng = Cc["@mozilla.org/security/random-generator;1"]
-                .createInstance(Ci.nsIRandomGenerator);
-              const randomBytes = rng.generateRandomBytes(32);
-              for (let i = 0; i < 32; i++) bytes[i] = randomBytes[i];
-              return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
-            }
-
-            /**
-             * Write connection info (port + auth token) to a well-known file
-             * so the bridge can discover how to connect.
-             * File: <TmpD>/thunderbird-mcp/connection.json
-             */
-            function writeConnectionInfo(port, token) {
-              const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-              tmpDir.append("thunderbird-mcp");
-              if (!tmpDir.exists()) {
-                tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
-              } else if (tmpDir.isSymlink()) {
-                throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
-              }
-              const connFile = tmpDir.clone();
-              connFile.append("connection.json");
-              // Symlink defense: remove any existing file first, then create
-              // with O_CREAT|O_EXCL (0x08|0x80) to fail if a symlink appeared
-              // between remove and create.
-              if (connFile.exists()) {
-                connFile.remove(false);
-              }
-              const data = JSON.stringify({ port, token, pid: Services.appinfo.processID });
-              const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
-                .createInstance(Ci.nsIFileOutputStream);
-              // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x80 = O_EXCL
-              ostream.init(connFile, 0x02 | 0x08 | 0x80, 0o600, 0);
-              const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
-                .createInstance(Ci.nsIConverterOutputStream);
-              converter.init(ostream, "UTF-8");
-              converter.writeString(data);
-              converter.close();
-              return connFile.path;
-            }
-
-            /**
-             * Remove the connection info file on shutdown.
-             */
-            function removeConnectionInfo() {
-              try {
-                const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-                tmpDir.append("thunderbird-mcp");
-                const connFile = tmpDir.clone();
-                connFile.append("connection.json");
-                if (connFile.exists()) {
-                  connFile.remove(false);
-                }
-              } catch {
-                // Best-effort cleanup
-              }
-            }
+            // Auth + connection-info plumbing. Factory takes the XPCOM
+            // globals (which are sandbox-only in api.js, not available
+            // in .sys.mjs) and returns the operational functions.
+            const { makeAuth } = ChromeUtils.importESModule(
+              "resource://thunderbird-mcp/mcp_server/lib/auth.sys.mjs"
+            );
+            const {
+              generateAuthToken,
+              timingSafeEqual,
+              writeConnectionInfo,
+              removeConnectionInfo,
+            } = makeAuth({ Services, Cc, Ci });
 
             const authToken = generateAuthToken();
 
-            /**
-             * Constant-time string comparison to prevent timing side-channel attacks.
-             */
-            function timingSafeEqual(a, b) {
-              const aStr = String(a);
-              const bStr = String(b);
-              const len = Math.max(aStr.length, bStr.length);
-              let result = aStr.length ^ bStr.length;
-              for (let i = 0; i < len; i++) {
-                result |= (aStr.charCodeAt(i) || 0) ^ (bStr.charCodeAt(i) || 0);
-              }
-              return result === 0;
-            }
-
-            /**
-             * Get the list of allowed account IDs from preferences.
-             * Returns an empty array if no restriction is set (all accounts allowed).
-             */
-            function getAllowedAccountIds() {
-              try {
-                const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
-                if (!pref) return [];
-                const parsed = JSON.parse(pref);
-                if (!Array.isArray(parsed)) {
-                  console.error("thunderbird-mcp: allowed accounts pref is not an array, blocking all accounts");
-                  return ["__invalid__"];
-                }
-                return parsed;
-              } catch (e) {
-                // Fail closed: corrupt pref means block all accounts, not allow all
-                console.error("thunderbird-mcp: failed to parse allowed accounts pref, blocking all accounts:", e);
-                return ["__invalid__"];
-              }
-            }
-
-            /**
-             * Check if an account is accessible based on the allowed accounts list.
-             * When the list is empty, all accounts are accessible (default).
-             */
-            function isAccountAllowed(accountKey) {
-              const allowed = getAllowedAccountIds();
-              if (allowed.length === 0) return true;
-              return allowed.includes(accountKey);
-            }
-
-            /**
-             * Check if the user has disabled the skipReview shortcut.
-             * When true, send/reply/forward tools must open the review window even
-             * if the caller passed skipReview: true.
-             */
-            function isSkipReviewBlocked() {
-              try {
-                return Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, false);
-              } catch {
-                // Fail closed: if we can't read the pref, assume blocked so the
-                // user retains ability to review before send.
-                return true;
-              }
-            }
-
-            /**
-             * Get the list of disabled tool names from preferences.
-             * Returns an empty array if no tools are disabled (all enabled).
-             * Fails closed: corrupt pref disables all tools.
-             */
-            function getDisabledTools() {
-              try {
-                const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
-                if (!pref) return [];
-                const parsed = JSON.parse(pref);
-                if (!Array.isArray(parsed) || !parsed.every(v => typeof v === "string")) {
-                  console.error("thunderbird-mcp: disabled tools pref is invalid, disabling all tools");
-                  return ["__all__"];
-                }
-                return parsed;
-              } catch (e) {
-                console.error("thunderbird-mcp: failed to parse disabled tools pref, disabling all tools:", e);
-                return ["__all__"];
-              }
-            }
-
-            /**
-             * Check if a tool is enabled.
-             * Undisableable tools (listAccounts, listFolders, getAccountAccess) always return true.
-             */
-            function isToolEnabled(toolName) {
-              if (UNDISABLEABLE_TOOLS.has(toolName)) return true;
-              const disabled = getDisabledTools();
-              if (disabled.includes("__all__")) return false;
-              return !disabled.includes(toolName);
-            }
-
-            /**
-             * Check if a resolved folder belongs to an allowed account.
-             * Returns true if the folder's account is accessible, false otherwise.
-             */
-            function isFolderAccessible(folder) {
-              if (!folder || !folder.server) return false;
-              const account = MailServices.accounts.findAccountForServer(folder.server);
-              return account ? isAccountAllowed(account.key) : false;
-            }
-
-            /**
-             * Lookup a folder by URI and verify it exists and is accessible.
-             * Returns { folder } on success, or { error } if not found or restricted.
-             */
-            function getAccessibleFolder(folderPath) {
-              const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-              if (!folder) return { error: `Folder not found: ${folderPath}` };
-              if (!isFolderAccessible(folder)) return { error: `Account not accessible for folder: ${folderPath}` };
-              return { folder };
-            }
-
-            /**
-             * Get all accessible Thunderbird accounts, filtered by allowed list.
-             */
-            function getAccessibleAccounts() {
-              const result = [];
-              for (const account of MailServices.accounts.accounts) {
-                if (isAccountAllowed(account.key)) {
-                  result.push(account);
-                }
-              }
-              return result;
-            }
+            // Account / folder / tool / send-safety access policy. Same
+            // factory pattern -- needs MailServices for account lookups
+            // and the four PREF_* / UNDISABLEABLE_TOOLS constants from
+            // constants.sys.mjs.
+            const { makeAccessControl } = ChromeUtils.importESModule(
+              "resource://thunderbird-mcp/mcp_server/lib/access-control.sys.mjs"
+            );
+            const {
+              getAllowedAccountIds,
+              isAccountAllowed,
+              isSkipReviewBlocked,
+              getDisabledTools,
+              isToolEnabled,
+              isFolderAccessible,
+              getAccessibleFolder,
+              getAccessibleAccounts,
+              getAccountAccess,
+            } = makeAccessControl({
+              Services,
+              MailServices,
+              PREF_ALLOWED_ACCOUNTS,
+              PREF_DISABLED_TOOLS,
+              PREF_BLOCK_SKIPREVIEW,
+              UNDISABLEABLE_TOOLS,
+            });
 
             function listAccounts() {
               const accounts = [];
@@ -413,28 +260,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 });
               }
               return accounts;
-            }
-
-            /**
-             * Get the current account access control list.
-             */
-            function getAccountAccess() {
-              const allowed = getAllowedAccountIds();
-              // Only return accessible accounts — restricted accounts are hidden
-              const accessibleAccounts = [];
-              for (const account of MailServices.accounts.accounts) {
-                if (!isAccountAllowed(account.key)) continue;
-                const server = account.incomingServer;
-                accessibleAccounts.push({
-                  id: account.key,
-                  name: server.prettyName,
-                  type: server.type,
-                });
-              }
-              return {
-                mode: allowed.length === 0 ? "all" : "restricted",
-                accounts: accessibleAccounts,
-              };
             }
 
             /**
