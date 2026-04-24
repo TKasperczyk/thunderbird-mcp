@@ -407,6 +407,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               ...registry.tools,
               ...tools.filter(t => !registeredNames.has(t.name)),
             ];
+            // Expose through globalThis so parallel namespace methods
+            // (getToolAccessConfig, etc. -- they live on the return object
+            // not inside start()'s closure) can read the same merged list.
+            // Cleared on onShutdown. Fallback consumers use legacy `tools`
+            // when the server hasn't started yet.
+            globalThis.__tbMcpMergedTools = mergedTools;
 
             // Dispatch: validateToolArgs / coerceToolArgs / callTool plus a
             // few HTTP-handler helpers (readRequestBody, paginate). The HTTP
@@ -1090,10 +1096,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            // Build tool list with group/crud metadata, sorted by group then CRUD order
-            // Use the merged list so the Tool Access page surfaces registry-driven
-            // tools alongside the legacy tools-schema entries.
-            const toolList = mergedTools
+            // Build tool list with group/crud metadata, sorted by group then CRUD order.
+            // Use the merged list populated by start() (registry + legacy) so the
+            // Tool Access page surfaces registry-driven tools alongside legacy ones.
+            // Falls back to the legacy `tools` array when the server hasn't started
+            // yet (settings page can be opened before start() has run).
+            const effectiveTools = Array.isArray(globalThis.__tbMcpMergedTools)
+              ? globalThis.__tbMcpMergedTools
+              : tools;
+            const toolList = effectiveTools
               .map(t => ({
                 name: t.name,
                 group: t.group,
@@ -1255,6 +1266,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     }
     // Clear the start promise so a fresh start can occur on reload
     globalThis.__tbMcpStartPromise = null;
+    // Clear the merged-tools snapshot that getToolAccessConfig reads
+    // through globalThis. On reload, the next start() repopulates it.
+    globalThis.__tbMcpMergedTools = null;
 
     // Always clean up the connection info file so stale tokens don't linger
     // (Inlined here because removeConnectionInfo() is scoped inside start())
