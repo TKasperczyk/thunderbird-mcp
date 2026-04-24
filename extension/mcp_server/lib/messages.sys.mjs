@@ -1724,9 +1724,20 @@ export function makeMessages({
 
     let moved = 0;
     const errors = [];
+    const tracer = globalThis.__tbMcpTracer;  // optional; api.js installs it
+    const moveTraceId = tracer ? tracer.newTraceId() : null;
+    if (tracer) {
+      tracer.info("bulk_move", "live.start", {
+        trace_id: moveTraceId,
+        matched: matchedHdrs.length,
+        sources: bySource.size,
+        dest_uri: dest && dest.URI,
+        addTags, removeTags, markRead, flagged,
+      });
+    }
     for (const [srcFolder, hdrs] of bySource) {
       try {
-        // Apply read/flag/tag before move (IMAP may not preserve on moved copy).
+        // Apply read/flag before move (IMAP may not preserve on moved copy).
         for (const h of hdrs) {
           try {
             if (markRead === true && !h.isRead) h.markRead(true);
@@ -1734,9 +1745,9 @@ export function makeMessages({
             if (flagged === true && !h.isFlagged) h.markFlagged(true);
             if (flagged === false && h.isFlagged) h.markFlagged(false);
           } catch (e) { errors.push({ id: h.messageId, error: `mark: ${e.toString()}` }); }
-          try {
-            if (Array.isArray(addTags)) for (const t of addTags) h.addProperty ? null : null;
-          } catch { /* best effort */ }
+          // (Removed an inert ternary loop here that had no side effect:
+          //  `for (const t of addTags) h.addProperty ? null : null;` -- the
+          //  real tag application is the keyword call below.)
         }
         // Tag add/remove via folder.addKeywordsToMessages / removeKeywordsFromMessages
         try {
@@ -1747,14 +1758,57 @@ export function makeMessages({
             srcFolder.removeKeywordsFromMessages(hdrs, removeTags.join(" "));
           }
         } catch (e) { errors.push({ error: `tag op: ${e.toString()}` }); }
-        // The async move -- fire-and-forget at the XPCOM layer. We can't
-        // wait for per-message completion without a listener; the caller
-        // should verify afterwards with searchMessages or listFolders.
-        srcFolder.copyMessages(dest, hdrs, true /* isMove */, null, null, false /* allowUndo */, false /* isFolder */);
-        moved += hdrs.length;
+
+        // CRITICAL: nsIMsgFolder.copyMessages is called on the DESTINATION
+        // folder with the SOURCE folder as the first argument. The earlier
+        // `srcFolder.copyMessages(dest, hdrs, ...)` had it inverted, which
+        // (depending on TB version) either silently no-ops or throws -- in
+        // CI run 24916918837 the live path returned moved=0 because the
+        // call threw and was caught by the outer try below.
+        //
+        // Modern signature (TB 128 nsIMsgFolder.idl, 6 args):
+        //   void copyMessages(in nsIMsgFolder srcFolder,
+        //                     in Array<nsIMsgDBHdr> messages,
+        //                     in boolean isMove,
+        //                     in nsIMsgCopyServiceListener listener,
+        //                     in nsIMsgWindow msgWindow,
+        //                     in boolean allowUndo);
+        // We pass null for both listener and msgWindow (fire-and-forget;
+        // the response surfaces on the destination's folder listeners).
+        try {
+          dest.copyMessages(srcFolder, hdrs, /* isMove */ true,
+                            /* listener */ null, /* msgWindow */ null,
+                            /* allowUndo */ false);
+          moved += hdrs.length;
+          if (tracer) {
+            tracer.info("bulk_move", "copy_dispatched", {
+              trace_id: moveTraceId,
+              src_uri: srcFolder.URI, dst_uri: dest.URI, count: hdrs.length,
+            });
+          }
+        } catch (copyErr) {
+          errors.push({ folder: srcFolder.URI, error: `copyMessages: ${copyErr.toString()}` });
+          if (tracer) {
+            tracer.error("bulk_move", "copy_threw", {
+              trace_id: moveTraceId,
+              src_uri: srcFolder.URI, dst_uri: dest.URI,
+              count: hdrs.length, err: copyErr && copyErr.message,
+            });
+          }
+        }
       } catch (e) {
         errors.push({ folder: srcFolder.URI, error: e.toString() });
+        if (tracer) {
+          tracer.error("bulk_move", "loop_threw", {
+            trace_id: moveTraceId, src_uri: srcFolder.URI, err: e && e.message,
+          });
+        }
       }
+    }
+    if (tracer) {
+      tracer.info("bulk_move", "live.end", {
+        trace_id: moveTraceId, moved, errors: errors.length,
+      });
     }
 
     return {
