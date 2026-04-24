@@ -15,9 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           # No cache: npm -- package-lock.json is gitignored, so setup-node
@@ -47,8 +47,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           # No cache: npm -- package-lock.json is gitignored, so setup-node
@@ -56,7 +56,7 @@ jobs:
           # (only acorn as a dev dep).
       - run: npm install --no-audit --no-fund
       - run: node scripts/build-xpi.cjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: thunderbird-mcp-xpi
           path: dist/thunderbird-mcp.xpi
@@ -85,11 +85,17 @@ jobs:
           - 3465:3465   # SMTPS (unused here)
           - 3993:3993   # IMAPS (unused here)
         env:
-          # greenmail/standalone reads GREENMAIL_OPTS and passes it to the JVM.
-          # - setup.test.smtp/imap: bind the plaintext listeners on 3025/3143
-          # - users: seed the mailbox TB will authenticate to
-          # - auth.disabled: accept any credentials (headless TB can't prompt)
-          GREENMAIL_OPTS: "-Dgreenmail.setup.test.smtp -Dgreenmail.setup.test.imap -Dgreenmail.users=test@ci.local:test -Dgreenmail.auth.disabled -Dgreenmail.verbose"
+          # CRITICAL: -Dgreenmail.hostname=0.0.0.0 is required or greenmail
+          # binds to container-localhost, docker port-forwarding SYN-
+          # accepts but RSTs on first byte ("SMTP closed early at step 0").
+          # The image's baked-in default ENV already includes this, so
+          # overriding GREENMAIL_OPTS at all means we must re-specify it.
+          #   setup.test.all   -> enable smtp/smtps/pop3/pop3s/imap/imaps
+          #   auth.disabled    -> accept any credentials (headless TB cant prompt)
+          #   hostname=0.0.0.0 -> see note above
+          #   verbose          -> log mail activity to stdout (visible in
+          #                       service logs on failure for debugging)
+          GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.auth.disabled -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.verbose"
         # No in-container healthcheck: greenmail/standalone is a slim JRE
         # image without nc/curl. The "Wait for greenmail" step below polls
         # the exposed ports from the runner instead.
@@ -99,9 +105,9 @@ jobs:
       GREENMAIL_IMAP_PORT: "3143"
       GREENMAIL_SMTP_PORT: "3025"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           # No cache: npm -- package-lock.json is gitignored, so setup-node
@@ -144,7 +150,7 @@ jobs:
       # below so we don't need acorn here either.
 
       - name: Download XPI artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: thunderbird-mcp-xpi
           path: dist/
@@ -166,7 +172,7 @@ jobs:
 
       - name: Upload TB logs on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: tb-logs-${{ matrix.tb_version }}
           path: |
