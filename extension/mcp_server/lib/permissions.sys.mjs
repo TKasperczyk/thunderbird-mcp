@@ -67,49 +67,36 @@ export function makePermissions({
   PREF_PERMISSIONS,
   UNDISABLEABLE_TOOLS,
   DEFAULT_DISABLED_TOOLS,
+  makeJsonPrefStore,   // injected factory from lib/json-pref-store.sys.mjs
 }) {
-  // ---- pref I/O ----------------------------------------------------------
+  // ---- pref I/O via the shared JSON-pref-store pattern -------------------
 
-  const EMPTY_POLICY = Object.freeze({ version: 1, tools: {}, accounts: {}, folders: {} });
-
-  function loadPolicy() {
-    try {
-      if (!Services.prefs.prefHasUserValue(PREF_PERMISSIONS)) {
-        return EMPTY_POLICY;
-      }
-      const raw = Services.prefs.getStringPref(PREF_PERMISSIONS, "");
-      if (!raw) return EMPTY_POLICY;
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object") return EMPTY_POLICY;
-      return {
-        version: parsed.version || 1,
-        tools: parsed.tools && typeof parsed.tools === "object" ? parsed.tools : {},
-        accounts: parsed.accounts && typeof parsed.accounts === "object" ? parsed.accounts : {},
-        folders: parsed.folders && typeof parsed.folders === "object" ? parsed.folders : {},
-      };
-    } catch (e) {
-      console.warn("thunderbird-mcp: permissions pref unparseable, using empty policy:", e);
-      return EMPTY_POLICY;
-    }
-  }
-
-  function savePolicy(policy) {
-    if (!policy || typeof policy !== "object") {
+  // Shape normalizer: this runs on both load (after JSON.parse) and save.
+  // Anything that isn't the expected object-of-objects shape is coerced to
+  // an empty sub-section rather than throwing, so a partial document from
+  // the options-page editor doesn't lose the user's other sections.
+  function normalizePolicy(raw) {
+    if (!raw || typeof raw !== "object") {
       throw new Error("policy must be an object");
     }
-    const normalized = {
-      version: 1,
-      tools: policy.tools && typeof policy.tools === "object" ? policy.tools : {},
-      accounts: policy.accounts && typeof policy.accounts === "object" ? policy.accounts : {},
-      folders: policy.folders && typeof policy.folders === "object" ? policy.folders : {},
+    return {
+      version: raw.version || 1,
+      tools:    (raw.tools    && typeof raw.tools    === "object") ? raw.tools    : {},
+      accounts: (raw.accounts && typeof raw.accounts === "object") ? raw.accounts : {},
+      folders:  (raw.folders  && typeof raw.folders  === "object") ? raw.folders  : {},
     };
-    Services.prefs.setStringPref(PREF_PERMISSIONS, JSON.stringify(normalized));
-    return normalized;
   }
 
-  function clearPolicy() {
-    try { Services.prefs.clearUserPref(PREF_PERMISSIONS); } catch { /* not set, fine */ }
-  }
+  const store = makeJsonPrefStore({
+    Services,
+    prefKey: PREF_PERMISSIONS,
+    validate: normalizePolicy,
+    defaultValue: { version: 1, tools: {}, accounts: {}, folders: {} },
+  });
+
+  const loadPolicy = store.load;
+  const savePolicy = store.save;
+  const clearPolicy = store.clear;
 
   // ---- arg-rule helpers --------------------------------------------------
 

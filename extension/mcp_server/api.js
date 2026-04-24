@@ -319,6 +319,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // per-account / per-folder rules in PREF_PERMISSIONS, with the
             // sandbox default (DEFAULT_DISABLED_TOOLS) as the floor. See
             // lib/permissions.sys.mjs for the full schema.
+            // Shared pattern for "complex JSON document stored in a string
+            // pref and exposed through an experiment-API method". Wraps the
+            // Mozilla workarounds (additionalProperties not honored on
+            // parameters; raw throws surface as generic error) so future
+            // pref-document stores don't have to re-solve them.
+            const { makeJsonPrefStore, wrapApi } = ChromeUtils.importESModule(
+              "resource://thunderbird-mcp/mcp_server/lib/json-pref-store.sys.mjs"
+            );
             const { makePermissions } = ChromeUtils.importESModule(
               "resource://thunderbird-mcp/mcp_server/lib/permissions.sys.mjs"
             );
@@ -326,6 +334,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               Services, MailServices,
               PREF_PERMISSIONS,
               UNDISABLEABLE_TOOLS, DEFAULT_DISABLED_TOOLS,
+              makeJsonPrefStore,
             });
 
             // Dispatch: validateToolArgs / coerceToolArgs / callTool plus a
@@ -1134,37 +1143,29 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         // documented in lib/permissions.sys.mjs. Stored as a single JSON
         // document in PREF_PERMISSIONS.
         getPermissionsConfig: async function() {
-          if (!permissions || typeof permissions.loadPolicy !== "function") {
-            return { error: "permissions module not loaded -- this XPI is older than the bridge expects, please reinstall the extension" };
-          }
-          try {
-            const policy = permissions.loadPolicy();
-            return { policy };
-          } catch (e) {
-            return { error: `getPermissionsConfig failed: ${e && e.message ? e.message : String(e)}` };
-          }
+          return wrapApi("getPermissionsConfig", () => {
+            if (!permissions || typeof permissions.loadPolicy !== "function") {
+              throw new Error("permissions module not loaded -- reinstall the XPI");
+            }
+            return { policy: permissions.loadPolicy() };
+          });
         },
         setPermissionsConfig: async function(policy) {
-          if (!permissions || typeof permissions.savePolicy !== "function") {
-            return { error: "permissions module not loaded" };
-          }
-          try {
-            const normalized = permissions.savePolicy(policy);
-            return { success: true, policy: normalized };
-          } catch (e) {
-            return { error: `setPermissionsConfig failed: ${e && e.message ? e.message : String(e)}` };
-          }
+          return wrapApi("setPermissionsConfig", () => {
+            if (!permissions || typeof permissions.savePolicy !== "function") {
+              throw new Error("permissions module not loaded");
+            }
+            return { success: true, policy: permissions.savePolicy(policy) };
+          });
         },
         clearPermissionsConfig: async function() {
-          if (!permissions || typeof permissions.clearPolicy !== "function") {
-            return { error: "permissions module not loaded" };
-          }
-          try {
+          return wrapApi("clearPermissionsConfig", () => {
+            if (!permissions || typeof permissions.clearPolicy !== "function") {
+              throw new Error("permissions module not loaded");
+            }
             permissions.clearPolicy();
             return { success: true };
-          } catch (e) {
-            return { error: `clearPermissionsConfig failed: ${e && e.message ? e.message : String(e)}` };
-          }
+          });
         },
       }
     };

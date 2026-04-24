@@ -17,17 +17,33 @@ const vm = require('vm');
 // ---- load makePermissions out of the .sys.mjs file ----------------------
 
 function loadPermissionsFactory() {
-  const src = fs.readFileSync(
+  // permissions.sys.mjs now depends on makeJsonPrefStore from the shared
+  // pref-store module -- load that too and expose it in the sandbox so
+  // the factory can call it. Both files get their `export ` prefix
+  // stripped so the function declarations evaluate as plain expressions.
+  const storeSrc = fs.readFileSync(
+    path.join(__dirname, '..', 'extension', 'mcp_server', 'lib', 'json-pref-store.sys.mjs'),
+    'utf8'
+  );
+  const permSrc = fs.readFileSync(
     path.join(__dirname, '..', 'extension', 'mcp_server', 'lib', 'permissions.sys.mjs'),
     'utf8'
   );
-  // Strip the leading `export ` so we can eval the function declaration as
-  // a plain expression in a sandbox. Same trick the existing tests use.
-  const stripped = src.replace(/^export\s+function\s+makePermissions/m, 'function makePermissions');
-  const sandbox = { console, makePermissions: undefined };
+  const sandbox = {
+    console,
+    structuredClone: globalThis.structuredClone || ((v) => JSON.parse(JSON.stringify(v))),
+    makeJsonPrefStore: undefined,
+    wrapApi: undefined,
+    makePermissions: undefined,
+  };
   vm.createContext(sandbox);
-  vm.runInContext(stripped + '\n;this.makePermissions = makePermissions;', sandbox);
-  return sandbox.makePermissions;
+  const strippedStore = storeSrc
+    .replace(/^export\s+function\s+makeJsonPrefStore/m, 'function makeJsonPrefStore')
+    .replace(/^export\s+async\s+function\s+wrapApi/m, 'async function wrapApi');
+  vm.runInContext(strippedStore + '\n;this.makeJsonPrefStore = makeJsonPrefStore;this.wrapApi = wrapApi;', sandbox);
+  const strippedPerm = permSrc.replace(/^export\s+function\s+makePermissions/m, 'function makePermissions');
+  vm.runInContext(strippedPerm + '\n;this.makePermissions = makePermissions;', sandbox);
+  return { makePermissions: sandbox.makePermissions, makeJsonPrefStore: sandbox.makeJsonPrefStore };
 }
 
 // ---- tiny mocks for Services + MailServices ----------------------------
@@ -62,7 +78,7 @@ function makeMockMailServices(folderToAccount) {
 
 // ---- tests --------------------------------------------------------------
 
-const makePermissions = loadPermissionsFactory();
+const { makePermissions, makeJsonPrefStore } = loadPermissionsFactory();
 
 const UNDISABLEABLE = new Set(['listAccounts', 'listFolders', 'getAccountAccess']);
 const DEFAULTS_OFF = new Set([
@@ -78,6 +94,7 @@ function makeEngine({ pref, folderMap = {} } = {}) {
     PREF_PERMISSIONS: 'extensions.thunderbird-mcp.permissions',
     UNDISABLEABLE_TOOLS: UNDISABLEABLE,
     DEFAULT_DISABLED_TOOLS: DEFAULTS_OFF,
+    makeJsonPrefStore,
   });
 }
 
