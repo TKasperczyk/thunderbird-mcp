@@ -30,6 +30,14 @@ jobs:
       - name: Import-graph validation
         run: node scripts/check-imports.cjs
 
+      - name: Tool wiring audit (schema / registry / handlers / dispatch)
+        # Cross-checks the four places a tool has to exist: tools-schema,
+        # lib/tools/ registry, api.js toolHandlers bag, dispatch switch.
+        # Exits non-zero only on structural errors (e.g. schema entry
+        # without dispatch case, dispatch case with missing handlerKey);
+        # the helper-handler warnings are informational.
+        run: node scripts/madger-chromeutils.cjs tool-audit
+
       - name: Run unit tests
         run: |
           node --test \
