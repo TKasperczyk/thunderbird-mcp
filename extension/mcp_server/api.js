@@ -154,13 +154,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // Gated on extensions.thunderbird-mcp.ciInjectLogins. Empty
             // in production -> entire block is a no-op.
             //
-            // dump() calls write to stderr unconditionally from chrome
-            // code -- console.info goes to the Browser Console which
-            // isn't captured in our CI tb-stderr.log artifact.
+            // Three-channel logging so at least one survives whatever
+            // prefs/build flags TB has:
+            //   1. dump()  -- stderr IF browser.dom.window.dump.enabled=true
+            //   2. Services.console.logStringMessage -- Error Console,
+            //      captured by MOZ_LOG=console:5 in the log file
+            //   3. Plain file at /tmp/thunderbird-mcp-inject.log --
+            //      always works, always captured by our failure artifact
+            //      upload. The only strictly reliable signal.
+            const _ciInjectLog = (msg) => {
+              try { dump(`thunderbird-mcp: ${msg}\n`); } catch {}
+              try { Services.console.logStringMessage(`thunderbird-mcp: ${msg}`); } catch {}
+              try {
+                const f = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+                f.initWithPath("/tmp/thunderbird-mcp-inject.log");
+                const fos = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(Ci.nsIFileOutputStream);
+                // PR_WRONLY | PR_CREATE_FILE | PR_APPEND = 0x02 | 0x08 | 0x10
+                fos.init(f, 0x02 | 0x08 | 0x10, 0o644, 0);
+                const cos = Cc["@mozilla.org/intl/converter-output-stream;1"].createInstance(Ci.nsIConverterOutputStream);
+                cos.init(fos, "UTF-8");
+                cos.writeString(new Date().toISOString() + " " + msg + "\n");
+                cos.close();
+              } catch {}
+            };
             try {
               const PREF_CI_LOGINS = "extensions.thunderbird-mcp.ciInjectLogins";
               const hasValue = Services.prefs.prefHasUserValue(PREF_CI_LOGINS);
-              dump(`thunderbird-mcp: CI login injection block entered, pref-set=${hasValue}\n`);
+              _ciInjectLog(`CI login injection block entered, pref-set=${hasValue}`);
               if (hasValue) {
                 const raw = Services.prefs.getStringPref(PREF_CI_LOGINS, "");
                 if (raw) {
@@ -173,11 +193,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       try {
                         const existing = Services.logins.findLogins(e.origin, "", e.httpRealm || null);
                         if (existing && existing.some(l => l.username === e.username)) {
-                          dump(`thunderbird-mcp: CI login for ${e.origin} user=${e.username} already present, skip\n`);
+                          _ciInjectLog(`CI login for ${e.origin} user=${e.username} already present, skip`);
                           continue;
                         }
                       } catch (fe) {
-                        dump(`thunderbird-mcp: findLogins threw for ${e.origin}: ${fe && fe.message}\n`);
+                        _ciInjectLog(`findLogins threw for ${e.origin}: ${fe && fe.message}`);
                       }
                       const info = Cc["@mozilla.org/login-manager/loginInfo;1"]
                         .createInstance(Ci.nsILoginInfo);
@@ -192,9 +212,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       );
                       try {
                         Services.logins.addLogin(info);
-                        dump(`thunderbird-mcp: injected CI login for ${e.origin} user=${e.username}\n`);
+                        _ciInjectLog(`injected CI login for ${e.origin} user=${e.username}`);
                       } catch (ex) {
-                        dump(`thunderbird-mcp: CI login injection for ${e.origin} FAILED: ${ex && ex.message}\n`);
+                        _ciInjectLog(`CI login injection for ${e.origin} FAILED: ${ex && ex.message}`);
                       }
                     }
                     // (2) In-memory server password: walk every account
@@ -217,9 +237,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           if (server.type === scheme && server.hostName === host && server.username === e.username) {
                             try {
                               server.password = e.password;
-                              dump(`thunderbird-mcp: set in-memory password on ${scheme}://${host} (server.key=${server.key})\n`);
+                              _ciInjectLog(`set in-memory password on ${scheme}://${host} (server.key=${server.key})`);
                             } catch (sex) {
-                              dump(`thunderbird-mcp: server.password set FAILED on ${scheme}://${host}: ${sex && sex.message}\n`);
+                              _ciInjectLog(`server.password set FAILED on ${scheme}://${host}: ${sex && sex.message}`);
                             }
                           }
                         }
@@ -240,22 +260,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             if (smtpHost === host) {
                               try {
                                 if ("password" in smtp) smtp.password = e.password;
-                                dump(`thunderbird-mcp: set SMTP in-memory password on ${host} (key=${smtp.key || "?"})\n`);
+                                _ciInjectLog(`set SMTP in-memory password on ${host} (key=${smtp.key || "?"})`);
                               } catch (sex) {
-                                dump(`thunderbird-mcp: SMTP password set FAILED on ${host}: ${sex && sex.message}\n`);
+                                _ciInjectLog(`SMTP password set FAILED on ${host}: ${sex && sex.message}`);
                               }
                             }
                           }
                         }
                       }
                     } catch (ie) {
-                      dump(`thunderbird-mcp: in-memory server password loop FAILED: ${ie && ie.message}\n`);
+                      _ciInjectLog(`in-memory server password loop FAILED: ${ie && ie.message}`);
                     }
                   }
                 }
               }
             } catch (e) {
-              dump(`thunderbird-mcp: CI login injection block THREW: ${e && e.message}\n`);
+              _ciInjectLog(`CI login injection block THREW: ${e && e.message}`);
             }
 
             let cal = null;

@@ -148,6 +148,14 @@ user_pref("extensions.thunderbird-mcp.disabledTools", "[]");
 // port, for both IMAP and SMTP).
 user_pref("extensions.thunderbird-mcp.ciInjectLogins", "[{\"origin\":\"imap://localhost\",\"httpRealm\":null,\"formActionOrigin\":null,\"username\":\"test@ci.local\",\"password\":\"test\"},{\"origin\":\"imap://localhost:3143\",\"httpRealm\":null,\"formActionOrigin\":null,\"username\":\"test@ci.local\",\"password\":\"test\"},{\"origin\":\"smtp://localhost\",\"httpRealm\":null,\"formActionOrigin\":null,\"username\":\"test@ci.local\",\"password\":\"test\"},{\"origin\":\"smtp://localhost:3025\",\"httpRealm\":null,\"formActionOrigin\":null,\"username\":\"test@ci.local\",\"password\":\"test\"}]");
 
+// ── Enable dump() from chrome code ─────────────────────────────────────
+// Without this pref, dump("...") from chrome JS (including our
+// experiment API in api.js) is silently no-op'd in release builds.
+// api.js's CI login injection uses dump() because console.info goes to
+// the Browser Console which isn't captured as a CI artifact.
+user_pref("browser.dom.window.dump.enabled", true);
+user_pref("devtools.console.stdout.chrome", true);
+
 // ── Defer IMAP login until something triggers it ───────────────────────
 // With login_at_startup=true, TB tries to open an authenticated IMAP
 // session before our extension has finished loading (and before it has

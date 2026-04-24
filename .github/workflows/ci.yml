@@ -187,6 +187,18 @@ jobs:
       - name: Run integration suite
         run: SKIP_BUILD=1 bash test/integration/run.sh
 
+      - name: Dump injection log on failure
+        if: failure()
+        run: |
+          if [ -s /tmp/thunderbird-mcp-inject.log ]; then
+            echo "=== /tmp/thunderbird-mcp-inject.log ==="
+            cat /tmp/thunderbird-mcp-inject.log
+            echo "=== end ==="
+          else
+            echo "injection log is empty or missing -- the block never ran or fs write failed"
+            ls -la /tmp/thunderbird-mcp-inject.log 2>&1 || true
+          fi
+
       - name: Capture greenmail logs on failure
         if: failure()
         # docker logs is how we reach a GH Actions service container's
@@ -213,6 +225,7 @@ jobs:
             /tmp/tb-stderr.log
             /tmp/tb-moz.log*
             /tmp/greenmail.log
+            /tmp/thunderbird-mcp-inject.log
             /tmp/thunderbird-mcp/connection.json
           if-no-files-found: ignore
           retention-days: 7

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Read(//c/Users/yabur/AppData/Roaming/Claude/Claude Extensions/local.mcpb.tomasz-kasperczyk.thunderbird-mcp/**)",
+      "Bash(node --test test/*.cjs)",
+      "Bash(git stash *)",
+      "Bash(node test_spawn.cjs)",
+      "Bash(npx --yes @anthropic-ai/mcpb pack build/mcpb dist/thunderbird-mcp.mcpb)",
+      "Bash(unzip -l dist/thunderbird-mcp.mcpb)"
+    ]
+  }
+}
