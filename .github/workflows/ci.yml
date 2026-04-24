@@ -15,9 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           # No cache: npm -- package-lock.json is gitignored, so setup-node
@@ -47,8 +47,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           # No cache: npm -- package-lock.json is gitignored, so setup-node
@@ -56,7 +56,7 @@ jobs:
           # (only acorn as a dev dep).
       - run: npm install --no-audit --no-fund
       - run: node scripts/build-xpi.cjs
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: thunderbird-mcp-xpi
           path: dist/thunderbird-mcp.xpi
@@ -105,9 +105,9 @@ jobs:
       GREENMAIL_IMAP_PORT: "3143"
       GREENMAIL_SMTP_PORT: "3025"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           # No cache: npm -- package-lock.json is gitignored, so setup-node
@@ -150,7 +150,7 @@ jobs:
       # below so we don't need acorn here either.
 
       - name: Download XPI artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: thunderbird-mcp-xpi
           path: dist/
@@ -172,7 +172,7 @@ jobs:
 
       - name: Upload TB logs on failure
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: tb-logs-${{ matrix.tb_version }}
           path: |
