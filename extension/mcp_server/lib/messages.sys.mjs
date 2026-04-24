@@ -57,6 +57,7 @@ export function makeMessages({
   DEFAULT_MAX_RESULTS,
   INTERNAL_KEYWORDS,
   _tempAttachFiles,                              // shared mutable state from state.sys.mjs (currently unused here; reserved for future inline-attachment temp tracking)
+  tracer,                                        // structured tracer (lib/trace.sys.mjs); optional -- code paths that use it must guard against null
 }) {
   // ── Module-private helpers ──
 
@@ -1724,7 +1725,8 @@ export function makeMessages({
 
     let moved = 0;
     const errors = [];
-    const tracer = globalThis.__tbMcpTracer;  // optional; api.js installs it
+    // tracer comes from the deps bag (.sys.mjs modules don't share
+    // globalThis with api.js's experiment-API sandbox).
     const moveTraceId = tracer ? tracer.newTraceId() : null;
     if (tracer) {
       tracer.info("bulk_move", "live.start", {

@@ -36,6 +36,11 @@ export function makeCompose({
   _attachTimers, _claimedReplyComposeWindows, _tempAttachFiles,
   // From constants.sys.mjs
   MAX_BASE64_SIZE, COMPOSE_WINDOW_LOAD_DELAY_MS,
+  // Optional structured tracer (lib/trace.sys.mjs). Modules under
+  // lib/ run in the system-module loader context which does NOT
+  // share globalThis with api.js's experiment-API sandbox, so we
+  // get this passed via deps rather than reaching out via globalThis.
+  tracer,
 }) {
   // Per-instance counter so each makeCompose call (in practice one per
   // start()) gets a fresh sequence for temp-attachment filenames.
@@ -1131,7 +1136,7 @@ export function makeCompose({
     if (drafts.length > 50) {
       return { error: "batch limit is 50 drafts per call" };
     }
-    const tracer = globalThis.__tbMcpTracer;  // optional
+    // tracer is in the deps bag closure -- see makeCompose signature.
     const batchTraceId = tracer ? tracer.newTraceId() : null;
     if (tracer) {
       tracer.info("create_drafts", "batch.start", {

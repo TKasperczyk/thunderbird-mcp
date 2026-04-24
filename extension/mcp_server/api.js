@@ -525,6 +525,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               SEARCH_COLLECTION_CAP, MAX_SEARCH_RESULTS_CAP,
               DEFAULT_MAX_RESULTS, INTERNAL_KEYWORDS,
               _tempAttachFiles,
+              tracer,    // structured tracer (.sys.mjs loaders don't
+                         // share globalThis with the experiment-API
+                         // sandbox, so it has to come through deps)
             });
 
 
@@ -544,6 +547,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               findMessage, markMessageDispositionState,
               _attachTimers, _claimedReplyComposeWindows, _tempAttachFiles,
               MAX_BASE64_SIZE, COMPOSE_WINDOW_LOAD_DELAY_MS,
+              tracer,    // see makeMessages note above on why this is
+                         // passed in deps rather than read from globalThis
             });
 
             // Fine-grained permission engine. Sits in front of dispatch so
