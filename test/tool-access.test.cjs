@@ -97,6 +97,10 @@ const ALL_TOOLS = [
   { name: "reorderFilters", group: "filters", crud: "update" },
   { name: "applyFilters", group: "filters", crud: "update" },
   { name: "deleteFilter", group: "filters", crud: "delete" },
+  // Aggregation + bulk + batch-draft tools (new):
+  { name: "inbox_inventory", group: "messages", crud: "read" },
+  { name: "bulk_move_by_query", group: "messages", crud: "update" },
+  { name: "createDrafts", group: "messages", crud: "create" },
 ];
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -791,7 +795,7 @@ describe("Structural: test data matches production source", () => {
 
   it("ALL_TOOLS count matches tool definitions in tools-schema.sys.mjs", () => {
     const src = fs.readFileSync(TOOLS_SCHEMA_PATH, "utf8");
-    const nameMatches = src.match(/{\s*name:\s*"[a-zA-Z]+"/g);
+    const nameMatches = src.match(/{\s*name:\s*"[a-zA-Z_]+"/g);
     assert.ok(nameMatches, "Could not find tool name declarations in tools-schema.sys.mjs");
     assert.equal(
       ALL_TOOLS.length,
@@ -803,8 +807,8 @@ describe("Structural: test data matches production source", () => {
 
   it("ALL_TOOLS names match production tool names", () => {
     const src = fs.readFileSync(TOOLS_SCHEMA_PATH, "utf8");
-    const nameMatches = src.match(/{\s*name:\s*"([a-zA-Z]+)"/g);
-    const prodNames = nameMatches.map(m => m.match(/"([a-zA-Z]+)"/)[1]).sort();
+    const nameMatches = src.match(/{\s*name:\s*"([a-zA-Z_]+)"/g);
+    const prodNames = nameMatches.map(m => m.match(/"([a-zA-Z_]+)"/)[1]).sort();
     const testNames = ALL_TOOLS.map(t => t.name).sort();
     assert.deepStrictEqual(testNames, prodNames, "Test ALL_TOOLS names don't match production");
   });

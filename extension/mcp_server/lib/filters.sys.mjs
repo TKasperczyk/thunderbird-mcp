@@ -454,7 +454,16 @@ export function makeFilters({
     }
   }
 
-  function applyFilters(accountId, folderPath) {
+  /**
+   * Run filters (or simulate) on a folder and return per-filter hit counts.
+   *
+   * Always runs a dry-evaluation pass first using nsIMsgFilter.matchHdr
+   * to compute how many messages each enabled filter would match. If
+   * dry_run is true, stops there. Otherwise calls the real filterService
+   * to actually execute the actions and returns the predicted counts
+   * (which track the real run assuming no mid-flight mutations).
+   */
+  function applyFilters(accountId, folderPath, dryRun) {
     try {
       const fl = getFilterListForAccount(accountId);
       if (fl.error) return fl;
@@ -464,34 +473,89 @@ export function makeFilters({
       if (afResult.error) return afResult;
       const folder = afResult.folder;
 
-      // Try MailServices.filters first, fall back to XPCOM contract ID
-      let filterService;
+      // Collect enabled filters (we only evaluate these; disabled filters
+      // are skipped to match what filterService.applyFiltersToFolders does).
+      const enabledFilters = [];
+      for (let i = 0; i < filterList.filterCount; i++) {
+        const f = filterList.getFilterAt(i);
+        if (f.enabled) enabledFilters.push({ index: i, filter: f, hit: 0 });
+      }
+
+      // Per-filter dry evaluation using nsIMsgFilter.matchHdr (TB's own
+      // evaluator). Single pass over folder messages for all filters.
+      let messagesProcessed = 0;
+      let evaluationError = null;
       try {
-        filterService = MailServices.filters;
-      } catch {}
+        const db = folder.msgDatabase;
+        if (db) {
+          for (const msgHdr of db.enumerateMessages()) {
+            messagesProcessed++;
+            for (const entry of enabledFilters) {
+              try {
+                if (entry.filter.matchHdr(msgHdr, folder, db, null, 0)) {
+                  entry.hit++;
+                }
+              } catch { /* filter.matchHdr may throw on exotic conditions; skip */ }
+            }
+          }
+        }
+      } catch (e) {
+        evaluationError = e.toString();
+      }
+
+      const byFilter = enabledFilters.map(e => ({
+        name: e.filter.filterName,
+        index: e.index,
+        hit: e.hit,
+        actions: (() => {
+          const acts = [];
+          const n = e.filter.actionCount || 0;
+          for (let i = 0; i < n; i++) {
+            try {
+              const a = e.filter.getActionAt(i);
+              const actionType = (ACTION_NAMES[a.type] || `type${a.type}`);
+              const entry = { type: actionType };
+              try { if (a.strValue) entry.value = a.strValue; } catch { /* ignore */ }
+              try { if (a.targetFolderUri) entry.targetFolderUri = a.targetFolderUri; } catch { /* ignore */ }
+              try { if (typeof a.priority === "number") entry.priority = a.priority; } catch { /* ignore */ }
+              acts.push(entry);
+            } catch { /* skip unreadable actions */ }
+          }
+          return acts;
+        })(),
+      }));
+
+      const baseReport = {
+        folder: folderPath,
+        filtersRun: enabledFilters.length,
+        messagesProcessed,
+        byFilter,
+        totalHits: byFilter.reduce((n, e) => n + e.hit, 0),
+      };
+      if (evaluationError) baseReport.evaluationWarning = evaluationError;
+
+      if (dryRun === true) {
+        return { ...baseReport, dryRun: true };
+      }
+
+      // Real execution -- hand off to Thunderbird's filter service after
+      // computing the dry report so the caller still gets per-filter counts.
+      let filterService;
+      try { filterService = MailServices.filters; } catch { /* fall through */ }
       if (!filterService) {
         try {
           filterService = Cc["@mozilla.org/messenger/filter-service;1"]
             .getService(Ci.nsIMsgFilterService);
-        } catch {}
+        } catch { /* ignore */ }
       }
       if (!filterService) {
         return { error: "Filter service not available in this Thunderbird version" };
       }
       filterService.applyFiltersToFolders(filterList, [folder], null);
-
-      // applyFiltersToFolders is async — returns immediately
       return {
-        success: true,
-        message: "Filters applied (processing may take a moment)",
-        folder: folderPath,
-        enabledFilters: (() => {
-          let count = 0;
-          for (let i = 0; i < filterList.filterCount; i++) {
-            if (filterList.getFilterAt(i).enabled) count++;
-          }
-          return count;
-        })(),
+        ...baseReport,
+        dryRun: false,
+        note: "applyFiltersToFolders is async; counts are predicted hit rates, verify state with searchMessages after a short delay",
       };
     } catch (e) {
       return { error: e.toString() };

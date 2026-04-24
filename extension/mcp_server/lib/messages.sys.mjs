@@ -1478,6 +1478,297 @@ export function makeMessages({
     }
   }
 
+  // ── Aggregation-first tools ─────────────────────────────────────────────
+  // These tools run the same folder-walk as searchMessages but never return
+  // raw per-message headers. Designed to keep MCP client context small when
+  // the answer is "count and bucket" rather than "show me each header".
+
+  // Compiles query / date / unread / tag filters into a callback that returns
+  // true for messages the caller wants. Shared by inbox_inventory and
+  // bulk_move_by_query so they stay byte-faithful to searchMessages semantics.
+  function _compileMessageFilter({ query, startDate, endDate, unreadOnly, flaggedOnly, tag }) {
+    const lowerQuery = (query || "").toLowerCase();
+    const hasQuery = !!lowerQuery;
+    const OPERATOR_RE = /^(from|subject|to|cc):\s*/;
+    let fieldTarget = null;
+    let queryTokens = [];
+    if (hasQuery) {
+      const opMatch = lowerQuery.match(OPERATOR_RE);
+      if (opMatch) {
+        const opMap = { from: "author", subject: "subject", to: "recipients", cc: "ccList" };
+        fieldTarget = opMap[opMatch[1]];
+        queryTokens = lowerQuery.slice(opMatch[0].length).trim().split(/\s+/).filter(Boolean);
+      } else {
+        queryTokens = lowerQuery.split(/\s+/).filter(Boolean);
+      }
+    }
+    const failedQuery = hasQuery && queryTokens.length === 0;
+    const parsedStart = startDate ? new Date(startDate).getTime() : NaN;
+    const parsedEnd = endDate ? new Date(endDate).getTime() : NaN;
+    const startTs = Number.isFinite(parsedStart) ? parsedStart * 1000 : null;
+    const isDateOnly = endDate && /^\d{4}-\d{2}-\d{2}$/.test(endDate.trim());
+    const endTs = Number.isFinite(parsedEnd) ? (parsedEnd + (isDateOnly ? 86400000 : 0)) * 1000 : null;
+
+    return function matches(msgHdr) {
+      if (failedQuery) return false;
+      const ts = msgHdr.date || 0;
+      if (startTs !== null && ts < startTs) return false;
+      if (endTs !== null && ts > endTs) return false;
+      if (unreadOnly && msgHdr.isRead) return false;
+      if (flaggedOnly && !msgHdr.isFlagged) return false;
+      if (tag) {
+        const keywords = (msgHdr.getStringProperty("keywords") || "").split(/\s+/);
+        if (!keywords.includes(tag)) return false;
+      }
+      if (hasQuery) {
+        const subject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
+        const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
+        const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
+        const ccList = (msgHdr.ccList || "").toLowerCase();
+        const preview = (msgHdr.getStringProperty("preview") || "").toLowerCase();
+        const fields = { subject, author, recipients, ccList };
+        const ok = fieldTarget
+          ? queryTokens.every(t => (fields[fieldTarget] || "").includes(t))
+          : queryTokens.every(t =>
+              subject.includes(t) || author.includes(t) || recipients.includes(t) || ccList.includes(t) || preview.includes(t)
+            );
+        if (!ok) return false;
+      }
+      return true;
+    };
+  }
+
+  function _walkFolderMessages(folder, callback, { includeSubfolders = true, cap = SEARCH_COLLECTION_CAP } = {}) {
+    let processed = 0;
+    let aborted = false;
+    function walk(f) {
+      if (aborted) return;
+      try {
+        if (f.server && f.server.type === "imap") {
+          try { f.updateFolder(null); } catch { /* best-effort refresh */ }
+        }
+        const db = f.msgDatabase;
+        if (!db) return;
+        for (const msgHdr of db.enumerateMessages()) {
+          if (processed >= cap) { aborted = true; return; }
+          const cont = callback(msgHdr, f);
+          processed++;
+          if (cont === false) { aborted = true; return; }
+        }
+      } catch { /* skip inaccessible folders */ }
+      if (!aborted && includeSubfolders && f.hasSubFolders) {
+        for (const sub of f.subFolders) {
+          if (aborted) break;
+          walk(sub);
+        }
+      }
+    }
+    walk(folder);
+    return { processed, capped: aborted && processed >= cap };
+  }
+
+  function _groupKeyFor(msgHdr, groupBy) {
+    const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").trim();
+    if (groupBy === "from_address") {
+      const m = author.match(/<([^>]+)>/);
+      return (m ? m[1] : author).toLowerCase() || "(unknown)";
+    }
+    if (groupBy === "subject_prefix") {
+      const subj = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").trim();
+      return subj.replace(/^(re|fwd|fw|aw|wg):\s*/i, "").slice(0, 30).toLowerCase() || "(no subject)";
+    }
+    if (groupBy === "tag") {
+      const tags = getUserTags(msgHdr);
+      return tags.length ? tags.slice().sort().join(",") : "(untagged)";
+    }
+    if (groupBy === "day") {
+      if (!msgHdr.date) return "(no date)";
+      return new Date(msgHdr.date / 1000).toISOString().slice(0, 10);
+    }
+    // default + explicit "from_domain"
+    const addr = (author.match(/<([^>]+)>/) || [null, author])[1] || author;
+    const m = addr.match(/@([A-Za-z0-9._-]+)/);
+    return (m ? m[1] : "(unknown)").toLowerCase();
+  }
+
+  /**
+   * Aggregate-first query. Returns grouped counts + sample IDs/subjects
+   * instead of per-message headers. See the tool description in
+   * tools-schema.sys.mjs for the full contract.
+   */
+  function inboxInventory(query, folderPath, groupBy, startDate, endDate, unreadOnly, flaggedOnly, tag, includeSubfolders, maxGroups, samplesPerGroup, collectAllIds) {
+    const effectiveGroupBy = ["from_domain", "from_address", "subject_prefix", "tag", "day"].includes(groupBy) ? groupBy : "from_domain";
+    const maxG = Math.max(1, Math.min(Number.isInteger(maxGroups) && maxGroups > 0 ? maxGroups : 50, 500));
+    const samplesN = Math.max(0, Math.min(Number.isInteger(samplesPerGroup) && samplesPerGroup >= 0 ? samplesPerGroup : 3, 20));
+    const ID_CAP_PER_GROUP = 5000;
+
+    const matches = _compileMessageFilter({ query, startDate, endDate, unreadOnly, flaggedOnly, tag });
+    const groups = new Map();
+
+    function record(msgHdr) {
+      if (!matches(msgHdr)) return;
+      const key = _groupKeyFor(msgHdr, effectiveGroupBy);
+      let g = groups.get(key);
+      if (!g) {
+        g = { count: 0, sampleIds: [], sampleSubjects: [], firstDate: null, lastDate: null };
+        if (collectAllIds) g.messageIds = [];
+        groups.set(key, g);
+      }
+      g.count++;
+      if (msgHdr.date) {
+        const iso = new Date(msgHdr.date / 1000).toISOString();
+        if (!g.firstDate || iso < g.firstDate) g.firstDate = iso;
+        if (!g.lastDate || iso > g.lastDate) g.lastDate = iso;
+      }
+      if (g.sampleIds.length < samplesN) {
+        g.sampleIds.push(msgHdr.messageId);
+        g.sampleSubjects.push((msgHdr.mime2DecodedSubject || msgHdr.subject || "(no subject)").slice(0, 120));
+      }
+      if (collectAllIds && g.messageIds.length < ID_CAP_PER_GROUP) {
+        g.messageIds.push(msgHdr.messageId);
+      }
+    }
+
+    let scanStats;
+    if (folderPath) {
+      const accessible = getAccessibleFolder(folderPath);
+      if (accessible.error) return accessible;
+      scanStats = _walkFolderMessages(accessible.folder, record, { includeSubfolders: includeSubfolders !== false });
+    } else {
+      let processed = 0;
+      let capped = false;
+      for (const account of getAccessibleAccounts()) {
+        if (capped) break;
+        const sub = _walkFolderMessages(account.incomingServer.rootFolder, record, { includeSubfolders: includeSubfolders !== false, cap: SEARCH_COLLECTION_CAP - processed });
+        processed += sub.processed;
+        capped = capped || sub.capped;
+      }
+      scanStats = { processed, capped };
+    }
+
+    const sorted = [...groups.entries()]
+      .map(([key, g]) => ({ key, ...g }))
+      .sort((a, b) => b.count - a.count);
+    const truncatedGroups = sorted.length > maxG;
+    const totalMatched = sorted.reduce((n, g) => n + g.count, 0);
+
+    return {
+      groupedBy: effectiveGroupBy,
+      totalMatched,
+      groupCount: sorted.length,
+      truncatedGroups,
+      truncatedScan: !!scanStats.capped,
+      messagesScanned: scanStats.processed,
+      groups: sorted.slice(0, maxG),
+    };
+  }
+
+  /**
+   * Search + move in one atomic call with dry-run safety. See tools-schema
+   * description for contract. Refuses to execute (dry_run=false) without a
+   * destination folder.
+   */
+  function bulkMoveByQuery(query, folderPath, to, dryRun, markRead, flagged, addTags, removeTags, limit, startDate, endDate, unreadOnly, flaggedOnly, includeSubfolders) {
+    if (!folderPath) return { error: "folderPath is required" };
+    const effectiveDry = (dryRun === undefined || dryRun === null) ? true : !!dryRun;
+    const cap = Math.max(1, Math.min(Number.isInteger(limit) && limit > 0 ? limit : 1000, 10000));
+
+    const source = getAccessibleFolder(folderPath);
+    if (source.error) return source;
+
+    let dest = null;
+    if (!effectiveDry) {
+      if (!to) return { error: "to (destination folder URI) is required when dry_run is false" };
+      const destResult = getAccessibleFolder(to);
+      if (destResult.error) return destResult;
+      dest = destResult.folder;
+    }
+
+    const matches = _compileMessageFilter({ query, startDate, endDate, unreadOnly, flaggedOnly });
+    const matchedHdrs = [];
+    const sample = [];
+
+    _walkFolderMessages(source.folder, (msgHdr, folder) => {
+      if (matchedHdrs.length >= cap) return false; // stop walking
+      if (!matches(msgHdr)) return true;
+      matchedHdrs.push({ msgHdr, folder });
+      if (sample.length < 5) {
+        sample.push({
+          id: msgHdr.messageId,
+          subject: (msgHdr.mime2DecodedSubject || msgHdr.subject || "").slice(0, 120),
+          author: msgHdr.mime2DecodedAuthor || msgHdr.author,
+          date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+        });
+      }
+      return true;
+    }, { includeSubfolders: !!includeSubfolders, cap });
+
+    if (effectiveDry) {
+      return {
+        dryRun: true,
+        matched: matchedHdrs.length,
+        reachedLimit: matchedHdrs.length >= cap,
+        sample,
+        wouldMoveTo: to || null,
+      };
+    }
+
+    // Actually execute. Group by source folder (all the same folder here,
+    // since we scoped to folderPath, but _walkFolderMessages may include
+    // subfolders, in which case the move-per-source-folder grouping matters).
+    const bySource = new Map();
+    for (const { msgHdr, folder } of matchedHdrs) {
+      if (!bySource.has(folder)) bySource.set(folder, []);
+      bySource.get(folder).push(msgHdr);
+    }
+
+    let moved = 0;
+    const errors = [];
+    for (const [srcFolder, hdrs] of bySource) {
+      try {
+        // Apply read/flag/tag before move (IMAP may not preserve on moved copy).
+        for (const h of hdrs) {
+          try {
+            if (markRead === true && !h.isRead) h.markRead(true);
+            if (markRead === false && h.isRead) h.markRead(false);
+            if (flagged === true && !h.isFlagged) h.markFlagged(true);
+            if (flagged === false && h.isFlagged) h.markFlagged(false);
+          } catch (e) { errors.push({ id: h.messageId, error: `mark: ${e.toString()}` }); }
+          try {
+            if (Array.isArray(addTags)) for (const t of addTags) h.addProperty ? null : null;
+          } catch { /* best effort */ }
+        }
+        // Tag add/remove via folder.addKeywordsToMessages / removeKeywordsFromMessages
+        try {
+          if (Array.isArray(addTags) && addTags.length) {
+            srcFolder.addKeywordsToMessages(hdrs, addTags.join(" "));
+          }
+          if (Array.isArray(removeTags) && removeTags.length) {
+            srcFolder.removeKeywordsFromMessages(hdrs, removeTags.join(" "));
+          }
+        } catch (e) { errors.push({ error: `tag op: ${e.toString()}` }); }
+        // The async move -- fire-and-forget at the XPCOM layer. We can't
+        // wait for per-message completion without a listener; the caller
+        // should verify afterwards with searchMessages or listFolders.
+        srcFolder.copyMessages(dest, hdrs, true /* isMove */, null, null, false /* allowUndo */, false /* isFolder */);
+        moved += hdrs.length;
+      } catch (e) {
+        errors.push({ folder: srcFolder.URI, error: e.toString() });
+      }
+    }
+
+    return {
+      dryRun: false,
+      matched: matchedHdrs.length,
+      moved,
+      movedTo: to,
+      reachedLimit: matchedHdrs.length >= cap,
+      sample,
+      errors: errors.length ? errors : undefined,
+      note: "Move is async on IMAP. Verify with searchMessages/listFolders after a short delay.",
+    };
+  }
+
   return {
     searchMessages,
     getMessage,
@@ -1488,5 +1779,7 @@ export function makeMessages({
     findMessage,
     getUserTags,
     markMessageDispositionState,
+    inboxInventory,
+    bulkMoveByQuery,
   };
 }

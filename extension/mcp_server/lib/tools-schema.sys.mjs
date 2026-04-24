@@ -665,15 +665,16 @@ export const tools = [
     name: "applyFilters",
     group: "filters", crud: "update",
     title: "Apply Filters",
-    description: "Manually run all enabled filters on a folder to organize existing messages",
+    description: "Run enabled filters on a folder and report per-filter results. With dry_run=true (default false) the filters are not executed; instead each filter is evaluated against every message in the folder and the report shows which filters WOULD hit how many messages, so you can verify before mutating anything. Always returns a detailed { filtersRun, messagesProcessed, byFilter: [{ name, hit, actions: [...] }] } summary.",
     inputSchema: {
       type: "object",
       properties: {
-    accountId: { type: "string", description: "Account ID (uses its filters)" },
-    folderPath: { type: "string", description: "Folder URI to apply filters to (from listFolders)" },
+        accountId: { type: "string", description: "Account ID (uses its filters)" },
+        folderPath: { type: "string", description: "Folder URI to apply filters to (from listFolders)" },
+        dry_run: { type: "boolean", description: "If true, evaluate each filter against messages and report hit counts without executing any actions" }
       },
-      required: ["accountId", "folderPath"],
-    },
+      required: ["accountId", "folderPath"]
+    }
   },
   {
     name: "getAccountAccess",
@@ -682,4 +683,88 @@ export const tools = [
     description: "Get the current account access control list. Shows which accounts the MCP server can access. Account access is configured by the user in the extension settings page (Tools > Add-ons > Thunderbird MCP > Options) and cannot be changed via MCP tools.",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
+  {
+    name: "inbox_inventory",
+    group: "messages", crud: "read",
+    title: "Inventory Messages",
+    description: "Aggregate messages by a key (from_domain, from_address, subject_prefix, tag, day) and return grouped counts + sample IDs + sample subjects instead of raw headers. Same filter syntax as searchMessages (query, folderPath, date range, unreadOnly, flaggedOnly, tag, includeSubfolders). Use this for \"what's in the inbox?\" questions on large folders -- a 25k-message inbox becomes ~50 groups and fits in <2k tokens instead of 80k+. Set collectAllIds=true to get the full ID lists for use with bulk_move_by_query.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Text to search. Same tokens and prefixes as searchMessages. Empty string = all messages." },
+        folderPath: { type: "string", description: "Optional folder URI to scope the scan" },
+        groupBy: { type: "string", enum: ["from_domain", "from_address", "subject_prefix", "tag", "day"], description: "Aggregation key (default: from_domain). subject_prefix strips Re:/Fwd: and caps at 30 chars. day buckets by ISO date (YYYY-MM-DD)." },
+        startDate: { type: "string", description: "Only count messages on or after this ISO date" },
+        endDate: { type: "string", description: "Only count messages on or before this ISO date. Date-only strings include the full day." },
+        unreadOnly: { type: "boolean" },
+        flaggedOnly: { type: "boolean" },
+        tag: { type: "string", description: "Filter by tag keyword (e.g. $label1)" },
+        includeSubfolders: { type: "boolean", description: "Default true" },
+        maxGroups: { type: "integer", description: "Cap the number of groups returned (default 50, max 500). Groups sorted by count descending." },
+        samplesPerGroup: { type: "integer", description: "Number of sample message IDs + subjects per group (default 3, max 20)" },
+        collectAllIds: { type: "boolean", description: "If true, include the FULL message-id list in each group (to hand off to bulk_move_by_query). Omit by default to keep responses small. Capped at 5000 ids per group." }
+      },
+      required: []
+    }
+  },
+  {
+    name: "bulk_move_by_query",
+    group: "messages", crud: "update",
+    title: "Bulk Move by Query",
+    description: "Search + move in one call, with dry-run safety. Finds all messages in folderPath matching the query and moves them to the target folder. dry_run defaults to TRUE -- returns { matched, sample } without executing so you can verify before acting. Set dry_run=false to actually move. Optional read/flagged/tag mutations applied during the move. Limit caps total messages per call (default 1000, max 10000). Halves both token cost and typo risk vs searchMessages + updateMessage.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Same syntax as searchMessages (from:, subject:, to:, cc:, tokens)" },
+        folderPath: { type: "string", description: "Source folder URI (from listFolders)" },
+        to: { type: "string", description: "Destination folder URI. Required when dry_run is false. Omit to just count." },
+        dry_run: { type: "boolean", description: "If true (default), do not execute -- return matched/sample only" },
+        markRead: { type: "boolean", description: "Mark moved messages as read" },
+        flagged: { type: "boolean", description: "Set flagged state on moved messages" },
+        addTags: { type: "array", items: { type: "string" }, description: "Tag keywords to add" },
+        removeTags: { type: "array", items: { type: "string" }, description: "Tag keywords to remove" },
+        limit: { type: "integer", description: "Max messages to process in one call (default 1000, max 10000)" },
+        startDate: { type: "string" },
+        endDate: { type: "string" },
+        unreadOnly: { type: "boolean" },
+        flaggedOnly: { type: "boolean" },
+        includeSubfolders: { type: "boolean", description: "Default false -- bulk ops should be folder-scoped unless explicitly widened" }
+      },
+      required: ["query", "folderPath"]
+    }
+  },
+  {
+    name: "createDrafts",
+    group: "messages", crud: "create",
+    title: "Create Drafts (batch)",
+    description: "Create multiple draft messages in the identity's Drafts folder in a single call, without opening compose windows. Designed for parallel correspondence (e.g. 8 agency replies at once). Returns an array with one result per draft: { success: true, draftFolder, messageId } or { error }. Each draft spec mirrors sendMail's signature. No messages are sent -- everything lands in Drafts for review.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        drafts: {
+          type: "array",
+          description: "Array of draft specs",
+          items: {
+            type: "object",
+            properties: {
+              to: { type: "string", description: "Recipient email address" },
+              subject: { type: "string" },
+              body: { type: "string" },
+              cc: { type: "string" },
+              bcc: { type: "string" },
+              isHtml: { type: "boolean" },
+              from: { type: "string", description: "Sender identity (email address or identity ID)" },
+              attachments: {
+                type: "array",
+                description: "File paths (strings) or inline objects ({name, contentType, base64})",
+                items: { oneOf: [ { type: "string" }, { type: "object" } ] }
+              }
+            },
+            required: ["to", "subject", "body"]
+          }
+        }
+      },
+      required: ["drafts"]
+    }
+  }
 ];

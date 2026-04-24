@@ -244,9 +244,43 @@ export function makeDispatch({
       case "reorderFilters":
         return toolHandlers.reorderFilters(args.accountId, args.fromIndex, args.toIndex);
       case "applyFilters":
-        return toolHandlers.applyFilters(args.accountId, args.folderPath);
+        return toolHandlers.applyFilters(args.accountId, args.folderPath, args.dry_run);
       case "getAccountAccess":
         return toolHandlers.getAccountAccess();
+      case "inbox_inventory":
+        return toolHandlers.inboxInventory(
+          args.query || "",
+          args.folderPath,
+          args.groupBy,
+          args.startDate,
+          args.endDate,
+          args.unreadOnly,
+          args.flaggedOnly,
+          args.tag,
+          args.includeSubfolders,
+          args.maxGroups,
+          args.samplesPerGroup,
+          args.collectAllIds
+        );
+      case "bulk_move_by_query":
+        return toolHandlers.bulkMoveByQuery(
+          args.query || "",
+          args.folderPath,
+          args.to,
+          args.dry_run,
+          args.markRead,
+          args.flagged,
+          args.addTags,
+          args.removeTags,
+          args.limit,
+          args.startDate,
+          args.endDate,
+          args.unreadOnly,
+          args.flaggedOnly,
+          args.includeSubfolders
+        );
+      case "createDrafts":
+        return await toolHandlers.createDrafts(args.drafts);
       default:
         throw new Error(`Unknown tool: ${name}`);
     }

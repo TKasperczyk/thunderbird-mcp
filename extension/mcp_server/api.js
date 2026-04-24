@@ -284,6 +284,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               searchMessages, getMessage, getRecentMessages, displayMessage,
               deleteMessages, updateMessage, findMessage,
               getUserTags, markMessageDispositionState,
+              inboxInventory, bulkMoveByQuery,
             } = makeMessages({
               MailServices, NetUtil, Services, Cc, Ci,
               GlodaMsgSearcher,
@@ -302,7 +303,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               "resource://thunderbird-mcp/mcp_server/lib/compose.sys.mjs"
             );
             const {
-              composeMail, replyToMessage, forwardMessage,
+              composeMail, replyToMessage, forwardMessage, createDrafts,
             } = makeCompose({
               Services, Cc, Ci, MailServices,
               isFolderAccessible, isSkipReviewBlocked,
@@ -345,7 +346,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               reorderFilters, applyFilters,
               searchMessages, getMessage, getRecentMessages, displayMessage,
               deleteMessages, updateMessage, findMessage,
-              composeMail, replyToMessage, forwardMessage,
+              inboxInventory, bulkMoveByQuery,
+              composeMail, replyToMessage, forwardMessage, createDrafts,
               getAccountAccess,
             };
             const {

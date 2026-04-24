@@ -999,5 +999,195 @@ export function makeCompose({
     });
   }
 
-  return { composeMail, replyToMessage, forwardMessage };
+  /**
+   * Save a single composed message as a draft via nsIMsgSend, without
+   * opening a compose window. Shares most of the machinery with
+   * sendMessageDirectly but passes SaveAsDraft as the delivery mode.
+   *
+   * Returns a promise resolving to { success, draftFolderURI?, messageId? }
+   * or { error }.
+   */
+  function saveAsDraftDirectly(composeFields, identity, attachDescs) {
+    if (!identity) {
+      return Promise.resolve({ error: "No identity available for draft" });
+    }
+    const SEND_TIMEOUT_MS = 60000;
+    return new Promise((resolve) => {
+      let settled = false;
+      let capturedDraftUri = null;
+      const settle = (result) => {
+        if (!settled) { settled = true; resolve(result); }
+      };
+
+      const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+      timer.initWithCallback({
+        notify() { settle({ error: "Draft save timed out after " + (SEND_TIMEOUT_MS / 1000) + "s" }); }
+      }, SEND_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+
+      try {
+        const msgSend = Cc["@mozilla.org/messengercompose/send;1"]
+          .createInstance(Ci.nsIMsgSend);
+
+        if (identity.email) {
+          const name = identity.fullName || "";
+          composeFields.from = name ? `"${name}" <${identity.email}>` : identity.email;
+        }
+        if (identity.organization) {
+          composeFields.organization = identity.organization;
+        }
+        for (const att of descsToMsgAttachments(attachDescs)) {
+          composeFields.addAttachment(att);
+        }
+        const body = composeFields.body || "";
+
+        let accountKey = "";
+        try {
+          for (const account of MailServices.accounts.accounts) {
+            for (let i = 0; i < account.identities.length; i++) {
+              if (account.identities[i].key === identity.key) {
+                accountKey = account.key;
+                break;
+              }
+            }
+            if (accountKey) break;
+          }
+        } catch { /* ignore */ }
+
+        const listener = {
+          QueryInterface: ChromeUtils.generateQI(["nsIMsgSendListener"]),
+          onStartSending() {},
+          onProgress() {},
+          onSendProgress() {},
+          onStatus() {},
+          onStopSending(msgID, status) {
+            timer.cancel();
+            if (Components.isSuccessCode(status)) {
+              settle({
+                success: true,
+                draftFolderURI: capturedDraftUri,
+                messageId: (msgID || "").replace(/^<|>$/g, "") || null,
+              });
+            } else {
+              settle({ error: `Draft save failed (status: 0x${(status >>> 0).toString(16)})` });
+            }
+          },
+          onGetDraftFolderURI(msgID, folderURI) {
+            capturedDraftUri = folderURI;
+          },
+          onSendNotPerformed() { timer.cancel(); settle({ error: "Draft save was not performed" }); },
+          onTransportSecurityError() { /* not applicable for drafts */ },
+        };
+
+        const commonArgs = [
+          null,
+          identity,
+          accountKey,
+          composeFields,
+          false,
+          false,
+          Ci.nsIMsgCompDeliverMode.SaveAsDraft,
+          null,
+          "text/html",
+          body,
+        ];
+        const tailArgs = [
+          null,
+          null,
+          listener,
+          "",
+          "",
+          Ci.nsIMsgCompType.New,
+        ];
+
+        let sendResult;
+        try {
+          sendResult = msgSend.createAndSendMessage(...commonArgs, ...tailArgs);
+        } catch (e) {
+          const isArgError = (e && e.result === 0x80570001) || String(e).includes("Not enough arguments");
+          if (!isArgError) { timer.cancel(); settle({ error: e.toString() }); return; }
+          // Legacy 18-arg signature (TB 102-127)
+          sendResult = msgSend.createAndSendMessage(...commonArgs, null, null, ...tailArgs);
+        }
+        if (sendResult && typeof sendResult.then === "function") {
+          sendResult.catch(e => { timer.cancel(); settle({ error: e.toString() }); });
+        }
+      } catch (e) {
+        timer.cancel();
+        settle({ error: e.toString() });
+      }
+    });
+  }
+
+  /**
+   * Batch draft creation. Builds one composeFields per spec and calls
+   * saveAsDraftDirectly for each, in sequence (serialized to avoid
+   * clobbering nsIMsgSend's per-process state). Returns an array with one
+   * result per input draft; failure of one doesn't abort the rest.
+   */
+  async function createDrafts(drafts) {
+    if (!Array.isArray(drafts) || drafts.length === 0) {
+      return { error: "drafts must be a non-empty array" };
+    }
+    if (drafts.length > 50) {
+      return { error: "batch limit is 50 drafts per call" };
+    }
+    const results = [];
+    for (const spec of drafts) {
+      try {
+        if (!spec || typeof spec !== "object") {
+          results.push({ error: "draft spec must be an object" });
+          continue;
+        }
+        const { to, subject, body, cc, bcc, isHtml, from, attachments } = spec;
+        if (!to || !subject || typeof body !== "string") {
+          results.push({ error: "draft requires to, subject, body" });
+          continue;
+        }
+
+        const composeFields = Cc["@mozilla.org/messengercompose/composefields;1"]
+          .createInstance(Ci.nsIMsgCompFields);
+        composeFields.to = to || "";
+        composeFields.cc = cc || "";
+        composeFields.bcc = bcc || "";
+        composeFields.subject = subject || "";
+
+        const formatted = formatBodyHtml(body, isHtml);
+        if (isHtml && formatted.includes("<html")) {
+          composeFields.body = formatted;
+        } else {
+          composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
+        }
+
+        // Resolve identity via the same path composeMail uses.
+        const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
+          .createInstance(Ci.nsIMsgComposeParams);
+        msgComposeParams.type = Ci.nsIMsgCompType.New;
+        msgComposeParams.format = Ci.nsIMsgCompFormat.HTML;
+        msgComposeParams.composeFields = composeFields;
+
+        const identityResult = setComposeIdentity(msgComposeParams, from, null);
+        if (identityResult && identityResult.error) {
+          results.push({ error: identityResult.error });
+          continue;
+        }
+
+        const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
+
+        const saveResult = await saveAsDraftDirectly(composeFields, msgComposeParams.identity, fileDescs);
+        if (saveResult && saveResult.success) {
+          const entry = { success: true, draftFolderURI: saveResult.draftFolderURI, messageId: saveResult.messageId, to, subject };
+          if (failedPaths.length > 0) entry.failedAttachments = failedPaths;
+          results.push(entry);
+        } else {
+          results.push(saveResult || { error: "unknown draft save failure" });
+        }
+      } catch (e) {
+        results.push({ error: e.toString() });
+      }
+    }
+    const successCount = results.filter(r => r && r.success).length;
+    return { total: drafts.length, succeeded: successCount, failed: drafts.length - successCount, drafts: results };
+  }
+
+  return { composeMail, replyToMessage, forwardMessage, createDrafts };
 }
