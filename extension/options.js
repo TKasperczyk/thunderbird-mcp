@@ -149,9 +149,19 @@ saveBtn.addEventListener("click", async () => {
 async function loadToolAccess() {
   try {
     const data = await browser.mcpServer.getToolAccessConfig();
-    currentTools = data.tools || [];
-    const groupLabels = data.groups || {};
-    const usingDefaults = !!data.usingDefaults;
+    // Engine returns a structured error object on failure now (mode: "error"
+    // + error: <message>) rather than throwing into the WebExtension boundary
+    // where it gets wrapped to "An unexpected error occurred".
+    if (data && data.error) {
+      toolList.innerHTML = "";
+      const li = document.createElement("li");
+      li.textContent = "Error loading tools: " + data.error;
+      toolList.appendChild(li);
+      return;
+    }
+    currentTools = (data && data.tools) || [];
+    const groupLabels = (data && data.groups) || {};
+    const usingDefaults = !!(data && data.usingDefaults);
 
     if (currentTools.length === 0) {
       toolList.innerHTML = "<li>No tools found.</li>";

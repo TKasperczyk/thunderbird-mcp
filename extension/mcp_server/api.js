@@ -967,62 +967,86 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         getToolAccessConfig: async function() {
-          // First-run state: pref never user-set means we are still serving the
-          // sandbox default (DEFAULT_DISABLED_TOOLS). The UI surfaces this so
-          // users see "X is off by default for safety" rather than thinking
-          // they explicitly disabled something they never touched.
-          let prefIsUserSet = false;
           try {
-            prefIsUserSet = !!Services.prefs.prefHasUserValue(PREF_DISABLED_TOOLS);
-          } catch { /* fall through to corrupt path */ }
+            // Defensive: if the constants module that ships DEFAULT_DISABLED_TOOLS
+            // is missing (e.g. user updated the .mcpb bridge but didn't
+            // reinstall the XPI), fall back to an empty default rather than
+            // throwing TypeError "...has of undefined".
+            const defaultsSet = (DEFAULT_DISABLED_TOOLS && typeof DEFAULT_DISABLED_TOOLS.has === "function")
+              ? DEFAULT_DISABLED_TOOLS
+              : new Set();
 
-          let disabled = [];
-          let corrupt = false;
-          if (!prefIsUserSet) {
-            disabled = [...DEFAULT_DISABLED_TOOLS];
-          } else {
+            // First-run state: pref never user-set means we are still serving the
+            // sandbox default. The UI surfaces this so users see "X is off by
+            // default for safety" rather than thinking they explicitly disabled
+            // something they never touched.
+            let prefIsUserSet = false;
             try {
-              const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
-              if (pref) {
-                const parsed = JSON.parse(pref);
-                if (!Array.isArray(parsed)) {
-                  corrupt = true;
-                } else {
-                  disabled = parsed;
-                }
-              }
-            } catch {
-              corrupt = true;
-            }
-          }
+              prefIsUserSet = !!Services.prefs.prefHasUserValue(PREF_DISABLED_TOOLS);
+            } catch { /* fall through to corrupt path */ }
 
-          // Build tool list with group/crud metadata, sorted by group then CRUD order
-          const toolList = tools
-            .map(t => ({
-              name: t.name,
-              group: t.group,
-              crud: t.crud,
-              enabled: corrupt ? UNDISABLEABLE_TOOLS.has(t.name) : !disabled.includes(t.name),
-              undisableable: UNDISABLEABLE_TOOLS.has(t.name),
-              defaultDisabled: DEFAULT_DISABLED_TOOLS.has(t.name),
-            }))
-            .sort((a, b) => {
-              const gA = GROUP_ORDER[a.group] ?? 99;
-              const gB = GROUP_ORDER[b.group] ?? 99;
-              if (gA !== gB) return gA - gB;
-              return (CRUD_ORDER[a.crud] ?? 99) - (CRUD_ORDER[b.crud] ?? 99);
-            });
-          const result = {
-            mode: corrupt ? "error" : (disabled.length === 0 ? "all" : "restricted"),
-            disabledTools: disabled,
-            usingDefaults: !prefIsUserSet && !corrupt,
-            groups: GROUP_LABELS,
-            tools: toolList,
-          };
-          if (corrupt) {
-            result.error = "Disabled tools preference is corrupt. All non-infrastructure tools are blocked. Save to reset.";
+            let disabled = [];
+            let corrupt = false;
+            if (!prefIsUserSet) {
+              disabled = [...defaultsSet];
+            } else {
+              try {
+                const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
+                if (pref) {
+                  const parsed = JSON.parse(pref);
+                  if (!Array.isArray(parsed)) {
+                    corrupt = true;
+                  } else {
+                    disabled = parsed;
+                  }
+                }
+              } catch {
+                corrupt = true;
+              }
+            }
+
+            // Build tool list with group/crud metadata, sorted by group then CRUD order
+            const toolList = tools
+              .map(t => ({
+                name: t.name,
+                group: t.group,
+                crud: t.crud,
+                enabled: corrupt ? UNDISABLEABLE_TOOLS.has(t.name) : !disabled.includes(t.name),
+                undisableable: UNDISABLEABLE_TOOLS.has(t.name),
+                defaultDisabled: defaultsSet.has(t.name),
+              }))
+              .sort((a, b) => {
+                const gA = GROUP_ORDER[a.group] ?? 99;
+                const gB = GROUP_ORDER[b.group] ?? 99;
+                if (gA !== gB) return gA - gB;
+                return (CRUD_ORDER[a.crud] ?? 99) - (CRUD_ORDER[b.crud] ?? 99);
+              });
+            const result = {
+              mode: corrupt ? "error" : (disabled.length === 0 ? "all" : "restricted"),
+              disabledTools: disabled,
+              usingDefaults: !prefIsUserSet && !corrupt,
+              groups: GROUP_LABELS,
+              tools: toolList,
+            };
+            if (corrupt) {
+              result.error = "Disabled tools preference is corrupt. All non-infrastructure tools are blocked. Save to reset.";
+            }
+            return result;
+          } catch (e) {
+            // Last-resort: never let this throw an unwrapped TypeError into the
+            // experiment-API boundary -- the UI gets "An unexpected error
+            // occurred" with no diagnostic. Return a structured error object
+            // the options page can render.
+            console.error("thunderbird-mcp: getToolAccessConfig failed:", e);
+            return {
+              mode: "error",
+              error: `getToolAccessConfig failed: ${e && e.message ? e.message : String(e)}`,
+              disabledTools: [],
+              usingDefaults: false,
+              groups: {},
+              tools: [],
+            };
           }
-          return result;
         },
 
         setToolAccess: async function(disabledTools) {
@@ -1108,27 +1132,36 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         // documented in lib/permissions.sys.mjs. Stored as a single JSON
         // document in PREF_PERMISSIONS.
         getPermissionsConfig: async function() {
+          if (!permissions || typeof permissions.loadPolicy !== "function") {
+            return { error: "permissions module not loaded -- this XPI is older than the bridge expects, please reinstall the extension" };
+          }
           try {
             const policy = permissions.loadPolicy();
             return { policy };
           } catch (e) {
-            return { error: e.toString() };
+            return { error: `getPermissionsConfig failed: ${e && e.message ? e.message : String(e)}` };
           }
         },
         setPermissionsConfig: async function(policy) {
+          if (!permissions || typeof permissions.savePolicy !== "function") {
+            return { error: "permissions module not loaded" };
+          }
           try {
             const normalized = permissions.savePolicy(policy);
             return { success: true, policy: normalized };
           } catch (e) {
-            return { error: e.toString() };
+            return { error: `setPermissionsConfig failed: ${e && e.message ? e.message : String(e)}` };
           }
         },
         clearPermissionsConfig: async function() {
+          if (!permissions || typeof permissions.clearPolicy !== "function") {
+            return { error: "permissions module not loaded" };
+          }
           try {
             permissions.clearPolicy();
             return { success: true };
           } catch (e) {
-            return { error: e.toString() };
+            return { error: `clearPermissionsConfig failed: ${e && e.message ? e.message : String(e)}` };
           }
         },
       }
