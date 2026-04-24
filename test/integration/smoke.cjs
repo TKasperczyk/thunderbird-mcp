@@ -163,11 +163,11 @@ function check(label, fn) {
 
   // 4. Trigger IMAP sync via searchMessages (updateFolder inside), then
   //    inbox_inventory should see the seeded messages
-  await tool("searchMessages", { query: "", folderPath: inbox.URI || inbox.folderPath, countOnly: true });
+  await tool("searchMessages", { query: "", folderPath: inbox.path, countOnly: true });
 
   const inv = await tool("inbox_inventory", {
     query: "",
-    folderPath: inbox.URI || inbox.folderPath,
+    folderPath: inbox.path,
     groupBy: "from_domain",
   });
   check("inbox_inventory groups by from_domain with >=3 groups", () => {
@@ -185,7 +185,7 @@ function check(label, fn) {
   //    search-filter + move-via-copyMessages pipeline AND the suspicious
   //    tag-apply loop.
   const linkedInFolderName = "CI-linkedin-triage";
-  await tool("createFolder", { parentFolderPath: inbox.URI || inbox.folderPath, name: linkedInFolderName });
+  await tool("createFolder", { parentFolderPath: inbox.path, name: linkedInFolderName });
   const foldersAfter = await tool("listFolders", { accountId: imapAccountId });
   const triageFolder = foldersAfter.find(f => f.name === linkedInFolderName);
   check("createFolder succeeded for triage target", () => {
@@ -194,8 +194,8 @@ function check(label, fn) {
 
   const dry = await tool("bulk_move_by_query", {
     query: "from:linkedin.com",
-    folderPath: inbox.URI || inbox.folderPath,
-    to: triageFolder.URI || triageFolder.folderPath,
+    folderPath: inbox.path,
+    to: triageFolder.path,
     dry_run: true,
   });
   check("bulk_move_by_query dry run reports matched>=6 linkedin messages", () => {
@@ -205,8 +205,8 @@ function check(label, fn) {
 
   const live = await tool("bulk_move_by_query", {
     query: "from:linkedin.com",
-    folderPath: inbox.URI || inbox.folderPath,
-    to: triageFolder.URI || triageFolder.folderPath,
+    folderPath: inbox.path,
+    to: triageFolder.path,
     dry_run: false,
     addTags: ["$label3"],  // exercises the tag-application code path
   });
@@ -220,7 +220,7 @@ function check(label, fn) {
   await new Promise(r => setTimeout(r, 3000));
   const triageContents = await tool("searchMessages", {
     query: "",
-    folderPath: triageFolder.URI || triageFolder.folderPath,
+    folderPath: triageFolder.path,
     countOnly: true,
   });
   check("linkedin messages landed in triage folder", () => {
@@ -233,7 +233,7 @@ function check(label, fn) {
   //    shape MUST be correct.)
   const filtersReport = await tool("applyFilters", {
     accountId: imapAccountId,
-    folderPath: inbox.URI || inbox.folderPath,
+    folderPath: inbox.path,
     dry_run: true,
   });
   check("applyFilters dry-run returns byFilter array + messagesProcessed", () => {
@@ -256,7 +256,7 @@ function check(label, fn) {
   });
 
   // 8. Cleanup tempfiles/windows (createTask would open a GUI dialog -- skip)
-  await tool("deleteFolder", { folderPath: triageFolder.URI || triageFolder.folderPath });
+  await tool("deleteFolder", { folderPath: triageFolder.path });
 
   bridge.stdin.end();
 
