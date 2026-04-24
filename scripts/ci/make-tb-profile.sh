@@ -138,17 +138,25 @@ user_pref("network.online", true);
 user_pref("extensions.thunderbird-mcp.disabledTools", "[]");
 PREFS
 
-# Passwords: TB reads logins from logins.json rather than prefs.js on
-# modern versions. Pre-populate with greenmail's any-creds-accepted auth.
+# Passwords: TB's login manager reads logins.json on modern versions.
+# Schema notes for TB 128:
+#   - Use `origin` (renamed from `hostname` circa TB 68, old key silently
+#     ignored in 128).
+#   - Use `formActionOrigin` (renamed from `formSubmitURL`, same story).
+#   - encType=0 = plaintext in `encryptedPassword` / `encryptedUsername`.
+#     Storage returns it as-is without NSS decryption.
+#   - Mail servers are keyed in the login manager by the full socket URL
+#     INCLUDING the port. Duplicate entries with and without port cover
+#     both lookup shapes TB has used across versions (belt and suspenders).
 cat > "$PROFILE_DIR/logins.json" <<'LOGINS'
 {
-  "nextId": 3,
+  "nextId": 5,
   "logins": [
     {
       "id": 1,
-      "hostname": "imap://localhost",
+      "origin": "imap://localhost",
       "httpRealm": null,
-      "formSubmitURL": null,
+      "formActionOrigin": null,
       "usernameField": "",
       "passwordField": "",
       "encryptedUsername": "test@ci.local",
@@ -162,14 +170,46 @@ cat > "$PROFILE_DIR/logins.json" <<'LOGINS'
     },
     {
       "id": 2,
-      "hostname": "smtp://localhost",
+      "origin": "imap://localhost:3143",
       "httpRealm": null,
-      "formSubmitURL": null,
+      "formActionOrigin": null,
       "usernameField": "",
       "passwordField": "",
       "encryptedUsername": "test@ci.local",
       "encryptedPassword": "test",
       "guid": "{00000000-0000-0000-0000-000000000002}",
+      "encType": 0,
+      "timeCreated": 0,
+      "timeLastUsed": 0,
+      "timePasswordChanged": 0,
+      "timesUsed": 1
+    },
+    {
+      "id": 3,
+      "origin": "smtp://localhost",
+      "httpRealm": null,
+      "formActionOrigin": null,
+      "usernameField": "",
+      "passwordField": "",
+      "encryptedUsername": "test@ci.local",
+      "encryptedPassword": "test",
+      "guid": "{00000000-0000-0000-0000-000000000003}",
+      "encType": 0,
+      "timeCreated": 0,
+      "timeLastUsed": 0,
+      "timePasswordChanged": 0,
+      "timesUsed": 1
+    },
+    {
+      "id": 4,
+      "origin": "smtp://localhost:3025",
+      "httpRealm": null,
+      "formActionOrigin": null,
+      "usernameField": "",
+      "passwordField": "",
+      "encryptedUsername": "test@ci.local",
+      "encryptedPassword": "test",
+      "guid": "{00000000-0000-0000-0000-000000000004}",
       "encType": 0,
       "timeCreated": 0,
       "timeLastUsed": 0,

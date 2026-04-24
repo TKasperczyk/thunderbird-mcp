@@ -96,7 +96,12 @@ log "launching Thunderbird headless (profile=$TB_PROFILE_DIR)"
 # last ~4s of log, which is exactly when the interesting thing happens.
 # rotate:1000 caps per-file size at ~1000 MB so verbose logs don't
 # exhaust disk if run.sh hangs somewhere.
-export MOZ_LOG="IMAP:5,MsgDB:4,timestamp,sync,rotate:1000"
+# Login:5 covers the login manager lookup path (nsILoginManager).
+# We added it after the IMAP log showed "Trying auth method 0x4" then
+# 26s of silence -- classic "decided how to auth, can't find the
+# password, stall". Login:5 surfaces whether nsILoginManager.findLogins
+# returns anything for the imap://localhost:3143 lookup.
+export MOZ_LOG="IMAP:5,Login:5,MsgDB:4,timestamp,sync,rotate:1000"
 export MOZ_LOG_FILE=/tmp/tb-moz.log
 thunderbird \
   --headless \
