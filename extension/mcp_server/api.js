@@ -219,9 +219,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     for (const e of entries) {
                       if (!e || typeof e !== "object") continue;
                       if (!e.origin || !e.username || !e.password) continue;
+                      // Match what addLoginAsync() will store -- same
+                      // origin + httpRealm tuple. searchLoginsAsync is
+                      // the modern API; fall back to findLogins for
+                      // older TB.
+                      const realmForLookup = e.httpRealm
+                        || (e.formActionOrigin ? null : e.origin);
                       let existingFound = false;
                       try {
-                        const existing = Services.logins.findLogins(e.origin, "", e.httpRealm || null);
+                        let existing;
+                        if (typeof Services.logins.searchLoginsAsync === "function") {
+                          existing = await Services.logins.searchLoginsAsync({
+                            origin: e.origin,
+                            httpRealm: realmForLookup,
+                          });
+                        } else {
+                          existing = Services.logins.findLogins(e.origin, "", realmForLookup);
+                        }
                         if (existing && existing.some(l => l.username === e.username)) {
                           existingFound = true;
                           tracer.debug("auth.inject", "login.duplicate_skip", {
@@ -234,12 +248,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         });
                       }
                       if (existingFound) continue;
+                      // LoginManager invariant: an entry MUST have
+                      // either a non-null httpRealm OR a non-null
+                      // formActionOrigin. Mail-server logins are
+                      // non-form-based, so the canonical Mozilla
+                      // pattern is httpRealm = the origin URI itself
+                      // (matches the example in the on-disk schema
+                      // docs: "hostname":"imap://imap.foo.xx",
+                      // "httpRealm":"imap://imap.foo.xx"). Auto-fill
+                      // when neither is set, so the pref JSON stays
+                      // minimal and we don't have to repeat origin.
+                      const httpRealm = e.httpRealm
+                        || (e.formActionOrigin ? null : e.origin);
                       const info = Cc["@mozilla.org/login-manager/loginInfo;1"]
                         .createInstance(Ci.nsILoginInfo);
                       info.init(
                         e.origin,
                         e.formActionOrigin || null,
-                        e.httpRealm || null,
+                        httpRealm,
                         e.username,
                         e.password,
                         e.usernameField || "",
