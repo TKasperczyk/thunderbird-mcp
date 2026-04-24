@@ -87,6 +87,23 @@
     .tool-default-off label {
       color: #5b5b66;
     }
+    .preset-btn {
+      background: #f0f0f4;
+      color: #15141a;
+      border: 1px solid #d7d7db;
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      margin-right: 6px;
+      margin-bottom: 4px;
+    }
+    .preset-btn:hover {
+      background: #e7e7eb;
+    }
+    .preset-btn:active {
+      background: #d7d7db;
+    }
     .mode-note {
       color: #5b5b66;
       font-size: 13px;
@@ -225,6 +242,16 @@
     <button type="button" class="preset-btn" data-preset="readOnly">Read-only (block all writes)</button>
     <button type="button" class="preset-btn" data-preset="sendDomain">Send only to one domain</button>
     <button type="button" class="preset-btn" data-preset="trashFolderOnly">Allow deletes in Trash only</button>
+    <button type="button" class="preset-btn" data-preset="inventoryAndTriage">Inbox triage (inventory + bulk move)</button>
+    <button type="button" class="preset-btn" data-preset="batchDrafts">Batch drafts (createDrafts, capped at 10)</button>
+  </p>
+  <p class="mode-note">
+    Context-savers for large inboxes:
+    <code>inbox_inventory</code> returns grouped counts + sample IDs instead of raw headers
+    (25k-message inbox &rarr; ~50 groups &rarr; &lt;2k tokens).
+    <code>bulk_move_by_query</code> combines search + move with <code>dry_run</code> default true --
+    check the count before committing. <code>createDrafts</code> stages up to 50 drafts at once
+    without opening compose windows. All three are off by default; enable in Tool Access above.
   </p>
   <textarea id="permissionsJson" rows="14" spellcheck="false"
     style="width:100%; font-family:Consolas,Menlo,monospace; font-size:12px; padding:8px; box-sizing:border-box;"

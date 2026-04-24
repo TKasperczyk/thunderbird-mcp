@@ -366,6 +366,32 @@ const PERMISSION_PRESETS = {
         }
       }
     }
+  },
+  // Inbox-triage workflow: enable the aggregation + bulk tools so the AI can
+  // (a) count-by-domain, (b) dry-run a batch move, (c) execute after the user
+  // eyeballs the count. maxBatchSize caps a single bulk call at 500.
+  inventoryAndTriage: {
+    version: 1,
+    tools: {
+      inbox_inventory:     { enabled: true },
+      bulk_move_by_query:  { enabled: true, maxBatchSize: 500, requireFolderArg: true }
+    },
+    accounts: {},
+    folders: {}
+  },
+  // Parallel-correspondence workflow: enable batch draft creation but keep
+  // every send-to-recipient path review-gated (alwaysReview forces the
+  // compose window, max 10 drafts per call to prevent a runaway loop).
+  batchDrafts: {
+    version: 1,
+    tools: {
+      createDrafts:   { enabled: true, maxBatchSize: 10 },
+      sendMail:       { enabled: true, alwaysReview: true },
+      replyToMessage: { enabled: true, alwaysReview: true },
+      forwardMessage: { enabled: true, alwaysReview: true }
+    },
+    accounts: {},
+    folders: {}
   }
 };
 

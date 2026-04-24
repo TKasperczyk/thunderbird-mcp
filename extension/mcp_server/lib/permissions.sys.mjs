@@ -263,9 +263,15 @@ export function makePermissions({
       const bulk = Array.isArray(args.messageIds) ? args.messageIds
                  : Array.isArray(args.contactIds) ? args.contactIds
                  : Array.isArray(args.eventIds) ? args.eventIds
+                 : Array.isArray(args.drafts) ? args.drafts
                  : null;
       if (bulk && bulk.length > rule.maxBatchSize) {
         return { allow: false, reason: `Tool '${toolName}' batch size ${bulk.length} exceeds policy maxBatchSize=${rule.maxBatchSize}` };
+      }
+      // Special case: bulk_move_by_query doesn't carry an array arg -- its
+      // batch size is the `limit` numeric arg. Apply the cap there.
+      if (toolName === "bulk_move_by_query" && typeof args.limit === "number" && args.limit > rule.maxBatchSize) {
+        return { allow: false, reason: `Tool 'bulk_move_by_query' limit ${args.limit} exceeds policy maxBatchSize=${rule.maxBatchSize}` };
       }
     }
     if (rule.alwaysReview === true && args.skipReview === true) {
