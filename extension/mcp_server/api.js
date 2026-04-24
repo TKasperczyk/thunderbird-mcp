@@ -134,40 +134,51 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // ── CI-only credential injection ────────────────────────
             //
-            // Headless Thunderbird running in our integration Dockerfile
-            // can't NSS-encrypt logins.json from outside the app, and
-            // writing plaintext entries is rejected silently by TB 128's
-            // LoginStore -- verified via MOZ_LOG=IMAP:5,Login:5 which
-            // caught TB choosing "old-style IMAP login" (authMethod=2 ->
-            // 0x4) then stalling 26s waiting on a nsIAuthPrompt2 prompt
-            // that can never fire in headless mode.
+            // Headless Thunderbird in our integration image can't
+            // NSS-encrypt logins.json from outside the app, and plaintext
+            // encType=0 entries on disk are silently rejected by TB 128's
+            // LoginStore. So we populate credentials from inside the
+            // extension via two cooperating paths:
             //
-            // Fix: let the extension itself populate nsILoginManager on
-            // startup, driven by a pref the CI profile sets to a JSON
-            // array of { origin, httpRealm, formActionOrigin, username,
-            // password } entries. TB encrypts them via NSS as normal.
-            // Production installs have the pref unset, so this is a
-            // no-op everywhere except under the CI profile.
+            //   1. nsILoginManager.addLogin()    -- persistent; TB does
+            //      the NSS encryption itself. Match on subsequent
+            //      password lookups.
+            //   2. nsIMsgIncomingServer.password setter -- immediate
+            //      in-memory store. Bypasses LoginManager's cache of
+            //      "no password for this server" which TB otherwise
+            //      keeps for the whole session (classic stale-cache
+            //      pattern, mirrors upstream issue #76). Critical to
+            //      win the race against the first discoverallboxes URL
+            //      which fires before start:'s addLogin() finishes.
             //
-            // Pref name: extensions.thunderbird-mcp.ciInjectLogins
+            // Gated on extensions.thunderbird-mcp.ciInjectLogins. Empty
+            // in production -> entire block is a no-op.
+            //
+            // dump() calls write to stderr unconditionally from chrome
+            // code -- console.info goes to the Browser Console which
+            // isn't captured in our CI tb-stderr.log artifact.
             try {
               const PREF_CI_LOGINS = "extensions.thunderbird-mcp.ciInjectLogins";
-              if (Services.prefs.prefHasUserValue(PREF_CI_LOGINS)) {
+              const hasValue = Services.prefs.prefHasUserValue(PREF_CI_LOGINS);
+              dump(`thunderbird-mcp: CI login injection block entered, pref-set=${hasValue}\n`);
+              if (hasValue) {
                 const raw = Services.prefs.getStringPref(PREF_CI_LOGINS, "");
                 if (raw) {
                   const entries = JSON.parse(raw);
                   if (Array.isArray(entries)) {
+                    // (1) LoginManager.addLogin for every entry.
                     for (const e of entries) {
                       if (!e || typeof e !== "object") continue;
                       if (!e.origin || !e.username || !e.password) continue;
-                      // Deduplicate: skip if a login already exists for
-                      // the same origin+username. Important because this
-                      // runs on every TB startup and addLogin would
-                      // throw on duplicate.
                       try {
                         const existing = Services.logins.findLogins(e.origin, "", e.httpRealm || null);
-                        if (existing && existing.some(l => l.username === e.username)) continue;
-                      } catch { /* findLogins missing in older TB -- fall through */ }
+                        if (existing && existing.some(l => l.username === e.username)) {
+                          dump(`thunderbird-mcp: CI login for ${e.origin} user=${e.username} already present, skip\n`);
+                          continue;
+                        }
+                      } catch (fe) {
+                        dump(`thunderbird-mcp: findLogins threw for ${e.origin}: ${fe && fe.message}\n`);
+                      }
                       const info = Cc["@mozilla.org/login-manager/loginInfo;1"]
                         .createInstance(Ci.nsILoginInfo);
                       info.init(
@@ -181,16 +192,70 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       );
                       try {
                         Services.logins.addLogin(info);
-                        console.info(`thunderbird-mcp: injected CI login for ${e.origin} user=${e.username}`);
+                        dump(`thunderbird-mcp: injected CI login for ${e.origin} user=${e.username}\n`);
                       } catch (ex) {
-                        console.warn(`thunderbird-mcp: CI login injection for ${e.origin} failed:`, ex && ex.message);
+                        dump(`thunderbird-mcp: CI login injection for ${e.origin} FAILED: ${ex && ex.message}\n`);
                       }
+                    }
+                    // (2) In-memory server password: walk every account
+                    // and match by hostname, set the password directly
+                    // on the nsIMsgIncomingServer. This beats TB's stale
+                    // "no creds" cache because the server consults its
+                    // own `.password` field before going to LoginManager.
+                    try {
+                      for (const account of MailServices.accounts.accounts) {
+                        const server = account.incomingServer;
+                        if (!server) continue;
+                        for (const e of entries) {
+                          if (!e || !e.origin) continue;
+                          // Parse `imap://host[:port]` -> compare against
+                          // server.hostName (no port). server.type is
+                          // `imap`, `pop3`, `smtp`, etc.
+                          const m = e.origin.match(/^([a-z0-9]+):\/\/([^:/]+)(?::(\d+))?$/i);
+                          if (!m) continue;
+                          const [, scheme, host] = m;
+                          if (server.type === scheme && server.hostName === host && server.username === e.username) {
+                            try {
+                              server.password = e.password;
+                              dump(`thunderbird-mcp: set in-memory password on ${scheme}://${host} (server.key=${server.key})\n`);
+                            } catch (sex) {
+                              dump(`thunderbird-mcp: server.password set FAILED on ${scheme}://${host}: ${sex && sex.message}\n`);
+                            }
+                          }
+                        }
+                      }
+                      // Same treatment for SMTP servers (different
+                      // iteration path -- MailServices.outgoingServer).
+                      if (MailServices.outgoingServer && MailServices.outgoingServer.servers) {
+                        for (const smtp of MailServices.outgoingServer.servers) {
+                          if (!smtp) continue;
+                          for (const e of entries) {
+                            if (!e || !e.origin || !e.origin.startsWith("smtp://")) continue;
+                            const m = e.origin.match(/^smtp:\/\/([^:/]+)/i);
+                            if (!m) continue;
+                            const host = m[1];
+                            // nsIMsgOutgoingServer shape varies; poke at
+                            // whichever property exists.
+                            const smtpHost = smtp.serverURI ? smtp.serverURI.host : (smtp.hostname || "");
+                            if (smtpHost === host) {
+                              try {
+                                if ("password" in smtp) smtp.password = e.password;
+                                dump(`thunderbird-mcp: set SMTP in-memory password on ${host} (key=${smtp.key || "?"})\n`);
+                              } catch (sex) {
+                                dump(`thunderbird-mcp: SMTP password set FAILED on ${host}: ${sex && sex.message}\n`);
+                              }
+                            }
+                          }
+                        }
+                      }
+                    } catch (ie) {
+                      dump(`thunderbird-mcp: in-memory server password loop FAILED: ${ie && ie.message}\n`);
                     }
                   }
                 }
               }
             } catch (e) {
-              console.warn("thunderbird-mcp: CI login injection skipped:", e && e.message);
+              dump(`thunderbird-mcp: CI login injection block THREW: ${e && e.message}\n`);
             }
 
             let cal = null;
