@@ -27,5 +27,8 @@
   ],
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "acorn": "^8.16.0"
   }
 }
