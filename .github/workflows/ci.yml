@@ -30,6 +30,15 @@ jobs:
       - name: Import-graph validation
         run: node scripts/check-imports.cjs
 
+      - name: ESLint (no-undef + promise hygiene)
+        # Catches the bug class that ate this PR several times: free
+        # references like `isAccountAllowed`, `extractPlainTextBody`,
+        # `removeConnectionInfo` left over from the modularization cut.
+        # Errors fail the unit job; warnings (unused vars, etc) are
+        # informational. Run before the unit tests so a typo is caught
+        # before the slower test suite runs.
+        run: npm run lint -- --max-warnings 100
+
       - name: Tool wiring audit (schema / registry / handlers / dispatch)
         # Cross-checks the four places a tool has to exist: tools-schema,
         # lib/tools/ registry, api.js toolHandlers bag, dispatch switch.

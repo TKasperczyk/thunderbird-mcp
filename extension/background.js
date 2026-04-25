@@ -1,4 +1,6 @@
-/* global browser */
+// `browser` is declared as a global in eslint.config.mjs (extension/
+// file group), so the per-file /* global browser */ comment isn't
+// needed here -- it triggered no-redeclare.
 
 async function init() {
   try {

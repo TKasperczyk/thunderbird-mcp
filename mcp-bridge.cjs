@@ -537,7 +537,10 @@ function buildConnectionDiscoveryErrorMessage() {
 }
 
 function sanitizeJson(data) {
-  // Remove control chars except \n, \r, \t
+  // Remove control chars except \n, \r, \t. The character class is
+  // intentional -- JSON-RPC payloads sometimes carry stray control
+  // bytes from upstream bugs and we sanitize them out before parse.
+  // eslint-disable-next-line no-control-regex
   let sanitized = data.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
   // Escape raw newlines/carriage returns/tabs that aren't already escaped.
   // Match an even number of backslashes (including zero) before the control

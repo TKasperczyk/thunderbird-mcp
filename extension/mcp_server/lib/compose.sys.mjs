@@ -37,6 +37,10 @@ export function makeCompose({
   openFolder,
   // From messages.sys.mjs
   findMessage, markMessageDispositionState,
+  extractPlainTextBody,           // used in two reply/forward fallbacks
+                                   // (lines ~810, 934). ESLint caught
+                                   // these as free refs before runtime
+                                   // would have ReferenceError'd them.
   // From state.sys.mjs (mutable singletons -- must be the SAME instances
   // that api.js and onShutdown both hold).
   _attachTimers, _claimedReplyComposeWindows, _tempAttachFiles,

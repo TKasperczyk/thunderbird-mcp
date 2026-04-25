@@ -1,4 +1,6 @@
-/* global ExtensionCommon, ChromeUtils, Services, Cc, Ci */
+// Globals (ExtensionCommon, ChromeUtils, Services, Cc, Ci) are declared
+// in eslint.config.mjs's extension/ block. Per-file /* global */
+// comments triggered no-redeclare so they're omitted here.
 "use strict";
 
 /**
@@ -516,6 +518,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               deleteMessages, updateMessage, findMessage,
               getUserTags, markMessageDispositionState,
               inboxInventory, bulkMoveByQuery,
+              extractPlainTextBody,
               _compileMessageFilter, _walkFolderMessages, _groupKeyFor,
             } = makeMessages({
               MailServices, NetUtil, Services, Cc, Ci,
@@ -554,6 +557,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               findIdentity, findIdentityIn, getIdentityAutoRecipientHeader,
               openFolder,
               findMessage, markMessageDispositionState,
+              extractPlainTextBody,    // for the reply/forward HTML-fallback
+                                       // branches in compose.sys.mjs:810/934
               _attachTimers, _claimedReplyComposeWindows, _tempAttachFiles,
               MAX_BASE64_SIZE, COMPOSE_WINDOW_LOAD_DELAY_MS,
               tracer,    // see makeMessages note above on why this is
@@ -582,6 +587,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               UNDISABLEABLE_TOOLS, DEFAULT_DISABLED_TOOLS,
               makeJsonPrefStore,
             });
+            // The getPermissionsConfig / setPermissionsConfig / clear-
+            // PermissionsConfig getters defined further down on the
+            // mcpServer class are siblings of start: -- they don't
+            // close over start:'s locals. Expose `permissions` and
+            // `wrapApi` via globalThis the same way mergedTools and
+            // tracer are exposed (see globalThis.__tbMcpMergedTools).
+            // Without this the getters ReferenceError at the first
+            // tools/call from the options page (caught by ESLint
+            // no-undef once the lint config landed).
+            globalThis.__tbMcpPermissions = permissions;
+            globalThis.__tbMcpWrapApi = wrapApi;
 
             // Auto-registry: tools under lib/tools/*.sys.mjs are picked up
             // via the build-time manifest (see scripts/build-xpi.cjs). The
@@ -892,20 +908,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { text: "", isHtml: false };
             }
 
-            /**
-             * Extracts plain text body from a MIME message.
-             * Uses coerceBodyToPlaintext as fast path, then MIME tree fallback.
-             * Used by reply/forward quoting where plain text is appropriate.
-             */
-            function extractPlainTextBody(aMimeMsg) {
-              if (!aMimeMsg) return "";
-              try {
-                const text = aMimeMsg.coerceBodyToPlaintext();
-                if (text) return text;
-              } catch { /* fall through */ }
-              const { text, isHtml } = extractBodyContent(aMimeMsg);
-              return isHtml ? stripHtml(text) : text;
-            }
+            // extractPlainTextBody is now imported from messages.sys.mjs's
+            // factory destructure above (line ~519). The local copy used
+            // to live here was a duplicate of the one in messages.sys.mjs;
+            // ESLint's no-redeclare flagged it once both became visible
+            // in the same scope. Single source of truth in messages.sys.mjs.
 
             /**
              * Extracts body from a MIME message in the requested format.
@@ -1200,7 +1207,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // Clear cached promise so a retry can attempt to bind again
             globalThis.__tbMcpStartPromise = null;
-            removeConnectionInfo();
+            // Inline removeConnectionInfo() because it's scoped inside
+            // the try block above and isn't reachable from this catch
+            // (ESLint no-undef caught the previous direct call). Keep
+            // semantics identical to writeConnectionInfo's teardown.
+            try {
+              const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+              tmpDir.append("thunderbird-mcp");
+              const connFile = tmpDir.clone();
+              connFile.append("connection.json");
+              if (connFile.exists()) connFile.remove(false);
+            } catch { /* best-effort cleanup */ }
             return { success: false, error: e.toString() };
           }
           })();
@@ -1474,7 +1491,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         // per-account / per-folder rules, argument whitelists). The schema is
         // documented in lib/permissions.sys.mjs. Stored as a single JSON
         // document in PREF_PERMISSIONS.
+        // These getters are siblings of start: in the experiment-API
+        // class definition; they do NOT close over start:'s locals.
+        // Read `permissions` + `wrapApi` from globalThis where start:
+        // installed them (same pattern as __tbMcpMergedTools /
+        // __tbMcpTracer above). ESLint no-undef caught the previous
+        // free references at lint time.
         getPermissionsConfig: async function() {
+          const permissions = globalThis.__tbMcpPermissions;
+          const wrapApi = globalThis.__tbMcpWrapApi;
+          if (!wrapApi) return { error: "MCP server not started yet" };
           return wrapApi("getPermissionsConfig", () => {
             if (!permissions || typeof permissions.loadPolicy !== "function") {
               throw new Error("permissions module not loaded -- reinstall the XPI");
@@ -1483,6 +1509,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           });
         },
         setPermissionsConfig: async function(policy) {
+          const permissions = globalThis.__tbMcpPermissions;
+          const wrapApi = globalThis.__tbMcpWrapApi;
+          if (!wrapApi) return { error: "MCP server not started yet" };
           return wrapApi("setPermissionsConfig", () => {
             if (!permissions || typeof permissions.savePolicy !== "function") {
               throw new Error("permissions module not loaded");
@@ -1491,6 +1520,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           });
         },
         clearPermissionsConfig: async function() {
+          const permissions = globalThis.__tbMcpPermissions;
+          const wrapApi = globalThis.__tbMcpWrapApi;
+          if (!wrapApi) return { error: "MCP server not started yet" };
           return wrapApi("clearPermissionsConfig", () => {
             if (!permissions || typeof permissions.clearPolicy !== "function") {
               throw new Error("permissions module not loaded");

@@ -28,8 +28,16 @@
   "engines": {
     "node": ">=18.0.0"
   },
+  "scripts": {
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
   "devDependencies": {
     "acorn": "^8.16.0",
-    "better-sqlite3": "^11.10.0"
+    "better-sqlite3": "^11.10.0",
+    "eslint": "^9.39.4",
+    "eslint-plugin-n": "^17.24.0",
+    "eslint-plugin-promise": "^7.2.1",
+    "globals": "^17.5.0"
   }
 }

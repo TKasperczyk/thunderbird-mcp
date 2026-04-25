@@ -1843,6 +1843,12 @@ export function makeMessages({
     markMessageDispositionState,
     inboxInventory,
     bulkMoveByQuery,
+    // MIME helpers shared with compose.sys.mjs's reply/forward paths.
+    // Without these, compose.sys.mjs:810,934 had free references to
+    // extractPlainTextBody that ESLint surfaced -- they would have
+    // thrown ReferenceError at runtime when a non-multipart reply
+    // exercised the HTML-fallback branch.
+    extractPlainTextBody,
     // Shared primitives exposed so registry-driven tool files under
     // lib/tools/ can do their own folder walks without duplicating the
     // searchMessages filter-compilation logic.

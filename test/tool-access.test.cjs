@@ -594,7 +594,7 @@ describe("Tool metadata: tools/list stripping", () => {
 
 describe("Tool access: tag keyword validation", () => {
   // Mirrors production: allowlist of safe IMAP atom characters
-  const VALID_TAG = /^[a-zA-Z0-9_$.\-]+$/;
+  const VALID_TAG = /^[a-zA-Z0-9_$.-]+$/;
   function sanitizeTags(tags) {
     return (tags || []).filter(t => typeof t === "string" && VALID_TAG.test(t));
   }
