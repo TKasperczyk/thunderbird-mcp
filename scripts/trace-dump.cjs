@@ -53,15 +53,16 @@ function fmtTs(usStr) {
   return new Date(ms).toISOString();
 }
 
-function fmtRow({ ts_us, level, scenario, event, ctx_json, trace_id }) {
+function fmtRow({ ts_us, level, scenario, event, ctx_json, trace_id, caller_file, caller_line }) {
   const lvl = LVL_NAME[Number(level)] || `L${level}`;
   const tid = trace_id ? ` trace=${trace_id}` : "";
+  const at  = caller_file ? ` at ${caller_file}:${caller_line}` : "";
   let ctxOut = "";
   if (ctx_json) {
     try { ctxOut = " " + JSON.stringify(JSON.parse(ctx_json)); }
     catch { ctxOut = " " + ctx_json; }
   }
-  return `${fmtTs(ts_us)} ${lvl} ${scenario}/${event}${tid}${ctxOut}`;
+  return `${fmtTs(ts_us)} ${lvl} ${scenario}/${event}${at}${tid}${ctxOut}`;
 }
 
 function dumpFromSqlite() {
@@ -79,7 +80,8 @@ function dumpFromSqlite() {
     return false;
   }
   let sql = `
-    SELECT ts_us, level, scenario, event, ctx_json, trace_id
+    SELECT ts_us, level, scenario, event, ctx_json, trace_id,
+           caller_file, caller_line
     FROM events
     WHERE level >= ? AND scenario LIKE ?
   `;
@@ -123,6 +125,7 @@ function dumpFromJsonl() {
         ts_us: r.ts_us, level: r.level,
         scenario: r.scenario, event: r.event,
         ctx_json: ctxStr, trace_id: r.trace_id,
+        caller_file: r.caller_file, caller_line: r.caller_line,
       }));
       printed++;
     } catch { /* skip malformed */ }

@@ -40,6 +40,36 @@ function newTraceId() {
 
 function nowUs() { return Date.now() * 1000; }
 
+/**
+ * Capture the first stack frame OUTSIDE this module.
+ * V8's stack format: "    at fn (file:line:col)" or "    at file:line:col".
+ * Returns { file, line } relative to repo root, or { null, null } on parse fail.
+ */
+const path = require("path");
+function captureCaller() {
+  try {
+    const stack = (new Error().stack || "").split("\n");
+    for (const raw of stack) {
+      const line = raw.trim();
+      if (!line.startsWith("at ")) continue;
+      // Match "at fn (file:line:col)" OR "at file:line:col"
+      let m = line.match(/at\s+[^(]+\(([^)]+):(\d+):\d+\)\s*$/);
+      if (!m) m = line.match(/at\s+([^\s()]+):(\d+):\d+\s*$/);
+      if (!m) continue;
+      let file = m[1];
+      // Skip frames inside this module (the call to captureCaller from
+      // emit, and emit itself). Match by basename to avoid path issues
+      // on Windows.
+      if (path.basename(file) === "trace-write.cjs") continue;
+      // Make repo-relative for readability if we recognize the prefix.
+      const rel = path.relative(path.resolve(__dirname, ".."), file);
+      if (!rel.startsWith("..")) file = rel.replace(/\\/g, "/");
+      return { file, line: parseInt(m[2], 10) };
+    }
+  } catch { /* fall through */ }
+  return { file: null, line: null };
+}
+
 function makeTraceWriter({
   dbPath,
   fallbackPath = null,
@@ -57,21 +87,27 @@ function makeTraceWriter({
     db.pragma("synchronous = NORMAL");      // we don't need fsync per insert
     db.exec(`
       CREATE TABLE IF NOT EXISTS events (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts_us     INTEGER NOT NULL,
-        level     INTEGER NOT NULL,
-        scenario  TEXT    NOT NULL,
-        event     TEXT    NOT NULL,
-        ctx_json  TEXT,
-        trace_id  TEXT
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_us        INTEGER NOT NULL,
+        level        INTEGER NOT NULL,
+        scenario     TEXT    NOT NULL,
+        event        TEXT    NOT NULL,
+        ctx_json     TEXT,
+        trace_id     TEXT,
+        caller_file  TEXT,
+        caller_line  INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_scenario_ts ON events(scenario, ts_us);
       CREATE INDEX IF NOT EXISTS idx_level_ts    ON events(level, ts_us);
       CREATE INDEX IF NOT EXISTS idx_trace_id    ON events(trace_id) WHERE trace_id IS NOT NULL;
     `);
+    // Schema migration when an older trace DB is reused.
+    for (const col of ["caller_file TEXT", "caller_line INTEGER"]) {
+      try { db.exec(`ALTER TABLE events ADD COLUMN ${col}`); } catch { /* already present */ }
+    }
     stmt = db.prepare(`
-      INSERT INTO events(ts_us, level, scenario, event, ctx_json, trace_id)
-      VALUES(@ts_us, @level, @scenario, @event, @ctx_json, @trace_id)
+      INSERT INTO events(ts_us, level, scenario, event, ctx_json, trace_id, caller_file, caller_line)
+      VALUES(@ts_us, @level, @scenario, @event, @ctx_json, @trace_id, @caller_file, @caller_line)
     `);
     mode = "sqlite";
   } catch (e) {
@@ -102,6 +138,7 @@ function makeTraceWriter({
 
   function emit(level, scenario, event, ctx) {
     if (level < minLevel) return;
+    const caller = captureCaller();
     const row = {
       ts_us: nowUs(),
       level,
@@ -110,6 +147,8 @@ function makeTraceWriter({
       event,
       ctx: ctx || null,
       trace_id: (ctx && ctx.trace_id) || null,
+      caller_file: caller.file,
+      caller_line: caller.line,
     };
     if (stmt) {
       try {
@@ -120,6 +159,8 @@ function makeTraceWriter({
           event: row.event,
           ctx_json: ctx ? JSON.stringify(ctx) : null,
           trace_id: row.trace_id,
+          caller_file: row.caller_file,
+          caller_line: row.caller_line,
         });
       } catch (e) {
         // Most likely cause: ext + smoke writing concurrently and we

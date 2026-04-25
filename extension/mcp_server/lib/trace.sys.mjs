@@ -22,7 +22,8 @@
  *
  * Schema (deliberately flat -- denormalised for append-only write):
  *
- *   events(id, ts_us, level, scenario, event, ctx_json, trace_id)
+ *   events(id, ts_us, level, scenario, event, ctx_json, trace_id,
+ *          caller_file, caller_line)
  *
  *   level: 0=trace, 1=debug, 2=info, 3=warn, 4=error (matches pino)
  *   scenario: namespace, e.g. "auth.inject", "imap.login",
@@ -32,6 +33,10 @@
  *   ctx_json: arbitrary JSON blob for context (folder URI, tool name,
  *             error message, etc.); kept as TEXT for flexibility
  *   trace_id: short random ID for span correlation; null for one-shot
+ *   caller_file/line: parsed from Error().stack at emit() time, points
+ *             at the source line that called tracer.info(...) etc.
+ *             Lets a failure dump pin a hang to a specific await
+ *             instead of "somewhere in compose". Costs ~1us per event.
  *
  * Usage:
  *
@@ -77,6 +82,44 @@ function nowUs() {
 }
 
 /**
+ * Pluck the first stack frame OUTSIDE this trace module, returning
+ * `{ file, line }`. Mozilla's stack format looks like
+ *   "frameFn@resource://thunderbird-mcp/.../trace.sys.mjs:123:9"
+ * with one frame per line. We skip frames whose URL contains the
+ * trace module's own filename so the pointer always lands on the
+ * caller of emit/info/error/etc, not on emit() itself.
+ *
+ * Returns { file: null, line: null } if the parse fails -- we never
+ * want to crash the logger, observability is strictly additive.
+ */
+function captureCaller() {
+  try {
+    const stack = new Error().stack || "";
+    const lines = stack.split("\n");
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      // Mozilla format: optional "fnName@" prefix, then URL, ":line:col"
+      const m = line.match(/(?:[^@]*@)?(.+):(\d+):\d+$/);
+      if (!m) continue;
+      const url = m[1];
+      // Skip frames inside the trace module itself.
+      if (url.endsWith("/trace.sys.mjs") || url.endsWith("trace.sys.mjs")) continue;
+      // Strip resource://thunderbird-mcp/ prefix if present so the path
+      // is relative to the extension root (matches how rest of the
+      // codebase reports paths).
+      let file = url;
+      const RES = "resource://thunderbird-mcp/";
+      if (file.startsWith(RES)) file = file.slice(RES.length);
+      return { file, line: parseInt(m[2], 10) };
+    }
+  } catch {
+    // Fall through to the null sentinel.
+  }
+  return { file: null, line: null };
+}
+
+/**
  * Factory. Returns a Tracer with { emit, trace, debug, info, warn,
  * error, span, flush, close }. Awaits SQLite open + schema migration.
  * Never throws -- a failed open falls through to the JSONL fallback.
@@ -97,15 +140,27 @@ export async function makeTrace({
     conn = await Sqlite.openConnection({ path: dbPath });
     await conn.execute(`
       CREATE TABLE IF NOT EXISTS events (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts_us     INTEGER NOT NULL,
-        level     INTEGER NOT NULL,
-        scenario  TEXT    NOT NULL,
-        event     TEXT    NOT NULL,
-        ctx_json  TEXT,
-        trace_id  TEXT
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_us        INTEGER NOT NULL,
+        level        INTEGER NOT NULL,
+        scenario     TEXT    NOT NULL,
+        event        TEXT    NOT NULL,
+        ctx_json     TEXT,
+        trace_id     TEXT,
+        caller_file  TEXT,
+        caller_line  INTEGER
       )
     `);
+    // Schema migration: older runs of the trace DB don't have the
+    // caller_* columns. Add them so cross-run dumps stay consistent.
+    // ALTER TABLE ADD COLUMN is idempotent in SQLite when wrapped to
+    // tolerate the "duplicate column" error.
+    for (const col of [
+      "caller_file TEXT",
+      "caller_line INTEGER",
+    ]) {
+      try { await conn.execute(`ALTER TABLE events ADD COLUMN ${col}`); } catch { /* already present */ }
+    }
     await conn.execute(`CREATE INDEX IF NOT EXISTS idx_scenario_ts ON events(scenario, ts_us)`);
     await conn.execute(`CREATE INDEX IF NOT EXISTS idx_level_ts    ON events(level, ts_us)`);
     await conn.execute(`CREATE INDEX IF NOT EXISTS idx_trace_id    ON events(trace_id) WHERE trace_id IS NOT NULL`);
@@ -148,9 +203,12 @@ export async function makeTrace({
     }
   }
 
-  // Primary emit. Short-circuits on level BEFORE serializing ctx.
+  // Primary emit. Short-circuits on level BEFORE serializing ctx or
+  // walking the stack -- both are expensive when the level is filtered
+  // out (matches pino's hot-path discipline).
   function emit(level, scenario, event, ctx) {
     if (level < minLevel) return;
+    const caller = captureCaller();
     const row = {
       ts_us: nowUs(),
       level,
@@ -159,13 +217,15 @@ export async function makeTrace({
       event,
       ctx: ctx || null,
       trace_id: (ctx && ctx.trace_id) || null,
+      caller_file: caller.file,
+      caller_line: caller.line,
     };
     // Fire-and-forget SQLite write. Errors log to Services.console so
     // we never lose a row silently; callers never have to await.
     if (conn) {
       conn.execute(
-        `INSERT INTO events(ts_us, level, scenario, event, ctx_json, trace_id)
-         VALUES(:ts_us, :level, :scenario, :event, :ctx_json, :trace_id)`,
+        `INSERT INTO events(ts_us, level, scenario, event, ctx_json, trace_id, caller_file, caller_line)
+         VALUES(:ts_us, :level, :scenario, :event, :ctx_json, :trace_id, :caller_file, :caller_line)`,
         {
           ts_us: row.ts_us,
           level: row.level,
@@ -173,6 +233,8 @@ export async function makeTrace({
           event: row.event,
           ctx_json: ctx ? JSON.stringify(ctx) : null,
           trace_id: row.trace_id,
+          caller_file: row.caller_file,
+          caller_line: row.caller_line,
         }
       ).catch((e) => {
         try { Services.console.logStringMessage(`thunderbird-mcp trace write failed: ${e && e.message}`); } catch {}
