@@ -1768,19 +1768,25 @@ export function makeMessages({
         // CI run 24916918837 the live path returned moved=0 because the
         // call threw and was caught by the outer try below.
         //
-        // Modern signature (TB 128 nsIMsgFolder.idl, 6 args):
+        // Verified against searchfox comm-esr128 nsIMsgFolder.idl. Exact
+        // 7-arg signature for TB 128:
         //   void copyMessages(in nsIMsgFolder srcFolder,
         //                     in Array<nsIMsgDBHdr> messages,
         //                     in boolean isMove,
-        //                     in nsIMsgCopyServiceListener listener,
         //                     in nsIMsgWindow msgWindow,
+        //                     in nsIMsgCopyServiceListener listener,
+        //                     in boolean isFolder,
         //                     in boolean allowUndo);
+        // (Note: msgWindow comes BEFORE listener -- different from the
+        // pre-128 order that some online docs still show. CI run
+        // 24917242345 caught the previous 6-arg attempt with
+        // 'Not enough arguments' from XPConnect.)
         // We pass null for both listener and msgWindow (fire-and-forget;
-        // the response surfaces on the destination's folder listeners).
+        // completion surfaces via the destination's folder listeners).
         try {
           dest.copyMessages(srcFolder, hdrs, /* isMove */ true,
-                            /* listener */ null, /* msgWindow */ null,
-                            /* allowUndo */ false);
+                            /* msgWindow */ null, /* listener */ null,
+                            /* isFolder */ false, /* allowUndo */ false);
           moved += hdrs.length;
           if (tracer) {
             tracer.info("bulk_move", "copy_dispatched", {

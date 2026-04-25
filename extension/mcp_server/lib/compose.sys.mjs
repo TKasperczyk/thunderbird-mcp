@@ -25,6 +25,12 @@ export function makeCompose({
   Services, Cc, Ci, MailServices,
   // From access-control.sys.mjs
   isFolderAccessible, isSkipReviewBlocked,
+  isAccountAllowed, getAccessibleAccounts,         // <- the modularization
+                                                     //    cut left these
+                                                     //    referenced from
+                                                     //    setComposeIdentity
+                                                     //    without being
+                                                     //    destructured here
   // From accounts.sys.mjs
   findIdentity, findIdentityIn, getIdentityAutoRecipientHeader,
   // From folders.sys.mjs

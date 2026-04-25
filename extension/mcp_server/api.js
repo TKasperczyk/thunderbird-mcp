@@ -542,6 +542,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             } = makeCompose({
               Services, Cc, Ci, MailServices,
               isFolderAccessible, isSkipReviewBlocked,
+              isAccountAllowed, getAccessibleAccounts,    // setComposeIdentity
+                                                          // fallbacks need
+                                                          // these (compose.sys
+                                                          // .mjs:647-665);
+                                                          // missing from the
+                                                          // original deps bag,
+                                                          // surfaced by the
+                                                          // create_drafts
+                                                          // trace events
               findIdentity, findIdentityIn, getIdentityAutoRecipientHeader,
               openFolder,
               findMessage, markMessageDispositionState,
