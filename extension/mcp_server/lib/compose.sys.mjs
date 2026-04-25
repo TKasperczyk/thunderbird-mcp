@@ -861,6 +861,14 @@ export function makeCompose({
                   result.message = msg;
                 }
                 resolve(result);
+              }).catch(e => {
+                // Without this catch, a rejection from sendMessageDirectly
+                // leaves the outer Promise (whose `resolve` we hold) unsettled
+                // forever -- the awaiting tool-call hangs until the host's
+                // request timeout fires. Bug class confirmed by smoke
+                // harness's TIMEOUT pattern. Settle with a structured error
+                // instead so the caller sees what actually failed.
+                resolve({ error: e && e.message ? e.message : String(e) });
               });
             } catch (e) {
               resolve({ error: e.toString() });
@@ -887,6 +895,11 @@ export function makeCompose({
             result.message = msg;
           }
           resolve(result);
+        }).catch(e => {
+          // Same hang risk -- compose-window opening rejects sometimes
+          // (window-init race, identity invalid, etc) and we'd lose the
+          // settle without this.
+          resolve({ error: e && e.message ? e.message : String(e) });
         });
 
       } catch (e) {
@@ -990,6 +1003,11 @@ export function makeCompose({
                   result.message = msg;
                 }
                 resolve(result);
+              }).catch(e => {
+                // See sibling reply path for rationale (~line 851):
+                // bare .then() without .catch leaves the outer await
+                // hanging when sendMessageDirectly rejects.
+                resolve({ error: e && e.message ? e.message : String(e) });
               });
               return;
             }

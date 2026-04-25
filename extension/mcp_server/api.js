@@ -29,6 +29,10 @@ const resProto = Cc[
 // Mutable counter that the bridge stays in api.js for now -- it's compose-only.
 let _tempFileCounter = 0;
 
+// Mozilla's experiment-API loader picks up `var mcpServer` from this
+// script's top-level scope by name. ESLint can't see that contract,
+// so the unused-var rule needs an explicit pass.
+// eslint-disable-next-line no-unused-vars
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
     const extensionRoot = context.extension.rootURI;
@@ -102,7 +106,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       console.error("thunderbird-mcp: Tool metadata validation failed:\n  " + toolErrors.join("\n  "));
     }
 
-    // Derive ALL_TOOL_NAMES from the tools array (single source of truth)
+    // Derive ALL_TOOL_NAMES from the tools array (single source of truth).
+    // eslint-disable-next-line no-unused-vars
     const ALL_TOOL_NAMES = tools.map(t => t.name);
 
     // Group display order for settings UI
@@ -407,7 +412,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               generateAuthToken,
               timingSafeEqual,
               writeConnectionInfo,
-              removeConnectionInfo,
+              // eslint-disable-next-line no-unused-vars
+              removeConnectionInfo,    // kept reachable for future hot-
+                                       //   reload / shutdown callers; the
+                                       //   current direct callsite was
+                                       //   inlined into startPromise's
+                                       //   catch block (sibling closure
+                                       //   can't see this binding).
             } = makeAuth({ Services, Cc, Ci });
 
             const authToken = generateAuthToken();
@@ -420,10 +431,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               "resource://thunderbird-mcp/mcp_server/lib/access-control.sys.mjs"
             );
             const {
-              getAllowedAccountIds,
+              // eslint-disable-next-line no-unused-vars
+              getAllowedAccountIds,    // kept: part of access-control's
+                                       //   public surface; consumers may
+                                       //   come from the WebExt bridge,
+                                       //   future code paths, or
+                                       //   framework introspection that
+                                       //   ESLint can't see.
               isAccountAllowed,
               isSkipReviewBlocked,
-              getDisabledTools,
+              // eslint-disable-next-line no-unused-vars
+              getDisabledTools,        // same rationale -- intentional
+                                       //   public surface, currently
+                                       //   consumed indirectly via
+                                       //   isToolEnabled.
               isToolEnabled,
               isFolderAccessible,
               getAccessibleFolder,
