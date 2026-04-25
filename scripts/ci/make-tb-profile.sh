@@ -82,16 +82,33 @@ user_pref("mail.identity.id1.valid", true);
 // Without explicit folder URIs, nsIMsgSend.createAndSendMessage in
 // SaveAsDraft mode HANGS waiting for an unresolved drafts folder
 // lookup -- the listener's onStopSending never fires and our 30 s
-// smoke TIMEOUT trips before the 60 s internal timeout. Verified
-// via the create_drafts trace dumping save.dispatch then no
-// save.success / save.failed for 30 s.
+// smoke TIMEOUT trips before the 60 s internal timeout.
 //
-// Pointing all four at the IMAP account's auto-created standard
-// folders. Greenmail creates them lazily on first APPEND/SELECT.
-user_pref("mail.identity.id1.drafts_folder",     "imap://test@ci.local@localhost/Drafts");
-user_pref("mail.identity.id1.fcc_folder",        "imap://test@ci.local@localhost/Sent");
-user_pref("mail.identity.id1.archive_folder",    "imap://test@ci.local@localhost/Archives");
-user_pref("mail.identity.id1.stationery_folder", "imap://test@ci.local@localhost/Templates");
+// Two TB-128 specifics that previous attempts got wrong:
+//
+//   1. The URL must use the URL-ENCODED form of the username. TB's
+//      account manager internally rewrites imap account URLs as
+//      `imap://test%40ci.local@localhost/...` (verified in moz.log
+//      at ProcessCurrentURL); preferences using the literal '@' make
+//      TB compare against a different URI than the account manager
+//      uses, which silently falls back to default-account lookup
+//      and hangs.
+//
+//   2. The picker_mode prefs must be set to 1 ("specific folder"),
+//      not the default 0 ("system default"). Mode 0 routes through
+//      account-manager defaulting which prompts the user to pick a
+//      folder if one isn't set -- another silent hang in headless.
+//
+// Greenmail creates the folders lazily on first APPEND / SELECT, so
+// we don't need to pre-populate.
+user_pref("mail.identity.id1.drafts_folder",          "imap://test%40ci.local@localhost/Drafts");
+user_pref("mail.identity.id1.fcc_folder",             "imap://test%40ci.local@localhost/Sent");
+user_pref("mail.identity.id1.archive_folder",         "imap://test%40ci.local@localhost/Archives");
+user_pref("mail.identity.id1.stationery_folder",      "imap://test%40ci.local@localhost/Templates");
+user_pref("mail.identity.id1.drafts_folder_picker_mode",  "1");
+user_pref("mail.identity.id1.fcc_folder_picker_mode",     "1");
+user_pref("mail.identity.id1.archives_folder_picker_mode","1");
+user_pref("mail.identity.id1.tmpl_folder_picker_mode",    "1");
 
 user_pref("mail.server.server1.type", "imap");
 user_pref("mail.server.server1.hostname", "localhost");

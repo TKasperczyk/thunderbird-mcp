@@ -702,9 +702,54 @@ async function forwardToThunderbird(message, _retried) {
 function startBridge() {
   debugLog(`startup version=${BRIDGE_VERSION} pid=${process.pid} platform=${process.platform}`);
 
+  // Stdout is a pipe to whoever spawned us (Claude Desktop, the smoke
+  // harness, etc). When that side closes early -- because they timed
+  // out a tools/call, killed us, or just exited -- the next write
+  // raises EPIPE on the underlying socket. Without an 'error' listener
+  // Node terminates with an unhandled 'error' event, dumping a stack
+  // trace and exit code 1 even though the right behavior is a clean
+  // shutdown.
+  //
+  // Treat any pipe-close as a graceful exit: we have no one to talk to,
+  // there's nothing useful to do. Use code 0 because EPIPE-on-stdout is
+  // a normal end-of-life for a stdio transport, not a fault.
+  let pipeClosed = false;
+  function handlePipeError(stream, err) {
+    if (pipeClosed) return;
+    if (err && (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED")) {
+      pipeClosed = true;
+      debugLog(`stdio pipe closed (${stream}, ${err.code}); exiting cleanly`);
+      // Drain anything we still owe before exiting; if we can't, just
+      // give up. process.exit is intentional here -- without it we'd
+      // sit on the event loop until something else kills us.
+      try { process.stdout.end(); } catch {}
+      try { process.stderr.end(); } catch {}
+      process.exit(0);
+    }
+    // Anything else: surface it. If the stream is genuinely broken in
+    // some other way we want a stack trace, not a silent exit.
+    throw err;
+  }
+  process.stdout.on('error', (err) => handlePipeError('stdout', err));
+  process.stdin.on('error',  (err) => handlePipeError('stdin',  err));
+
   function writeOutput(data) {
     return new Promise((resolve) => {
-      if (process.stdout.write(data)) {
+      if (pipeClosed) {
+        resolve();
+        return;
+      }
+      let ok;
+      try {
+        ok = process.stdout.write(data);
+      } catch (e) {
+        // Sync EPIPE -- handler above resolves the promise via the
+        // pipeClosed flag flip, but we still need to unblock callers.
+        handlePipeError('stdout-sync', e);
+        resolve();
+        return;
+      }
+      if (ok) {
         resolve();
       } else {
         process.stdout.once('drain', resolve);
