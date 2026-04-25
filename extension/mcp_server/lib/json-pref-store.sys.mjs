@@ -78,6 +78,10 @@ export function makeJsonPrefStore({
   validate,       // optional: (raw) => normalized  (throws on invalid)
   defaultValue,   // required: the shape returned when pref is unset / corrupt
   logPrefix = "thunderbird-mcp",
+  // Optional logger sink. Defaults to console; unit tests pass
+  // { warn() {}, error() {} } to silence the intentional fallback
+  // logs from corrupt-pref / validator-throws negative-path tests.
+  logger = console,
 }) {
   if (!Services || !prefKey) {
     throw new Error("makeJsonPrefStore requires { Services, prefKey }");
@@ -95,7 +99,7 @@ export function makeJsonPrefStore({
       const parsed = JSON.parse(raw);
       return validate ? validate(parsed) : parsed;
     } catch (e) {
-      console.warn(`${logPrefix}: ${prefKey} unparseable, using default:`, e);
+      logger.warn(`${logPrefix}: ${prefKey} unparseable, using default:`, e);
       return cloneDefault();
     }
   }
@@ -124,12 +128,12 @@ export function makeJsonPrefStore({
  * @returns {Promise<any>} Resolves to op()'s result, or { error: string }
  *                         if op threw / rejected.
  */
-export async function wrapApi(name, op) {
+export async function wrapApi(name, op, { logger = console } = {}) {
   try {
     return await op();
   } catch (e) {
     const msg = e && e.message ? e.message : String(e);
-    console.error(`thunderbird-mcp: ${name} failed:`, e);
+    logger.error(`thunderbird-mcp: ${name} failed:`, e);
     return { error: `${name} failed: ${msg}` };
   }
 }

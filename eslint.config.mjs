@@ -39,6 +39,7 @@ export default [
       "dist/",
       "extension/buildinfo.json",
       "extension/mcp_server/lib/tools/_manifest.sys.mjs",  // generated
+      "extension/httpd.sys.mjs",                            // vendored Mozilla
       ".claude/",
     ],
   },

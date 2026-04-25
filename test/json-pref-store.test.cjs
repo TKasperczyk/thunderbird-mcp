@@ -42,6 +42,12 @@ function makeMockServices(initial) {
   };
 }
 
+// Silent logger for the intentional negative-path tests below (corrupt
+// JSON, validator throws, wrapApi op throws). Without this the tests
+// pollute CI output with the module's expected console.warn / .error
+// lines -- TAP renders them as `# ...` comments above each assertion.
+const silentLogger = { warn() {}, error() {}, log() {}, info() {} };
+
 const { makeJsonPrefStore, wrapApi } = loadStore();
 
 describe('makeJsonPrefStore: load', () => {
@@ -82,6 +88,7 @@ describe('makeJsonPrefStore: load', () => {
       Services: makeMockServices('{ not valid'),
       prefKey: 'test.pref',
       defaultValue: { fallback: true },
+      logger: silentLogger,
     });
     assert.deepEqual(store.load(), { fallback: true });
   });
@@ -92,6 +99,7 @@ describe('makeJsonPrefStore: load', () => {
       prefKey: 'test.pref',
       defaultValue: { safe: true },
       validate: () => { throw new Error('nope'); },
+      logger: silentLogger,
     });
     assert.deepEqual(store.load(), { safe: true });
   });
@@ -150,11 +158,11 @@ describe('wrapApi', () => {
     assert.deepEqual(res, { async: true });
   });
   it('returns { error: ... } on throw with method prefix', async () => {
-    const res = await wrapApi('setFoo', () => { throw new Error('boom'); });
+    const res = await wrapApi('setFoo', () => { throw new Error('boom'); }, { logger: silentLogger });
     assert.match(res.error, /^setFoo failed: boom$/);
   });
   it('returns { error: ... } on async rejection', async () => {
-    const res = await wrapApi('setFoo', async () => { throw new Error('async boom'); });
+    const res = await wrapApi('setFoo', async () => { throw new Error('async boom'); }, { logger: silentLogger });
     assert.match(res.error, /^setFoo failed: async boom$/);
   });
 });
