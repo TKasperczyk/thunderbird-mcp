@@ -78,6 +78,21 @@ user_pref("mail.identity.id1.fullName", "CI Test");
 user_pref("mail.identity.id1.smtpServer", "smtp1");
 user_pref("mail.identity.id1.valid", true);
 
+// ── Special folders for createDrafts / sendMail ───────────────────────
+// Without explicit folder URIs, nsIMsgSend.createAndSendMessage in
+// SaveAsDraft mode HANGS waiting for an unresolved drafts folder
+// lookup -- the listener's onStopSending never fires and our 30 s
+// smoke TIMEOUT trips before the 60 s internal timeout. Verified
+// via the create_drafts trace dumping save.dispatch then no
+// save.success / save.failed for 30 s.
+//
+// Pointing all four at the IMAP account's auto-created standard
+// folders. Greenmail creates them lazily on first APPEND/SELECT.
+user_pref("mail.identity.id1.drafts_folder",     "imap://test@ci.local@localhost/Drafts");
+user_pref("mail.identity.id1.fcc_folder",        "imap://test@ci.local@localhost/Sent");
+user_pref("mail.identity.id1.archive_folder",    "imap://test@ci.local@localhost/Archives");
+user_pref("mail.identity.id1.stationery_folder", "imap://test@ci.local@localhost/Templates");
+
 user_pref("mail.server.server1.type", "imap");
 user_pref("mail.server.server1.hostname", "localhost");
 user_pref("mail.server.server1.port", 3143);
