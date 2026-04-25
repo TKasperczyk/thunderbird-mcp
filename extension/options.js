@@ -1,4 +1,6 @@
-/* global browser */
+// `browser` is declared as a global in eslint.config.mjs for the
+// extension/ file group, so we don't repeat the /* global */ comment
+// here (it triggered no-redeclare).
 "use strict";
 
 const statusDot = document.getElementById("statusDot");
@@ -149,8 +151,19 @@ saveBtn.addEventListener("click", async () => {
 async function loadToolAccess() {
   try {
     const data = await browser.mcpServer.getToolAccessConfig();
-    currentTools = data.tools || [];
-    const groupLabels = data.groups || {};
+    // Engine returns a structured error object on failure now (mode: "error"
+    // + error: <message>) rather than throwing into the WebExtension boundary
+    // where it gets wrapped to "An unexpected error occurred".
+    if (data && data.error) {
+      toolList.innerHTML = "";
+      const li = document.createElement("li");
+      li.textContent = "Error loading tools: " + data.error;
+      toolList.appendChild(li);
+      return;
+    }
+    currentTools = (data && data.tools) || [];
+    const groupLabels = (data && data.groups) || {};
+    const usingDefaults = !!(data && data.usingDefaults);
 
     if (currentTools.length === 0) {
       toolList.innerHTML = "<li>No tools found.</li>";
@@ -159,8 +172,19 @@ async function loadToolAccess() {
 
     toolList.innerHTML = "";
 
+    // Banner at the top when the user is still on the safety defaults --
+    // destructive ops (send, delete) are off until the user opts in.
+    if (usingDefaults) {
+      const banner = document.createElement("li");
+      banner.className = "tool-defaults-banner";
+      banner.textContent =
+        "Safe defaults active: send/forward/reply, all delete tools, and " +
+        "batch tools (bulk_move_by_query, createDrafts) are off. " +
+        "Check the boxes below for the ones you want to allow, then Save.";
+      toolList.appendChild(banner);
+    }
+
     // Tools arrive pre-sorted by group then CRUD order from the server.
-    // Build grouped structure from tool metadata.
     let currentGroup = null;
     let currentCrud = null;
 
@@ -168,7 +192,6 @@ async function loadToolAccess() {
       const group = tool.group || "other";
       const crud = tool.crud || "other";
 
-      // New group header
       if (group !== currentGroup) {
         currentGroup = group;
         currentCrud = null;
@@ -178,7 +201,6 @@ async function loadToolAccess() {
         toolList.appendChild(header);
       }
 
-      // New CRUD sub-header within group
       if (crud !== currentCrud) {
         currentCrud = crud;
         const subHeader = document.createElement("li");
@@ -188,6 +210,9 @@ async function loadToolAccess() {
       }
 
       const li = document.createElement("li");
+      if (tool.defaultDisabled) {
+        li.classList.add("tool-default-off");
+      }
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.id = "tool-" + tool.name;
@@ -208,6 +233,11 @@ async function loadToolAccess() {
         lockSpan.className = "account-type";
         lockSpan.textContent = "required";
         label.appendChild(lockSpan);
+      } else if (tool.defaultDisabled) {
+        const defSpan = document.createElement("span");
+        defSpan.className = "account-type tool-default-off-badge";
+        defSpan.textContent = "off by default";
+        label.appendChild(defSpan);
       }
 
       li.appendChild(checkbox);
@@ -289,7 +319,167 @@ saveSkipReviewBtn.addEventListener("click", async () => {
   saveSkipReviewBtn.disabled = false;
 });
 
-loadServerInfo();
-loadAccountAccess();
-loadToolAccess();
-loadSkipReviewPref();
+// ── Advanced Permissions ─────────────────────────────────────────────────
+
+const permissionsJson = document.getElementById("permissionsJson");
+const savePermissionsBtn = document.getElementById("savePermissionsBtn");
+const clearPermissionsBtn = document.getElementById("clearPermissionsBtn");
+const savePermissionsStatus = document.getElementById("savePermissionsStatus");
+
+const PERMISSION_PRESETS = {
+  empty: { version: 1, tools: {}, accounts: {}, folders: {} },
+  readOnly: {
+    version: 1,
+    tools: {
+      "*": { enabled: false }, // not honored by engine but documents intent
+      sendMail: { enabled: false }, replyToMessage: { enabled: false }, forwardMessage: { enabled: false },
+      createContact: { enabled: false }, updateContact: { enabled: false }, deleteContact: { enabled: false },
+      createEvent: { enabled: false }, updateEvent: { enabled: false }, deleteEvent: { enabled: false },
+      createTask: { enabled: false }, updateTask: { enabled: false },
+      createFilter: { enabled: false }, updateFilter: { enabled: false }, deleteFilter: { enabled: false },
+      reorderFilters: { enabled: false }, applyFilters: { enabled: false },
+      createFolder: { enabled: false }, renameFolder: { enabled: false }, deleteFolder: { enabled: false },
+      moveFolder: { enabled: false }, emptyTrash: { enabled: false }, emptyJunk: { enabled: false },
+      updateMessage: { enabled: false }, deleteMessages: { enabled: false },
+      bulk_move_by_query: { enabled: false }, createDrafts: { enabled: false },
+    },
+    accounts: {}, folders: {}
+  },
+  sendDomain: {
+    version: 1,
+    tools: {
+      sendMail:        { enabled: true, alwaysReview: true, argRules: { to: { anyOf: ["*@example.com"] }, cc: { anyOf: ["*@example.com"] }, bcc: { anyOf: ["*@example.com"] } } },
+      replyToMessage:  { enabled: true, alwaysReview: true, argRules: { to: { anyOf: ["*@example.com"] }, cc: { anyOf: ["*@example.com"] }, bcc: { anyOf: ["*@example.com"] } } },
+      forwardMessage:  { enabled: true, alwaysReview: true, argRules: { to: { anyOf: ["*@example.com"] }, cc: { anyOf: ["*@example.com"] }, bcc: { anyOf: ["*@example.com"] } } }
+    },
+    accounts: {}, folders: {}
+  },
+  trashFolderOnly: {
+    version: 1,
+    tools: {
+      deleteMessages: { enabled: false },
+      deleteFolder:   { enabled: false }
+    },
+    accounts: {},
+    folders: {
+      "imap://user%40example.com@imap.example.com/Trash": {
+        tools: {
+          deleteMessages: { enabled: true, maxBatchSize: 500 }
+        }
+      }
+    }
+  },
+  // Inbox-triage workflow: enable the aggregation + bulk tools so the AI can
+  // (a) count-by-domain, (b) dry-run a batch move, (c) execute after the user
+  // eyeballs the count. maxBatchSize caps a single bulk call at 500.
+  inventoryAndTriage: {
+    version: 1,
+    tools: {
+      inbox_inventory:     { enabled: true },
+      bulk_move_by_query:  { enabled: true, maxBatchSize: 500, requireFolderArg: true }
+    },
+    accounts: {},
+    folders: {}
+  },
+  // Parallel-correspondence workflow: enable batch draft creation but keep
+  // every send-to-recipient path review-gated (alwaysReview forces the
+  // compose window, max 10 drafts per call to prevent a runaway loop).
+  batchDrafts: {
+    version: 1,
+    tools: {
+      createDrafts:   { enabled: true, maxBatchSize: 10 },
+      sendMail:       { enabled: true, alwaysReview: true },
+      replyToMessage: { enabled: true, alwaysReview: true },
+      forwardMessage: { enabled: true, alwaysReview: true }
+    },
+    accounts: {},
+    folders: {}
+  }
+};
+
+async function loadPermissionsConfig() {
+  try {
+    const data = await browser.mcpServer.getPermissionsConfig();
+    if (data.error) {
+      savePermissionsStatus.textContent = "Error: " + data.error;
+      savePermissionsStatus.className = "save-status error";
+      return;
+    }
+    permissionsJson.value = JSON.stringify(data.policy, null, 2);
+    savePermissionsBtn.disabled = false;
+    savePermissionsStatus.textContent = "";
+  } catch (e) {
+    savePermissionsStatus.textContent = "Error loading: " + e.message;
+    savePermissionsStatus.className = "save-status error";
+  }
+}
+
+savePermissionsBtn.addEventListener("click", async () => {
+  savePermissionsBtn.disabled = true;
+  savePermissionsStatus.textContent = "Saving...";
+  savePermissionsStatus.className = "save-status";
+  let parsed;
+  try {
+    parsed = JSON.parse(permissionsJson.value || "{}");
+  } catch (e) {
+    savePermissionsStatus.textContent = "Invalid JSON: " + e.message;
+    savePermissionsStatus.className = "save-status error";
+    savePermissionsBtn.disabled = false;
+    return;
+  }
+  try {
+    const res = await browser.mcpServer.setPermissionsConfig(parsed);
+    if (res.error) {
+      savePermissionsStatus.textContent = "Error: " + res.error;
+      savePermissionsStatus.className = "save-status error";
+    } else {
+      savePermissionsStatus.textContent = "Saved.";
+      permissionsJson.value = JSON.stringify(res.policy, null, 2);
+    }
+  } catch (e) {
+    savePermissionsStatus.textContent = "Error: " + e.message;
+    savePermissionsStatus.className = "save-status error";
+  }
+  savePermissionsBtn.disabled = false;
+});
+
+clearPermissionsBtn.addEventListener("click", async () => {
+  savePermissionsStatus.textContent = "";
+  try {
+    const res = await browser.mcpServer.clearPermissionsConfig();
+    if (res.error) {
+      savePermissionsStatus.textContent = "Error: " + res.error;
+      savePermissionsStatus.className = "save-status error";
+      return;
+    }
+    permissionsJson.value = JSON.stringify(PERMISSION_PRESETS.empty, null, 2);
+    savePermissionsStatus.textContent = "Cleared.";
+    savePermissionsBtn.disabled = false;
+  } catch (e) {
+    savePermissionsStatus.textContent = "Error: " + e.message;
+    savePermissionsStatus.className = "save-status error";
+  }
+});
+
+document.querySelectorAll(".preset-btn").forEach(btn => {
+  btn.addEventListener("click", () => {
+    const preset = PERMISSION_PRESETS[btn.dataset.preset];
+    if (preset) {
+      permissionsJson.value = JSON.stringify(preset, null, 2);
+      savePermissionsStatus.textContent = "Preset loaded -- click Save policy to apply.";
+      savePermissionsStatus.className = "save-status";
+      // Re-enable Save regardless of prior state. If the initial
+      // loadPermissionsConfig() errored and left the button disabled,
+      // the user still needs to be able to commit the preset they just
+      // picked -- the preset is local data, not dependent on a
+      // successful load round-trip.
+      savePermissionsBtn.disabled = false;
+    }
+  });
+});
+
+loadServerInfo().catch(e => console.error("thunderbird-mcp options:", "loadServerInfo failed:", e));
+loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAccountAccess failed:", e));
+loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
+loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
+loadPermissionsConfig().catch(e => console.error("thunderbird-mcp options:", "loadPermissionsConfig failed:", e));

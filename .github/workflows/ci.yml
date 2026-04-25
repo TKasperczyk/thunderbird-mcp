@@ -1,0 +1,252 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, "refactor/**", "feature/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # ─── Tier 1: Unit tests ──────────────────────────────────────────────
+  # Pure-Node tests of mcp-bridge, auth, permissions, tool-access,
+  # validation, stress, json-pref-store. No Thunderbird, no network.
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          # No cache: npm -- package-lock.json is gitignored, so setup-node
+          # has nothing to key a cache against. Install is fast anyway
+          # (only acorn as a dev dep).
+
+      - name: Install dev deps
+        run: npm install --no-audit --no-fund
+
+      - name: Import-graph validation
+        run: node scripts/check-imports.cjs
+
+      - name: ESLint (no-undef + promise hygiene)
+        # Catches the bug class that ate this PR several times: free
+        # references like `isAccountAllowed`, `extractPlainTextBody`,
+        # `removeConnectionInfo` left over from the modularization cut.
+        # Errors fail the unit job; warnings (unused vars, etc) are
+        # informational. Run before the unit tests so a typo is caught
+        # before the slower test suite runs.
+        run: npm run lint -- --max-warnings 100
+
+      - name: Tool wiring audit (schema / registry / handlers / dispatch)
+        # Cross-checks the four places a tool has to exist: tools-schema,
+        # lib/tools/ registry, api.js toolHandlers bag, dispatch switch.
+        # Exits non-zero only on structural errors (e.g. schema entry
+        # without dispatch case, dispatch case with missing handlerKey);
+        # the helper-handler warnings are informational.
+        run: node scripts/madger-chromeutils.cjs tool-audit
+
+      - name: Run unit tests
+        run: |
+          node --test \
+            test/auth.test.cjs \
+            test/json-pref-store.test.cjs \
+            test/mcp-bridge.test.cjs \
+            test/permissions.test.cjs \
+            test/stress.test.cjs \
+            test/tool-access.test.cjs \
+            test/validation.test.cjs
+
+  # ─── Build XPI (reused by integration + release) ─────────────────────
+  build-xpi:
+    name: Build XPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          # No cache: npm -- package-lock.json is gitignored, so setup-node
+          # has nothing to key a cache against. Install is fast anyway
+          # (only acorn as a dev dep).
+      - run: npm install --no-audit --no-fund
+      - run: node scripts/build-xpi.cjs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: thunderbird-mcp-xpi
+          path: dist/thunderbird-mcp.xpi
+          if-no-files-found: error
+          retention-days: 14
+
+  # ─── Tier 2: Integration ─────────────────────────────────────────────
+  # Real Thunderbird (pinned ESR tarball) ↔ Greenmail (service container)
+  # ↔ our MCP bridge ↔ smoke.cjs. Asserts tools actually do the work
+  # against a live IMAP server.
+  integration:
+    name: Integration (TB ${{ matrix.tb_version }} + Greenmail)
+    runs-on: ubuntu-latest
+    needs: [unit, build-xpi]
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        tb_version: ["128.14.0esr"]
+    services:
+      greenmail:
+        image: greenmail/standalone:2.1.2
+        ports:
+          - 3025:3025   # SMTP
+          - 3143:3143   # IMAP
+          - 3465:3465   # SMTPS (unused here)
+          - 3993:3993   # IMAPS (unused here)
+        env:
+          # Greenmail config the smoke suite needs:
+          #
+          # - hostname=0.0.0.0   bind 0.0.0.0 not container-localhost.
+          #                      Without this docker-proxy SYN-accepts
+          #                      then RSTs on the first byte.
+          #
+          # - auth.disabled      accept ANY login/password. We don't
+          #                      use users= because greenmail's
+          #                      login:password[:email] parser
+          #                      mis-handles addresses with `@` in
+          #                      the login (CI run 24916777867 startup
+          #                      logged 'Creating user test@test'
+          #                      instead of test@ci.local). With
+          #                      auth.disabled the credential the
+          #                      extension injects matches whatever
+          #                      TB sends -- mailbox routing then
+          #                      happens by SMTP RCPT TO so seeded
+          #                      messages land in test@ci.local's
+          #                      inbox where TB looks for them.
+          #
+          # - setup.test.all     smtp/smtps/pop3/pop3s/imap/imaps.
+          # - verbose            wire traffic in greenmail.log artifact.
+          #
+          # NOTE: an earlier iteration removed auth.disabled because
+          # it strips AUTH= mechanisms from the IMAP CAPABILITY,
+          # which broke TB's authMethod=3. We've since switched to
+          # authMethod=2 (bare IMAP4 LOGIN, no AUTH= negotiation) so
+          # CAPABILITY content no longer matters. auth.disabled is
+          # back; the full auth path is now: extension injects creds
+          # via addLoginAsync -> TB sends LOGIN -> greenmail accepts.
+          GREENMAIL_OPTS: "-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.auth.disabled -Dgreenmail.verbose"
+        # No in-container healthcheck: greenmail/standalone is a slim JRE
+        # image without nc/curl. The "Wait for greenmail" step below polls
+        # the exposed ports from the runner instead.
+    env:
+      ESR_VERSION: ${{ matrix.tb_version }}
+      GREENMAIL_HOST: localhost
+      GREENMAIL_IMAP_PORT: "3143"
+      GREENMAIL_SMTP_PORT: "3025"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          # No cache: npm -- package-lock.json is gitignored, so setup-node
+          # has nothing to key a cache against. Install is fast anyway
+          # (only acorn as a dev dep).
+
+      - name: Install runtime deps for Thunderbird
+        # Same package list as docker/integration.Dockerfile. Kept inline
+        # so the GH job doesn't have to pull our image (saves 10 min per
+        # run vs. `docker build`). bzip2 is required for TB tarball
+        # extraction.
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl bzip2 \
+            libgtk-3-0 libasound2t64 libx11-xcb1 libxcomposite1 libxdamage1 \
+            libxext6 libxfixes3 libxrandr2 libgbm1 libpango-1.0-0 libpangocairo-1.0-0 \
+            libnss3 libnspr4 libcups2 libdrm2 libxkbcommon0 libatk1.0-0 \
+            libatk-bridge2.0-0 libatspi2.0-0 libdbus-glib-1-2 libxtst6 \
+            dbus dbus-x11 netcat-openbsd jq
+
+      - name: Install Thunderbird ${{ matrix.tb_version }}
+        # Mozilla ships TB Linux builds as .tar.bz2 (unlike Firefox which
+        # uses .tar.xz). If this URL ever 404s, the first check is whether
+        # Mozilla switched back to xz or whether the pinned version was
+        # EOL'd -- see https://ftp.mozilla.org/pub/thunderbird/releases/
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /opt/thunderbird
+          curl -fsSL \
+            "https://ftp.mozilla.org/pub/thunderbird/releases/${ESR_VERSION}/linux-x86_64/en-US/thunderbird-${ESR_VERSION}.tar.bz2" \
+            -o /tmp/tb.tar.bz2
+          sudo tar -xjf /tmp/tb.tar.bz2 -C /opt/thunderbird --strip-components=1
+          sudo ln -sf /opt/thunderbird/thunderbird /usr/local/bin/thunderbird
+          thunderbird --version
+          thunderbird --headless --version
+
+      - name: Install npm deps (better-sqlite3 for trace-dump)
+        # smoke.cjs + seed-greenmail.cjs + run.sh stay zero-dep; the
+        # only reason for this step is scripts/trace-dump.cjs which
+        # uses better-sqlite3 to read the structured-trace artifact
+        # on failure. Cheap install, builds in <30s.
+        run: npm install --no-audit --no-fund
+
+      - name: Download XPI artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: thunderbird-mcp-xpi
+          path: dist/
+
+      - name: Wait for greenmail
+        run: |
+          for i in $(seq 1 30); do
+            if nc -z localhost 3143 && nc -z localhost 3025; then
+              echo "greenmail up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "greenmail never came up" >&2
+          exit 1
+
+      - name: Run integration suite
+        run: SKIP_BUILD=1 bash test/integration/run.sh
+
+      - name: Dump structured trace on failure (debug+)
+        if: failure()
+        run: |
+          echo "=== /tmp/thunderbird-mcp-trace.sqlite ==="
+          ls -la /tmp/thunderbird-mcp-trace.sqlite 2>&1 || true
+          ls -la /tmp/thunderbird-mcp-trace.jsonl 2>&1 || true
+          node scripts/trace-dump.cjs --limit=400 --min-level=1 || true
+          echo "=== end trace ==="
+
+      - name: Capture greenmail logs on failure
+        if: failure()
+        # docker logs is how we reach a GH Actions service container's
+        # stdout. Container name is <svc>_<random> but the image name is
+        # stable enough to grep.
+        run: |
+          docker ps -a
+          CID=$(docker ps -a --filter "ancestor=greenmail/standalone:2.1.2" --format '{{.ID}}' | head -1)
+          if [ -n "$CID" ]; then
+            docker logs "$CID" > /tmp/greenmail.log 2>&1 || true
+            echo "--- greenmail last 60 lines ---"
+            tail -60 /tmp/greenmail.log || true
+          else
+            echo "no greenmail container found"
+          fi
+
+      - name: Upload TB + greenmail logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: tb-logs-${{ matrix.tb_version }}
+          path: |
+            /tmp/tb-stdout.log
+            /tmp/tb-stderr.log
+            /tmp/tb-moz.log*
+            /tmp/greenmail.log
+            /tmp/thunderbird-mcp-trace.sqlite
+            /tmp/thunderbird-mcp-trace.jsonl
+            /tmp/thunderbird-mcp/connection.json
+          if-no-files-found: ignore
+          retention-days: 7

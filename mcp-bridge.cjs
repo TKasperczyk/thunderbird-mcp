@@ -7,7 +7,6 @@
  */
 
 const http = require('http');
-const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -22,6 +21,47 @@ const DEFAULT_PROC_ROOT = '/proc';
 const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
 const CONNECTION_FILE_BASENAME = 'connection.json';
+
+// MCP protocol versions the bridge negotiates. This list intentionally tracks
+// the bundled @modelcontextprotocol/sdk inside Claude Desktop, NOT the latest
+// published spec. The new 2025-11-25 spec exists, but Claude Desktop's
+// client-side SDK was pinned at LATEST_PROTOCOL_VERSION='2025-06-18' before
+// that spec landed; if we echo "2025-11-25" back the client SDK's validator
+// silently rejects the negotiated version and we sit at a 60-second timeout.
+// Filesystem MCP returns "2025-06-18" against the same client and attaches
+// fine -- we mirror that.
+//
+// Authoritative reference (from the SDK bundled with Anthropic's Filesystem
+// MCP extension):
+//   LATEST_PROTOCOL_VERSION = '2025-06-18';
+//   SUPPORTED_PROTOCOL_VERSIONS =
+//     ['2025-06-18','2025-03-26','2024-11-05','2024-10-07'];
+const SUPPORTED_PROTOCOL_VERSIONS = new Set([
+  '2024-10-07',
+  '2024-11-05',
+  '2025-03-26',
+  '2025-06-18',
+]);
+const LATEST_PROTOCOL_VERSION = '2025-06-18';
+const BRIDGE_VERSION = (() => {
+  try {
+    return require('./package.json').version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+const SERVER_INFO = Object.freeze({
+  name: 'thunderbird-mcp',
+  version: BRIDGE_VERSION,
+});
+
+const DEBUG = !!process.env.THUNDERBIRD_MCP_DEBUG;
+
+function debugLog(message) {
+  if (DEBUG) {
+    process.stderr.write('[thunderbird-mcp] ' + message + '\n');
+  }
+}
 
 let cachedConnectionInfo = null;
 let connectionCacheExpiry = 0;
@@ -497,7 +537,10 @@ function buildConnectionDiscoveryErrorMessage() {
 }
 
 function sanitizeJson(data) {
-  // Remove control chars except \n, \r, \t
+  // Remove control chars except \n, \r, \t. The character class is
+  // intentional -- JSON-RPC payloads sometimes carry stray control
+  // bytes from upstream bugs and we sanitize them out before parse.
+  // eslint-disable-next-line no-control-regex
   let sanitized = data.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
   // Escape raw newlines/carriage returns/tabs that aren't already escaped.
   // Match an even number of backslashes (including zero) before the control
@@ -523,16 +566,21 @@ async function handleMessage(line) {
   // Handle MCP lifecycle methods locally so the bridge can complete
   // handshake even when Thunderbird isn't running yet.
   switch (message.method) {
-    case 'initialize':
+    case 'initialize': {
+      const requested = message.params?.protocolVersion;
+      const negotiated = (typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.has(requested))
+        ? requested
+        : LATEST_PROTOCOL_VERSION;
       return {
         jsonrpc: '2.0',
         id: message.id,
         result: {
-          protocolVersion: '2024-11-05',
+          protocolVersion: negotiated,
           capabilities: { tools: {} },
-          serverInfo: { name: 'thunderbird-mcp', version: '0.1.0' }
-        }
+          serverInfo: SERVER_INFO,
+        },
       };
+    }
     case 'ping':
       return { jsonrpc: '2.0', id: message.id, result: {} };
     case 'resources/list':
@@ -655,23 +703,56 @@ async function forwardToThunderbird(message, _retried) {
 }
 
 function startBridge() {
-  // Ensure stdout doesn't buffer - critical for MCP protocol
-  if (process.stdout._handle?.setBlocking) {
-    process.stdout._handle.setBlocking(true);
-  }
+  debugLog(`startup version=${BRIDGE_VERSION} pid=${process.pid} platform=${process.platform}`);
 
-  let pendingRequests = 0;
-  let stdinClosed = false;
-
-  function checkExit() {
-    if (stdinClosed && pendingRequests === 0) {
+  // Stdout is a pipe to whoever spawned us (Claude Desktop, the smoke
+  // harness, etc). When that side closes early -- because they timed
+  // out a tools/call, killed us, or just exited -- the next write
+  // raises EPIPE on the underlying socket. Without an 'error' listener
+  // Node terminates with an unhandled 'error' event, dumping a stack
+  // trace and exit code 1 even though the right behavior is a clean
+  // shutdown.
+  //
+  // Treat any pipe-close as a graceful exit: we have no one to talk to,
+  // there's nothing useful to do. Use code 0 because EPIPE-on-stdout is
+  // a normal end-of-life for a stdio transport, not a fault.
+  let pipeClosed = false;
+  function handlePipeError(stream, err) {
+    if (pipeClosed) return;
+    if (err && (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED")) {
+      pipeClosed = true;
+      debugLog(`stdio pipe closed (${stream}, ${err.code}); exiting cleanly`);
+      // Drain anything we still owe before exiting; if we can't, just
+      // give up. process.exit is intentional here -- without it we'd
+      // sit on the event loop until something else kills us.
+      try { process.stdout.end(); } catch {}
+      try { process.stderr.end(); } catch {}
       process.exit(0);
     }
+    // Anything else: surface it. If the stream is genuinely broken in
+    // some other way we want a stack trace, not a silent exit.
+    throw err;
   }
+  process.stdout.on('error', (err) => handlePipeError('stdout', err));
+  process.stdin.on('error',  (err) => handlePipeError('stdin',  err));
 
   function writeOutput(data) {
     return new Promise((resolve) => {
-      if (process.stdout.write(data)) {
+      if (pipeClosed) {
+        resolve();
+        return;
+      }
+      let ok;
+      try {
+        ok = process.stdout.write(data);
+      } catch (e) {
+        // Sync EPIPE -- handler above resolves the promise via the
+        // pipeClosed flag flip, but we still need to unblock callers.
+        handlePipeError('stdout-sync', e);
+        resolve();
+        return;
+      }
+      if (ok) {
         resolve();
       } else {
         process.stdout.once('drain', resolve);
@@ -679,51 +760,94 @@ function startBridge() {
     });
   }
 
-  // Process stdin as JSON-RPC messages
-  const rl = readline.createInterface({ input: process.stdin, terminal: false });
-
-  rl.on('line', (line) => {
+  function dispatch(line) {
     if (!line.trim()) {
       return;
     }
 
     let messageId = null;
+    let messageMethod = null;
     try {
-      messageId = JSON.parse(line).id ?? null;
+      const parsed = JSON.parse(line);
+      messageId = parsed.id ?? null;
+      messageMethod = parsed.method ?? null;
     } catch {
       // Leave as null when request cannot be parsed
     }
 
-    pendingRequests++;
+    debugLog(`recv method=${messageMethod} id=${messageId}`);
+
     handleMessage(line)
       .then(async (response) => {
         if (response !== null) {
           await writeOutput(JSON.stringify(response) + '\n');
+          debugLog(`send id=${messageId} method=${messageMethod}`);
         }
       })
       .catch(async (err) => {
+        debugLog(`error id=${messageId} method=${messageMethod} message=${err.message}`);
         await writeOutput(JSON.stringify({
           jsonrpc: '2.0',
           id: messageId,
           error: { code: -32700, message: `Bridge error: ${err.message}` }
         }) + '\n');
-      })
-      .finally(() => {
-        pendingRequests--;
-        checkExit();
       });
-  });
+  }
 
-  rl.on('close', () => {
-    stdinClosed = true;
-    checkExit();
+  // Manual newline-delimited JSON parsing on raw stdin. Matches what the
+  // official @modelcontextprotocol/sdk stdio transport does.
+  //
+  // We deliberately do NOT call process.exit on stdin 'end' or on signals.
+  // Claude Desktop closes stdin as a normal teardown signal but may still
+  // be waiting for an in-flight stdout response to come back. Exiting on
+  // 'end' races against the response write on Windows pipes (where 'end'
+  // can fire in the same tick as 'data') and silently drops the response.
+  // Let the host kill us when it's actually done.
+  process.stdin.setEncoding('utf8');
+  let buffer = '';
+  process.stdin.on('data', (chunk) => {
+    buffer += chunk;
+    let idx;
+    while ((idx = buffer.indexOf('\n')) !== -1) {
+      const line = buffer.slice(0, idx).replace(/\r$/, '');
+      buffer = buffer.slice(idx + 1);
+      dispatch(line);
+    }
   });
-
-  process.on('SIGINT', () => process.exit(0));
-  process.on('SIGTERM', () => process.exit(0));
+  process.stdin.on('end', () => {
+    if (buffer.length > 0) {
+      const tail = buffer.replace(/\r$/, '');
+      buffer = '';
+      dispatch(tail);
+    }
+  });
 }
 
-if (require.main === module) {
+// Decide whether to auto-start the bridge.
+//
+// The standard `require.main === module` guard works when the bridge is
+// invoked as `node mcp-bridge.cjs`, but Claude Desktop's "built-in Node.js"
+// loader (verified via runtime trace: `require.main` points to
+// app.asar/.vite/build/mcp-runtime/nodeHost.js) wraps the script such that
+// `require.main !== module` even though the bridge IS the entry point.
+// Without the argv fallback, top-level constants get evaluated, the file
+// is loaded, but startBridge() never runs and the client sits at a
+// 60-second initialize timeout because no stdin listener is ever installed.
+//
+// Fall back to an argv heuristic: if argv[1] basename matches the bridge
+// script, we are running as the entry script no matter what require.main
+// reports. Tests that `require('../mcp-bridge.cjs')` use a different
+// argv[1] (the test file or the test runner) and correctly skip auto-start.
+const _autoStart = (() => {
+  if (require.main === module) return true;
+  try {
+    const entry = (process.argv && process.argv[1]) || '';
+    if (entry && path.basename(entry) === 'mcp-bridge.cjs') return true;
+  } catch { /* fall through */ }
+  return false;
+})();
+
+if (_autoStart) {
   startBridge();
 }
 

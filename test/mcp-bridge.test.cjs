@@ -226,7 +226,15 @@ describe('Bridge discovery', () => {
       token: 'foreign-token',
     });
 
+    // Explicitly override BOTH files' stat.uid. On Linux/macOS, fs.statSync
+    // would return the test process's real uid (matching currentUid) for
+    // both files since the test process created them. On Windows, fs.statSync
+    // always returns uid=0 for everything (NTFS has no POSIX uid concept),
+    // so without an explicit override the owned file would be wrongly
+    // skipped by the macOS uid filter and the test would fail on Windows
+    // even though the production code is correct.
     const statOverrides = new Map();
+    statOverrides.set(ownedConnFile, { uid: currentUid });
     statOverrides.set(foreignConnFile, { uid: currentUid + 1 });
 
     const connInfo = readConnectionInfo({

@@ -97,6 +97,10 @@ const ALL_TOOLS = [
   { name: "reorderFilters", group: "filters", crud: "update" },
   { name: "applyFilters", group: "filters", crud: "update" },
   { name: "deleteFilter", group: "filters", crud: "delete" },
+  // Aggregation + bulk + batch-draft tools (new):
+  { name: "inbox_inventory", group: "messages", crud: "read" },
+  { name: "bulk_move_by_query", group: "messages", crud: "update" },
+  { name: "createDrafts", group: "messages", crud: "create" },
 ];
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -590,7 +594,7 @@ describe("Tool metadata: tools/list stripping", () => {
 
 describe("Tool access: tag keyword validation", () => {
   // Mirrors production: allowlist of safe IMAP atom characters
-  const VALID_TAG = /^[a-zA-Z0-9_$.\-]+$/;
+  const VALID_TAG = /^[a-zA-Z0-9_$.-]+$/;
   function sanitizeTags(tags) {
     return (tags || []).filter(t => typeof t === "string" && VALID_TAG.test(t));
   }
@@ -783,45 +787,58 @@ describe("Build version: options.js display parsing", () => {
 // ── Structural: ALL_TOOLS sync with production ───────────────────────
 
 describe("Structural: test data matches production source", () => {
-  it("ALL_TOOLS count matches tool definitions in api.js", () => {
-    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
-    const src = fs.readFileSync(apiPath, "utf8");
-    // Count tool name declarations in the tools array: name: "toolName"
-    // Each tool object in the `const tools = [...]` array has a name field
-    const nameMatches = src.match(/{\s*name:\s*"[a-zA-Z]+"/g);
-    assert.ok(nameMatches, "Could not find tool name declarations in api.js");
+  // Tools are declared in two places now:
+  //   (a) lib/tools-schema.sys.mjs                     legacy bulk list
+  //   (b) lib/tools/*.sys.mjs (export const tool={...}) registry-migrated
+  // Structural tests union-scan both so ALL_TOOLS stays in sync.
+  const TOOLS_SCHEMA_PATH = path.join(__dirname, "..", "extension", "mcp_server", "lib", "tools-schema.sys.mjs");
+  const TOOLS_DIR = path.join(__dirname, "..", "extension", "mcp_server", "lib", "tools");
+  const CONSTANTS_PATH = path.join(__dirname, "..", "extension", "mcp_server", "lib", "constants.sys.mjs");
+
+  function collectProductionToolNames() {
+    const names = new Set();
+    const bulkSrc = fs.readFileSync(TOOLS_SCHEMA_PATH, "utf8");
+    for (const m of bulkSrc.matchAll(/{\s*name:\s*"([a-zA-Z_]+)"/g)) names.add(m[1]);
+    if (fs.existsSync(TOOLS_DIR)) {
+      for (const entry of fs.readdirSync(TOOLS_DIR, { withFileTypes: true })) {
+        if (!entry.isFile() || entry.name.startsWith("_") || !entry.name.endsWith(".sys.mjs")) continue;
+        const src = fs.readFileSync(path.join(TOOLS_DIR, entry.name), "utf8");
+        const m = src.match(/export\s+const\s+tool\s*=\s*{[\s\S]*?name:\s*"([a-zA-Z_]+)"/);
+        if (m) names.add(m[1]);
+      }
+    }
+    return [...names].sort();
+  }
+
+  it("ALL_TOOLS count matches tool definitions across schema + registry", () => {
+    const prodNames = collectProductionToolNames();
+    assert.ok(prodNames.length > 0, "Could not find any tool name declarations");
     assert.equal(
       ALL_TOOLS.length,
-      nameMatches.length,
-      `Test ALL_TOOLS has ${ALL_TOOLS.length} tools but api.js has ${nameMatches.length} tool definitions. ` +
-      `Update ALL_TOOLS when adding/removing tools.`
+      prodNames.length,
+      `Test ALL_TOOLS has ${ALL_TOOLS.length} tools but production has ${prodNames.length}. Update ALL_TOOLS.`
     );
   });
 
   it("ALL_TOOLS names match production tool names", () => {
-    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
-    const src = fs.readFileSync(apiPath, "utf8");
-    const nameMatches = src.match(/{\s*name:\s*"([a-zA-Z]+)"/g);
-    const prodNames = nameMatches.map(m => m.match(/"([a-zA-Z]+)"/)[1]).sort();
+    const prodNames = collectProductionToolNames();
     const testNames = ALL_TOOLS.map(t => t.name).sort();
     assert.deepStrictEqual(testNames, prodNames, "Test ALL_TOOLS names don't match production");
   });
 
   it("VALID_GROUPS matches production VALID_GROUPS", () => {
-    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
-    const src = fs.readFileSync(apiPath, "utf8");
-    const m = src.match(/const VALID_GROUPS\s*=\s*\[([^\]]+)\]/);
-    assert.ok(m, "Could not find VALID_GROUPS in api.js");
+    const src = fs.readFileSync(CONSTANTS_PATH, "utf8");
+    const m = src.match(/export const VALID_GROUPS\s*=\s*\[([^\]]+)\]/);
+    assert.ok(m, "Could not find VALID_GROUPS in constants.sys.mjs");
     const prodGroups = m[1].match(/"([^"]+)"/g).map(s => s.replace(/"/g, "")).sort();
     const testGroups = [...VALID_GROUPS].sort();
     assert.deepStrictEqual(testGroups, prodGroups, "Test VALID_GROUPS doesn't match production");
   });
 
   it("VALID_CRUD matches production VALID_CRUD", () => {
-    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
-    const src = fs.readFileSync(apiPath, "utf8");
-    const m = src.match(/const VALID_CRUD\s*=\s*\[([^\]]+)\]/);
-    assert.ok(m, "Could not find VALID_CRUD in api.js");
+    const src = fs.readFileSync(CONSTANTS_PATH, "utf8");
+    const m = src.match(/export const VALID_CRUD\s*=\s*\[([^\]]+)\]/);
+    assert.ok(m, "Could not find VALID_CRUD in constants.sys.mjs");
     const prodCrud = m[1].match(/"([^"]+)"/g).map(s => s.replace(/"/g, "")).sort();
     const testCrud = [...VALID_CRUD].sort();
     assert.deepStrictEqual(testCrud, prodCrud, "Test VALID_CRUD doesn't match production");
