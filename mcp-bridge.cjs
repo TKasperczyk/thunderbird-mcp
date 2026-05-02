@@ -21,10 +21,10 @@ function isWsl({ fsImpl = fs } = {}) {
   }
 }
 
-function detectWslGatewayIp({ fsImpl = fs, resolvPath = '/etc/resolv.conf' } = {}) {
+function detectWslGatewayIp({ fsImpl = fs } = {}) {
   if (!isWsl({ fsImpl })) return null;
   try {
-    const resolv = fsImpl.readFileSync(resolvPath, 'utf8');
+    const resolv = fsImpl.readFileSync('/etc/resolv.conf', 'utf8');
     const match = resolv.match(/^nameserver\s+(\S+)/m);
     return match ? match[1] : null;
   } catch {
