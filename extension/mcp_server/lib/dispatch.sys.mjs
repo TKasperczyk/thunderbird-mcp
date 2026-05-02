@@ -212,7 +212,7 @@ export function makeDispatch({
       case "deleteEvent":
         return await toolHandlers.deleteEvent(args.eventId, args.calendarId);
       case "createTask":
-        return toolHandlers.createTask(args.title, args.dueDate, args.calendarId);
+        return await toolHandlers.createTask(args.title, args.dueDate, args.calendarId, args.description, args.priority, args.categories, args.skipReview);
       case "listTasks":
         return await toolHandlers.listTasks(args.calendarId, args.completed, args.dueBefore, args.maxResults);
       case "updateTask":

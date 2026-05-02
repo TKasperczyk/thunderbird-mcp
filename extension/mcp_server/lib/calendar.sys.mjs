@@ -490,12 +490,9 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
     }
   }
 
-  function createTask(title, dueDate, calendarId) {
+  async function createTask(title, dueDate, calendarId, description, priority, categories, skipReview) {
     if (!cal || !CalTodo) return { error: "Calendar module not available" };
     try {
-      const win = Services.wm.getMostRecentWindow("mail:3pane");
-      if (!win) return { error: "No Thunderbird window found" };
-
       let dueDt = null;
       if (dueDate) {
         const js = new Date(dueDate);
@@ -521,6 +518,29 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
         }
       }
 
+      if (skipReview) {
+        // Direct save -- supports description, priority, and categories.
+        if (!targetCalendar) {
+          // Pick first writable task-capable calendar when none specified.
+          targetCalendar = cal.manager.getCalendars().find(
+            c => !c.readOnly && c.getProperty("capabilities.tasks.supported") !== false
+          );
+          if (!targetCalendar) return { error: "No writable task-capable calendar found" };
+        }
+        const todo = new CalTodo();
+        todo.title = title;
+        if (dueDt) todo.dueDate = dueDt;
+        if (description) todo.setProperty("DESCRIPTION", description);
+        if (priority !== undefined) todo.priority = priority;
+        if (categories && categories.length > 0) todo.setCategories(categories);
+        await targetCalendar.addItem(todo);
+        return { success: true, message: `Task "${title}" created in calendar "${targetCalendar.name}"` };
+      }
+
+      const win = Services.wm.getMostRecentWindow("mail:3pane");
+      if (!win) return { error: "No Thunderbird window found" };
+
+      // description, priority, and categories require skipReview: true.
       // Cross-context CalTodo objects cause silent save failure in dialog.
       // Pass title as summary param; TB creates its own CalTodo internally.
       win.createTodoWithDialog(targetCalendar, dueDt, title, null);
