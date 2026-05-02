@@ -3286,15 +3286,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             function descriptionToHTML(text) {
-              const escaped = text
+              // Stash existing <a> tags so they survive HTML escaping.
+              const anchors = [];
+              let processed = text.replace(/<a\s[^>]*>[\s\S]*?<\/a>/gi, match => {
+                anchors.push(match);
+                return `\x00ANCHOR${anchors.length - 1}\x00`;
+              });
+              // Escape remaining plain text, then auto-link bare URLs.
+              processed = processed
                 .replace(/&/g, "&amp;")
                 .replace(/</g, "&lt;")
                 .replace(/>/g, "&gt;");
-              const linked = escaped.replace(
+              processed = processed.replace(
                 /https?:\/\/[^\s<>"]+/g,
                 url => `<a href="${url}">${url}</a>`
               );
-              return `<html><body><div>${linked.replace(/\n/g, "<br>")}</div></body></html>`;
+              // Restore stashed <a> tags and convert newlines.
+              processed = processed.replace(/\x00ANCHOR(\d+)\x00/g, (_, i) => anchors[i]);
+              return `<html><body><div>${processed.replace(/\n/g, "<br>")}</div></body></html>`;
             }
 
             async function createTask(title, dueDate, calendarId, description, priority, categories, skipReview) {
