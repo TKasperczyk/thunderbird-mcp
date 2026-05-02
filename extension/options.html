@@ -143,6 +143,21 @@
     <span class="info-label">Build:</span>
     <span id="buildInfo" class="info-value">--</span>
   </div>
+  <div class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="listenAll">
+        <span>Listen on all interfaces</span>
+      </label>
+    </li>
+  </div>
+  <p class="mode-note">
+    When enabled, the MCP server binds to 0.0.0.0 instead of 127.0.0.1, making it accessible from other machines on your network. Required for WSL or remote bridge access. Auth token is still required.
+  </p>
+  <div class="save-row">
+    <button id="saveListenAllBtn" disabled>Save</button>
+    <span id="saveListenAllStatus" class="save-status"></span>
+  </div>
 </div>
 
 <div class="section">
