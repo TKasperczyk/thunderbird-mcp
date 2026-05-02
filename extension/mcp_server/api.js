@@ -253,13 +253,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "createTask",
         group: "calendar", crud: "create",
         title: "Create Task",
-        description: "Open a pre-filled task dialog in Thunderbird for user review before saving",
+        description: "Open a pre-filled task dialog in Thunderbird for user review before saving, or save directly when skipReview is true. Description, priority, and categories are only applied when skipReview is true.",
         inputSchema: {
           type: "object",
           properties: {
             title: { type: "string", description: "Task title" },
             dueDate: { type: "string", description: "Due date in ISO 8601 format (optional)" },
             calendarId: { type: "string", description: "Target calendar ID (from listCalendars, must have supportsTasks=true)" },
+            description: { type: "string", description: "Task description/body (optional; only applied when skipReview is true)" },
+            priority: { type: "integer", description: "Priority: 1=high, 5=normal, 9=low (optional; only applied when skipReview is true)" },
+            categories: { type: "array", items: { type: "string" }, description: "Category labels, e.g. [\"personal\"] (optional; only applied when skipReview is true)" },
+            skipReview: { type: "boolean", description: "If true, save the task directly without opening a review dialog (default: false). Required to apply description, priority, and categories." },
           },
           required: ["title"],
         },
@@ -3265,12 +3269,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function createTask(title, dueDate, calendarId) {
+            async function createTask(title, dueDate, calendarId, description, priority, categories, skipReview) {
               if (!cal || !CalTodo) return { error: "Calendar module not available" };
               try {
-                const win = Services.wm.getMostRecentWindow("mail:3pane");
-                if (!win) return { error: "No Thunderbird window found" };
-
                 let dueDt = null;
                 if (dueDate) {
                   const js = new Date(dueDate);
@@ -3296,8 +3297,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                 }
 
+                if (skipReview) {
+                  // Direct save — supports description, priority, and categories.
+                  if (!targetCalendar) {
+                    // Pick first writable task-capable calendar when none specified.
+                    targetCalendar = cal.manager.getCalendars().find(
+                      c => !c.readOnly && c.getProperty("capabilities.tasks.supported") !== false
+                    );
+                    if (!targetCalendar) return { error: "No writable task-capable calendar found" };
+                  }
+                  const todo = new CalTodo();
+                  todo.title = title;
+                  if (dueDt) todo.dueDate = dueDt;
+                  if (description) todo.setProperty("DESCRIPTION", description);
+                  if (priority !== undefined) todo.priority = priority;
+                  if (categories && categories.length > 0) todo.setCategories(categories);
+                  await targetCalendar.addItem(todo);
+                  return { success: true, message: `Task "${title}" created in calendar "${targetCalendar.name}"` };
+                }
+
+                const win = Services.wm.getMostRecentWindow("mail:3pane");
+                if (!win) return { error: "No Thunderbird window found" };
+
                 // Cross-context CalTodo objects cause silent save failure in dialog.
                 // Pass title as summary param; TB creates its own CalTodo internally.
+                // description, priority, and categories require skipReview: true.
                 win.createTodoWithDialog(targetCalendar, dueDt, title, null);
 
                 return { success: true, message: `Task dialog opened for "${title}"` };
@@ -5305,7 +5329,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId);
                 case "createTask":
-                  return createTask(args.title, args.dueDate, args.calendarId);
+                  return await createTask(args.title, args.dueDate, args.calendarId, args.description, args.priority, args.categories, args.skipReview);
                 case "listTasks":
                   return await listTasks(args.calendarId, args.completed, args.dueBefore, args.maxResults);
                 case "updateTask":
