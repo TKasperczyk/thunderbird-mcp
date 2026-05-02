@@ -7,6 +7,7 @@ const path = require('path');
 const {
   buildConnectionDiscoveryErrorMessage,
   clearConnectionCache,
+  detectWslGatewayIp,
   readConnectionInfo,
 } = require('../mcp-bridge.cjs');
 
@@ -272,5 +273,62 @@ describe('Bridge discovery', () => {
     assert.equal(readConnectionInfo(options), null);
     assert.match(buildConnectionDiscoveryErrorMessage(), /THUNDERBIRD_MCP_CONNECTION_FILE/);
     assert.match(buildConnectionDiscoveryErrorMessage(), /file not found/);
+  });
+});
+
+describe('WSL gateway detection', () => {
+  let root;
+
+  beforeEach(() => {
+    root = makeTempRoot();
+  });
+
+  afterEach(() => {
+    cleanupTempRoot(root);
+  });
+
+  it('returns gateway IP from resolv.conf', () => {
+    const resolvPath = path.join(root, 'resolv.conf');
+    fs.writeFileSync(resolvPath, 'nameserver 172.20.100.1\nsearch localdomain\n', 'utf8');
+
+    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath });
+    assert.equal(ip, '172.20.100.1');
+  });
+
+  it('returns null when resolv.conf is missing', () => {
+    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath: path.join(root, 'nonexistent') });
+    assert.equal(ip, null);
+  });
+
+  it('returns null when resolv.conf has no nameserver line', () => {
+    const resolvPath = path.join(root, 'resolv.conf');
+    fs.writeFileSync(resolvPath, 'search localdomain\noptions timeout:2\n', 'utf8');
+
+    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath });
+    assert.equal(ip, null);
+  });
+
+  it('returns null when resolv.conf is empty', () => {
+    const resolvPath = path.join(root, 'resolv.conf');
+    fs.writeFileSync(resolvPath, '', 'utf8');
+
+    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath });
+    assert.equal(ip, null);
+  });
+
+  it('handles nameserver with trailing whitespace', () => {
+    const resolvPath = path.join(root, 'resolv.conf');
+    fs.writeFileSync(resolvPath, 'nameserver  192.168.1.1   \n', 'utf8');
+
+    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath });
+    assert.equal(ip, '192.168.1.1');
+  });
+
+  it('uses first nameserver when multiple are present', () => {
+    const resolvPath = path.join(root, 'resolv.conf');
+    fs.writeFileSync(resolvPath, 'nameserver 10.0.0.1\nnameserver 10.0.0.2\n', 'utf8');
+
+    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath });
+    assert.equal(ip, '10.0.0.1');
   });
 });

@@ -12,9 +12,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-function detectWslGatewayIp() {
+function detectWslGatewayIp({ fsImpl = fs, resolvPath = '/etc/resolv.conf' } = {}) {
   try {
-    const resolv = fs.readFileSync('/etc/resolv.conf', 'utf8');
+    const resolv = fsImpl.readFileSync(resolvPath, 'utf8');
     const match = resolv.match(/^nameserver\s+(\S+)/m);
     return match ? match[1] : null;
   } catch {
@@ -22,8 +22,10 @@ function detectWslGatewayIp() {
   }
 }
 
-const thunderbirdGatewayIp = detectWslGatewayIp() ?? '127.0.0.1';
-const THUNDERBIRD_HOSTS = [thunderbirdGatewayIp, '127.0.0.1'];
+const wslGatewayIp = detectWslGatewayIp();
+const THUNDERBIRD_HOSTS = wslGatewayIp && wslGatewayIp !== '127.0.0.1'
+  ? [wslGatewayIp, '127.0.0.1']
+  : ['127.0.0.1'];
 const CONNECT_TIMEOUT = 2000; // ms — fail fast when trying unreachable hosts
 const REQUEST_TIMEOUT = 30000;
 const CONNECTION_RETRY_DELAY_MS = 1000;
@@ -782,6 +784,7 @@ module.exports = {
   buildConnectionDiscoveryErrorMessage,
   clearConnectionCache,
   createDiscoveryContext,
+  detectWslGatewayIp,
   discoverConnectionInfo,
   findFlatpakConnectionCandidates,
   findMacOsConnectionCandidates,
