@@ -501,6 +501,8 @@ nsHttpServer.prototype = {
   },
 
   startAll(port) {
+    // Bind to all interfaces on both IPv4 and IPv6 via dual-stack socket.
+    // Uses "::" (not "0.0.0.0") so the kernel enables dual-stack mode.
     this._start(port, "::", true);
   },
 
@@ -531,14 +533,9 @@ nsHttpServer.prototype = {
       );
 
     try {
-      var loopback = true;
-      if (
-        this._host != "127.0.0.1" &&
-        this._host != "localhost" &&
-        this._host != "[::1]"
-      ) {
-        loopback = false;
-      }
+      var loopback = this._host === "127.0.0.1" ||
+        this._host === "localhost" ||
+        this._host === "[::1]";
 
       // When automatically selecting a port, sometimes the chosen port is
       // "blocked" from clients. We don't want to use these ports because

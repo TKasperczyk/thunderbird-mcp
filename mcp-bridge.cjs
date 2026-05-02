@@ -12,15 +12,18 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// Detect Windows gateway IP from /etc/resolv.conf (WSL2 NAT gateway).
-// Falls back to 127.0.0.1 on non-WSL systems or if detection fails.
-let windowsHost = '127.0.0.1';
-try {
-  const resolv = fs.readFileSync('/etc/resolv.conf', 'utf8');
-  const m = resolv.match(/^nameserver\s+(\S+)/m);
-  if (m) windowsHost = m[1];
-} catch { /* not WSL or resolv.conf unavailable */ }
-const THUNDERBIRD_HOSTS = [windowsHost, '127.0.0.1'];
+function detectWslGatewayIp() {
+  try {
+    const resolv = fs.readFileSync('/etc/resolv.conf', 'utf8');
+    const match = resolv.match(/^nameserver\s+(\S+)/m);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+const thunderbirdGatewayIp = detectWslGatewayIp() ?? '127.0.0.1';
+const THUNDERBIRD_HOSTS = [thunderbirdGatewayIp, '127.0.0.1'];
 const CONNECT_TIMEOUT = 2000; // ms — fail fast when trying unreachable hosts
 const REQUEST_TIMEOUT = 30000;
 const CONNECTION_RETRY_DELAY_MS = 1000;
@@ -585,7 +588,7 @@ function parseHttpResponse(response) {
  * Send a JSON-RPC message to Thunderbird over a raw TCP socket.
  * Uses HTTP/1.0 to stay compatible with Windows netsh portproxy.
  */
-function tryRequest(hostname, postData, port, token) {
+function requestViaSocket(hostname, postData, port, token) {
   return new Promise((resolve, reject) => {
     const request = buildHttpRequest(postData, port, token);
 
@@ -634,26 +637,50 @@ function tryRequest(hostname, postData, port, token) {
   });
 }
 
-async function forwardToThunderbird(message, _retried) {
-  const postData = JSON.stringify(message);
-
-  // Read connection info (port + auth token) from the file written by the extension.
-  // Fail-closed: if the connection file is missing, retry a few times
-  // (Thunderbird may still be starting), then fail with an error.
-  // Never forward requests without authentication.
+async function readConnectionInfoWithRetry() {
   let connInfo = readConnectionInfo();
   if (!connInfo) {
     for (let attempt = 0; attempt < CONNECTION_MAX_RETRIES; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, CONNECTION_RETRY_DELAY_MS));
       connInfo = readConnectionInfo();
-      if (connInfo) {
-        break;
-      }
-    }
-    if (!connInfo) {
-      throw new Error(buildConnectionDiscoveryErrorMessage());
+      if (connInfo) break;
     }
   }
+  if (!connInfo) {
+    throw new Error(buildConnectionDiscoveryErrorMessage());
+  }
+  return connInfo;
+}
+
+function isConnectionFailure(err) {
+  return err.code === 'ECONNREFUSED' ||
+    err.code === 'EADDRNOTAVAIL' ||
+    err.code === 'EAFNOSUPPORT' ||
+    err.code === 'ECONNRESET' ||
+    (err.message && err.message.includes('timed out'));
+}
+
+function shouldRetryWithFreshInfo(err, _retried) {
+  if (_retried) return false;
+  const isAuthError = err.message && err.message.includes('403');
+  return isAuthError || isConnectionFailure(err);
+}
+
+function handleRequestError(err, _retried, message) {
+  if (shouldRetryWithFreshInfo(err, _retried)) {
+    clearConnectionCache();
+    return forwardToThunderbird(message, true);
+  }
+  if (isConnectionFailure(err)) {
+    throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
+  }
+  throw err;
+}
+
+async function forwardToThunderbird(message, _retried) {
+  const postData = JSON.stringify(message);
+
+  const connInfo = await readConnectionInfoWithRetry();
 
   if (!connInfo.port || !connInfo.token) {
     throw new Error('Invalid connection file: missing port or token');
@@ -664,38 +691,13 @@ async function forwardToThunderbird(message, _retried) {
 
   const { port, token } = connInfo;
 
-  // Try each host in order - handles platforms where 'localhost' resolves to
-  // IPv6 (::1) but the extension only listens on IPv4 (127.0.0.1).
-  const isConnectionFailure = (err) =>
-    err.code === 'ECONNREFUSED' ||
-    err.code === 'EADDRNOTAVAIL' ||
-    err.code === 'EAFNOSUPPORT' ||
-    err.code === 'ECONNRESET' ||
-    (err.message && err.message.includes('timed out'));
-
   const tryNext = (hosts) => {
     const [hostname, ...rest] = hosts;
-    return tryRequest(hostname, postData, port, token).catch((err) => {
+    return requestViaSocket(hostname, postData, port, token).catch((err) => {
       if (rest.length > 0 && isConnectionFailure(err)) {
         return tryNext(rest);
       }
-      // On 403 or connection failure, clear cache and retry once with fresh
-      // connection info (Thunderbird may have restarted on a new port/token).
-      if (!_retried) {
-        if (err.message && err.message.includes('403')) {
-          clearConnectionCache();
-          return forwardToThunderbird(message, true);
-        }
-        if (isConnectionFailure(err)) {
-          clearConnectionCache();
-          return forwardToThunderbird(message, true);
-        }
-      }
-      // Already retried or non-recoverable error
-      if (isConnectionFailure(err)) {
-        throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`);
-      }
-      throw err;
+      return handleRequestError(err, _retried, message);
     });
   };
 

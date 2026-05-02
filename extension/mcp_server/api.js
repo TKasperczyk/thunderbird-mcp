@@ -41,6 +41,11 @@ const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
 const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
 const PREF_LISTEN_ALL = "extensions.thunderbird-mcp.listenAll";
+
+function isListenAllEnabled() {
+  try { return Services.prefs.getBoolPref(PREF_LISTEN_ALL, false); } catch { return false; }
+}
+
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
 const VALID_CRUD = ["create", "read", "update", "delete"];
@@ -5506,9 +5511,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // Try the default port first, then fall back to nearby ports
             let boundPort = null;
-            const listenAll = (() => {
-              try { return Services.prefs.getBoolPref(PREF_LISTEN_ALL, false); } catch { return false; }
-            })();
+            const listenAll = isListenAllEnabled();
             for (let attempt = 0; attempt < MCP_MAX_PORT_ATTEMPTS; attempt++) {
               const tryPort = MCP_DEFAULT_PORT + attempt;
               try {
@@ -5763,11 +5766,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         getListenAll: async function() {
-          let listenAll = false;
-          try {
-            listenAll = Services.prefs.getBoolPref(PREF_LISTEN_ALL, false);
-          } catch { /* ignore */ }
-          return { listenAll };
+          return { listenAll: isListenAllEnabled() };
         },
 
         setListenAll: async function(listenAll) {
