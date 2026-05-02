@@ -2995,43 +2995,58 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const rangeEnd = cal.dtz.jsDateToDateTime(endJs, cal.dtz.defaultTimezone);
                 const limit = Math.min(Math.max(maxResults || 100, 1), 500);
 
-                // Query with date range and occurrence expansion
+                // Two-phase query to correctly handle recurring events.
+                //
+                // The FILTER_OCCURRENCES flag is intended to make the storage layer
+                // expand recurring masters and return individual occurrences within the
+                // date range. In practice this does not work for offline-backed calendars
+                // (e.g. OWL/Exchange): recurring masters are stored with event_start set
+                // to their original first occurrence date, which is typically outside the
+                // queried range, so a date-range query never returns them and the manual
+                // expansion at the call site never runs.
+                //
+                // Fix — Phase 1: fetch non-recurring events and modified-occurrence
+                // exceptions within the date range (their event_start is inside the
+                // range). Phase 2: fetch ALL recurring masters without a date filter,
+                // then expand each with recurrenceInfo.getOccurrences() and keep only
+                // occurrences that fall within the queried range.
                 const FILTER_EVENT = 1 << 3;
-                const FILTER_OCCURRENCES = 1 << 4;
                 const results = [];
                 for (const calendar of targets) {
-                  let items;
+                  const EVENT_COLLECTION_CAP = limit * 10;
+
+                  // Phase 1: non-recurring events + modified-occurrence exceptions.
+                  const rangeItems = await getCalendarItems(calendar, rangeStart, rangeEnd);
+                  for (const item of rangeItems) {
+                    if (results.length >= EVENT_COLLECTION_CAP) break;
+                    if (!item.recurrenceInfo) results.push(formatEvent(item, calendar));
+                  }
+
+                  // Phase 2: all recurring masters (no date filter) → manual expansion.
+                  let allItems = [];
                   try {
-                    // Try with occurrence expansion first (works on most providers)
                     if (typeof calendar.getItemsAsArray === "function") {
-                      items = await calendar.getItemsAsArray(FILTER_EVENT | FILTER_OCCURRENCES, 0, rangeStart, rangeEnd);
+                      allItems = await calendar.getItemsAsArray(FILTER_EVENT, 0, null, null);
                     } else {
-                      items = [];
-                      const stream = cal.iterate.streamValues(calendar.getItems(FILTER_EVENT | FILTER_OCCURRENCES, 0, rangeStart, rangeEnd));
+                      const stream = cal.iterate.streamValues(calendar.getItems(FILTER_EVENT, 0, null, null));
                       for await (const chunk of stream) {
-                        for (const i of chunk) items.push(i);
+                        for (const i of chunk) allItems.push(i);
                       }
                     }
                   } catch {
-                    // Fallback: fetch without occurrence expansion, expand manually
-                    items = await getCalendarItems(calendar, rangeStart, rangeEnd);
+                    allItems = rangeItems;
                   }
 
-                  const EVENT_COLLECTION_CAP = limit * 10; // Safety cap for recurring event expansion
-                  for (const item of items) {
+                  for (const item of allItems) {
                     if (results.length >= EVENT_COLLECTION_CAP) break;
-                    // If we got base recurring events (fallback path), expand them
-                    if (item.recurrenceInfo) {
-                      try {
-                        const occurrences = item.recurrenceInfo.getOccurrences(rangeStart, rangeEnd, 0);
-                        for (const occ of occurrences) {
-                          if (results.length >= EVENT_COLLECTION_CAP) break;
-                          results.push(formatEvent(occ, calendar));
-                        }
-                      } catch {
-                        results.push(formatEvent(item, calendar));
+                    if (!item.recurrenceInfo) continue;
+                    try {
+                      const occurrences = item.recurrenceInfo.getOccurrences(rangeStart, rangeEnd, 0);
+                      for (const occ of occurrences) {
+                        if (results.length >= EVENT_COLLECTION_CAP) break;
+                        results.push(formatEvent(occ, calendar));
                       }
-                    } else {
+                    } catch {
                       results.push(formatEvent(item, calendar));
                     }
                   }
