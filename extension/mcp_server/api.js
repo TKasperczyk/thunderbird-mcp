@@ -40,6 +40,12 @@ const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
 const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
+const PREF_LISTEN_ALL = "extensions.thunderbird-mcp.listenAll";
+
+function isListenAllEnabled() {
+  try { return Services.prefs.getBoolPref(PREF_LISTEN_ALL, false); } catch { return false; }
+}
+
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
 const VALID_CRUD = ["create", "read", "update", "delete"];
@@ -5505,10 +5511,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // Try the default port first, then fall back to nearby ports
             let boundPort = null;
+            const listenAll = isListenAllEnabled();
             for (let attempt = 0; attempt < MCP_MAX_PORT_ATTEMPTS; attempt++) {
               const tryPort = MCP_DEFAULT_PORT + attempt;
               try {
-                server.start(tryPort);
+                if (listenAll) {
+                  server.startAll(tryPort);
+                } else {
+                  server.start(tryPort);
+                }
                 boundPort = tryPort;
                 break;
               } catch (portErr) {
@@ -5752,6 +5763,41 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             try { Services.prefs.clearUserPref(PREF_BLOCK_SKIPREVIEW); } catch { /* ignore */ }
           }
           return { success: true, blockSkipReview };
+        },
+
+        getListenAll: async function() {
+          return { listenAll: isListenAllEnabled() };
+        },
+
+        setListenAll: async function(listenAll) {
+          if (typeof listenAll !== "boolean") {
+            return { error: "listenAll must be a boolean" };
+          }
+          if (listenAll) {
+            Services.prefs.setBoolPref(PREF_LISTEN_ALL, true);
+          } else {
+            try { Services.prefs.clearUserPref(PREF_LISTEN_ALL); } catch { /* ignore */ }
+          }
+
+          // Stop existing server
+          if (globalThis.__tbMcpServer) {
+            try { globalThis.__tbMcpServer.stop(() => {}); } catch { /* ignore */ }
+            globalThis.__tbMcpServer = null;
+          }
+          // Clear sentinels so start() can reinitialize
+          globalThis.__tbMcpStartPromise = null;
+
+          // Remove stale connection file
+          try {
+            const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+            tmpDir.append("thunderbird-mcp");
+            const connFile = tmpDir.clone();
+            connFile.append("connection.json");
+            if (connFile.exists()) connFile.remove(false);
+          } catch { /* best-effort cleanup */ }
+
+          // Restart server with new binding
+          return await this.start();
         },
       }
     };

@@ -7,6 +7,8 @@ const path = require('path');
 const {
   buildConnectionDiscoveryErrorMessage,
   clearConnectionCache,
+  detectWslGatewayIp,
+  isWsl,
   readConnectionInfo,
 } = require('../mcp-bridge.cjs');
 
@@ -272,5 +274,128 @@ describe('Bridge discovery', () => {
     assert.equal(readConnectionInfo(options), null);
     assert.match(buildConnectionDiscoveryErrorMessage(), /THUNDERBIRD_MCP_CONNECTION_FILE/);
     assert.match(buildConnectionDiscoveryErrorMessage(), /file not found/);
+  });
+});
+
+function makeMockFs(fileContents) {
+  return {
+    readFileSync(filePath, encoding) {
+      if (Object.prototype.hasOwnProperty.call(fileContents, filePath)) {
+        return fileContents[filePath];
+      }
+      const err = new Error('ENOENT: no such file or directory');
+      err.code = 'ENOENT';
+      throw err;
+    },
+  };
+}
+
+describe('WSL detection', () => {
+  it('returns true when /proc/version contains WSL', () => {
+    const mockFs = makeMockFs({
+      '/proc/version': 'Linux version 5.15.0-microsoft-standard-WSL2',
+    });
+    assert.equal(isWsl({ fsImpl: mockFs }), true);
+  });
+
+  it('returns false for Azure Linux (has "microsoft" but no "WSL")', () => {
+    const mockFs = makeMockFs({
+      '/proc/version': 'Linux version 5.15.0-microsoft-standard-Azure',
+    });
+    assert.equal(isWsl({ fsImpl: mockFs }), false);
+  });
+
+  it('returns false for generic WSL string without "microsoft"', () => {
+    const mockFs = makeMockFs({
+      '/proc/version': 'Linux version 6.0-wsl-custom',
+    });
+    assert.equal(isWsl({ fsImpl: mockFs }), false);
+  });
+
+  it('returns false when /proc/version has no WSL markers', () => {
+    const mockFs = makeMockFs({
+      '/proc/version': 'Linux version 6.8.0-generic (Ubuntu)',
+    });
+    assert.equal(isWsl({ fsImpl: mockFs }), false);
+  });
+
+  it('returns false when /proc/version is missing', () => {
+    const mockFs = makeMockFs({});
+    assert.equal(isWsl({ fsImpl: mockFs }), false);
+  });
+});
+
+describe('WSL gateway detection', () => {
+  const wslVersion = 'Linux version 5.15.0-microsoft-standard-WSL2';
+
+  it('returns gateway IP from resolv.conf when in WSL', () => {
+    const mockFs = makeMockFs({
+      '/proc/version': wslVersion,
+      '/etc/resolv.conf': 'nameserver 172.20.100.1\nsearch localdomain\n',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
+    assert.equal(ip, '172.20.100.1');
+  });
+
+  it('returns null when not in WSL', () => {
+    const mockFs = makeMockFs({
+      '/proc/version': 'Linux version 6.8.0-generic (Ubuntu)',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
+    assert.equal(ip, null);
+  });
+
+  it('returns null when /proc/version is missing', () => {
+    const mockFs = makeMockFs({});
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
+    assert.equal(ip, null);
+  });
+
+  it('returns null when resolv.conf has no nameserver line', () => {
+    const mockFs = makeMockFs({
+      '/proc/version': wslVersion,
+      '/etc/resolv.conf': 'search localdomain\noptions timeout:2\n',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
+    assert.equal(ip, null);
+  });
+
+  it('returns null when resolv.conf is empty', () => {
+    const mockFs = makeMockFs({
+      '/proc/version': wslVersion,
+      '/etc/resolv.conf': '',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
+    assert.equal(ip, null);
+  });
+
+  it('handles nameserver with trailing whitespace', () => {
+    const mockFs = makeMockFs({
+      '/proc/version': wslVersion,
+      '/etc/resolv.conf': 'nameserver  192.168.1.1   \n',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
+    assert.equal(ip, '192.168.1.1');
+  });
+
+  it('uses first nameserver when multiple are present', () => {
+    const mockFs = makeMockFs({
+      '/proc/version': wslVersion,
+      '/etc/resolv.conf': 'nameserver 10.0.0.1\nnameserver 10.0.0.2\n',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
+    assert.equal(ip, '10.0.0.1');
+  });
+
+  it('returns null on read error other than ENOENT', () => {
+    const mockFs = {
+      readFileSync() {
+        const err = new Error('EACCES: permission denied');
+        err.code = 'EACCES';
+        throw err;
+      },
+    };
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
+    assert.equal(ip, null);
   });
 });

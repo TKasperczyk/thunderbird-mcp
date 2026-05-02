@@ -78,6 +78,26 @@
             "description": "When true, send/reply/forward tools reject skipReview=true and require the review window."
           }
         ]
+      },
+      {
+        "name": "getListenAll",
+        "type": "function",
+        "async": true,
+        "description": "Get whether the server listens on all network interfaces",
+        "parameters": []
+      },
+      {
+        "name": "setListenAll",
+        "type": "function",
+        "async": true,
+        "description": "Set whether the server listens on all network interfaces. When enabled, the server is accessible from other machines on your network (e.g. WSL, Docker). Warning: this bypasses localhost-only binding and exposes the MCP endpoint beyond this machine, though auth token is still required.",
+        "parameters": [
+          {
+            "name": "listenAll",
+            "type": "boolean",
+            "description": "When true, server binds to 0.0.0.0 instead of 127.0.0.1. Server will be restarted."
+          }
+        ]
       }
     ]
   }

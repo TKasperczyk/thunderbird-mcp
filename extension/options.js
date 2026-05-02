@@ -258,6 +258,10 @@ const blockSkipReviewCheckbox = document.getElementById("blockSkipReview");
 const saveSkipReviewBtn = document.getElementById("saveSkipReviewBtn");
 const saveSkipReviewStatus = document.getElementById("saveSkipReviewStatus");
 
+const listenAllCheckbox = document.getElementById("listenAll");
+const saveListenAllBtn = document.getElementById("saveListenAllBtn");
+const saveListenAllStatus = document.getElementById("saveListenAllStatus");
+
 async function loadSkipReviewPref() {
   try {
     const { blockSkipReview } = await browser.mcpServer.getBlockSkipReview();
@@ -269,6 +273,38 @@ async function loadSkipReviewPref() {
     saveSkipReviewStatus.className = "save-status error";
   }
 }
+
+async function loadListenAllPref() {
+  try {
+    const { listenAll } = await browser.mcpServer.getListenAll();
+    listenAllCheckbox.checked = !!listenAll;
+    saveListenAllBtn.disabled = false;
+    saveListenAllStatus.textContent = "";
+  } catch (e) {
+    saveListenAllStatus.textContent = "Error loading setting: " + e.message;
+    saveListenAllStatus.className = "save-status error";
+  }
+}
+
+saveListenAllBtn.addEventListener("click", async () => {
+  saveListenAllBtn.disabled = true;
+  saveListenAllStatus.textContent = "Saving...";
+  saveListenAllStatus.className = "save-status";
+  try {
+    const result = await browser.mcpServer.setListenAll(listenAllCheckbox.checked);
+    if (result.error) {
+      saveListenAllStatus.textContent = result.error;
+      saveListenAllStatus.className = "save-status error";
+    } else {
+      saveListenAllStatus.textContent = "Saved.";
+      await loadServerInfo();
+    }
+  } catch (e) {
+    saveListenAllStatus.textContent = "Error: " + e.message;
+    saveListenAllStatus.className = "save-status error";
+  }
+  saveListenAllBtn.disabled = false;
+});
 
 saveSkipReviewBtn.addEventListener("click", async () => {
   saveSkipReviewBtn.disabled = true;
@@ -293,3 +329,4 @@ loadServerInfo();
 loadAccountAccess();
 loadToolAccess();
 loadSkipReviewPref();
+loadListenAllPref();

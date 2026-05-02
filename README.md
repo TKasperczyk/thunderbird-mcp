@@ -1,7 +1,7 @@
 # Thunderbird MCP
 
 [![Tools](https://img.shields.io/badge/35_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
-[![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
+[![Token Auth](https://img.shields.io/badge/Privacy-token_auth-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
 
@@ -26,10 +26,12 @@ Compose tools open a review window before sending by default. Set `skipReview` t
 ## How it works
 
 ```
-                    stdio              HTTP (localhost:8765-8774)
-  MCP Client  <----------->  Bridge  <--------------------->  Thunderbird
-  (Claude, etc.)           mcp-bridge.cjs                    Extension + HTTP Server
+                     stdio              HTTP (localhost:8765-8774)
+   MCP Client  <----------->  Bridge  <--------------------->  Thunderbird
+   (Claude, etc.)           mcp-bridge.cjs                    Extension + HTTP Server
 ```
+
+For WSL2, the same bridge auto-detects the Windows gateway IP and connects via raw TCP socket.
 
 The Thunderbird extension embeds a local HTTP server with session-scoped auth tokens. The Node.js bridge translates between MCP's stdio protocol and HTTP, discovering the port and token automatically via a connection file. The bridge handles MCP lifecycle methods (initialize, ping) locally, so clients can connect even before Thunderbird is fully loaded.
 
@@ -170,6 +172,18 @@ Example override:
 
 That's it. Your AI can now access Thunderbird.
 
+### WSL2
+
+The bridge auto-detects the Windows gateway IP from `/etc/resolv.conf`, so the same `mcp-bridge.cjs` works in WSL2. Enable **"Listen on all interfaces"** in the extension settings (Add-ons > Thunderbird MCP > Options), then set up a Windows firewall rule and port proxy once:
+
+```powershell
+# PowerShell as Admin
+New-NetFirewallRule -DisplayName "Thunderbird MCP" -Direction Inbound -Protocol TCP -LocalPort 8765 -Action Allow -Profile Any
+netsh interface portproxy add v4tov4 listenport=8765 listenaddress=<WSL_GATEWAY_IP> connectport=8765 connectaddress=127.0.0.1
+```
+
+Full setup guide: see [WSL-INSTALL.md](WSL-INSTALL.md).
+
 ---
 
 ## Security
@@ -178,7 +192,7 @@ That's it. Your AI can now access Thunderbird.
 - **Dynamic port**: Tries ports 8765-8774, records the actual port in the connection file. No hardcoded port dependency.
 - **Account access control**: Restrict which email accounts are visible to MCP clients via the settings page. Changes take effect immediately.
 - **Tool access control**: Disable specific tools via the settings page. Disabled tools are hidden from `tools/list` and blocked at dispatch.
-- **Localhost only**: No remote access. The bridge fails closed -- refuses to forward requests without a valid token.
+- **Network binding**: By default the server listens on localhost only. The "Listen on all interfaces" option in settings binds to all interfaces (IPv4 & IPv6) for WSL, Docker, or remote access. Auth token is always required.
 
 ---
 
@@ -225,7 +239,7 @@ After changing extension code: remove from Thunderbird, restart, reinstall the X
 
 ```
 thunderbird-mcp/
-├── mcp-bridge.cjs              # stdio <-> HTTP bridge (auth, port discovery)
+├── mcp-bridge.cjs              # stdio <-> HTTP bridge (auth, port discovery, WSL-aware)
 ├── extension/
 │   ├── manifest.json
 │   ├── background.js           # Extension entry point
