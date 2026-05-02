@@ -518,21 +518,26 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
         }
       }
 
+      // Build a fully-populated CalTodo. The extension runs in addon_parent
+      // (main-process privileged context) and imports CalTodo from the same
+      // resource:/// ESModule singleton as the chrome, so the object is fully
+      // interoperable with createTodoWithDialog and the task edit dialog.
+      const todo = new CalTodo();
+      todo.title = title;
+      if (dueDt) todo.dueDate = dueDt;
+      if (description) todo.setProperty("DESCRIPTION", description);
+      if (priority !== undefined) todo.priority = priority;
+      if (categories && categories.length > 0) todo.setCategories(categories);
+      if (targetCalendar) todo.calendar = targetCalendar;
+
       if (skipReview) {
-        // Direct save -- supports description, priority, and categories.
         if (!targetCalendar) {
-          // Pick first writable task-capable calendar when none specified.
           targetCalendar = cal.manager.getCalendars().find(
             c => !c.readOnly && c.getProperty("capabilities.tasks.supported") !== false
           );
           if (!targetCalendar) return { error: "No writable task-capable calendar found" };
+          todo.calendar = targetCalendar;
         }
-        const todo = new CalTodo();
-        todo.title = title;
-        if (dueDt) todo.dueDate = dueDt;
-        if (description) todo.setProperty("DESCRIPTION", description);
-        if (priority !== undefined) todo.priority = priority;
-        if (categories && categories.length > 0) todo.setCategories(categories);
         await targetCalendar.addItem(todo);
         return { success: true, message: `Task "${title}" created in calendar "${targetCalendar.name}"` };
       }
@@ -540,10 +545,10 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
       const win = Services.wm.getMostRecentWindow("mail:3pane");
       if (!win) return { error: "No Thunderbird window found" };
 
-      // description, priority, and categories require skipReview: true.
-      // Cross-context CalTodo objects cause silent save failure in dialog.
-      // Pass title as summary param; TB creates its own CalTodo internally.
-      win.createTodoWithDialog(targetCalendar, dueDt, title, null);
+      // Pass the pre-populated CalTodo to the dialog. createTodoWithDialog
+      // clones it (clearing the id) before opening, so all fields are
+      // pre-filled and the user can review or cancel without side effects.
+      win.createTodoWithDialog(targetCalendar, dueDt, null, todo);
 
       return { success: true, message: `Task dialog opened for "${title}"` };
     } catch (e) {
