@@ -490,6 +490,18 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
     }
   }
 
+  function descriptionToHTML(text) {
+    const escaped = text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+    const linked = escaped.replace(
+      /https?:\/\/[^\s<>"]+/g,
+      url => `<a href="${url}">${url}</a>`
+    );
+    return `<html><body><div>${linked.replace(/\n/g, "<br>")}</div></body></html>`;
+  }
+
   async function createTask(title, dueDate, calendarId, description, priority, categories, skipReview) {
     if (!cal || !CalTodo) return { error: "Calendar module not available" };
     try {
@@ -525,7 +537,7 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
       const todo = new CalTodo();
       todo.title = title;
       if (dueDt) todo.dueDate = dueDt;
-      if (description) todo.setProperty("DESCRIPTION", description);
+      if (description) todo.descriptionHTML = descriptionToHTML(description);
       if (priority !== undefined) todo.priority = priority;
       if (categories && categories.length > 0) todo.setCategories(categories);
       if (targetCalendar) todo.calendar = targetCalendar;
