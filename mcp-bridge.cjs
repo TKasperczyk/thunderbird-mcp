@@ -12,7 +12,17 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+function isWsl({ fsImpl = fs } = {}) {
+  try {
+    const version = fsImpl.readFileSync('/proc/version', 'utf8');
+    return /microsoft/i.test(version) && /wsl/i.test(version);
+  } catch {
+    return false;
+  }
+}
+
 function detectWslGatewayIp({ fsImpl = fs, resolvPath = '/etc/resolv.conf' } = {}) {
+  if (!isWsl({ fsImpl })) return null;
   try {
     const resolv = fsImpl.readFileSync(resolvPath, 'utf8');
     const match = resolv.match(/^nameserver\s+(\S+)/m);
@@ -785,6 +795,7 @@ module.exports = {
   clearConnectionCache,
   createDiscoveryContext,
   detectWslGatewayIp,
+  isWsl,
   discoverConnectionInfo,
   findFlatpakConnectionCandidates,
   findMacOsConnectionCandidates,
