@@ -5509,16 +5509,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const listenAll = (() => {
               try { return Services.prefs.getBoolPref(PREF_LISTEN_ALL, false); } catch { return false; }
             })();
-            console.log(`[MCP] listenAll pref = ${listenAll}`);
             for (let attempt = 0; attempt < MCP_MAX_PORT_ATTEMPTS; attempt++) {
               const tryPort = MCP_DEFAULT_PORT + attempt;
               try {
                 if (listenAll) {
                   server.startAll(tryPort);
-                  console.log(`[MCP] Bound to 0.0.0.0:${tryPort}`);
                 } else {
                   server.start(tryPort);
-                  console.log(`[MCP] Bound to localhost:${tryPort}`);
                 }
                 boundPort = tryPort;
                 break;
@@ -5777,7 +5774,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           if (typeof listenAll !== "boolean") {
             return { error: "listenAll must be a boolean" };
           }
-          console.log(`[MCP] setListenAll called with: ${listenAll}`);
           if (listenAll) {
             Services.prefs.setBoolPref(PREF_LISTEN_ALL, true);
           } else {
@@ -5802,7 +5798,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           } catch { /* best-effort cleanup */ }
 
           // Restart server with new binding
-          console.log(`[MCP] Restarting server...`);
           return await this.start();
         },
       }
