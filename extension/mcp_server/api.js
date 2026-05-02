@@ -262,11 +262,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             calendarId: { type: "string", description: "Target calendar ID (from listCalendars, must have supportsTasks=true)" },
             description: { type: "string", description: "Task description/body (optional)" },
             priority: { type: "integer", description: "Priority: 1=high, 5=normal, 9=low (optional)" },
-            categories: { type: "array", items: { type: "string" }, description: "Category labels, e.g. [\"personal\"] (optional)" },
+            categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Use listCategories to get exact existing names before setting." },
             skipReview: { type: "boolean", description: "If true, save the task directly without opening a review dialog (default: false)" },
           },
           required: ["title"],
         },
+      },
+      {
+        name: "listCategories",
+        group: "calendar", crud: "read",
+        title: "List Categories",
+        description: "Return all calendar category names defined in Thunderbird preferences. Use this before creating tasks or events to get exact category names (case-sensitive).",
+        inputSchema: { type: "object", properties: {} },
       },
       {
         name: "listTasks",
@@ -3063,6 +3070,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function listCategories() {
+              try {
+                const names = cal.category.fromPrefs();
+                return { categories: names.sort((a, b) => a.localeCompare(b)) };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
             async function listTasks(calendarId, completed, dueBefore, maxResults) {
               if (!cal) return { error: "Calendar not available" };
               try {
@@ -5333,6 +5349,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId);
+                case "listCategories":
+                  return listCategories();
                 case "createTask":
                   return await createTask(args.title, args.dueDate, args.calendarId, args.description, args.priority, args.categories, args.skipReview);
                 case "listTasks":
