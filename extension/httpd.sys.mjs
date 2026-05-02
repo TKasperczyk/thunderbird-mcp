@@ -501,7 +501,7 @@ nsHttpServer.prototype = {
   },
 
   startAll(port) {
-    this._start(port, "0.0.0.0");
+    this._start(port, "::", true);
   },
 
   _start(port, host, dualStack) {
