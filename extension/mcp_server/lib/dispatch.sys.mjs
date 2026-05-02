@@ -215,6 +215,8 @@ export function makeDispatch({
         return await toolHandlers.createTask(args.title, args.dueDate, args.calendarId, args.description, args.priority, args.categories, args.skipReview);
       case "listTasks":
         return await toolHandlers.listTasks(args.calendarId, args.completed, args.dueBefore, args.maxResults);
+      case "listCategories":
+        return toolHandlers.listCategories();
       case "updateTask":
         return await toolHandlers.updateTask(args.taskId, args.calendarId, args.title, args.dueDate, args.description, args.completed, args.percentComplete, args.priority);
       case "sendMail":

@@ -509,7 +509,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const {
               listCalendars,
               createEvent, listEvents, updateEvent, deleteEvent,
-              createTask, listTasks, updateTask,
+              createTask, listTasks, updateTask, listCategories,
             } = makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo });
 
             // Mail filter rules. Falls back from MailServices.filters to the
@@ -661,7 +661,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeMail, replyToMessage, forwardMessage, createDrafts,
                 // Calendar + tasks
                 listCalendars, createEvent, listEvents, updateEvent, deleteEvent,
-                createTask, listTasks, updateTask,
+                createTask, listTasks, updateTask, listCategories,
                 // Contacts
                 searchContacts, createContact, updateContact, deleteContact,
                 // Filters
@@ -709,7 +709,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               listFolders, openFolder, createFolder, renameFolder, deleteFolder,
               moveFolder, emptyTrash, emptyJunk,
               listCalendars, createEvent, listEvents, updateEvent, deleteEvent,
-              createTask, listTasks, updateTask,
+              createTask, listTasks, updateTask, listCategories,
               listFilters, createFilter, updateFilter, deleteFilter,
               reorderFilters, applyFilters,
               searchMessages, getMessage, getRecentMessages, displayMessage,

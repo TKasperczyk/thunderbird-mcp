@@ -750,6 +750,16 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
     }
   }
 
+  function listCategories() {
+    if (!cal) return { error: "Calendar not available" };
+    try {
+      const names = cal.category.fromPrefs();
+      return { categories: names.sort((a, b) => a.localeCompare(b)) };
+    } catch (e) {
+      return { error: e.toString() };
+    }
+  }
+
   return {
     listCalendars,
     createEvent,
@@ -759,5 +769,6 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
     createTask,
     listTasks,
     updateTask,
+    listCategories,
   };
 }
