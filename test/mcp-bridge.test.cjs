@@ -277,58 +277,74 @@ describe('Bridge discovery', () => {
 });
 
 describe('WSL gateway detection', () => {
-  let root;
-
-  beforeEach(() => {
-    root = makeTempRoot();
-  });
-
-  afterEach(() => {
-    cleanupTempRoot(root);
-  });
+  function makeMockFs(fileContents) {
+    return {
+      readFileSync(filePath, encoding) {
+        if (Object.prototype.hasOwnProperty.call(fileContents, filePath)) {
+          return fileContents[filePath];
+        }
+        const err = new Error('ENOENT: no such file or directory');
+        err.code = 'ENOENT';
+        throw err;
+      },
+    };
+  }
 
   it('returns gateway IP from resolv.conf', () => {
-    const resolvPath = path.join(root, 'resolv.conf');
-    fs.writeFileSync(resolvPath, 'nameserver 172.20.100.1\nsearch localdomain\n', 'utf8');
-
-    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath });
+    const mockFs = makeMockFs({
+      '/etc/resolv.conf': 'nameserver 172.20.100.1\nsearch localdomain\n',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
     assert.equal(ip, '172.20.100.1');
   });
 
   it('returns null when resolv.conf is missing', () => {
-    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath: path.join(root, 'nonexistent') });
+    const mockFs = makeMockFs({});
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
     assert.equal(ip, null);
   });
 
   it('returns null when resolv.conf has no nameserver line', () => {
-    const resolvPath = path.join(root, 'resolv.conf');
-    fs.writeFileSync(resolvPath, 'search localdomain\noptions timeout:2\n', 'utf8');
-
-    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath });
+    const mockFs = makeMockFs({
+      '/etc/resolv.conf': 'search localdomain\noptions timeout:2\n',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
     assert.equal(ip, null);
   });
 
   it('returns null when resolv.conf is empty', () => {
-    const resolvPath = path.join(root, 'resolv.conf');
-    fs.writeFileSync(resolvPath, '', 'utf8');
-
-    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath });
+    const mockFs = makeMockFs({
+      '/etc/resolv.conf': '',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
     assert.equal(ip, null);
   });
 
   it('handles nameserver with trailing whitespace', () => {
-    const resolvPath = path.join(root, 'resolv.conf');
-    fs.writeFileSync(resolvPath, 'nameserver  192.168.1.1   \n', 'utf8');
-
-    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath });
+    const mockFs = makeMockFs({
+      '/etc/resolv.conf': 'nameserver  192.168.1.1   \n',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
     assert.equal(ip, '192.168.1.1');
   });
 
   it('uses first nameserver when multiple are present', () => {
-    const resolvPath = path.join(root, 'resolv.conf');
-    fs.writeFileSync(resolvPath, 'nameserver 10.0.0.1\nnameserver 10.0.0.2\n', 'utf8');
-
-    const ip = detectWslGatewayIp({ fsImpl: fs, resolvPath });
+    const mockFs = makeMockFs({
+      '/etc/resolv.conf': 'nameserver 10.0.0.1\nnameserver 10.0.0.2\n',
+    });
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
     assert.equal(ip, '10.0.0.1');
+  });
+
+  it('returns null on read error other than ENOENT', () => {
+    const mockFs = {
+      readFileSync() {
+        const err = new Error('EACCES: permission denied');
+        err.code = 'EACCES';
+        throw err;
+      },
+    };
+    const ip = detectWslGatewayIp({ fsImpl: mockFs });
+    assert.equal(ip, null);
   });
 });
