@@ -2913,7 +2913,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const changes = [];
 
                 if (title !== undefined) { newItem.title = title; changes.push("title"); }
-                if (description !== undefined) { newItem.setProperty("DESCRIPTION", description); changes.push("description"); }
+                if (description !== undefined) { newItem.descriptionHTML = descriptionToHTML(description); changes.push("description"); }
                 if (priority !== undefined) { newItem.priority = priority; changes.push("priority"); }
 
                 if (dueDate !== undefined) {
