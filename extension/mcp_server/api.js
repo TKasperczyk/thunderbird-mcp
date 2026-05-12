@@ -1283,7 +1283,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "createEvent",
         group: "calendar", crud: "create",
         title: "Create Event",
-        description: "Create a calendar event through a review dialog. The skipReview safety block is on by default; direct creation is honored only when the user explicitly disables that preference.",
+        description: "Create a calendar event through a review dialog. The skipReview safety block is on by default; direct creation is honored only when the user explicitly disables that preference. Recurring events are supported via the recurrence parameter.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1298,6 +1298,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; use listCategories to get exact existing names before setting." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). After creation, OWL embeds the join URL in the event description and exposes it via listEvents (onlineMeetingURL). No-op on non-OWL backends." },
+            recurrence: { type: "string", description: "iCalendar RRULE string for recurring events (e.g. 'FREQ=WEEKLY;BYDAY=MO,TU,TH,FR' or 'RRULE:FREQ=DAILY;COUNT=10'). The 'RRULE:' prefix is optional and added automatically if missing. FREQ=SECONDLY and FREQ=MINUTELY are rejected." },
             skipReview: { type: "boolean", description: "Request direct creation without a review dialog. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
           },
           required: ["title", "startDate"],
@@ -1323,7 +1324,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "updateEvent",
         group: "calendar", crud: "update",
         title: "Update Event",
-        description: "Update an existing calendar event's title, dates, location, or description",
+        description: "Update an existing calendar event's title, dates, location, description, or recurrence rule.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1338,6 +1339,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Pass null to clear TRANSP only. Explicit status parameter overrides the STATUS coupling." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; pass an empty array to clear all categories. Use listCategories to get exact existing names before setting." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). Pass false to remove an existing Teams link." },
+            recurrence: { type: "string", description: "New iCalendar RRULE string (optional). Pass an empty string (or null) to clear the recurrence and turn the event into a one-shot. The 'RRULE:' prefix is optional. FREQ=SECONDLY and FREQ=MINUTELY are rejected. Replacing the rule discards existing per-occurrence exceptions (EXDATEs / modified occurrences)." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -4249,7 +4251,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting) {
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting, recurrence) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -4355,6 +4357,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (categories && categories.length > 0) event.setCategories(categories);
                 if (onlineMeeting) event.setProperty("X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
 
+                if (recurrence) {
+                  try {
+                    setRecurrenceOnItem(event, recurrence);
+                  } catch (re) {
+                    return { error: `Invalid recurrence rule: ${re.toString()}` };
+                  }
+                }
+
                 // Find target calendar
                 const calendars = cal.manager.getCalendars();
                 let targetCalendar = null;
@@ -4435,6 +4445,73 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return VEVENT_STATUS_MAP[String(status).trim().toLowerCase()] || null;
             }
 
+            // Normalize a user-supplied RRULE string: trim, accept an optional
+            // case-insensitive "RRULE:" prefix, require a FREQ part (RFC 5545
+            // makes it mandatory; without it libical fails opaquely or yields a
+            // never-firing rule), and reject FREQ=SECONDLY / FREQ=MINUTELY
+            // upfront -- Thunderbird's rrule engine parses them but generates
+            // no occurrences, so accepting them would silently create a
+            // never-firing recurrence. Returns the full "RRULE:..." line.
+            // Throws on empty or unsupported rules.
+            function normalizeRRule(recurrence) {
+              const body = String(recurrence).trim().replace(/^rrule:/i, "").trim();
+              if (!body) throw new Error("Empty recurrence rule");
+              const m = /(?:^|;)FREQ=([^;]*)/i.exec(body);
+              if (!m) throw new Error("Recurrence rule must contain a FREQ part (e.g. FREQ=WEEKLY)");
+              const freq = m[1].toUpperCase();
+              if (freq === "SECONDLY" || freq === "MINUTELY") {
+                throw new Error(`FREQ=${freq} is not supported: Thunderbird's recurrence engine generates no occurrences for it`);
+              }
+              return "RRULE:" + body;
+            }
+
+            // Build a calIRecurrenceInfo from an iCal RRULE string and attach it
+            // to `item`. Passing "" or null clears any existing recurrence. The
+            // "RRULE:" prefix is optional. Throws on invalid rules. Note: this
+            // replaces the whole calIRecurrenceInfo, so any existing EXDATEs or
+            // modified occurrences (exceptions) on the item are discarded.
+            function setRecurrenceOnItem(item, recurrence) {
+              if (recurrence === "" || recurrence === null) {
+                item.recurrenceInfo = null;
+                return;
+              }
+              const line = normalizeRRule(recurrence);
+              const fm = /(?:^|[:;])FREQ=([^;]*)/i.exec(line);
+              if (item.startDate && item.startDate.isDate && fm && fm[1].toUpperCase() === "HOURLY") {
+                throw new Error("FREQ=HOURLY cannot be applied to an all-day event: a date-only start cannot expand a sub-daily frequency");
+              }
+              const rinfo = Cc["@mozilla.org/calendar/recurrence-info;1"]
+                .createInstance(Ci.calIRecurrenceInfo);
+              rinfo.item = item;
+              const ritem = Cc["@mozilla.org/calendar/recurrence-rule;1"]
+                .createInstance(Ci.calIRecurrenceRule);
+              ritem.icalString = line;
+              rinfo.appendRecurrenceItem(ritem);
+              item.recurrenceInfo = rinfo;
+            }
+
+            // Return the first RRULE on `item` without its "RRULE:" prefix, or
+            // null if the event is not recurring / has no RRULE among its items
+            // (e.g. RDATE-only recurrences). Occurrence proxies produced by the
+            // listEvents recurrence expansion carry the rule on their
+            // parentItem, not on themselves.
+            function extractRRuleFromItem(item) {
+              const rinfo = (item.parentItem || item).recurrenceInfo;
+              if (!rinfo) return null;
+              try {
+                const rules = rinfo.getRecurrenceItems();
+                for (const r of rules) {
+                  if (r && typeof r.icalString === "string") {
+                    const line = r.icalString.replace(/\r?\n$/, "");
+                    if (line.startsWith("RRULE:")) return line.slice("RRULE:".length);
+                  }
+                }
+              } catch (e) {
+                console.warn("thunderbird-mcp: RRULE extraction failed for", item.id || item.title, e);
+              }
+              return null;
+            }
+
             function formatEvent(item, calendar) {
               const allDay = item.startDate ? item.startDate.isDate : false;
               // For all-day events, iCal DTEND is exclusive. Convert to inclusive
@@ -4463,7 +4540,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 categories: item.getCategories(),
                 onlineMeetingURL: item.getProperty("X-MICROSOFT-SKYPETEAMSMEETINGURL") || null,
                 allDay,
-                isRecurring: !!item.recurrenceInfo,
+                isRecurring: !!(item.parentItem || item).recurrenceInfo,
+                recurrence: extractRRuleFromItem(item),
               };
               // Occurrences of recurring events share the parent's id.
               // Include recurrenceId so callers can distinguish them.
@@ -4793,7 +4871,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting, recurrence) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -4896,6 +4974,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   changes.push("onlineMeeting");
                 }
 
+                if (recurrence !== undefined) {
+                  try {
+                    setRecurrenceOnItem(newItem, recurrence);
+                    changes.push("recurrence");
+                  } catch (re) {
+                    return { error: `Invalid recurrence rule: ${re.toString()}` };
+                  }
+                }
+
                 if (changes.length === 0) return { error: "No changes specified" };
 
                 // Validate end > start after all changes
@@ -4905,7 +4992,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 await calendar.modifyItem(newItem, oldItem);
                 const result = { success: true, updated: changes };
-                if (oldItem.recurrenceInfo) {
+                // Read the post-update state: after clearing the recurrence
+                // (recurrence: "" / null) the event is no longer a series and
+                // the warning would state the opposite of what happened.
+                if (newItem.recurrenceInfo) {
                   result.warning = "This is a recurring event -- changes apply to the entire series.";
                 }
                 return result;
@@ -8255,11 +8345,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories, args.onlineMeeting);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId);
                 case "listCategories":
