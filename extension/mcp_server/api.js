@@ -1339,7 +1339,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Pass null to clear TRANSP only. Explicit status parameter overrides the STATUS coupling." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; pass an empty array to clear all categories. Use listCategories to get exact existing names before setting." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). Pass false to remove an existing Teams link." },
-            recurrence: { type: "string", description: "New iCalendar RRULE string (optional). Pass an empty string (or null) to clear the recurrence and turn the event into a one-shot. The 'RRULE:' prefix is optional. FREQ=SECONDLY and FREQ=MINUTELY are rejected. Replacing the rule discards existing per-occurrence exceptions (EXDATEs / modified occurrences)." },
+            recurrence: { type: "string", description: "New iCalendar RRULE string (optional). Pass an empty string (or null) to clear the recurrence and turn the event into a one-shot. The 'RRULE:' prefix is optional. FREQ=SECONDLY and FREQ=MINUTELY are rejected. Replacing the rule discards existing per-occurrence exceptions (EXDATEs / modified occurrences). Cannot be combined with recurrenceId — recurrence rules apply to the master event, not a single occurrence." },
+            recurrenceId: { type: "string", description: "Optional ISO 8601 recurrence ID (from listEvents). When provided, only the matching single occurrence is modified (createException) instead of the full series. The 'recurrence' parameter must NOT be used together with recurrenceId." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -1348,12 +1349,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "deleteEvent",
         group: "calendar", crud: "delete",
         title: "Delete Event",
-        description: "Delete a calendar event",
+        description: "Delete a calendar event. By default removes the entire item (full series for recurring events). Pass recurrenceId to remove only a single occurrence (EXDATE).",
         inputSchema: {
           type: "object",
           properties: {
             eventId: { type: "string", description: "The event ID (from listEvents results)" },
             calendarId: { type: "string", description: "The calendar ID containing the event (from listEvents results)" },
+            recurrenceId: { type: "string", description: "Optional ISO 8601 recurrence ID (from listEvents). When provided, only the matching single occurrence is excluded (EXDATE) instead of the full series." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -4871,11 +4873,142 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting, recurrence) {
+            // Leading calendar-date digits of an ISO 8601 string. For date-only
+            // values, read the date straight from these digits -- round-tripping
+            // through new Date() getters can shift the day by one depending on
+            // the host timezone (listEvents serializes all-day ids as UTC
+            // midnight, which local getters render as the previous day west of
+            // UTC).
+            const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})/;
+
+            // Parse an ISO 8601 recurrenceId into a calIDateTime matching what
+            // the rrule engine generates for RECURRENCE-ID. Uses the master's
+            // own timezone so EXDATE / occurrence-lookup comparisons succeed --
+            // parsing as UTC silently no-ops on tz'd events. Returns { recDt }
+            // on success or { error } on an unparseable input.
+            function recurrenceIdToCalDateTime(masterItem, recurrenceId) {
+              if (masterItem.startDate && masterItem.startDate.isDate) {
+                const dm = DATE_ONLY_RE.exec(String(recurrenceId).trim());
+                if (!dm) return { error: `Invalid recurrenceId: ${recurrenceId}` };
+                const recDt = cal.createDateTime();
+                recDt.resetTo(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3]), 0, 0, 0, cal.dtz.floating);
+                recDt.isDate = true;
+                return { recDt };
+              }
+              const js = new Date(recurrenceId);
+              if (isNaN(js.getTime())) {
+                return { error: `Invalid recurrenceId: ${recurrenceId}` };
+              }
+              const tz = (masterItem.startDate && masterItem.startDate.timezone) || cal.dtz.defaultTimezone;
+              return { recDt: cal.dtz.jsDateToDateTime(js, tz) };
+            }
+
+            // Apply title/dates/location/description on a target item (master clone or
+            // occurrence clone). Returns { changes } on success or { error } on failure.
+            // Used by both the master-update and the single-occurrence-update paths.
+            function applyEventChanges(targetItem, title, startDate, endDate, location, description) {
+              const changes = [];
+              if (title !== undefined) { targetItem.title = title; changes.push("title"); }
+
+              if (startDate !== undefined) {
+                if (targetItem.startDate && targetItem.startDate.isDate) {
+                  const dm = DATE_ONLY_RE.exec(String(startDate).trim());
+                  if (!dm) return { error: `Invalid startDate: ${startDate}` };
+                  const dt = cal.createDateTime();
+                  dt.resetTo(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3]), 0, 0, 0, cal.dtz.floating);
+                  dt.isDate = true;
+                  targetItem.startDate = dt;
+                } else {
+                  const js = new Date(startDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid startDate: ${startDate}` };
+                  targetItem.startDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                }
+                changes.push("startDate");
+              }
+
+              if (endDate !== undefined) {
+                if (targetItem.endDate && targetItem.endDate.isDate) {
+                  const dm = DATE_ONLY_RE.exec(String(endDate).trim());
+                  if (!dm) return { error: `Invalid endDate: ${endDate}` };
+                  const dt = cal.createDateTime();
+                  // iCal DTEND is exclusive for all-day -- bump by 1 day
+                  // (Date.UTC handles month/year rollover on the +1).
+                  const next = new Date(Date.UTC(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3]) + 1));
+                  dt.resetTo(next.getUTCFullYear(), next.getUTCMonth(), next.getUTCDate(), 0, 0, 0, cal.dtz.floating);
+                  dt.isDate = true;
+                  targetItem.endDate = dt;
+                } else {
+                  const js = new Date(endDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid endDate: ${endDate}` };
+                  targetItem.endDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                }
+                changes.push("endDate");
+              }
+
+              if (location !== undefined) { targetItem.setProperty("LOCATION", location); changes.push("location"); }
+              if (description !== undefined) { targetItem.setProperty("DESCRIPTION", description); changes.push("description"); }
+
+              return { changes };
+            }
+
+            // Apply status/showAs/categories/onlineMeeting on a target item
+            // (master clone or occurrence clone). Appends to `changes`.
+            // Returns { error } on invalid input, {} otherwise. Used by both
+            // the master-update and the single-occurrence-update paths.
+            function applyEventMetaChanges(targetItem, status, showAs, categories, onlineMeeting, changes) {
+              if (status !== undefined) {
+                if (status === null || status === "") {
+                  targetItem.deleteProperty("STATUS");
+                } else {
+                  const normalized = normalizeEventStatus(status);
+                  if (!normalized) {
+                    return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
+                  }
+                  targetItem.setProperty("STATUS", normalized);
+                }
+                changes.push("status");
+              }
+              if (showAs !== undefined) {
+                if (showAs === null || showAs === "") {
+                  targetItem.deleteProperty("TRANSP");
+                } else if (showAs === "free") {
+                  targetItem.setProperty("TRANSP", "TRANSPARENT");
+                  // Also set STATUS:TENTATIVE for Thunderbird visual display unless caller overrides
+                  if (status === undefined) { targetItem.setProperty("STATUS", "TENTATIVE"); changes.push("status"); }
+                } else if (showAs === "busy") {
+                  targetItem.setProperty("TRANSP", "OPAQUE");
+                  // Also set STATUS:CONFIRMED for Thunderbird visual display unless caller overrides
+                  if (status === undefined) { targetItem.setProperty("STATUS", "CONFIRMED"); changes.push("status"); }
+                } else {
+                  return { error: `Invalid showAs: "${showAs}". Expected "busy" or "free".` };
+                }
+                changes.push("showAs");
+              }
+              // null/undefined preserves existing categories; empty array clears them.
+              if (Array.isArray(categories)) {
+                targetItem.setCategories(categories);
+                changes.push("categories");
+              }
+              if (onlineMeeting !== undefined) {
+                if (onlineMeeting) {
+                  targetItem.setProperty("X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
+                } else {
+                  targetItem.deleteProperty("X-ONLINE-MEETING-PROVIDER");
+                  targetItem.deleteProperty("X-MICROSOFT-SKYPETEAMSMEETINGURL");
+                }
+                changes.push("onlineMeeting");
+              }
+              return {};
+            }
+
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting, recurrence, recurrenceId) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
                 if (!calendarId) return { error: "calendarId is required" };
+                if (recurrenceId !== undefined && recurrence !== undefined) {
+                  return { error: "Cannot combine recurrence and recurrenceId: recurrence rules apply to the master event only." };
+                }
 
                 const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
                 if (!calendar) return { error: `Calendar not found: ${calendarId}` };
@@ -4893,86 +5026,44 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (!oldItem) return { error: `Event not found: ${eventId}` };
 
+                // ---- Single-occurrence path ----
+                if (recurrenceId !== undefined) {
+                  if (!oldItem.recurrenceInfo) {
+                    return { error: "Event is not recurring; recurrenceId cannot be applied" };
+                  }
+                  const rid = recurrenceIdToCalDateTime(oldItem, recurrenceId);
+                  if (rid.error) return { error: rid.error };
+                  const occurrence = oldItem.recurrenceInfo.getOccurrenceFor(rid.recDt);
+                  if (!occurrence) {
+                    return { error: `No occurrence found at recurrenceId: ${recurrenceId}` };
+                  }
+
+                  const modOcc = occurrence.clone();
+                  const r = applyEventChanges(modOcc, title, startDate, endDate, location, description);
+                  if (r.error) return { error: r.error };
+                  const meta = applyEventMetaChanges(modOcc, status, showAs, categories, onlineMeeting, r.changes);
+                  if (meta.error) return { error: meta.error };
+                  if (r.changes.length === 0) return { error: "No changes specified" };
+                  if (modOcc.startDate && modOcc.endDate && modOcc.endDate.compare(modOcc.startDate) <= 0) {
+                    return { error: "endDate must be after startDate" };
+                  }
+
+                  // Pass the modified occurrence itself, not a master clone:
+                  // providers detect parentItem and register the exception on
+                  // the series. Sending the master would make OWL/Exchange
+                  // target the whole series and overwrite every occurrence on
+                  // the next sync.
+                  await calendar.modifyItem(modOcc, occurrence);
+                  return { success: true, updated: r.changes, mode: "occurrence", recurrenceId };
+                }
+
+                // ---- Master / series path (default) ----
                 const newItem = oldItem.clone();
-                const changes = [];
-
-                if (title !== undefined) { newItem.title = title; changes.push("title"); }
-
-                if (startDate !== undefined) {
-                  const js = new Date(startDate);
-                  if (isNaN(js.getTime())) return { error: `Invalid startDate: ${startDate}` };
-                  if (newItem.startDate && newItem.startDate.isDate) {
-                    const dt = cal.createDateTime();
-                    dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
-                    dt.isDate = true;
-                    newItem.startDate = dt;
-                  } else {
-                    newItem.startDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
-                  }
-                  changes.push("startDate");
-                }
-
-                if (endDate !== undefined) {
-                  const js = new Date(endDate);
-                  if (isNaN(js.getTime())) return { error: `Invalid endDate: ${endDate}` };
-                  if (newItem.endDate && newItem.endDate.isDate) {
-                    const dt = cal.createDateTime();
-                    // iCal DTEND is exclusive for all-day -- bump by 1 day
-                    const next = new Date(js.getFullYear(), js.getMonth(), js.getDate());
-                    next.setDate(next.getDate() + 1);
-                    dt.resetTo(next.getFullYear(), next.getMonth(), next.getDate(), 0, 0, 0, cal.dtz.floating);
-                    dt.isDate = true;
-                    newItem.endDate = dt;
-                  } else {
-                    newItem.endDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
-                  }
-                  changes.push("endDate");
-                }
-
-                if (location !== undefined) { newItem.setProperty("LOCATION", location); changes.push("location"); }
-                if (description !== undefined) { newItem.setProperty("DESCRIPTION", description); changes.push("description"); }
-                if (status !== undefined) {
-                  if (status === null || status === "") {
-                    newItem.deleteProperty("STATUS");
-                  } else {
-                    const normalized = normalizeEventStatus(status);
-                    if (!normalized) {
-                      return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
-                    }
-                    newItem.setProperty("STATUS", normalized);
-                  }
-                  changes.push("status");
-                }
-                if (showAs !== undefined) {
-                  if (showAs === null || showAs === "") {
-                    newItem.deleteProperty("TRANSP");
-                  } else if (showAs === "free") {
-                    newItem.setProperty("TRANSP", "TRANSPARENT");
-                    // Also set STATUS:TENTATIVE for Thunderbird visual display unless caller overrides
-                    if (status === undefined) { newItem.setProperty("STATUS", "TENTATIVE"); changes.push("status"); }
-                  } else if (showAs === "busy") {
-                    newItem.setProperty("TRANSP", "OPAQUE");
-                    // Also set STATUS:CONFIRMED for Thunderbird visual display unless caller overrides
-                    if (status === undefined) { newItem.setProperty("STATUS", "CONFIRMED"); changes.push("status"); }
-                  } else {
-                    return { error: `Invalid showAs: "${showAs}". Expected "busy" or "free".` };
-                  }
-                  changes.push("showAs");
-                }
-                // null/undefined preserves existing categories; empty array clears them.
-                if (Array.isArray(categories)) {
-                  newItem.setCategories(categories);
-                  changes.push("categories");
-                }
-                if (onlineMeeting !== undefined) {
-                  if (onlineMeeting) {
-                    newItem.setProperty("X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
-                  } else {
-                    newItem.deleteProperty("X-ONLINE-MEETING-PROVIDER");
-                    newItem.deleteProperty("X-MICROSOFT-SKYPETEAMSMEETINGURL");
-                  }
-                  changes.push("onlineMeeting");
-                }
+                const r = applyEventChanges(newItem, title, startDate, endDate, location, description);
+                if (r.error) return { error: r.error };
+                const changes = r.changes;
+                const meta = applyEventMetaChanges(newItem, status, showAs, categories, onlineMeeting, changes);
+                if (meta.error) return { error: meta.error };
 
                 if (recurrence !== undefined) {
                   try {
@@ -5004,7 +5095,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function deleteEvent(eventId, calendarId) {
+            async function deleteEvent(eventId, calendarId, recurrenceId) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -5023,6 +5114,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   item = all.find(i => i.id === eventId) || null;
                 }
                 if (!item) return { error: `Event not found: ${eventId}` };
+
+                if (recurrenceId !== undefined) {
+                  if (!item.recurrenceInfo) {
+                    return { error: "Event is not recurring; recurrenceId cannot be applied" };
+                  }
+                  const rid = recurrenceIdToCalDateTime(item, recurrenceId);
+                  if (rid.error) return { error: rid.error };
+                  // removeOccurrenceAt happily EXDATEs a date with no
+                  // occurrence; validate first so a miss is an error, not a
+                  // silent success that leaves the real occurrence in place.
+                  if (!item.recurrenceInfo.getOccurrenceFor(rid.recDt)) {
+                    return { error: `No occurrence found at recurrenceId: ${recurrenceId}` };
+                  }
+                  const newItem = item.clone();
+                  newItem.recurrenceInfo.removeOccurrenceAt(rid.recDt);
+                  await calendar.modifyItem(newItem, item);
+                  return { success: true, deleted: eventId, recurrenceId, mode: "occurrence" };
+                }
 
                 const isRecurring = !!item.recurrenceInfo;
                 await calendar.deleteItem(item);
@@ -8349,9 +8458,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence, args.recurrenceId);
                 case "deleteEvent":
-                  return await deleteEvent(args.eventId, args.calendarId);
+                  return await deleteEvent(args.eventId, args.calendarId, args.recurrenceId);
                 case "listCategories":
                   return listCategories();
                 case "createTask":
