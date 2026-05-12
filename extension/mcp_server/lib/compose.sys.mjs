@@ -585,14 +585,17 @@ export function makeCompose({
 
         // Try modern 16-arg signature first (TB 128+).
         // On TB 102-127, XPCOM throws NS_ERROR_XPC_NOT_ENOUGH_ARGS
-        // (0x80570001), so we fall back to legacy 18-arg with null
-        // attachment params (attachments already on composeFields).
+        // so we fall back to legacy 18-arg with null attachment params
+        // (attachments already on composeFields).
         // Modern TB may return a Promise -- catch async rejections.
         let sendResult;
         try {
           sendResult = msgSend.createAndSendMessage(...commonArgs, ...tailArgs);
         } catch (e) {
-          const isArgError = (e && e.result === 0x80570001) ||
+          // String(e).includes() is a locale-dependent fallback for older
+          // TB where Cr might not expose NS_ERROR_XPC_NOT_ENOUGH_ARGS;
+          // can remove once minimum TB version is 128.
+          const isArgError = (e && e.result === Cr.NS_ERROR_XPC_NOT_ENOUGH_ARGS) ||
             String(e).includes("Not enough arguments");
           if (isArgError) {
             sendResult = msgSend.createAndSendMessage(...commonArgs, null, null, ...tailArgs);
@@ -1074,16 +1077,17 @@ export function makeCompose({
       let settled = false;
       let capturedDraftUri = null;
       let capturedMessageId = null;
+      // Single arbiter for the legacy onStopSending path (TB 102-127) and
+      // the promise-resolution path (TB 128+, Bug 1211292) -- both can
+      // fire and `settled` decides who wins. Timer cancel lives here so
+      // it can never run after settle or twice, eliminating the
+      // nsITimer-already-cancelled race that earlier scattered
+      // timer.cancel() calls were vulnerable to.
       const settle = (result) => {
-        if (!settled) { settled = true; resolve(result); }
-      };
-      const settleSuccess = () => {
-        timer.cancel();
-        settle({
-          success: true,
-          draftFolderURI: capturedDraftUri,
-          messageId: capturedMessageId,
-        });
+        if (settled) return;
+        settled = true;
+        try { timer.cancel(); } catch { /* nsITimer may already be cancelled */ }
+        resolve(result);
       };
 
       const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
@@ -1134,22 +1138,25 @@ export function makeCompose({
               capturedMessageId = msgID.replace(/^<|>$/g, "") || null;
             }
             if (Components.isSuccessCode(status)) {
-              settleSuccess();
+              settle({
+                success: true,
+                draftFolderURI: capturedDraftUri,
+                messageId: capturedMessageId,
+              });
             } else {
-              timer.cancel();
               settle({ error: `Draft save failed (status: 0x${(status >>> 0).toString(16)})` });
             }
           },
           // Fires from _mimeDoFcc on both old and new code paths.
-          // Captures the URI so settleSuccess() can return it regardless
-          // of which completion path wins the race.
+          // Captures the URI so the success settle() can return it
+          // regardless of which completion path wins the race.
           onGetDraftFolderURI(msgID, folderURI) {
             capturedDraftUri = folderURI;
             if (msgID && !capturedMessageId) {
               capturedMessageId = msgID.replace(/^<|>$/g, "") || null;
             }
           },
-          onSendNotPerformed() { timer.cancel(); settle({ error: "Draft save was not performed" }); },
+          onSendNotPerformed() { settle({ error: "Draft save was not performed" }); },
           onTransportSecurityError() { /* not applicable for drafts */ },
         };
 
@@ -1178,8 +1185,12 @@ export function makeCompose({
         try {
           sendResult = msgSend.createAndSendMessage(...commonArgs, ...tailArgs);
         } catch (e) {
-          const isArgError = (e && e.result === 0x80570001) || String(e).includes("Not enough arguments");
-          if (!isArgError) { timer.cancel(); settle({ error: e.toString() }); return; }
+          // String(e).includes() is a locale-dependent fallback for older
+          // TB where Cr might not expose NS_ERROR_XPC_NOT_ENOUGH_ARGS;
+          // can remove once minimum TB version is 128.
+          const isArgError = (e && e.result === Cr.NS_ERROR_XPC_NOT_ENOUGH_ARGS) ||
+            String(e).includes("Not enough arguments");
+          if (!isArgError) { settle({ error: e.toString() }); return; }
           // Legacy 18-arg signature (TB 102-127)
           sendResult = msgSend.createAndSendMessage(...commonArgs, null, null, ...tailArgs);
         }
@@ -1187,12 +1198,15 @@ export function makeCompose({
         // (_mimeDoFcc finished). Rejection = error mid-save.
         if (sendResult && typeof sendResult.then === "function") {
           sendResult.then(
-            settleSuccess,
-            e => { timer.cancel(); settle({ error: e.toString() }); }
+            () => settle({
+              success: true,
+              draftFolderURI: capturedDraftUri,
+              messageId: capturedMessageId,
+            }),
+            e => settle({ error: e.toString() })
           );
         }
       } catch (e) {
-        timer.cancel();
         settle({ error: e.toString() });
       }
     });
