@@ -1611,7 +1611,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const timeout = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                 timeout.initWithCallback({
                   notify() {
-                    finish({ error: "Timed out waiting for reply compose window" });
+                    finish({ error: "Timed out waiting for compose window" });
                   }
                 }, OPEN_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
 
@@ -2099,6 +2099,41 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return text;
               }
               return escapeHtml(body || "").replace(/\n/g, '<br>');
+            }
+
+            /**
+             * Decides whether a compose operation will (or should) run in HTML
+             * mode, and returns the matching msgComposeParams.format value.
+             *
+             * The caller's explicit isHtml wins (true/false). When isHtml is
+             * omitted, the identity's compose-format preference is consulted.
+             *
+             * ForwardInline is a special case: Thunderbird's compose service
+             * only passes format through when it's Default or OppositeOfDefault
+             * for that compType, so when the caller's explicit isHtml conflicts
+             * with the identity pref on a forward, we have to ask for
+             * OppositeOfDefault instead of HTML/PlainText.
+             *
+             * Identity must be resolved (setComposeIdentity) before calling this.
+             */
+            function resolveComposeFormat(identity, isHtml, compType) {
+              const identityUsesHtml = identity?.composeHtml !== false;
+              const useHtml = isHtml === true || (isHtml !== false && identityUsesHtml);
+              const isForward = compType === Ci.nsIMsgCompType.ForwardInline
+                             || compType === Ci.nsIMsgCompType.ForwardAsAttachment;
+
+              let format;
+              if (isHtml === undefined) {
+                format = Ci.nsIMsgCompFormat.Default;
+              } else if (isForward) {
+                const explicitMatchesPref = (isHtml === true) === identityUsesHtml;
+                format = explicitMatchesPref
+                  ? Ci.nsIMsgCompFormat.Default
+                  : Ci.nsIMsgCompFormat.OppositeOfDefault;
+              } else {
+                format = isHtml === true ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.PlainText;
+              }
+              return { useHtml, format };
             }
 
             /**
@@ -3950,21 +3985,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeFields.bcc = bcc || "";
                 composeFields.subject = subject || "";
 
-                const formatted = formatBodyHtml(body, isHtml);
-                if (isHtml && formatted.includes('<html')) {
-                  composeFields.body = formatted;
-                } else {
-                  composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
-                }
-
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
-                // Respect the user's compose-format preference unless the caller
-                // explicitly forced HTML via isHtml: true.
-                msgComposeParams.format = isHtml === true ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.Default;
                 msgComposeParams.composeFields = composeFields;
 
                 const identityResult = setComposeIdentity(msgComposeParams, from, null);
                 if (identityResult && identityResult.error) return identityResult;
+
+                // Match body shape and format to caller intent / identity pref.
+                // When the resolved mode is plain, ship a plain body -- the HTML
+                // envelope would otherwise render as literal text in plain-mode
+                // editors and recipients.
+                const { useHtml, format } = resolveComposeFormat(msgComposeParams.identity, isHtml, Ci.nsIMsgCompType.New);
+                msgComposeParams.format = format;
+                if (useHtml) {
+                  const formatted = formatBodyHtml(body, isHtml);
+                  composeFields.body = isHtml && formatted.includes('<html')
+                    ? formatted
+                    : `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
+                } else {
+                  composeFields.body = body || "";
+                }
 
                 const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
@@ -4027,9 +4067,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    .createInstance(Ci.nsIMsgCompFields);
 
 	                  msgComposeParams.type = compType;
-	                  // Respect the user's compose-format preference unless the caller
-	                  // explicitly forced HTML via isHtml: true.
-	                  msgComposeParams.format = isHtml === true ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.Default;
 	                  msgComposeParams.originalMsgURI = msgURI;
 	                  msgComposeParams.composeFields = composeFields;
 
@@ -4042,6 +4079,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    resolve(identityResult);
 	                    return;
 	                  }
+
+	                  // Resolve compose mode against caller intent + identity pref.
+	                  // The skipReview branch reads useHtml below to shape the body.
+	                  const { useHtml: replyUseHtml, format: replyFormat } =
+	                    resolveComposeFormat(msgComposeParams.identity, isHtml, compType);
+	                  msgComposeParams.format = replyFormat;
 
 	                  // Pass through only the fields the caller explicitly provided.
 	                  // Any field left undefined is filled in by Thunderbird's native
@@ -4083,18 +4126,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
 	                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
 	                        const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
-	                        const quotedLines = originalBody.split('\n').map(line =>
-	                          `&gt; ${escapeHtml(line)}`
-	                        ).join('<br>');
-	                        const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
-	                        const quoteBlock = isHtml
-	                          ? `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<blockquote type="cite">${quotedHtml}</blockquote>`
-	                          : `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<br>${quotedLines}`;
 
 	                        // Direct send goes through nsIMsgSend, not nsIMsgCompose, so
 	                        // it still uses a hand-built quoted body and cannot place the
-	                        // identity signature according to reply preferences.
-	                        composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
+	                        // identity signature according to reply preferences. The shape
+	                        // matches the resolved compose mode -- shipping an HTML envelope
+	                        // for a plain-format send would otherwise render as literal
+	                        // markup in the recipient's mail client.
+	                        if (replyUseHtml) {
+	                          const quotedLines = originalBody.split('\n').map(line =>
+	                            `&gt; ${escapeHtml(line)}`
+	                          ).join('<br>');
+	                          const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
+	                          const quoteBlock = isHtml
+	                            ? `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<blockquote type="cite">${quotedHtml}</blockquote>`
+	                            : `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<br>${quotedLines}`;
+	                          composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
+	                        } else {
+	                          const quotedLines = originalBody.split('\n').map(line => `> ${line}`).join('\n');
+	                          composeFields.body = `${body || ""}\n\nOn ${dateStr}, ${author} wrote:\n${quotedLines}`;
+	                        }
 
 	                        sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType).then(result => {
 	                          if (result.success) {
@@ -4182,9 +4233,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     .createInstance(Ci.nsIMsgCompFields);
 
                   msgComposeParams.type = compType;
-                  // Respect the user's compose-format preference unless the caller
-                  // explicitly forced HTML via isHtml: true.
-                  msgComposeParams.format = isHtml === true ? Ci.nsIMsgCompFormat.HTML : Ci.nsIMsgCompFormat.Default;
                   msgComposeParams.originalMsgURI = msgURI;
                   msgComposeParams.composeFields = composeFields;
 
@@ -4197,6 +4245,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     resolve(identityResult);
                     return;
                   }
+
+                  // ForwardInline only passes the format flag through when it is
+                  // Default or OppositeOfDefault -- HTML/PlainText are ignored and
+                  // the identity's compose pref always wins. resolveComposeFormat
+                  // returns OppositeOfDefault when the caller's explicit isHtml
+                  // conflicts with the identity pref so we can still force the
+                  // intended editor mode.
+                  const { useHtml: fwdUseHtml, format: fwdFormat } =
+                    resolveComposeFormat(msgComposeParams.identity, isHtml, compType);
+                  msgComposeParams.format = fwdFormat;
 
                   if (skipReview) {
                     const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
@@ -4218,28 +4276,36 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         const fwdAuthor = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
                         const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
 
-                        const fwdHeaderHtml =
-                          `-------- Forwarded Message --------<br>` +
-                          `Subject: ${escapeHtml(origSubject)}<br>` +
-                          `Date: ${dateStr}<br>` +
-                          `From: ${escapeHtml(fwdAuthor)}<br>` +
-                          `To: ${escapeHtml(fwdRecipients)}<br><br>`;
-                        const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
-                        const quotedLines = originalBody.split('\n').map(line =>
-                          `&gt; ${escapeHtml(line)}`
-                        ).join('<br>');
-
-                        // Direct send goes through nsIMsgSend, not nsIMsgCompose, so
-                        // we still hand-build the forward block. Mirror the reply
-                        // path's HTML/plain shape: when isHtml is true, wrap the
-                        // forwarded content in <blockquote type="cite"> to match
-                        // native TB rendering; otherwise emit the text-divider form.
-                        const forwardBlock = isHtml
-                          ? `<blockquote type="cite">${fwdHeaderHtml}${quotedHtml}</blockquote>`
-                          : `${fwdHeaderHtml}${quotedLines}`;
-                        const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
-
-                        composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
+                        // Direct send goes through nsIMsgSend, not nsIMsgCompose,
+                        // so we hand-build the forward block. The shape matches the
+                        // resolved compose mode -- shipping an HTML envelope for a
+                        // plain-format send would render as literal markup in the
+                        // recipient's mail client.
+                        if (fwdUseHtml) {
+                          const fwdHeaderHtml =
+                            `-------- Forwarded Message --------<br>` +
+                            `Subject: ${escapeHtml(origSubject)}<br>` +
+                            `Date: ${dateStr}<br>` +
+                            `From: ${escapeHtml(fwdAuthor)}<br>` +
+                            `To: ${escapeHtml(fwdRecipients)}<br><br>`;
+                          const quotedHtml = escapeHtml(originalBody).replace(/\n/g, '<br>');
+                          const quotedLinesHtml = originalBody.split('\n').map(line =>
+                            `&gt; ${escapeHtml(line)}`
+                          ).join('<br>');
+                          const forwardBlock = isHtml
+                            ? `<blockquote type="cite">${fwdHeaderHtml}${quotedHtml}</blockquote>`
+                            : `${fwdHeaderHtml}${quotedLinesHtml}`;
+                          const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
+                          composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
+                        } else {
+                          const fwdHeader =
+                            `-------- Forwarded Message --------\n` +
+                            `Subject: ${origSubject}\n` +
+                            `Date: ${dateStr}\n` +
+                            `From: ${fwdAuthor}\n` +
+                            `To: ${fwdRecipients}\n\n`;
+                          composeFields.body = `${body ? body + '\n\n' : ''}${fwdHeader}${originalBody}`;
+                        }
 
                         const origDescs = [];
                         if (aMimeMsg && aMimeMsg.allUserAttachments) {
