@@ -321,12 +321,11 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
       const FILTER_EVENT = 1 << 3;
       const results = [];
       for (const calendar of targets) {
-        const EVENT_COLLECTION_CAP = limit * 10;
-
         // Phase 1: non-recurring events + modified-occurrence exceptions.
+        // Bounded by the date range so no expansion cap is needed here --
+        // applying one would risk starving Phase 2 on wide ranges.
         const rangeItems = await getCalendarItems(calendar, rangeStart, rangeEnd);
         for (const item of rangeItems) {
-          if (results.length >= EVENT_COLLECTION_CAP) break;
           if (!item.recurrenceInfo) results.push(formatEvent(item, calendar));
         }
 
@@ -345,17 +344,26 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
           allItems = rangeItems;
         }
 
+        // Cap recurring expansion to prevent a malformed daily-over-decades
+        // master from blowing up the result. Tracked independently of Phase 1
+        // so a busy date range cannot starve recurring expansion.
+        const OCCURRENCE_EXPANSION_CAP = limit * 10;
+        let expanded = 0;
         for (const item of allItems) {
-          if (results.length >= EVENT_COLLECTION_CAP) break;
+          if (expanded >= OCCURRENCE_EXPANSION_CAP) break;
           if (!item.recurrenceInfo) continue;
           try {
             const occurrences = item.recurrenceInfo.getOccurrences(rangeStart, rangeEnd, 0);
             for (const occ of occurrences) {
-              if (results.length >= EVENT_COLLECTION_CAP) break;
+              if (expanded >= OCCURRENCE_EXPANSION_CAP) break;
               results.push(formatEvent(occ, calendar));
+              expanded++;
             }
-          } catch {
-            results.push(formatEvent(item, calendar));
+          } catch (e) {
+            // Don't push the master on failure -- its event_start is the original
+            // first-occurrence date and is almost certainly outside the queried
+            // range, which would pollute results with stale events.
+            console.warn("thunderbird-mcp: recurrence expansion failed for", item.id || item.title, e);
           }
         }
       }
