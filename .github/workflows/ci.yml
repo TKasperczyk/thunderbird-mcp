@@ -6,6 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least-privilege default. Jobs needing more (e.g. uploading artifacts)
+# override at the job level. Without an explicit permissions block,
+# GITHUB_TOKEN defaults to read+write across the board which is more
+# than any of these jobs need.
+permissions:
+  contents: read
+
 jobs:
   # ─── Tier 1: Unit tests ──────────────────────────────────────────────
   # Pure-Node tests of mcp-bridge, auth, permissions, tool-access,
