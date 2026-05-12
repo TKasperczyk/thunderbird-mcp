@@ -1,47 +1,18 @@
 {
   "$schema": "https://unpkg.com/knip@5/schema.json",
-  "_comment": [
-    "Knip = dead-code finder. Complements dependency-cruiser:",
-    "  - dep-cruise sees orphans (files imported by nothing).",
-    "  - knip also sees unused exports (functions/consts no one calls),",
-    "    unused devDeps, and unused npm scripts.",
-    "Entries are LOADED, not imported — Knip treats them as the start",
-    "of the reachable graph. Anything not transitively reachable from",
-    "an entry is dead.",
-    "We intentionally do NOT list lib/*.sys.mjs as entries. Those land",
-    "in PR #2 (refactor/api-modular-split). When that PR lands, the",
-    "entries list grows to include them."
-  ],
   "entry": [
-    "mcp-bridge.cjs",
     "extension/background.js",
     "extension/options.js",
     "extension/mcp_server/api.js",
     "scripts/**/*.cjs",
-    "scripts/**/*.mjs",
-    "test/**/*.cjs",
-    "test/**/*.mjs",
-    "eslint.config.mjs",
-    ".dependency-cruiser.cjs",
-    "commitlint.config.cjs"
+    "test/**/*.cjs"
   ],
   "project": [
-    "mcp-bridge.cjs",
     "extension/**/*.{js,mjs,sys.mjs}",
     "scripts/**/*.{cjs,mjs}",
     "test/**/*.{cjs,mjs}"
   ],
   "ignore": [
-    "extension/httpd.sys.mjs",
-    "node_modules/**",
-    "dist/**",
-    ".claude/**"
-  ],
-  "ignoreDependencies": [
-    "@commitlint/config-conventional"
-  ],
-  "ignoreBinaries": [
-    "thunderbird",
-    "thunderbird-bin"
+    "extension/httpd.sys.mjs"
   ]
 }
