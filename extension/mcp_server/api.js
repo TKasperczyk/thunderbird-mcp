@@ -220,7 +220,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "createEvent",
         group: "calendar", crud: "create",
         title: "Create Event",
-        description: "Create a calendar event. By default opens a review dialog; set skipReview to add directly.",
+        description: "Create a calendar event. By default opens a review dialog; set skipReview to add directly. Recurring events are supported via the recurrence parameter.",
         inputSchema: {
           type: "object",
           properties: {
@@ -232,6 +232,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable calendar)" },
             allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
             status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
+            recurrence: { type: "string", description: "iCalendar RRULE string for recurring events (e.g. 'FREQ=WEEKLY;BYDAY=MO,TU,TH,FR' or 'RRULE:FREQ=DAILY;COUNT=10'). The 'RRULE:' prefix is optional and added automatically if missing." },
             skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
           },
           required: ["title", "startDate"],
@@ -257,7 +258,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "updateEvent",
         group: "calendar", crud: "update",
         title: "Update Event",
-        description: "Update an existing calendar event's title, dates, location, or description",
+        description: "Update an existing calendar event's title, dates, location, description, or recurrence rule.",
         inputSchema: {
           type: "object",
           properties: {
@@ -269,6 +270,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             location: { type: "string", description: "New event location (optional)" },
             description: { type: "string", description: "New event description (optional)" },
             status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
+            recurrence: { type: "string", description: "New iCalendar RRULE string (optional). Pass an empty string to clear the recurrence and turn the event into a one-shot. The 'RRULE:' prefix is optional." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -2733,7 +2735,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status) {
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, recurrence) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -2828,6 +2830,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   event.setProperty("STATUS", normalized);
                 }
 
+                if (recurrence) {
+                  try {
+                    setRecurrenceOnItem(event, recurrence);
+                  } catch (re) {
+                    return { error: `Invalid recurrence rule: ${re.toString()}` };
+                  }
+                }
+
                 // Find target calendar
                 const calendars = cal.manager.getCalendars();
                 let targetCalendar = null;
@@ -2908,6 +2918,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return VEVENT_STATUS_MAP[String(status).trim().toLowerCase()] || null;
             }
 
+            // Build a calIRecurrenceInfo from an iCal RRULE string and attach it
+            // to `item`. Passing "" or null clears any existing recurrence. The
+            // "RRULE:" prefix is optional. Throws on invalid rules.
+            function setRecurrenceOnItem(item, recurrence) {
+              if (recurrence === "" || recurrence === null) {
+                item.recurrenceInfo = null;
+                return;
+              }
+              const rinfo = Cc["@mozilla.org/calendar/recurrence-info;1"]
+                .createInstance(Ci.calIRecurrenceInfo);
+              rinfo.item = item;
+              const ritem = Cc["@mozilla.org/calendar/recurrence-rule;1"]
+                .createInstance(Ci.calIRecurrenceRule);
+              ritem.icalString = recurrence.startsWith("RRULE:") ? recurrence : ("RRULE:" + recurrence);
+              rinfo.appendRecurrenceItem(ritem);
+              item.recurrenceInfo = rinfo;
+            }
+
+            // Return the first RRULE on `item` without its "RRULE:" prefix, or
+            // null if the event is not recurring / has no RRULE among its items
+            // (e.g. RDATE-only recurrences).
+            function extractRRuleFromItem(item) {
+              if (!item.recurrenceInfo) return null;
+              try {
+                const rules = item.recurrenceInfo.getRecurrenceItems();
+                for (const r of rules) {
+                  if (r && typeof r.icalString === "string" && r.icalString.startsWith("RRULE:")) {
+                    return r.icalString.replace(/^RRULE:/, "");
+                  }
+                }
+              } catch { /* ignore */ }
+              return null;
+            }
+
             function formatEvent(item, calendar) {
               const allDay = item.startDate ? item.startDate.isDate : false;
               // For all-day events, iCal DTEND is exclusive. Convert to inclusive
@@ -2935,6 +2979,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 status: (item.getProperty("STATUS") || "").toLowerCase(),
                 allDay,
                 isRecurring: !!item.recurrenceInfo,
+                recurrence: extractRRuleFromItem(item),
               };
               // Occurrences of recurring events share the parent's id.
               // Include recurrenceId so callers can distinguish them.
@@ -3264,7 +3309,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurrence) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -3335,6 +3380,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     newItem.setProperty("STATUS", normalized);
                   }
                   changes.push("status");
+                }
+
+                if (recurrence !== undefined) {
+                  try {
+                    setRecurrenceOnItem(newItem, recurrence);
+                    changes.push("recurrence");
+                  } catch (re) {
+                    return { error: `Invalid recurrence rule: ${re.toString()}` };
+                  }
                 }
 
                 if (changes.length === 0) return { error: "No changes specified" };
@@ -5567,11 +5621,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.recurrence);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurrence);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId);
                 case "listCategories":
