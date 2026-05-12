@@ -511,9 +511,21 @@ export function makeCalendar({ Services, Cc, Ci, cal, CalEvent, CalTodo }) {
     // dropped to plain text -- TB's task UI sanitizes on render but the raw
     // markup is persisted in ALTREP and may be consumed by other clients.
     const anchors = [];
-    let processed = input.replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, (whole, inner) => {
+    // Closing-tag regex uses \b[^>]*> so HTML5 whitespace variants like
+    // </a > or </a\n> match -- a literal </a> regex would let the rest
+    // of the anchor leak through (CodeRabbit).
+    let processed = input.replace(/<a\b[^>]*>([\s\S]*?)<\/a\b[^>]*>/gi, (whole, inner) => {
       const hrefMatch = whole.match(/href\s*=\s*(['"])([^'"]*)\1/i);
-      const innerText = escapeText(inner.replace(/<[^>]+>/g, ""));
+      // Strip script/style blocks explicitly before the generic tag
+      // stripper. The generic <[^>]+> pass alone is incomplete
+      // multi-character sanitization (CodeQL js/bad-tag-filter) -- a
+      // payload like <scr<script>ipt> can survive a single pass.
+      // \b[^>]*> in the end tag tolerates HTML5 whitespace and attrs.
+      const stripped = inner
+        .replace(/<script\b[^>]*>[\s\S]*?<\/script\b[^>]*>/gi, "")
+        .replace(/<style\b[^>]*>[\s\S]*?<\/style\b[^>]*>/gi, "")
+        .replace(/<[^>]+>/g, "");
+      const innerText = escapeText(stripped);
       if (!hrefMatch || !SAFE_HREF.test(hrefMatch[2].trim())) {
         return innerText;
       }

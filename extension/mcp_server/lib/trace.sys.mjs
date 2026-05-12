@@ -209,6 +209,20 @@ export async function makeTrace({
   function emit(level, scenario, event, ctx) {
     if (level < minLevel) return;
     const caller = captureCaller();
+    // Serialize ctx defensively. JSON.stringify throws on BigInt fields or
+    // circular references, and the tracer must never break the caller --
+    // degrade to a marker payload so the row still gets written.
+    let ctxJson = null;
+    if (ctx) {
+      try {
+        ctxJson = JSON.stringify(ctx);
+      } catch (e) {
+        ctxJson = JSON.stringify({
+          __trace_serialization_error: String((e && e.message) || e),
+          __ctx_keys: typeof ctx === "object" ? Object.keys(ctx) : null,
+        });
+      }
+    }
     const row = {
       ts_us: nowUs(),
       level,
@@ -231,7 +245,7 @@ export async function makeTrace({
           level: row.level,
           scenario: row.scenario,
           event: row.event,
-          ctx_json: ctx ? JSON.stringify(ctx) : null,
+          ctx_json: ctxJson,
           trace_id: row.trace_id,
           caller_file: row.caller_file,
           caller_line: row.caller_line,
