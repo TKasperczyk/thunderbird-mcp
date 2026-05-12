@@ -2908,6 +2908,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return VEVENT_STATUS_MAP[String(status).trim().toLowerCase()] || null;
             }
 
+            function formatAttendee(att) {
+              if (!att) return null;
+              return {
+                id: att.id || "",
+                commonName: att.commonName || "",
+                participationStatus: att.participationStatus || "",
+                role: att.role || "",
+              };
+            }
+
             function formatEvent(item, calendar) {
               const allDay = item.startDate ? item.startDate.isDate : false;
               // For all-day events, iCal DTEND is exclusive. Convert to inclusive
@@ -2941,6 +2951,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (item.recurrenceId) {
                 result.recurrenceId = calDateToISO(item.recurrenceId);
               }
+              // Organizer + attendees + my own participation status, so callers
+              // can filter out DECLINED invites (e.g. ghost events kept on the
+              // server but no longer attended).
+              try {
+                result.organizer = formatAttendee(item.organizer);
+              } catch { result.organizer = null; }
+              try {
+                const atts = typeof item.getAttendees === "function" ? item.getAttendees() : [];
+                result.attendees = (atts || []).map(formatAttendee).filter(Boolean);
+              } catch { result.attendees = []; }
+              try {
+                const me = cal.itip && typeof cal.itip.getInvitedAttendee === "function"
+                  ? cal.itip.getInvitedAttendee(item, calendar)
+                  : null;
+                result.myPartStat = me ? (me.participationStatus || "") : "";
+              } catch { result.myPartStat = ""; }
               return result;
             }
 
