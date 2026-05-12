@@ -51,12 +51,13 @@ jobs:
         with:
           fail-on-severity: moderate
           comment-summary-in-pr: on-failure
-          # MIT-equivalent + permissive licenses we accept transitively.
-          # Update if a legitimate dep needs adding here; keep deny tight.
-          allow-licenses: >-
-            MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC,
-            CC0-1.0, Unlicense, MPL-2.0, 0BSD, BlueOak-1.0.0,
-            Python-2.0
+          # Deny-list only: dependency-review-action rejects configs
+          # that specify both allow-licenses and deny-licenses (they're
+          # mutually exclusive in the action's schema).
+          # Intent: block copyleft licenses that conflict with this
+          # project's MIT license under transitive redistribution.
+          # Everything else (MIT, Apache-2.0, BSD-*, ISC, MPL-2.0,
+          # BlueOak-1.0.0, ...) is allowed by default.
           deny-licenses: >-
             GPL-2.0-only, GPL-2.0-or-later,
             GPL-3.0-only, GPL-3.0-or-later,

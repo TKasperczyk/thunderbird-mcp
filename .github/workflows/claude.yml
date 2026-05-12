@@ -1,0 +1,63 @@
+# Claude Code Action -- on-demand AI review.
+#
+# Fires when someone comments "@claude" on a PR or issue. The
+# anthropics/claude-code-action@v1 entry point detects the mention,
+# reads the PR diff + comment context, and posts a review reply.
+#
+# Why this exists separately from CodeRabbit:
+#   - CodeRabbit runs on every PR (subject to .coderabbit.yaml config)
+#     and is good at structured walkthroughs + per-file remarks.
+#   - Claude is on-demand and is good at deep-dive answers, RFC-level
+#     architecture questions, and "is X the right approach" calls.
+#   - Different prompts get different value out of each.
+#
+# Cost guard:
+#   The `if:` predicate ensures we only burn API budget when someone
+#   actually @mentioned Claude in a PR comment. Without it, every
+#   issue comment + PR review comment in the repo would invoke the
+#   action.
+#
+# Required secret:
+#   ANTHROPIC_API_KEY -- set via the /install-github-app flow in the
+#   Claude Code terminal. The flow creates this secret in the repo's
+#   Actions secrets. If this workflow ever fails with "secret not
+#   found", re-run `/install-github-app`.
+
+name: Claude
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read         # to read repo + diff
+  pull-requests: write   # to post the review reply
+  issues: write          # to post on issues
+
+jobs:
+  claude:
+    name: claude review
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Skip unless someone @mentioned Claude in a PR (not just any
+    # repo issue comment). Avoids burning API budget on Dependabot
+    # PR comments, CodeRabbit summaries, etc.
+    if: |
+      (github.event.issue.pull_request != null || github.event.pull_request != null) &&
+      contains(github.event.comment.body, '@claude')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # claude-code-action needs full history to diff PR base..head
+          # accurately. Shallow fetch breaks the "what changed in this
+          # PR" reasoning.
+          fetch-depth: 0
+
+      - name: Claude review
+        uses: anthropics/claude-code-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}

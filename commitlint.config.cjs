@@ -26,5 +26,23 @@ module.exports = {
   rules: {
     "header-max-length": [2, "always", 150],
     "body-max-line-length": [1, "always", 120],
+    // Downgraded from error (2) to warning (1).
+    //
+    // Default config-conventional bans sentence-case / start-case /
+    // pascal-case / upper-case in the subject. That conflicts with
+    // legitimate uses of tech acronyms (TB, EPIPE, URL, MCP, HTTP,
+    // CI, etc) at subject start: commitlint sees the leading
+    // uppercase word and classifies the whole subject as start-case.
+    //
+    // Project-wide we still WANT subjects to read like sentences
+    // (lowercase first word where possible). Warning surfaces the
+    // signal without blocking commits where the acronym is the
+    // accurate term -- e.g. "fix(bridge): EPIPE-safe stdout writes"
+    // is more descriptive than "fix(bridge): epipe-safe stdout writes".
+    "subject-case": [
+      1,
+      "never",
+      ["pascal-case", "upper-case"],
+    ],
   },
 };
