@@ -1039,6 +1039,29 @@ export function makeCompose({
    * opening a compose window. Shares most of the machinery with
    * sendMessageDirectly but passes SaveAsDraft as the delivery mode.
    *
+   * IMPORTANT: TB 128's JS rewrite of nsMsgSend
+   * (mailnews/compose/src/MessageSend.sys.mjs) treats SaveAsDraft as
+   * a fire-and-return code path:
+   *
+   *     // _deliverMessage:
+   *     if ([..., nsMsgSaveAsDraft, nsMsgSaveAsTemplate].includes(this._deliverMode)) {
+   *         await this._mimeDoFcc();
+   *         return;   // <-- no notifyListenerOnStopSending
+   *     }
+   *
+   * The listener's onStopSending() is ONLY invoked for nsMsgDeliverNow
+   * via _deliveryExitProcessing. For SaveAsDraft, only onGetDraftFolderURI
+   * fires (from _mimeDoFcc). Completion of the draft save is signaled by
+   * resolution of the promise that createAndSendMessage returns.
+   *
+   * So this function waits on whichever fires first:
+   *   - listener.onStopSending      -- legacy TB (102-127, C++ nsMsgSend)
+   *   - createAndSendMessage promise resolution -- TB 128+ (JS rewrite)
+   * Both paths converge on the same idempotent settle() with the
+   * draftFolderURI that onGetDraftFolderURI captured along the way.
+   *
+   * Reference: https://bugzilla.mozilla.org/show_bug.cgi?id=1211292
+   *
    * Returns a promise resolving to { success, draftFolderURI?, messageId? }
    * or { error }.
    */
@@ -1050,8 +1073,17 @@ export function makeCompose({
     return new Promise((resolve) => {
       let settled = false;
       let capturedDraftUri = null;
+      let capturedMessageId = null;
       const settle = (result) => {
         if (!settled) { settled = true; resolve(result); }
+      };
+      const settleSuccess = () => {
+        timer.cancel();
+        settle({
+          success: true,
+          draftFolderURI: capturedDraftUri,
+          messageId: capturedMessageId,
+        });
       };
 
       const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
@@ -1094,20 +1126,28 @@ export function makeCompose({
           onProgress() {},
           onSendProgress() {},
           onStatus() {},
+          // Legacy (TB 102-127, C++ nsMsgSend) completion signal.
+          // On TB 128+ this never fires for SaveAsDraft -- promise
+          // resolution below is the completion signal instead.
           onStopSending(msgID, status) {
-            timer.cancel();
+            if (msgID && !capturedMessageId) {
+              capturedMessageId = msgID.replace(/^<|>$/g, "") || null;
+            }
             if (Components.isSuccessCode(status)) {
-              settle({
-                success: true,
-                draftFolderURI: capturedDraftUri,
-                messageId: (msgID || "").replace(/^<|>$/g, "") || null,
-              });
+              settleSuccess();
             } else {
+              timer.cancel();
               settle({ error: `Draft save failed (status: 0x${(status >>> 0).toString(16)})` });
             }
           },
+          // Fires from _mimeDoFcc on both old and new code paths.
+          // Captures the URI so settleSuccess() can return it regardless
+          // of which completion path wins the race.
           onGetDraftFolderURI(msgID, folderURI) {
             capturedDraftUri = folderURI;
+            if (msgID && !capturedMessageId) {
+              capturedMessageId = msgID.replace(/^<|>$/g, "") || null;
+            }
           },
           onSendNotPerformed() { timer.cancel(); settle({ error: "Draft save was not performed" }); },
           onTransportSecurityError() { /* not applicable for drafts */ },
@@ -1143,8 +1183,13 @@ export function makeCompose({
           // Legacy 18-arg signature (TB 102-127)
           sendResult = msgSend.createAndSendMessage(...commonArgs, null, null, ...tailArgs);
         }
+        // TB 128+ promise path. Resolution = SaveAsDraft completion
+        // (_mimeDoFcc finished). Rejection = error mid-save.
         if (sendResult && typeof sendResult.then === "function") {
-          sendResult.catch(e => { timer.cancel(); settle({ error: e.toString() }); });
+          sendResult.then(
+            settleSuccess,
+            e => { timer.cancel(); settle({ error: e.toString() }); }
+          );
         }
       } catch (e) {
         timer.cancel();
