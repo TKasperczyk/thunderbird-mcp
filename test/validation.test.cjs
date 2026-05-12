@@ -29,6 +29,15 @@ function createValidator(tools) {
     const schema = toolSchemas[name];
     if (!schema) return [`Unknown tool: ${name}`];
 
+    // Mirror the dispatch.sys.mjs normalization: no-arg tools may arrive
+    // with arguments omitted; treat missing/null args as an empty object
+    // and reject non-object args with a typed error.
+    if (args == null) {
+      args = {};
+    } else if (typeof args !== 'object' || Array.isArray(args)) {
+      return [`Parameters must be an object, got ${Array.isArray(args) ? 'array' : typeof args}`];
+    }
+
     const errors = [];
     const props = schema.properties || {};
     const required = schema.required || [];
@@ -456,5 +465,45 @@ describe('Validation: account access control', () => {
     const errors = validate('getAccountAccess', { bogus: 'value' });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /Unknown parameter/);
+  });
+});
+
+describe('Validation: missing/non-object params', () => {
+  // No-arg tools (getAccountAccess) can legitimately arrive with the
+  // arguments object omitted entirely. The validator must treat that as
+  // an empty object instead of dereferencing null/undefined.
+  it('accepts undefined args for a no-arg tool', () => {
+    const errors = validate('getAccountAccess', undefined);
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts null args for a no-arg tool', () => {
+    const errors = validate('getAccountAccess', null);
+    assert.equal(errors.length, 0);
+  });
+
+  it('reports missing required params when args omitted on a required-param tool', () => {
+    const errors = validate('createContact', undefined);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /email/);
+  });
+
+  it('rejects array args with a typed error', () => {
+    const errors = validate('getAccountAccess', []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an object/);
+    assert.match(errors[0], /array/);
+  });
+
+  it('rejects string args with a typed error', () => {
+    const errors = validate('createContact', 'not-an-object');
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an object/);
+  });
+
+  it('rejects number args with a typed error', () => {
+    const errors = validate('createContact', 42);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an object/);
   });
 });

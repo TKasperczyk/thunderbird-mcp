@@ -78,6 +78,17 @@ export function makeDispatch({
     const schema = toolSchemas[name];
     if (!schema) return [`Unknown tool: ${name}`];
 
+    // Normalize missing/non-object params. No-arg tools can legitimately
+    // arrive with arguments omitted; treat that as an empty object rather
+    // than dereferencing null/undefined below. Reject arrays and
+    // primitives explicitly so the client gets a typed error instead of a
+    // confusing "Missing required parameter" cascade.
+    if (args == null) {
+      args = {};
+    } else if (typeof args !== "object" || Array.isArray(args)) {
+      return [`Parameters must be an object, got ${Array.isArray(args) ? "array" : typeof args}`];
+    }
+
     const errors = [];
     const props = schema.properties || {};
     const required = schema.required || [];
@@ -132,6 +143,12 @@ export function makeDispatch({
   function coerceToolArgs(name, args) {
     const schema = toolSchemas[name];
     if (!schema) return args;
+    // Mirror the validateToolArgs normalization: no-arg tools may arrive
+    // with arguments omitted, and we must not dereference null/undefined
+    // or iterate a non-object. Hand non-object input straight back so
+    // validateToolArgs can report the typed error to the client.
+    if (args == null) return {};
+    if (typeof args !== "object" || Array.isArray(args)) return args;
     const props = schema.properties || {};
     for (const [key, value] of Object.entries(args)) {
       if (value === undefined || value === null) continue;
@@ -181,8 +198,18 @@ export function makeDispatch({
     // Registry-driven tools: one file per tool under lib/tools/, handler
     // takes the args object directly. If the name is registered here we
     // skip the legacy switch entirely. See lib/tool-registry.sys.mjs.
-    if (registryHandlers && registryHandlers[name]) {
-      return await registryHandlers[name](args);
+    //
+    // Use hasOwnProperty + typeof guards so an unknown tool name like
+    // "toString" or "constructor" can't pick up Object.prototype members
+    // and bypass the "Unknown tool" default. The typeof check is
+    // defense-in-depth in case the registry ever stores non-function
+    // values under a key.
+    const registryHandler =
+      registryHandlers && Object.prototype.hasOwnProperty.call(registryHandlers, name)
+        ? registryHandlers[name]
+        : null;
+    if (typeof registryHandler === "function") {
+      return await registryHandler(args);
     }
     switch (name) {
       case "listAccounts":
