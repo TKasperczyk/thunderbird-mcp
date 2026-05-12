@@ -73,6 +73,11 @@ const ALL_TOOLS = [
   { name: "forwardMessage", group: "messages", crud: "create" },
   { name: "updateMessage", group: "messages", crud: "update" },
   { name: "deleteMessages", group: "messages", crud: "delete" },
+  // TODO(refactor): saveDraft was added to main in 5667e08 after this
+  // refactor branch was forked. Re-add here once it's implemented in
+  // lib/messages.sys.mjs + registered in lib/tools-schema.sys.mjs.
+  // Currently absent from production (no longer in api.js post-split,
+  // not yet in lib/), so testing for its presence would fail.
   { name: "createFolder", group: "folders", crud: "create" },
   { name: "renameFolder", group: "folders", crud: "update" },
   { name: "moveFolder", group: "folders", crud: "update" },

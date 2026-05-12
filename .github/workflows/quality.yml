@@ -1,0 +1,108 @@
+# Quality-tier checks for thunderbird-mcp.
+#
+# Why this file exists:
+#   - Every contributor PR needs a green check before review starts.
+#     Without it, regressions surface only when the maintainer manually
+#     runs things, which doesn't scale across the open feature PRs.
+#   - The integration tier (headless Thunderbird + greenmail) lives in
+#     ci.yml — it's heavy (real TB tarball + Docker greenmail) so it
+#     runs in its own workflow. quality.yml is the cheap always-on tier.
+#
+# Why split from ci.yml:
+#   - ci.yml is the slow path: unit + build-xpi + integration with a
+#     pinned TB ESR. quality.yml is the fast path: ESLint + knip +
+#     dep-cruise + node:test + commitlint. Keeping them as separate
+#     workflows lets contributors see quality go green in <2 min while
+#     the integration job catches up (~10 min). Two checks on a PR
+#     instead of one job with confusing partial-failure semantics.
+#
+# Jobs:
+#   - quality:  lint (ESLint, hard gate) + dead-code (knip,
+#               informational) + structure (dependency-cruiser,
+#               informational) + node:test.
+#   - commits:  commitlint on PR commits only. Push-events skip so
+#               historical non-conventional commits don't fail CI.
+#
+# Tolerances (intentional, documented):
+#   - dead-code and dep-cruise are informational (continue-on-error).
+#     Both produce useful signal but neither has a zero-baseline today;
+#     gating PRs on them would block normal feature work. They become
+#     hard gates in a follow-up after the team agrees a baseline.
+#
+# Setup-node cache note:
+#   package-lock.json is .gitignore'd in this repo, so there's no key
+#   for setup-node to cache against. We use `npm install` (not `npm ci`)
+#   and omit `cache: npm`. Install is fast (<30s with current deps).
+
+name: Quality
+
+on:
+  push:
+    branches: [main, master, "refactor/**", "feature/**"]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: lint + tests + dead-code
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Dead-code (knip, informational)
+        run: npm run dead-code
+        continue-on-error: true
+
+      - name: Structure (dep-cruise, informational)
+        run: npm run dep-cruise
+        continue-on-error: true
+
+      - name: Unit tests (node:test)
+        run: npm test
+
+  commits:
+    name: commit messages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # commitlint needs base..head; full history is the simplest fetch
+          # depth that works across rebases, force-pushes, and merge commits.
+          fetch-depth: 0
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Commitlint (PR range)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: npx --no-install commitlint --from "$BASE_SHA" --to "$HEAD_SHA" --verbose

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "entry": [
+    "extension/background.js",
+    "extension/options.js",
+    "extension/mcp_server/api.js",
+    "extension/mcp_server/lib/**/*.sys.mjs",
+    "scripts/**/*.cjs",
+    "test/**/*.cjs"
+  ],
+  "project": [
+    "extension/**/*.{js,mjs,sys.mjs}",
+    "scripts/**/*.{cjs,mjs}",
+    "test/**/*.{cjs,mjs}"
+  ],
+  "ignore": [
+    "extension/httpd.sys.mjs"
+  ]
+}
