@@ -138,11 +138,14 @@ export function makeMessages({
     let text = String(html);
 
     // Remove style/script blocks.
-    // \s* before the closing > because HTML5 parsers accept whitespace
-    // in end tags (</script >, </style >) -- without it, a crafted body
-    // can smuggle a tag through this sanitizer (CodeQL js/bad-tag-filter).
-    text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, " ");
-    text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, " ");
+    // HTML5 end tags accept whitespace + ignored attributes after the tag
+    // name; \b[^>]* catches all variants (</script>, </script >,
+    // </script\n>, </script type="foo">, </script  bar baz>). The earlier
+    // \s* form still let a crafted body smuggle a tag through this
+    // sanitizer when garbage followed the whitespace (CodeQL
+    // js/bad-tag-filter).
+    text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script\b[^>]*>/gi, " ");
+    text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style\b[^>]*>/gi, " ");
 
     // Convert block-level tags to newlines before stripping
     text = text.replace(/<br\s*\/?>/gi, "\n");
@@ -1542,6 +1545,13 @@ export function makeMessages({
     };
   }
 
+  // Convention for `includeSubfolders` across every walker in this module
+  // (searchFolder ~L574, collectFromFolder ~L1201, _walkFolderMessages here):
+  // `undefined` (or option object omitted) means "yes, recurse". Only the
+  // explicit value `false` disables recursion. Callers must therefore pass
+  // `includeSubfolders !== false`, NOT `!!includeSubfolders` -- the latter
+  // flips the default-true to default-false on `undefined`, which would be
+  // inconsistent with the rest of the module.
   function _walkFolderMessages(folder, callback, { includeSubfolders = true, cap = SEARCH_COLLECTION_CAP } = {}) {
     let processed = 0;
     let aborted = false;
@@ -1705,7 +1715,7 @@ export function makeMessages({
         });
       }
       return true;
-    }, { includeSubfolders: !!includeSubfolders, cap });
+    }, { includeSubfolders: includeSubfolders !== false, cap });
 
     if (effectiveDry) {
       return {
@@ -1743,17 +1753,24 @@ export function makeMessages({
     for (const [srcFolder, hdrs] of bySource) {
       try {
         // Apply read/flag before move (IMAP may not preserve on moved copy).
-        for (const h of hdrs) {
-          try {
-            if (markRead === true && !h.isRead) h.markRead(true);
-            if (markRead === false && h.isRead) h.markRead(false);
-            if (flagged === true && !h.isFlagged) h.markFlagged(true);
-            if (flagged === false && h.isFlagged) h.markFlagged(false);
-          } catch (e) { errors.push({ id: h.messageId, error: `mark: ${e.toString()}` }); }
-          // (Removed an inert ternary loop here that had no side effect:
-          //  `for (const t of addTags) h.addProperty ? null : null;` -- the
-          //  real tag application is the keyword call below.)
+        // Use folder-level batched APIs for proper IMAP sync -- the
+        // per-hdr h.markRead() / h.markFlagged() variants only touch the
+        // local DB and don't queue IMAP STORE commands, so flag changes
+        // would not round-trip to the server. Matches the pattern
+        // updateMessage uses (~L1426 / ~L1431).
+        try {
+          if (markRead === true || markRead === false) {
+            srcFolder.markMessagesRead(hdrs, markRead);
+          }
+          if (flagged === true || flagged === false) {
+            srcFolder.markMessagesFlagged(hdrs, flagged);
+          }
+        } catch (e) {
+          errors.push({ folder: srcFolder.URI, error: `mark: ${e.toString()}` });
         }
+        // (Removed an inert ternary loop here that had no side effect:
+        //  `for (const t of addTags) h.addProperty ? null : null;` -- the
+        //  real tag application is the keyword call below.)
         // Tag add/remove via folder.addKeywordsToMessages / removeKeywordsFromMessages
         try {
           if (Array.isArray(addTags) && addTags.length) {
