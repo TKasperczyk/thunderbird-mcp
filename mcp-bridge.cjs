@@ -17,6 +17,15 @@ const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
 const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
 
+// Adversarial-input bounds. The bridge runs in the user's session with full
+// fs privileges; any unbounded buffer that grows from external bytes is a
+// trivial DoS vector. Caps are sized generously so legitimate payloads
+// (large message bodies, base64 attachment chunks) fly through, while a
+// runaway upstream / compromised local listener cannot OOM the process.
+const MAX_STDIN_BUFFER = 16 * 1024 * 1024;        // 16 MiB; LSPs cap 4-8 MiB
+const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;      // 64 MiB
+const IN_FLIGHT_WARN_THRESHOLD = 50;              // observability only, no hard limit
+
 const DEFAULT_PROC_ROOT = '/proc';
 const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
@@ -46,7 +55,18 @@ const LATEST_PROTOCOL_VERSION = '2025-06-18';
 const BRIDGE_VERSION = (() => {
   try {
     return require('./package.json').version || '0.0.0';
-  } catch {
+  } catch (e) {
+    // debugLog isn't defined yet at this point in module init. Surface the
+    // cause via direct stderr write so a "0.0.0" bug report can be diagnosed
+    // -- otherwise the silent catch makes "couldn't read package.json from
+    // script dir" indistinguishable from a normal run.
+    if (process.env.THUNDERBIRD_MCP_DEBUG) {
+      try {
+        process.stderr.write(
+          `[thunderbird-mcp] could not read package.json from ${__dirname}: ${e.message}; using fallback version\n`
+        );
+      } catch { /* stderr may already be closed */ }
+    }
     return '0.0.0';
   }
 })();
@@ -618,9 +638,26 @@ function tryRequest(hostname, postData, port, token) {
       method: 'POST',
       headers
     }, (res) => {
+      // Cap the response body. Auth token mitigates the spoof angle, but a
+      // compromised local listener that wins the discovery race could
+      // otherwise return GBs of data and OOM the bridge before res.end fires.
       const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
+      let totalBytes = 0;
+      let aborted = false;
+      res.on('data', (chunk) => {
+        if (aborted) return;
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_RESPONSE_BYTES) {
+          aborted = true;
+          debugLog(`HTTP response exceeded ${MAX_RESPONSE_BYTES} bytes; aborting`);
+          req.destroy(new Error(`response body exceeded ${MAX_RESPONSE_BYTES} bytes`));
+          reject(new Error(`Response body from Thunderbird exceeded ${MAX_RESPONSE_BYTES} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on('end', () => {
+        if (aborted) return;
         if (res.statusCode === 403) {
           clearConnectionCache();
           reject(new Error('Authentication failed (403). Token may be stale — retrying with fresh connection info.'));
@@ -712,6 +749,46 @@ async function forwardToThunderbird(message, _retried) {
   return tryNext(THUNDERBIRD_HOSTS);
 }
 
+// Module-level in-flight counter so observability survives across dispatches.
+// Soft warn-log only; no hard concurrency cap. A flood of stdin requests would
+// otherwise spawn N concurrent forwards (each holding a 30s timeout + HTTP
+// socket) with no signal in the logs.
+let inFlight = 0;
+
+function noteInFlightStart() {
+  inFlight++;
+  // Soft warn-log: every IN_FLIGHT_WARN_THRESHOLD-th increment past the
+  // threshold (so 50, 100, 150, ...). One log per 50 keeps noise bounded
+  // under a flood without hiding the trend.
+  if (inFlight >= IN_FLIGHT_WARN_THRESHOLD && inFlight % IN_FLIGHT_WARN_THRESHOLD === 0) {
+    debugLog(`high in-flight count: ${inFlight}`);
+  }
+}
+
+function noteInFlightEnd() {
+  if (inFlight > 0) inFlight--;
+}
+
+function getInFlightCount() {
+  return inFlight;
+}
+
+/**
+ * Push a chunk into the stdin buffer with a hard cap. Exposed for tests.
+ * Returns the next buffer, or `null` if the overflow was triggered (caller
+ * should also have observed the JSON-RPC parse error on stdout).
+ */
+function appendStdinChunk(buffer, chunk, { maxBytes = MAX_STDIN_BUFFER, onOverflow } = {}) {
+  const next = buffer + chunk;
+  if (next.length > maxBytes) {
+    if (typeof onOverflow === 'function') {
+      onOverflow(next.length);
+    }
+    return null;
+  }
+  return next;
+}
+
 function startBridge() {
   debugLog(`startup version=${BRIDGE_VERSION} pid=${process.pid} platform=${process.platform}`);
 
@@ -787,6 +864,7 @@ function startBridge() {
 
     debugLog(`recv method=${messageMethod} id=${messageId}`);
 
+    noteInFlightStart();
     handleMessage(line)
       .then(async (response) => {
         if (response !== null) {
@@ -801,6 +879,9 @@ function startBridge() {
           id: messageId,
           error: { code: -32700, message: `Bridge error: ${err.message}` }
         }) + '\n');
+      })
+      .finally(() => {
+        noteInFlightEnd();
       });
   }
 
@@ -816,7 +897,26 @@ function startBridge() {
   process.stdin.setEncoding('utf8');
   let buffer = '';
   process.stdin.on('data', (chunk) => {
-    buffer += chunk;
+    const next = appendStdinChunk(buffer, chunk, {
+      onOverflow: (size) => {
+        // Drop the buffer and surface a JSON-RPC parse error. id is null
+        // because we don't have a parsed message to attribute the error to.
+        debugLog(`stdin buffer overflow at ${size} bytes; dropping`);
+        process.stdout.write(JSON.stringify({
+          jsonrpc: '2.0',
+          id: null,
+          error: {
+            code: -32700,
+            message: `stdin buffer exceeded ${MAX_STDIN_BUFFER} bytes; input dropped`,
+          },
+        }) + '\n');
+      },
+    });
+    if (next === null) {
+      buffer = '';
+      return;
+    }
+    buffer = next;
     let idx;
     while ((idx = buffer.indexOf('\n')) !== -1) {
       const line = buffer.slice(0, idx).replace(/\r$/, '');
@@ -862,6 +962,7 @@ if (_autoStart) {
 }
 
 module.exports = {
+  appendStdinChunk,
   buildCandidateGroups,
   buildConnectionDiscoveryErrorMessage,
   clearConnectionCache,
@@ -871,6 +972,11 @@ module.exports = {
   findMacOsConnectionCandidates,
   findSnapConnectionCandidates,
   formatDiscoveryAttempts,
+  getInFlightCount,
+  MAX_RESPONSE_BYTES,
+  MAX_STDIN_BUFFER,
+  noteInFlightEnd,
+  noteInFlightStart,
   readConnectionInfo,
   startBridge,
 };

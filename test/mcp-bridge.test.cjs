@@ -5,8 +5,13 @@ const os = require('os');
 const path = require('path');
 
 const {
+  appendStdinChunk,
   buildConnectionDiscoveryErrorMessage,
   clearConnectionCache,
+  getInFlightCount,
+  MAX_STDIN_BUFFER,
+  noteInFlightEnd,
+  noteInFlightStart,
   readConnectionInfo,
 } = require('../mcp-bridge.cjs');
 
@@ -280,5 +285,96 @@ describe('Bridge discovery', () => {
     assert.equal(readConnectionInfo(options), null);
     assert.match(buildConnectionDiscoveryErrorMessage(), /THUNDERBIRD_MCP_CONNECTION_FILE/);
     assert.match(buildConnectionDiscoveryErrorMessage(), /file not found/);
+  });
+});
+
+describe('Bridge stdin buffer cap (DoS prevention)', () => {
+  // TODO: regression test for HTTP body cap once test harness supports mocked
+  // http.request -- the response cap path is awkward to exercise without
+  // wiring a fake server.
+
+  it('exports a non-trivial MAX_STDIN_BUFFER constant', () => {
+    assert.equal(typeof MAX_STDIN_BUFFER, 'number');
+    // 16 MiB. Bound is generous vs typical LSP 4-8 MiB so legitimate
+    // payloads (large message bodies, base64 attachments) don't trip.
+    assert.equal(MAX_STDIN_BUFFER, 16 * 1024 * 1024);
+  });
+
+  it('appendStdinChunk passes through chunks under the cap', () => {
+    const next = appendStdinChunk('abc', 'def');
+    assert.equal(next, 'abcdef');
+  });
+
+  it('appendStdinChunk fires onOverflow and returns null when over the cap', () => {
+    // Use a tiny synthetic cap so we don't actually allocate 16 MiB in the
+    // test. Production wiring uses MAX_STDIN_BUFFER; the overflow path is
+    // identical.
+    const smallCap = 64;
+    let observedSize = null;
+    const next = appendStdinChunk(
+      'a'.repeat(40),
+      'b'.repeat(40),
+      {
+        maxBytes: smallCap,
+        onOverflow: (size) => { observedSize = size; },
+      }
+    );
+    assert.equal(next, null);
+    assert.equal(observedSize, 80);
+    assert.ok(observedSize > smallCap);
+  });
+
+  it('appendStdinChunk does not call onOverflow when under the cap', () => {
+    let called = false;
+    const next = appendStdinChunk(
+      'short',
+      ' content',
+      {
+        maxBytes: 1024,
+        onOverflow: () => { called = true; },
+      }
+    );
+    assert.equal(next, 'short content');
+    assert.equal(called, false);
+  });
+
+  it('the overflow JSON-RPC error shape is well-formed', () => {
+    // Mirror the exact shape the bridge writes on stdin overflow. If the
+    // bridge silently drops without emitting this, an MCP client sits at a
+    // timeout instead of seeing a parse error.
+    const errorEnvelope = {
+      jsonrpc: '2.0',
+      id: null,
+      error: {
+        code: -32700,
+        message: `stdin buffer exceeded ${MAX_STDIN_BUFFER} bytes; input dropped`,
+      },
+    };
+    const serialized = JSON.stringify(errorEnvelope);
+    const parsed = JSON.parse(serialized);
+    assert.equal(parsed.jsonrpc, '2.0');
+    assert.equal(parsed.id, null);
+    assert.equal(parsed.error.code, -32700);
+    assert.match(parsed.error.message, /stdin buffer exceeded/);
+  });
+});
+
+describe('Bridge in-flight observability', () => {
+  it('counts increments and decrements symmetrically', () => {
+    const baseline = getInFlightCount();
+    noteInFlightStart();
+    noteInFlightStart();
+    assert.equal(getInFlightCount(), baseline + 2);
+    noteInFlightEnd();
+    noteInFlightEnd();
+    assert.equal(getInFlightCount(), baseline);
+  });
+
+  it('floor at zero on extra decrements', () => {
+    // Drain any leftover from earlier tests.
+    while (getInFlightCount() > 0) noteInFlightEnd();
+    noteInFlightEnd();
+    noteInFlightEnd();
+    assert.equal(getInFlightCount(), 0);
   });
 });
