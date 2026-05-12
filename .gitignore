@@ -17,6 +17,10 @@ Thumbs.db
 # MCP config (contains local paths)
 .mcp.json
 
+# Local Claude Code state (per-user IDE / agent config, worktree pointers,
+# session transcripts). Not source-of-truth for the repo.
+.claude/
+
 # Local dev notes (agent/developer orientation, not for upstream)
 DEV_NOTES.md
 
