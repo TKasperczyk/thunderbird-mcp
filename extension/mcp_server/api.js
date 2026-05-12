@@ -1,4 +1,6 @@
-/* global ExtensionCommon, ChromeUtils, Services, Cc, Ci */
+// XPCOM globals (ExtensionCommon, ChromeUtils, Services, Cc, Ci) are
+// declared in eslint.config.mjs's extension/ file group. Per-file
+// /* global */ comment triggered no-redeclare.
 "use strict";
 
 /**

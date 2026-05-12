@@ -1,4 +1,6 @@
-/* global browser */
+// `browser` is declared as a global in eslint.config.mjs for the
+// extension/ file group. Per-file /* global browser */ triggered
+// no-redeclare.
 "use strict";
 
 const statusDot = document.getElementById("statusDot");
