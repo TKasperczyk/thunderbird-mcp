@@ -61,7 +61,17 @@ function makeMockServices(initialPref) {
   };
 }
 
-function makeMockMailServices(folderToAccount) {
+function makeMockMailServices(folderToAccount, extraAccountKeys = []) {
+  // Build a stable set of known account keys: every key referenced by any
+  // folder mapping plus any explicitly listed extras (e.g. accounts that
+  // appear in the policy but not in folderToAccount). The engine uses this
+  // list to reject unknown accountId args; tests that exercise the
+  // account-default branch must list the accounts they expect to validate.
+  const knownKeys = new Set([
+    ...Object.values(folderToAccount),
+    ...extraAccountKeys,
+  ]);
+  const accountObjects = [...knownKeys].map((key) => ({ key }));
   return {
     folderLookup: {
       getFolderForURL: (uri) => {
@@ -71,6 +81,7 @@ function makeMockMailServices(folderToAccount) {
       },
     },
     accounts: {
+      accounts: accountObjects,
       findAccountForServer: (server) => server && server._key ? { key: server._key } : null,
     },
   };
@@ -87,10 +98,10 @@ const DEFAULTS_OFF = new Set([
   'deleteFolder', 'emptyTrash', 'emptyJunk',
 ]);
 
-function makeEngine({ pref, folderMap = {} } = {}) {
+function makeEngine({ pref, folderMap = {}, knownAccountKeys = [] } = {}) {
   return makePermissions({
     Services: makeMockServices(pref),
-    MailServices: makeMockMailServices(folderMap),
+    MailServices: makeMockMailServices(folderMap, knownAccountKeys),
     PREF_PERMISSIONS: 'extensions.thunderbird-mcp.permissions',
     UNDISABLEABLE_TOOLS: UNDISABLEABLE,
     DEFAULT_DISABLED_TOOLS: DEFAULTS_OFF,
@@ -161,18 +172,24 @@ describe('permissions engine: Level 2 (per-tool constraints)', () => {
 
 describe('permissions engine: Level 3 (per-account + per-folder rules)', () => {
   it('per-account override denies for one account, allows for another', () => {
-    const e = makeEngine({ pref: JSON.stringify({
-      tools: { searchMessages: { enabled: true } },
-      accounts: { account_a: { tools: { searchMessages: { enabled: false } } } }
-    }) });
+    const e = makeEngine({
+      pref: JSON.stringify({
+        tools: { searchMessages: { enabled: true } },
+        accounts: { account_a: { tools: { searchMessages: { enabled: false } } } }
+      }),
+      knownAccountKeys: ['account_a', 'account_b'],
+    });
     assert.equal(e.evaluate('searchMessages', { query: 'foo', accountId: 'account_a' }, true).allow, false);
     assert.equal(e.evaluate('searchMessages', { query: 'foo', accountId: 'account_b' }, true).allow, true);
   });
   it('account default=deny blocks tools without explicit per-tool rule', () => {
-    const e = makeEngine({ pref: JSON.stringify({
-      tools: { searchMessages: { enabled: true } },
-      accounts: { account_a: { default: 'deny' } }
-    }) });
+    const e = makeEngine({
+      pref: JSON.stringify({
+        tools: { searchMessages: { enabled: true } },
+        accounts: { account_a: { default: 'deny' } }
+      }),
+      knownAccountKeys: ['account_a'],
+    });
     assert.equal(e.evaluate('searchMessages', { query: 'foo', accountId: 'account_a' }, true).allow, false);
   });
   it('per-folder rule overrides per-account rule', () => {
@@ -215,6 +232,201 @@ describe('permissions engine: Level 4 (argument whitelists)', () => {
     }) });
     assert.equal(e.evaluate('deleteMessages', { messageIds: ['a', 'b'], folderPath: 'f' }, true).allow, true);
     assert.equal(e.evaluate('deleteMessages', { messageIds: ['a', 'b', 'c', 'd'], folderPath: 'f' }, true).allow, false);
+  });
+});
+
+describe('permissions engine: bypass-fix regression tests', () => {
+  it('bulk_move_by_query clamps args.limit when omitted (CodeRabbit)', () => {
+    // Caller omits `limit`; tool default is 1000 (per tools-schema.sys.mjs)
+    // which would silently bypass maxBatchSize=50. Engine must clamp to cap.
+    const e = makeEngine({ pref: JSON.stringify({
+      tools: { bulk_move_by_query: { enabled: true, maxBatchSize: 50 } }
+    }) });
+    const r = e.evaluate(
+      'bulk_move_by_query',
+      { query: 'subject:foo', folderPath: 'imap://s/INBOX' },
+      true
+    );
+    assert.equal(r.allow, true);
+    assert.equal(r.args.limit, 50, 'limit must be clamped to maxBatchSize when omitted');
+  });
+
+  it('bulk_move_by_query clamps args.limit when over cap (CodeRabbit)', () => {
+    const e = makeEngine({ pref: JSON.stringify({
+      tools: { bulk_move_by_query: { enabled: true, maxBatchSize: 50 } }
+    }) });
+    const r = e.evaluate(
+      'bulk_move_by_query',
+      { query: 'subject:foo', folderPath: 'imap://s/INBOX', limit: 9999 },
+      true
+    );
+    assert.equal(r.allow, true);
+    assert.equal(r.args.limit, 50, 'limit must be clamped down to maxBatchSize');
+  });
+
+  it('bulk_move_by_query leaves args.limit alone when within cap (CodeRabbit)', () => {
+    const e = makeEngine({ pref: JSON.stringify({
+      tools: { bulk_move_by_query: { enabled: true, maxBatchSize: 50 } }
+    }) });
+    const r = e.evaluate(
+      'bulk_move_by_query',
+      { query: 'subject:foo', folderPath: 'imap://s/INBOX', limit: 10 },
+      true
+    );
+    assert.equal(r.allow, true);
+    assert.equal(r.args.limit, 10);
+  });
+
+  it('maxBatchSize denies oversized JSON-string-encoded array (Claude §2a)', () => {
+    // deleteMessages JSON.parses string messageIds itself; the policy engine
+    // must apply maxBatchSize to the parsed payload, not silently let the
+    // stringified form through.
+    const e = makeEngine({ pref: JSON.stringify({
+      tools: { deleteMessages: { enabled: true, maxBatchSize: 3 } }
+    }) });
+    const overSized = JSON.stringify(['a', 'b', 'c', 'd', 'e']);
+    const r = e.evaluate('deleteMessages', { messageIds: overSized, folderPath: 'f' }, false);
+    assert.equal(r.allow, false);
+    assert.match(r.reason, /maxBatchSize=3/);
+  });
+
+  it('maxBatchSize permits within-cap JSON-string-encoded array (Claude §2a)', () => {
+    const e = makeEngine({ pref: JSON.stringify({
+      tools: { deleteMessages: { enabled: true, maxBatchSize: 5 } }
+    }) });
+    const withinCap = JSON.stringify(['a', 'b', 'c']);
+    const r = e.evaluate('deleteMessages', { messageIds: withinCap, folderPath: 'f' }, false);
+    assert.equal(r.allow, true);
+  });
+
+  it('destination folder rule denies bulk_move into a denied folder (Claude §2b)', () => {
+    // Per-folder rule on the destination must be honoured even when the
+    // source folder rule allows the move.
+    const e = makeEngine({
+      pref: JSON.stringify({
+        tools: { bulk_move_by_query: { enabled: true, maxBatchSize: 1000 } },
+        folders: {
+          'imap://acct/Archive': { tools: { bulk_move_by_query: { enabled: false } } },
+        },
+      }),
+      folderMap: {
+        'imap://acct/INBOX': 'account_x',
+        'imap://acct/Archive': 'account_x',
+      },
+    });
+    const r = e.evaluate(
+      'bulk_move_by_query',
+      { query: 'subject:x', folderPath: 'imap://acct/INBOX', to: 'imap://acct/Archive' },
+      true
+    );
+    assert.equal(r.allow, false);
+    assert.match(r.reason, /destination folder/);
+  });
+
+  it('destination folder rule allows bulk_move when destination is not denied (Claude §2b)', () => {
+    const e = makeEngine({
+      pref: JSON.stringify({
+        tools: { bulk_move_by_query: { enabled: true, maxBatchSize: 1000 } },
+        folders: {
+          'imap://acct/Archive': { tools: { bulk_move_by_query: { enabled: false } } },
+        },
+      }),
+      folderMap: {
+        'imap://acct/INBOX': 'account_x',
+        'imap://acct/Backups': 'account_x',
+      },
+    });
+    const r = e.evaluate(
+      'bulk_move_by_query',
+      { query: 'subject:x', folderPath: 'imap://acct/INBOX', to: 'imap://acct/Backups' },
+      true
+    );
+    assert.equal(r.allow, true);
+  });
+
+  it('unknown accountId is rejected up front (Claude §2c)', () => {
+    // Without this check, account.default=deny would silently not apply
+    // because policy.accounts["doesnotexist"] is undefined.
+    const e = makeEngine({
+      pref: JSON.stringify({
+        tools: { searchMessages: { enabled: true } },
+        accounts: { account_a: { default: 'deny' } },
+      }),
+      knownAccountKeys: ['account_a'],
+    });
+    const r = e.evaluate('searchMessages', { query: 'foo', accountId: 'doesnotexist' }, true);
+    assert.equal(r.allow, false);
+    assert.match(r.reason, /Unknown accountId/);
+  });
+
+  it('known accountId still resolves normally after the validation gate (Claude §2c)', () => {
+    const e = makeEngine({
+      pref: JSON.stringify({
+        tools: { searchMessages: { enabled: true } },
+      }),
+      knownAccountKeys: ['account_a'],
+    });
+    assert.equal(e.evaluate('searchMessages', { query: 'foo', accountId: 'account_a' }, true).allow, true);
+  });
+
+  it('includeSubfolders=true is denied when per-folder rules exist for the tool (Claude §2d)', () => {
+    // A per-folder deny on a subfolder must not be bypassable by recursing
+    // from the parent. The pragmatic policy: block recursion outright as
+    // soon as any per-folder rule exists for this tool.
+    const e = makeEngine({
+      pref: JSON.stringify({
+        tools: { bulk_move_by_query: { enabled: true, maxBatchSize: 1000 } },
+        folders: {
+          'imap://acct/INBOX/Sensitive': { tools: { bulk_move_by_query: { enabled: false } } },
+        },
+      }),
+      folderMap: {
+        'imap://acct/INBOX': 'account_x',
+        'imap://acct/INBOX/Sensitive': 'account_x',
+      },
+    });
+    const r = e.evaluate(
+      'bulk_move_by_query',
+      { query: 'subject:x', folderPath: 'imap://acct/INBOX', includeSubfolders: true },
+      true
+    );
+    assert.equal(r.allow, false);
+    assert.match(r.reason, /includeSubfolders/);
+  });
+
+  it('includeSubfolders=true is allowed when no per-folder rules exist for the tool (Claude §2d)', () => {
+    const e = makeEngine({
+      pref: JSON.stringify({
+        tools: { bulk_move_by_query: { enabled: true, maxBatchSize: 1000 } },
+      }),
+    });
+    const r = e.evaluate(
+      'bulk_move_by_query',
+      { query: 'subject:x', folderPath: 'imap://acct/INBOX', includeSubfolders: true },
+      true
+    );
+    assert.equal(r.allow, true);
+  });
+
+  it('catastrophic-backtracking regex in argRule.match is rejected at load (Claude §5 / CodeRabbit)', () => {
+    // (a+)+ -- classic ReDoS shape. The engine must treat the rule as
+    // invalid-skip and deny any value that hits it.
+    const e = makeEngine({ pref: JSON.stringify({
+      tools: { sendMail: { enabled: true, argRules: { subject: { match: '(a+)+$' } } } }
+    }) });
+    const r = e.evaluate('sendMail', { to: 'x@y.z', subject: 'aaaaaaaaa!' }, false);
+    assert.equal(r.allow, false);
+    assert.match(r.reason, /rejected at policy load|not whitelisted/);
+  });
+
+  it('overlong argRule.match (>200 chars) is rejected at load (CodeRabbit)', () => {
+    const longPattern = 'a'.repeat(250);
+    const e = makeEngine({ pref: JSON.stringify({
+      tools: { sendMail: { enabled: true, argRules: { subject: { match: longPattern } } } }
+    }) });
+    const r = e.evaluate('sendMail', { to: 'x@y.z', subject: 'hi' }, false);
+    assert.equal(r.allow, false);
+    assert.match(r.reason, /rejected at policy load|not whitelisted/);
   });
 });
 

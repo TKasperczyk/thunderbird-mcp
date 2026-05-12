@@ -94,11 +94,119 @@ export function makePermissions({
     defaultValue: { version: 1, tools: {}, accounts: {}, folders: {} },
   });
 
-  const loadPolicy = store.load;
+  // ---- regex compilation + catastrophic-backtracking guard ---------------
+  //
+  // CodeRabbit flagged ReDoS risk: argRule.match was compiled with `new RegExp`
+  // on every tool call, and the input is operator-controlled. We pre-compile
+  // and cache per arg-rule object via a WeakMap keyed by the rule, plus reject
+  // obviously-dangerous shapes (nested quantifiers, overlong patterns) at load
+  // time. Invalid rules are demoted to "<<invalid-skip>>" which never matches.
+
+  const _compiledMatch = new WeakMap();
+  const SUSPICIOUS_RE = /\([^)]*[+*][^)]*\)[+*]|\(\.\*\)\*|\(\.\+\)\+/;
+
+  function isLikelyCatastrophic(pattern) {
+    if (typeof pattern !== "string") return true;
+    if (pattern.length > 200) return true;
+    if (SUSPICIOUS_RE.test(pattern)) return true;
+    return false;
+  }
+
+  function precompileArgRuleMatch(argRule) {
+    if (!argRule || typeof argRule !== "object") return null;
+    if (_compiledMatch.has(argRule)) return _compiledMatch.get(argRule);
+    if (!argRule.match) {
+      _compiledMatch.set(argRule, null);
+      return null;
+    }
+    let compiled = null;
+    if (isLikelyCatastrophic(argRule.match)) {
+      try {
+        console.warn(
+          `[permissions] arg-rule match pattern rejected as potentially catastrophic; ` +
+          `treating as <<invalid-skip>>: ${String(argRule.match).slice(0, 80)}`
+        );
+      } catch { /* console missing -- ignore */ }
+      compiled = { invalid: true };
+    } else {
+      try {
+        compiled = { re: new RegExp(argRule.match, "i") };
+      } catch (e) {
+        try {
+          console.warn(`[permissions] invalid regex in arg-rule match: ${e.message}`);
+        } catch { /* ignore */ }
+        compiled = { invalid: true, reason: e.message };
+      }
+    }
+    _compiledMatch.set(argRule, compiled);
+    return compiled;
+  }
+
+  // Walk the whole policy once after load to pre-compile every match-regex.
+  // Cheap because each rule object is only walked the first time it appears;
+  // subsequent loadPolicy() calls return the same cached objects.
+  function precompileAllRuleRegexes(policy) {
+    if (!policy || typeof policy !== "object") return policy;
+    const visit = (toolMap) => {
+      if (!toolMap || typeof toolMap !== "object") return;
+      for (const ruleKey of Object.keys(toolMap)) {
+        const rule = toolMap[ruleKey];
+        if (!rule || typeof rule !== "object" || !rule.argRules) continue;
+        for (const argName of Object.keys(rule.argRules)) {
+          precompileArgRuleMatch(rule.argRules[argName]);
+        }
+      }
+    };
+    visit(policy.tools);
+    if (policy.accounts) {
+      for (const a of Object.values(policy.accounts)) visit(a && a.tools);
+    }
+    if (policy.folders) {
+      for (const f of Object.values(policy.folders)) visit(f && f.tools);
+    }
+    return policy;
+  }
+
+  function loadPolicy() {
+    const p = store.load();
+    precompileAllRuleRegexes(p);
+    return p;
+  }
   const savePolicy = store.save;
   const clearPolicy = store.clear;
 
   // ---- arg-rule helpers --------------------------------------------------
+
+  // Some MCP clients (and our own deleteMessages) accept arrays serialized as
+  // JSON strings. The permission engine must apply array-length caps to the
+  // *parsed* array, otherwise a caller can ship `messageIds: "[...10000 ids...]"`
+  // and slip past Array.isArray-gated checks entirely. (Claude review §2a.)
+  function asArrayOrNull(v) {
+    if (Array.isArray(v)) return v;
+    if (typeof v === "string") {
+      try {
+        const parsed = JSON.parse(v);
+        return Array.isArray(parsed) ? parsed : null;
+      } catch { return null; }
+    }
+    return null;
+  }
+
+  // True iff any per-folder policy entry has a rule for this tool. Used to
+  // reject includeSubfolders=true when per-folder rules exist, because a
+  // recursive walk would otherwise process subfolders that may be denied
+  // by their own policy entries. Pragmatic mitigation -- a full per-subfolder
+  // expansion would require reaching into the folder tree from here. (Claude
+  // review §2d.)
+  function policyHasPerFolderRulesForTool(policy, toolName) {
+    if (!policy || !policy.folders) return false;
+    for (const folderUri of Object.keys(policy.folders)) {
+      const fld = policy.folders[folderUri];
+      const rule = fld && fld.tools && (fld.tools[toolName] || fld.tools["*"]);
+      if (rule) return true;
+    }
+    return false;
+  }
 
   // Glob -> regex, anchored. * = any chars, ? = single char. Other regex
   // metachars are escaped so users can't accidentally write half-broken
@@ -124,8 +232,14 @@ export function makePermissions({
     }
     let matchRe = null;
     if (argRule.match) {
-      try { matchRe = new RegExp(argRule.match, "i"); }
-      catch (e) { return { ok: false, reason: `invalid match regex: ${e.message}` }; }
+      const compiled = precompileArgRuleMatch(argRule);
+      if (compiled && compiled.invalid) {
+        // Rule was demoted at load-time (catastrophic-backtracking shape or
+        // unparseable). Treat as never-matching so we always deny rather than
+        // accidentally letting unfiltered input through.
+        return { ok: false, reason: `arg-rule match regex was rejected at policy load; value not whitelisted` };
+      }
+      matchRe = compiled ? compiled.re : null;
     }
     let anyOfRes = null;
     if (Array.isArray(argRule.anyOf) && argRule.anyOf.length > 0) {
@@ -171,20 +285,60 @@ export function makePermissions({
     }
   }
 
+  // Tools that operate on TWO folders (source + destination). The per-folder
+  // policy must be evaluated against BOTH or the destination rule is silently
+  // ignored. (Claude review §2b.) Today only bulk_move_by_query has this
+  // shape; the table is here so future tools (move_message, copyMessage, …)
+  // are an additive change.
+  const DEST_FOLDER_ARG_BY_TOOL = Object.freeze({
+    bulk_move_by_query: "to",
+  });
+
+  function isKnownAccountKey(accountKey) {
+    if (!accountKey || !MailServices || !MailServices.accounts) return false;
+    try {
+      const accounts = MailServices.accounts.accounts;
+      if (!accounts) return false;
+      // .accounts can be an nsIArray on real Thunderbird or a plain JS array
+      // in the test harness; support both shapes.
+      if (typeof accounts.some === "function") {
+        return accounts.some(a => a && a.key === accountKey);
+      }
+      // nsIArray-style: iterate via .length / queryElementAt is overkill --
+      // most callers use `for...of`. Fall through to that.
+      for (const a of accounts) {
+        if (a && a.key === accountKey) return true;
+      }
+      return false;
+    } catch { return false; }
+  }
+
   function resolveContext(toolName, args) {
     // Best-effort: tools that pass an accountId arg use it directly; tools
     // that pass folderPath have their account derived. Some tools take
     // both, in which case folderPath wins (it's more specific).
     let accountKey = null;
     let folderUri = null;
+    let destFolderUri = null;
     if (args && typeof args === "object") {
       if (typeof args.accountId === "string") accountKey = args.accountId;
       if (typeof args.folderPath === "string") folderUri = args.folderPath;
       if (typeof args.parentFolderPath === "string" && !folderUri) folderUri = args.parentFolderPath;
       if (typeof args.newParentPath === "string" && !folderUri) folderUri = args.newParentPath;
       if (folderUri && !accountKey) accountKey = accountKeyForFolderUri(folderUri);
+
+      // Destination folder for tools that have one (e.g. bulk_move_by_query.to).
+      const destArg = DEST_FOLDER_ARG_BY_TOOL[toolName];
+      if (destArg && typeof args[destArg] === "string" && args[destArg]) {
+        destFolderUri = args[destArg];
+      }
     }
-    return { accountKey, folderUri };
+    // folderUris = [src, dst] filtered to truthy + deduped. Evaluate denies if
+    // any one of them is rule-denied.
+    const folderUris = [];
+    if (folderUri) folderUris.push(folderUri);
+    if (destFolderUri && destFolderUri !== folderUri) folderUris.push(destFolderUri);
+    return { accountKey, folderUri, destFolderUri, folderUris };
   }
 
   function effectiveRule(policy, toolName, ctx) {
@@ -204,6 +358,17 @@ export function makePermissions({
       rule = mergeRule(rule, fldRule);
     }
     return rule;
+  }
+
+  // Returns just the per-folder rule for a single folderUri (no merging with
+  // globals/account). Used to independently check destination-folder denials
+  // for tools like bulk_move_by_query, where the source rule was already
+  // merged into the main `rule` via effectiveRule. (Claude review §2b.)
+  function perFolderRule(policy, toolName, folderUri) {
+    if (!folderUri || !policy.folders) return null;
+    const fld = policy.folders[folderUri];
+    if (!fld || !fld.tools) return null;
+    return fld.tools[toolName] || fld.tools["*"] || null;
   }
 
   // ---- the main entry point ---------------------------------------------
@@ -226,6 +391,17 @@ export function makePermissions({
 
     const policy = loadPolicy();
     const ctx = resolveContext(toolName, args);
+
+    // Reject unknown accountId early: otherwise effectiveRule would silently
+    // skip the account.default=deny branch because the bogus key isn't in
+    // policy.accounts. (Claude review §2c.) We only validate if the caller
+    // explicitly passed an accountId arg; tools that derive accountKey from
+    // folderUri can't trigger this -- a valid folder always maps to a real
+    // account or returns null.
+    if (typeof args.accountId === "string" && args.accountId && !isKnownAccountKey(args.accountId)) {
+      return { allow: false, reason: `Unknown accountId '${args.accountId}'` };
+    }
+
     const rule = effectiveRule(policy, toolName, ctx);
 
     // Layer 1: explicit enabled toggle (rule wins over baseAllowed)
@@ -240,6 +416,29 @@ export function makePermissions({
       return { allow: false, reason: `Tool '${toolName}' is off by default. Enable it in the extension settings page.` };
     }
 
+    // Destination folder check: if the tool has a destination folder arg and
+    // that destination has its own per-folder rule that disables this tool,
+    // deny regardless of the source-folder decision. (Claude review §2b.)
+    if (ctx.destFolderUri && ctx.destFolderUri !== ctx.folderUri) {
+      const dstRule = perFolderRule(policy, toolName, ctx.destFolderUri);
+      if (dstRule && dstRule.enabled === false) {
+        return { allow: false, reason: `Tool '${toolName}' is disabled by policy in destination folder ${ctx.destFolderUri}` };
+      }
+    }
+
+    // Recursive-walk safeguard: if the policy defines per-folder rules for
+    // this tool, do not let includeSubfolders=true bypass them. (Claude
+    // review §2d.) A complete fix would expand the folder tree here, but
+    // that requires nsIMsgFolder access this module deliberately doesn't
+    // have. The pragmatic policy: opt out of recursion as soon as ANY
+    // per-folder rule exists for the tool.
+    if (args.includeSubfolders === true && policyHasPerFolderRulesForTool(policy, toolName)) {
+      return {
+        allow: false,
+        reason: `Tool '${toolName}': includeSubfolders disabled because per-folder policy rules exist for this tool`
+      };
+    }
+
     if (!rule) return { allow: true, args };
 
     // Layer 2: per-tool constraints
@@ -247,18 +446,25 @@ export function makePermissions({
       return { allow: false, reason: `Tool '${toolName}' requires a folderPath argument under current policy` };
     }
     if (rule.maxBatchSize != null) {
-      const bulk = Array.isArray(args.messageIds) ? args.messageIds
-                 : Array.isArray(args.contactIds) ? args.contactIds
-                 : Array.isArray(args.eventIds) ? args.eventIds
-                 : Array.isArray(args.drafts) ? args.drafts
-                 : null;
+      // CodeRabbit + Claude §2a: array-args may arrive as JSON strings (the
+      // tools themselves JSON.parse them). Use asArrayOrNull so a stringified
+      // payload of 10 000 ids can't slip past Array.isArray.
+      const bulk = asArrayOrNull(args.messageIds) ||
+                   asArrayOrNull(args.contactIds) ||
+                   asArrayOrNull(args.eventIds) ||
+                   asArrayOrNull(args.drafts);
       if (bulk && bulk.length > rule.maxBatchSize) {
         return { allow: false, reason: `Tool '${toolName}' batch size ${bulk.length} exceeds policy maxBatchSize=${rule.maxBatchSize}` };
       }
       // Special case: bulk_move_by_query doesn't carry an array arg -- its
-      // batch size is the `limit` numeric arg. Apply the cap there.
-      if (toolName === "bulk_move_by_query" && typeof args.limit === "number" && args.limit > rule.maxBatchSize) {
-        return { allow: false, reason: `Tool 'bulk_move_by_query' limit ${args.limit} exceeds policy maxBatchSize=${rule.maxBatchSize}` };
+      // batch size is the `limit` numeric arg. CodeRabbit caught that
+      // omitting `limit` entirely fell through to the tool's default of
+      // 1000 instead of being capped, so we clamp here (mirrors the
+      // alwaysReview->args.skipReview mutation pattern above).
+      if (toolName === "bulk_move_by_query") {
+        if (typeof args.limit !== "number" || args.limit > rule.maxBatchSize) {
+          args.limit = rule.maxBatchSize;
+        }
       }
     }
     if (rule.alwaysReview === true && args.skipReview === true) {
