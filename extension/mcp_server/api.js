@@ -2967,7 +2967,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (title !== undefined) { newItem.title = title; changes.push("title"); }
                 if (description !== undefined) { newItem.descriptionHTML = descriptionToHTML(description); changes.push("description"); }
-                if (priority !== undefined) { newItem.priority = priority; changes.push("priority"); }
+                if (priority !== undefined) {
+                  if (priority !== null && (!Number.isInteger(priority) || priority < 0 || priority > 9)) {
+                    return { error: "priority must be an integer between 0 and 9 (0=unset, 1=high, 5=normal, 9=low)" };
+                  }
+                  newItem.priority = priority ?? 0;
+                  changes.push("priority");
+                }
 
                 if (dueDate !== undefined) {
                   // Explicit null or empty string clears the due date.
@@ -3133,8 +3139,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function listCategories() {
               try {
-                const names = cal.category.fromPrefs();
-                return { categories: names.sort((a, b) => a.localeCompare(b)) };
+                return cal.category.fromPrefs().sort((a, b) => a.localeCompare(b));
               } catch (e) {
                 return { error: e.toString() };
               }
@@ -3347,22 +3352,35 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             function descriptionToHTML(text) {
-              // Stash existing <a> tags so they survive HTML escaping.
+              if (text == null || text === "") return "";
+              // Strip null bytes so the sentinel below can't collide with user input.
+              const input = String(text).replace(/\x00/g, "");
+              const escapeText = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+              const escapeAttr = s => escapeText(s).replace(/"/g, "&quot;");
+              const SAFE_HREF = /^(?:https?:|mailto:)/i;
+
+              // Stash sanitized anchors so the global HTML-escape doesn't double-escape
+              // them. Anchors with unsafe (e.g. javascript:, data:) or missing href are
+              // dropped to plain text -- TB's task UI sanitizes on render but the raw
+              // markup is persisted in ALTREP and may be consumed by other clients.
               const anchors = [];
-              let processed = text.replace(/<a\s[^>]*>[\s\S]*?<\/a>/gi, match => {
-                anchors.push(match);
+              let processed = input.replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, (whole, inner) => {
+                const hrefMatch = whole.match(/href\s*=\s*(['"])([^'"]*)\1/i);
+                const innerText = escapeText(inner.replace(/<[^>]+>/g, ""));
+                if (!hrefMatch || !SAFE_HREF.test(hrefMatch[2].trim())) {
+                  return innerText;
+                }
+                anchors.push(`<a href="${escapeAttr(hrefMatch[2].trim())}">${innerText}</a>`);
                 return `\x00ANCHOR${anchors.length - 1}\x00`;
               });
+
               // Escape remaining plain text, then auto-link bare URLs.
-              processed = processed
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;");
-              processed = processed.replace(
+              processed = escapeText(processed).replace(
                 /https?:\/\/[^\s<>"]+/g,
-                url => `<a href="${url}">${url}</a>`
+                url => `<a href="${escapeAttr(url)}">${url}</a>`
               );
-              // Restore stashed <a> tags and convert newlines.
+
+              // Restore sanitized anchors and convert newlines.
               processed = processed.replace(/\x00ANCHOR(\d+)\x00/g, (_, i) => anchors[i]);
               return `<html><body><div>${processed.replace(/\n/g, "<br>")}</div></body></html>`;
             }
@@ -3399,11 +3417,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // (main-process privileged context) and imports CalTodo from the same
                 // resource:/// ESModule singleton as the chrome, so the object is fully
                 // interoperable with createTodoWithDialog and the task edit dialog.
+                if (priority !== undefined && priority !== null) {
+                  if (!Number.isInteger(priority) || priority < 0 || priority > 9) {
+                    return { error: "priority must be an integer between 0 and 9 (0=unset, 1=high, 5=normal, 9=low)" };
+                  }
+                }
+
                 const todo = new CalTodo();
                 todo.title = title;
                 if (dueDt) todo.dueDate = dueDt;
                 if (description) todo.descriptionHTML = descriptionToHTML(description);
-                if (priority !== undefined) todo.priority = priority;
+                if (priority !== undefined && priority !== null) todo.priority = priority;
                 if (categories && categories.length > 0) todo.setCategories(categories);
                 if (targetCalendar) todo.calendar = targetCalendar;
 
