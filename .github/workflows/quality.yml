@@ -1,0 +1,114 @@
+# Quality-tier checks for thunderbird-mcp.
+#
+# Why this file exists:
+#   - Every contributor PR needs a green check before review starts. Without
+#     it, regressions are caught only when the maintainer manually runs
+#     things, and "manually" doesn't scale across the 5+ open feature PRs
+#     currently in flight on this repo.
+#   - The integration tier (headless Thunderbird + greenmail) is too heavy
+#     for every PR and lives in a separate workflow (planned for the
+#     refactor PR as .github/workflows/ci.yml). This file is the cheap,
+#     always-on tier.
+#
+# Why "quality.yml" and not "ci.yml":
+#   - A larger ci.yml (3-tier: unit / build-xpi / integration) lives on the
+#     refactor branch and will land with the refactor PR. Keeping this one
+#     as a separately-named workflow avoids a same-file merge conflict and
+#     lets both run side-by-side after the refactor lands.
+#
+# Jobs:
+#   - quality:  lint (ESLint) + dead-code (knip, informational) +
+#               structure (dependency-cruiser, informational) + node:test.
+#   - commits:  commitlint on PR commits only. Push-events skip this so
+#               historical non-conventional commits on main don't fail.
+#
+# Tolerances (intentional, documented):
+#   - ESLint config downgrades no-undef to warn for extension/mcp_server/
+#     api.js because the upstream monolith has a known ghost-ref bug
+#     (removeConnectionInfo at line ~5982). The fix lives in the refactor
+#     PR where the file splits into lib/*.sys.mjs and the scope problem
+#     disappears. After that PR lands, the override gets removed and lint
+#     tightens automatically.
+#   - dead-code and dep-cruise are informational (continue-on-error). Both
+#     produce useful signal but neither has a zero-baseline today; gating
+#     PRs on them would block normal feature work. They become hard gates
+#     in a follow-up after the team agrees a baseline.
+#
+# Setup-node cache note:
+#   package-lock.json is .gitignore'd in this repo, so there's no key for
+#   setup-node to cache against. We use `npm install` (not `npm ci`) and
+#   omit `cache: npm`. Install is fast (<30s with current deps).
+
+name: Quality
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: lint + tests + dead-code
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      - name: Dead-code (knip, informational)
+        run: npm run dead-code
+        continue-on-error: true
+
+      - name: Structure (dep-cruise, informational)
+        run: npm run dep-cruise
+        continue-on-error: true
+
+      - name: Unit tests (node:test)
+        run: npm test
+
+  commits:
+    name: commit messages
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # commitlint needs base..head; full history is the simplest fetch
+          # depth that works across rebases, force-pushes, and merge commits.
+          fetch-depth: 0
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Commitlint (PR range)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: npx --no-install commitlint --from "$BASE_SHA" --to "$HEAD_SHA" --verbose

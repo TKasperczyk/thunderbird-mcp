@@ -29,6 +29,9 @@
     "node": ">=18.0.0"
   },
   "scripts": {
+    "test": "node --test test/validation.test.cjs test/stress.test.cjs test/mcp-bridge.test.cjs test/tool-access.test.cjs",
+    "test:auth": "node --test test/auth.test.cjs",
+    "test:all": "node --test test/",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "commitlint": "commitlint --from=HEAD~10 --to=HEAD --verbose",
