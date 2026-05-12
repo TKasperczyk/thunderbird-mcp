@@ -23,6 +23,17 @@ if git -C "$PROJECT_DIR" describe --tags --always > /dev/null 2>&1; then
 elif git -C "$PROJECT_DIR" rev-parse --short HEAD > /dev/null 2>&1; then
   VERSION=$(git -C "$PROJECT_DIR" rev-parse --short HEAD)
 fi
+PACKAGE_VERSION=""
+if command -v node > /dev/null 2>&1; then
+  PACKAGE_VERSION=$(node -e "
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const pkg = JSON.parse(fs.readFileSync(path.join('$PROJECT_DIR', 'package.json'), 'utf8'));
+      process.stdout.write(typeof pkg.version === 'string' ? pkg.version : '');
+    } catch {}
+  ")
+fi
 # Append +dirty if there are uncommitted changes
 if ! git -C "$PROJECT_DIR" diff --quiet 2>/dev/null || ! git -C "$PROJECT_DIR" diff --cached --quiet 2>/dev/null; then
   VERSION="${VERSION}+dirty"
@@ -31,22 +42,25 @@ BUILT_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 echo "{\"version\":\"$VERSION\",\"builtAt\":\"$BUILT_AT\"}" > "$EXTENSION_DIR/buildinfo.json"
 echo "Build version: $VERSION"
 
-# Update manifest.json version from git tag (Thunderbird requires numeric version)
-TAG_VERSION=$(echo "$VERSION" | grep -oE '^v?[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's/^v//')
-if [ -n "$TAG_VERSION" ]; then
+# Update manifest.json version from package.json.
+MANIFEST_VERSION="$PACKAGE_VERSION"
+if [ -z "$MANIFEST_VERSION" ]; then
+  MANIFEST_VERSION=$(echo "$VERSION" | grep -oE '^v?[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's/^v//')
+fi
+if [ -n "$MANIFEST_VERSION" ]; then
   if command -v node > /dev/null 2>&1; then
     node -e "
       const fs = require('fs');
       const p = '$EXTENSION_DIR/manifest.json';
       const m = JSON.parse(fs.readFileSync(p, 'utf8'));
-      m.version = '$TAG_VERSION';
+      m.version = '$MANIFEST_VERSION';
       fs.writeFileSync(p, JSON.stringify(m, null, 2) + '\n');
     "
   else
-    sed -i.bak "s/\"version\": *\"[^\"]*\"/\"version\": \"$TAG_VERSION\"/" "$EXTENSION_DIR/manifest.json"
+    sed -i.bak "s/\"version\": *\"[^\"]*\"/\"version\": \"$MANIFEST_VERSION\"/" "$EXTENSION_DIR/manifest.json"
     rm -f "$EXTENSION_DIR/manifest.json.bak"
   fi
-  echo "Manifest version: $TAG_VERSION"
+  echo "Manifest version: $MANIFEST_VERSION"
 fi
 
 # Package extension

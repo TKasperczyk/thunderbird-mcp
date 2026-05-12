@@ -104,6 +104,16 @@ function addDir(zip, dir, prefix) {
   }
 }
 
+function readPackageVersion() {
+  const packageFile = path.join(PROJECT_DIR, 'package.json');
+  try {
+    const pkg = JSON.parse(fs.readFileSync(packageFile, 'utf8'));
+    return typeof pkg.version === 'string' && pkg.version ? pkg.version : null;
+  } catch {
+    return null;
+  }
+}
+
 // Stamp buildinfo.json with git describe version and timestamp
 const { execSync } = require('child_process');
 const BUILDINFO_FILE = path.join(EXT_DIR, 'buildinfo.json');
@@ -125,12 +135,14 @@ try {
   const buildInfo = JSON.stringify({ version, builtAt: new Date().toISOString() });
   fs.writeFileSync(BUILDINFO_FILE, buildInfo);
 
-  // Update manifest.json version from git tag (Thunderbird requires numeric version)
+  // Update manifest.json version from package.json.
   const MANIFEST_FILE = path.join(EXT_DIR, 'manifest.json');
   const manifest = JSON.parse(fs.readFileSync(MANIFEST_FILE, 'utf8'));
-  const tagMatch = version.match(/^v?(\d+\.\d+(?:\.\d+)?)/);
-  if (tagMatch) {
-    manifest.version = tagMatch[1];
+  const packageVersion = readPackageVersion();
+  const fallbackTagMatch = version.match(/^v?(\d+\.\d+(?:\.\d+)?)/);
+  const manifestVersion = packageVersion || (fallbackTagMatch ? fallbackTagMatch[1] : null);
+  if (manifestVersion) {
+    manifest.version = manifestVersion;
     fs.writeFileSync(MANIFEST_FILE, JSON.stringify(manifest, null, 2) + '\n');
   }
 } catch {
