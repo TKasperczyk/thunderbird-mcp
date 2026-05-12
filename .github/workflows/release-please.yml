@@ -1,0 +1,55 @@
+# Automated release management via release-please.
+#
+# How it works:
+#   1. Every push to main, release-please scans commits since the last
+#      release tag.
+#   2. It groups them by conventional-commit type (feat / fix / etc),
+#      computes the next semver bump (feat=minor, fix=patch, BREAKING
+#      CHANGE=major), and opens (or updates) a Release PR.
+#   3. The Release PR's diff:
+#         - bumps version in package.json + extension/manifest.json
+#         - prepends a changelog entry to CHANGELOG.md
+#   4. Merging the Release PR triggers the second invocation, which
+#      tags the release and creates the GitHub Release notes from the
+#      changelog section.
+#
+# Why this exists:
+#   Manual versioning rots. With conventional commits in place
+#   (commitlint enforces it), release-please turns the commit log
+#   into the release notes for free. No more "fix: bump v0.5.0 to
+#   0.5.1 because PR #80 forgot" follow-up commits.
+#
+# Files referenced:
+#   - .release-please-config.json    -- per-package config
+#   - .release-please-manifest.json  -- current released versions
+#   - CHANGELOG.md                   -- generated, do not hand-edit
+#
+# Permissions:
+#   contents: write       -- to create the Release PR + tag
+#   pull-requests: write  -- to open/update the Release PR
+#   Token is the auto-provisioned GITHUB_TOKEN; no PAT needed.
+
+name: release-please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: release-please
+        uses: googleapis/release-please-action@v4
+        with:
+          # token is GITHUB_TOKEN by default; explicit for clarity.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: .release-please-config.json
+          manifest-file: .release-please-manifest.json

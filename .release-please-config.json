@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "node",
+  "packages": {
+    ".": {
+      "package-name": "thunderbird-mcp",
+      "include-component-in-tag": false,
+      "include-v-in-tag": true,
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "json",
+          "path": "extension/manifest.json",
+          "jsonpath": "$.version"
+        }
+      ],
+      "changelog-sections": [
+        { "type": "feat",     "section": "Features" },
+        { "type": "fix",      "section": "Bug Fixes" },
+        { "type": "perf",     "section": "Performance" },
+        { "type": "refactor", "section": "Refactoring" },
+        { "type": "docs",     "section": "Documentation" },
+        { "type": "test",     "section": "Tests",         "hidden": true },
+        { "type": "build",    "section": "Build",         "hidden": true },
+        { "type": "ci",       "section": "CI",            "hidden": true },
+        { "type": "chore",    "section": "Chores",        "hidden": true },
+        { "type": "style",    "section": "Style",         "hidden": true },
+        { "type": "revert",   "section": "Reverts" }
+      ]
+    }
+  },
+  "bootstrap-sha": "16784c8",
+  "draft": false,
+  "prerelease": false,
+  "separate-pull-requests": false
+}
