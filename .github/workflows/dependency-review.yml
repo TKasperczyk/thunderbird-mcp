@@ -1,0 +1,65 @@
+# Dependency review on every PR.
+#
+# What it does:
+#   Diffs package.json between PR base + head, checks each added /
+#   bumped dep against:
+#     - GitHub Advisory Database (CVE-mapped vulnerabilities)
+#     - License allow/deny list
+#   Fails the PR check if a new or bumped dep introduces a known
+#   vulnerability at the configured severity, or if its license is
+#   incompatible with this project.
+#
+# Why this exists:
+#   Dependabot opens grouped PRs that bump multiple deps weekly.
+#   Each PR is reviewed individually. But contributor PRs that add
+#   NEW deps need the same scrutiny -- and a tired reviewer might
+#   just merge "added 50 deps for X" without inspecting the
+#   transitive surface. This action makes that scrutiny mandatory.
+#
+# Permissions:
+#   contents: read         -- diff PR base..head
+#   pull-requests: write   -- post the summary comment on the PR
+#
+# Why fail-on-severity: moderate (not "high"):
+#   "high" lets CVSS 4-6 through, which include things like
+#   prototype pollution and ReDoS that bridge code is exposed to.
+#   We can downgrade to "high" if false-positives become an issue.
+
+name: dependency-review
+
+on:
+  pull_request:
+    paths:
+      - "package.json"
+      - "package-lock.json"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dependency-review:
+    name: review
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure
+          # MIT-equivalent + permissive licenses we accept transitively.
+          # Update if a legitimate dep needs adding here; keep deny tight.
+          allow-licenses: >-
+            MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC,
+            CC0-1.0, Unlicense, MPL-2.0, 0BSD, BlueOak-1.0.0,
+            Python-2.0
+          deny-licenses: >-
+            GPL-2.0-only, GPL-2.0-or-later,
+            GPL-3.0-only, GPL-3.0-or-later,
+            AGPL-1.0-only, AGPL-1.0-or-later,
+            AGPL-3.0-only, AGPL-3.0-or-later,
+            SSPL-1.0
