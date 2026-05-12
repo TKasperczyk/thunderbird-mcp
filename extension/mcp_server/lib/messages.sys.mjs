@@ -137,9 +137,12 @@ export function makeMessages({
     if (!html) return "";
     let text = String(html);
 
-    // Remove style/script blocks
-    text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ");
-    text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ");
+    // Remove style/script blocks.
+    // \s* before the closing > because HTML5 parsers accept whitespace
+    // in end tags (</script >, </style >) -- without it, a crafted body
+    // can smuggle a tag through this sanitizer (CodeQL js/bad-tag-filter).
+    text = text.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, " ");
+    text = text.replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, " ");
 
     // Convert block-level tags to newlines before stripping
     text = text.replace(/<br\s*\/?>/gi, "\n");
