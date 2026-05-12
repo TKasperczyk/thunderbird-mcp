@@ -33,13 +33,16 @@
     "lint:fix": "eslint . --fix",
     "commitlint": "commitlint --from=HEAD~10 --to=HEAD --verbose",
     "dep-cruise": "depcruise --config .dependency-cruiser.cjs mcp-bridge.cjs extension scripts test",
-    "dep-cruise:graph": "depcruise --config .dependency-cruiser.cjs --output-type dot mcp-bridge.cjs extension scripts test"
+    "dep-cruise:graph": "depcruise --config .dependency-cruiser.cjs --output-type dot mcp-bridge.cjs extension scripts test",
+    "dead-code": "knip",
+    "dead-code:fix": "knip --fix"
   },
   "devDependencies": {
     "@commitlint/cli": "^20.5.2",
     "@commitlint/config-conventional": "^20.5.0",
     "dependency-cruiser": "^17.2.0",
     "eslint": "^9.39.4",
+    "knip": "^5.66.0",
     "eslint-plugin-n": "^17.24.0",
     "eslint-plugin-promise": "^7.2.1",
     "globals": "^17.5.0"
