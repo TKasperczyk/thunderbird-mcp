@@ -187,7 +187,9 @@ export function makeCompose({
         if (desc.size != null) att.size = desc.size;
         if (desc.contentType) att.contentType = desc.contentType;
         result.push(att);
-      } catch {}
+      } catch (e) {
+        console.warn("thunderbird-mcp: failed to convert attachment descriptor:", desc?.name || desc?.url || desc, e);
+      }
     }
     return result;
   }

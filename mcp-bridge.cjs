@@ -568,7 +568,17 @@ async function handleMessage(line) {
   switch (message.method) {
     case 'initialize': {
       const requested = message.params?.protocolVersion;
-      const negotiated = (typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.has(requested))
+      if (typeof requested !== 'string') {
+        return {
+          jsonrpc: '2.0',
+          id: message.id,
+          error: {
+            code: -32602,
+            message: 'Invalid params: protocolVersion must be a string',
+          },
+        };
+      }
+      const negotiated = SUPPORTED_PROTOCOL_VERSIONS.has(requested)
         ? requested
         : LATEST_PROTOCOL_VERSION;
       return {

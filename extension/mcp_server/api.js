@@ -1118,7 +1118,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       // Behavior never depends on the version inside Thunderbird,
                       // so we accept any well-known protocol version.
                       const requested = params?.protocolVersion;
-                      const negotiated = (typeof requested === "string" && MCP_SUPPORTED_PROTOCOL_VERSIONS.has(requested))
+                      if (typeof requested !== "string") {
+                        res.setStatusLine("1.1", 200, "OK");
+                        res.setHeader("Content-Type", "application/json; charset=utf-8", false);
+                        res.write(JSON.stringify({
+                          jsonrpc: "2.0",
+                          id: id ?? null,
+                          error: { code: -32602, message: "Invalid params: protocolVersion must be a string" }
+                        }));
+                        res.finish();
+                        return;
+                      }
+                      const negotiated = MCP_SUPPORTED_PROTOCOL_VERSIONS.has(requested)
                         ? requested
                         : MCP_LATEST_PROTOCOL_VERSION;
                       result = {
