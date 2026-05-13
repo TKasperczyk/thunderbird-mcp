@@ -235,6 +235,107 @@ function validateAgainstSchema(value, schema, path, errors) {
   }
 }
 
+// ─── Rate limiter (sliding window per tool name) ─────────────────────────────
+
+/**
+ * Defaults are conservative: outbound mail / contact writes / filter create
+ * are the operations a confused LLM agent could do real harm with. Read tools
+ * are not rate-limited here -- the HTTP body cap + per-request validation
+ * already bound them, and the agent legitimately fans out many reads.
+ *
+ * Format: tool name -> { limit, windowMs }
+ */
+const RATE_LIMIT_DEFAULTS = {
+  sendMail:         { limit: 10, windowMs: 5 * 60 * 1000 },
+  replyToMessage:   { limit: 10, windowMs: 5 * 60 * 1000 },
+  forwardMessage:   { limit: 10, windowMs: 5 * 60 * 1000 },
+  saveDraft:        { limit: 30, windowMs: 5 * 60 * 1000 },
+  createContact:    { limit:  5, windowMs: 60 * 1000 },
+  updateContact:    { limit:  5, windowMs: 60 * 1000 },
+  deleteContact:    { limit:  5, windowMs: 60 * 1000 },
+  createFilter:     { limit:  5, windowMs: 5 * 60 * 1000 },
+  updateFilter:     { limit:  5, windowMs: 5 * 60 * 1000 },
+  deleteFilter:     { limit: 10, windowMs: 5 * 60 * 1000 },
+};
+
+/**
+ * Sliding-window rate limiter. Each tool keeps a ring of recent call
+ * timestamps; on consume(), we drop timestamps outside the window and check
+ * the remaining count against `limit`.
+ *
+ * Stateless from the caller's view -- pass `now()` so tests can advance time.
+ * Lives in security_helpers so tests exercise the same code; production
+ * passes Date.now and a singleton state object created at extension startup.
+ */
+function createRateLimiterState(limits) {
+  const config = { ...RATE_LIMIT_DEFAULTS, ...(limits || {}) };
+  return { config, hits: Object.create(null) };
+}
+
+/**
+ * Try to consume one rate-limit slot for `tool`. Returns:
+ *   { allowed: true,  remaining, resetAfterMs }  - call is permitted
+ *   { allowed: false, remaining: 0, resetAfterMs, limit, windowMs } - blocked
+ *
+ * If `tool` is not in the config map the call is always allowed (no limit
+ * defined means no limit enforced).
+ */
+function consumeRateLimit(state, tool, nowMs) {
+  if (!state || !state.config) return { allowed: true, remaining: Infinity, resetAfterMs: 0 };
+  const cfg = state.config[tool];
+  if (!cfg) return { allowed: true, remaining: Infinity, resetAfterMs: 0 };
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const cutoff = now - cfg.windowMs;
+  const ring = state.hits[tool] || [];
+  // Drop expired timestamps from the front.
+  let firstAlive = 0;
+  while (firstAlive < ring.length && ring[firstAlive] <= cutoff) firstAlive++;
+  const fresh = firstAlive === 0 ? ring : ring.slice(firstAlive);
+  if (fresh.length >= cfg.limit) {
+    // Earliest fresh hit is the one whose expiry resets a slot.
+    const resetAfterMs = (fresh[0] + cfg.windowMs) - now;
+    state.hits[tool] = fresh;
+    return {
+      allowed: false,
+      remaining: 0,
+      resetAfterMs: Math.max(0, resetAfterMs),
+      limit: cfg.limit,
+      windowMs: cfg.windowMs,
+    };
+  }
+  fresh.push(now);
+  state.hits[tool] = fresh;
+  return {
+    allowed: true,
+    remaining: cfg.limit - fresh.length,
+    resetAfterMs: cfg.windowMs,
+  };
+}
+
+/**
+ * Snapshot the current bucket state without mutating it. Used by
+ * getServerCapabilities so the LLM can plan around how many slots it has
+ * left before the next call.
+ */
+function inspectRateLimits(state, nowMs) {
+  const now = typeof nowMs === "number" ? nowMs : Date.now();
+  const result = {};
+  if (!state || !state.config) return result;
+  for (const tool of Object.keys(state.config)) {
+    const cfg = state.config[tool];
+    const ring = state.hits[tool] || [];
+    const cutoff = now - cfg.windowMs;
+    const fresh = ring.filter(t => t > cutoff);
+    result[tool] = {
+      limit: cfg.limit,
+      windowMs: cfg.windowMs,
+      used: fresh.length,
+      remaining: Math.max(0, cfg.limit - fresh.length),
+    };
+  }
+  return result;
+}
+
 module.exports = {
   SENSITIVE_ATTACHMENT_PATTERNS,
   isSensitiveFilePath,
@@ -254,4 +355,8 @@ module.exports = {
   SYSTEM_PRINCIPAL_FETCH_SCHEMES,
   isSystemPrincipalFetchAllowed,
   validateAgainstSchema,
+  RATE_LIMIT_DEFAULTS,
+  createRateLimiterState,
+  consumeRateLimit,
+  inspectRateLimits,
 };

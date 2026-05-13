@@ -152,7 +152,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       renderMarkdownLink,
       isSystemPrincipalFetchAllowed,
       validateAgainstSchema,
+      createRateLimiterState,
+      consumeRateLimit,
+      inspectRateLimits,
     } = __helperScope.module.exports;
+
+    // One rate-limiter state per server instance. Resets on extension reload
+    // -- intentional: that's typically a developer action and we don't want a
+    // restart to feel "stuck" for the windowMs duration.
+    const __rateLimiterState = createRateLimiterState();
 
     const tools = [
       {
@@ -230,6 +238,29 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
           },
           required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "getServerCapabilities",
+        group: "system", crud: "read",
+        title: "Get Server Capabilities",
+        description: "Return a snapshot of the LLM's sandbox: enabled / disabled tool names, accessible account IDs, current safeguard pref states (blockSkipReview, blockFilterForwardReply, blockContactWrites), current rate-limit bucket states with remaining slots per tool, server version, and audit-log location. Call this once at the start of an agent loop so you know what you can do before you try things that will fail.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "getAuditLog",
+        group: "system", crud: "read",
+        title: "Get Audit Log",
+        description: "Read parsed entries from the MCP audit log newest-first. Every outbound compose (sendMail / replyToMessage / forwardMessage / saveDraft) and every contact write are recorded as JSON lines with timestamp + tool + metadata (no body, no attachment content, no recipient addresses beyond counts). Useful for the agent to answer 'what did I send today?' or 'have I already contacted this target?'",
+        inputSchema: {
+          type: "object",
+          properties: {
+            maxEntries: { type: "integer", description: "Max entries to return (default 200, hard cap 10000)" },
+            tool: { type: "string", description: "Filter by exact tool name (e.g. 'sendMail')" },
+            since: { type: "string", description: "Filter to entries on or after this ISO 8601 timestamp" },
+            until: { type: "string", description: "Filter to entries on or before this ISO 8601 timestamp" },
+          },
+          required: [],
         },
       },
       {
@@ -1250,6 +1281,109 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // summarizeAttachmentsForAudit + countRecipients live in
             // security_helpers.js; loaded above and destructured into scope.
+
+            /**
+             * Read the audit log file(s) and return parsed JSON entries newest-
+             * first. Reads both audit.log and audit.log.1 if rotation happened
+             * so the caller sees the full bounded history.
+             *
+             * Returns { entries, totalScanned, truncated, errors }:
+             *   - entries: array of parsed log objects (most recent first)
+             *   - totalScanned: number of bytes read
+             *   - truncated: true if maxEntries cut the list
+             *   - errors: per-line parse failures (object with line + reason)
+             *
+             * filter is optional: { tool, since, until } where since/until are
+             * ISO timestamps and tool is an exact name match.
+             */
+            function readAuditLog(maxEntries, filter) {
+              const limit = Number.isFinite(maxEntries) && maxEntries > 0
+                ? Math.min(Math.floor(maxEntries), 10000)
+                : 500;
+              const wantTool = filter && typeof filter.tool === "string" ? filter.tool : null;
+              const sinceTs = filter && filter.since ? Date.parse(filter.since) : null;
+              const untilTs = filter && filter.until ? Date.parse(filter.until) : null;
+
+              const out = { entries: [], totalScanned: 0, truncated: false, errors: [] };
+              const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+              const auditDir = profDir.clone();
+              auditDir.append(AUDIT_LOG_SUBDIR);
+              if (!auditDir.exists()) return out;
+
+              // Read the active log first, then the rotated one. Newest-first
+              // means we read each file end-to-end, parse, reverse the file's
+              // entries, then append. The rotated file (.log.1) is older.
+              const fileNames = [AUDIT_LOG_FILENAME, AUDIT_LOG_ROTATED_FILENAME];
+              for (const fname of fileNames) {
+                if (out.entries.length >= limit) {
+                  out.truncated = true;
+                  break;
+                }
+                const f = auditDir.clone();
+                f.append(fname);
+                if (!f.exists()) continue;
+                let text = "";
+                try {
+                  const fis = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
+                  fis.init(f, 0x01, 0, 0);
+                  const cis = Cc["@mozilla.org/intl/converter-input-stream;1"].createInstance(Ci.nsIConverterInputStream);
+                  cis.init(fis, "UTF-8", 0, 0);
+                  const buf = {};
+                  let read;
+                  while ((read = cis.readString(65536, buf)) > 0) {
+                    text += buf.value;
+                  }
+                  cis.close();
+                  out.totalScanned += text.length;
+                } catch (e) {
+                  out.errors.push({ file: fname, reason: String(e) });
+                  continue;
+                }
+                const lines = text.split("\n");
+                // Reverse so newest-first; skip empty trailing line.
+                for (let i = lines.length - 1; i >= 0; i--) {
+                  const line = lines[i];
+                  if (!line) continue;
+                  let parsed;
+                  try { parsed = JSON.parse(line); }
+                  catch { out.errors.push({ line: line.slice(0, 80), reason: "parse failure" }); continue; }
+                  if (wantTool && parsed.tool !== wantTool) continue;
+                  if (sinceTs && parsed.ts && Date.parse(parsed.ts) < sinceTs) continue;
+                  if (untilTs && parsed.ts && Date.parse(parsed.ts) > untilTs) continue;
+                  out.entries.push(parsed);
+                  if (out.entries.length >= limit) {
+                    out.truncated = true;
+                    break;
+                  }
+                }
+              }
+              return out;
+            }
+
+            /**
+             * Truncate both audit.log and audit.log.1. Returns the number of
+             * bytes deleted. Best-effort; missing files are silent successes.
+             */
+            function clearAuditLog() {
+              let bytesRemoved = 0;
+              try {
+                const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+                const auditDir = profDir.clone();
+                auditDir.append(AUDIT_LOG_SUBDIR);
+                if (!auditDir.exists()) return { success: true, bytesRemoved: 0 };
+                for (const fname of [AUDIT_LOG_FILENAME, AUDIT_LOG_ROTATED_FILENAME]) {
+                  const f = auditDir.clone();
+                  f.append(fname);
+                  if (f.exists()) {
+                    try { bytesRemoved += f.fileSize; } catch { /* ignore */ }
+                    try { f.remove(false); } catch { /* ignore */ }
+                  }
+                }
+              } catch (e) {
+                return { error: String(e), bytesRemoved };
+              }
+              return { success: true, bytesRemoved };
+            }
 
             /**
              * Get the list of allowed account IDs from preferences.
@@ -4510,6 +4644,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * for an agent that wants to self-check a compose call before
              * committing to it.
              */
+
+            /**
+             * Snapshot of the agent's sandbox: what tools are available, what
+             * accounts are reachable, what gates are on, how much rate-limit
+             * budget remains. Designed for the LLM to call ONCE at the start
+             * of a session to plan around constraints rather than discovering
+             * them via failed calls.
+             */
+            function getServerCapabilities() {
+              const allTools = tools.map(t => t.name);
+              const enabled = allTools.filter(n => isToolEnabled(n));
+              const disabled = allTools.filter(n => !isToolEnabled(n));
+              const accessibleAccounts = getAccessibleAccounts().map(a => ({
+                id: a.key,
+                name: a.incomingServer && a.incomingServer.prettyName ? a.incomingServer.prettyName : a.key,
+              }));
+              const safeguards = {
+                blockSkipReview: isSkipReviewBlocked(),
+                blockFilterForwardReply: isFilterForwardReplyBlocked(),
+                blockContactWrites: isContactWritesBlocked(),
+              };
+              return {
+                serverVersion: getExtVersion(),
+                tools: { enabled, disabled, total: allTools.length },
+                accessibleAccounts,
+                accessMode: getAllowedAccountIds().length === 0 ? "all" : "restricted",
+                safeguards,
+                rateLimits: inspectRateLimits(__rateLimiterState),
+                auditLogPath: `<ProfD>/${AUDIT_LOG_SUBDIR}/${AUDIT_LOG_FILENAME}`,
+              };
+            }
+
             function dryRunCompose(to, subject, body, cc, bcc, isHtml, from, attachments) {
               const result = {
                 wouldSucceed: true,
@@ -6332,6 +6498,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return getMessageHeaders(args.messageId, args.folderPath);
                 case "dryRunCompose":
                   return dryRunCompose(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
+                case "getServerCapabilities":
+                  return getServerCapabilities();
+                case "getAuditLog": {
+                  const filter = {};
+                  if (typeof args.tool === "string") filter.tool = args.tool;
+                  if (typeof args.since === "string") filter.since = args.since;
+                  if (typeof args.until === "string") filter.until = args.until;
+                  const max = typeof args.maxEntries === "number" ? args.maxEntries : 200;
+                  return readAuditLog(max, filter);
+                }
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
                 case "createContact":
@@ -6545,6 +6721,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                       if (!isToolEnabled(params.name)) {
                         throw new Error(`Tool is disabled: ${params.name}`);
+                      }
+                      // Rate-limit check. Runs BEFORE coerce/validate so an
+                      // agent stuck in a tight loop is throttled even if it
+                      // is sending malformed arguments.
+                      {
+                        const rl = consumeRateLimit(__rateLimiterState, params.name);
+                        if (!rl.allowed) {
+                          throw new Error(
+                            `Rate limit exceeded for '${params.name}': ` +
+                            `${rl.limit} calls per ${Math.round(rl.windowMs / 1000)}s. ` +
+                            `Retry in ${Math.ceil(rl.resetAfterMs / 1000)}s.`
+                          );
+                        }
                       }
                       {
                         const toolArgs = coerceToolArgs(params.name, params.arguments || {});
@@ -6886,6 +7075,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           }
           Services.prefs.setBoolPref(PREF_BLOCK_CONTACT_WRITES, blockContactWrites);
           return { success: true, blockContactWrites };
+        },
+
+        readAuditLog: async function(maxEntries, filter) {
+          // Defensive normalization of the filter object so a malformed call
+          // from options.html cannot crash the experiment-API scope.
+          const safeFilter = (filter && typeof filter === "object" && !Array.isArray(filter)) ? filter : null;
+          return readAuditLog(maxEntries, safeFilter);
+        },
+
+        clearAuditLog: async function() {
+          return clearAuditLog();
         },
 
         getStableAuthToken: async function() {

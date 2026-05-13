@@ -64,6 +64,8 @@ const ALL_TOOLS = [
   { name: "listAccounts", group: "system", crud: "read" },
   { name: "listFolders", group: "system", crud: "read" },
   { name: "getAccountAccess", group: "system", crud: "read" },
+  { name: "getAuditLog", group: "system", crud: "read" },
+  { name: "getServerCapabilities", group: "system", crud: "read" },
   { name: "searchMessages", group: "messages", crud: "read" },
   { name: "getMessage", group: "messages", crud: "read" },
   { name: "getMessageHeaders", group: "messages", crud: "read" },

@@ -34,6 +34,10 @@ const {
   renderMarkdownLink,
   isSystemPrincipalFetchAllowed,
   validateAgainstSchema,
+  createRateLimiterState,
+  consumeRateLimit,
+  inspectRateLimits,
+  RATE_LIMIT_DEFAULTS,
 } = helpers;
 
 
@@ -1330,5 +1334,105 @@ describe('Inline-image partUrl construction: URL encoding', () => {
     // part= value, not as a sibling parameter.
     assert.ok(!url.includes('&injected=evil'), `injection should have been encoded, got: ${url}`);
     assert.ok(url.endsWith('part=1%26injected%3Devil'));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rate limiter: sliding-window per tool. Tests pass an explicit `now` so we
+// don't depend on real time.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('Rate limiter: sliding-window per tool', () => {
+  it('allows calls up to the configured limit', () => {
+    const state = createRateLimiterState({ sendMail: { limit: 3, windowMs: 60000 } });
+    const t = 1_000_000;
+    assert.equal(consumeRateLimit(state, 'sendMail', t).allowed, true);
+    assert.equal(consumeRateLimit(state, 'sendMail', t).allowed, true);
+    assert.equal(consumeRateLimit(state, 'sendMail', t).allowed, true);
+  });
+
+  it('blocks the call that exceeds the limit', () => {
+    const state = createRateLimiterState({ sendMail: { limit: 3, windowMs: 60000 } });
+    const t = 1_000_000;
+    consumeRateLimit(state, 'sendMail', t);
+    consumeRateLimit(state, 'sendMail', t);
+    consumeRateLimit(state, 'sendMail', t);
+    const blocked = consumeRateLimit(state, 'sendMail', t);
+    assert.equal(blocked.allowed, false);
+    assert.equal(blocked.remaining, 0);
+    assert.equal(blocked.limit, 3);
+    assert.equal(blocked.windowMs, 60000);
+    assert.ok(blocked.resetAfterMs > 0);
+  });
+
+  it('returns the time until the oldest call expires', () => {
+    const state = createRateLimiterState({ sendMail: { limit: 1, windowMs: 60000 } });
+    consumeRateLimit(state, 'sendMail', 1_000_000); // fills the bucket
+    const blocked = consumeRateLimit(state, 'sendMail', 1_010_000); // 10s later
+    // The oldest call was at 1_000_000, expires at 1_060_000, so 50s left.
+    assert.equal(blocked.allowed, false);
+    assert.equal(blocked.resetAfterMs, 50000);
+  });
+
+  it('lets calls through once the window slides past them', () => {
+    const state = createRateLimiterState({ sendMail: { limit: 2, windowMs: 60000 } });
+    consumeRateLimit(state, 'sendMail', 1_000_000);
+    consumeRateLimit(state, 'sendMail', 1_010_000);
+    // 61s after the first call -> the first hit is expired, slot opens up
+    const t = 1_061_000;
+    const r = consumeRateLimit(state, 'sendMail', t);
+    assert.equal(r.allowed, true);
+  });
+
+  it('does not enforce limits on unconfigured tool names', () => {
+    const state = createRateLimiterState();
+    for (let i = 0; i < 1000; i++) {
+      const r = consumeRateLimit(state, 'searchMessages', 1_000_000 + i);
+      assert.equal(r.allowed, true);
+    }
+  });
+
+  it('tracks each tool independently', () => {
+    const state = createRateLimiterState({
+      sendMail: { limit: 1, windowMs: 60000 },
+      createContact: { limit: 1, windowMs: 60000 },
+    });
+    assert.equal(consumeRateLimit(state, 'sendMail', 1).allowed, true);
+    assert.equal(consumeRateLimit(state, 'sendMail', 1).allowed, false);
+    // sendMail blocked but createContact has a fresh bucket
+    assert.equal(consumeRateLimit(state, 'createContact', 1).allowed, true);
+  });
+
+  it('inspectRateLimits reports remaining slots without mutating', () => {
+    const state = createRateLimiterState({ sendMail: { limit: 5, windowMs: 60000 } });
+    consumeRateLimit(state, 'sendMail', 1);
+    consumeRateLimit(state, 'sendMail', 2);
+    const snap = inspectRateLimits(state, 3);
+    assert.equal(snap.sendMail.used, 2);
+    assert.equal(snap.sendMail.remaining, 3);
+    // Inspect twice, count must not change
+    const snap2 = inspectRateLimits(state, 4);
+    assert.equal(snap2.sendMail.used, 2);
+  });
+
+  it('inspectRateLimits drops expired entries from the count', () => {
+    const state = createRateLimiterState({ sendMail: { limit: 5, windowMs: 60000 } });
+    consumeRateLimit(state, 'sendMail', 1_000_000);
+    consumeRateLimit(state, 'sendMail', 1_010_000);
+    // Look at the bucket 60s+1ms after the FIRST hit but still within the
+    // window of the second hit: first is expired (1_000_000 == cutoff,
+    // strictly-greater filter drops it), second is still fresh (1_010_000
+    // > 1_000_001 cutoff at inspect-time 1_060_001).
+    const snap = inspectRateLimits(state, 1_060_001);
+    assert.equal(snap.sendMail.used, 1);
+    assert.equal(snap.sendMail.remaining, 4);
+  });
+
+  it('exposes sane defaults for the high-risk write tools', () => {
+    // Smoke-test the shipped defaults so a typo in the constant gets caught.
+    assert.ok(RATE_LIMIT_DEFAULTS.sendMail.limit > 0);
+    assert.ok(RATE_LIMIT_DEFAULTS.sendMail.windowMs >= 60000);
+    assert.ok(RATE_LIMIT_DEFAULTS.createContact);
+    assert.ok(RATE_LIMIT_DEFAULTS.createFilter);
   });
 });

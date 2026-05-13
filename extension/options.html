@@ -283,7 +283,45 @@
     <button id="saveSkipReviewBtn" disabled>Save</button>
     <span id="saveSkipReviewStatus" class="save-status"></span>
   </div>
+
+  <h2>Audit log</h2>
+  <p class="mode-note">
+    Every outbound compose (<code>sendMail</code>, <code>replyToMessage</code>,
+    <code>forwardMessage</code>, <code>saveDraft</code>) and every contact
+    write goes to <code>&lt;profile&gt;/thunderbird-mcp/audit.log</code>
+    as a JSON line. Bodies and attachment contents are <em>not</em> recorded
+    -- only metadata. Newest entries first; the most recent 200 are shown.
+  </p>
+  <div class="audit-controls">
+    <label>
+      Filter by tool:
+      <select id="auditToolFilter">
+        <option value="">(all)</option>
+        <option value="sendMail">sendMail</option>
+        <option value="replyToMessage">replyToMessage</option>
+        <option value="forwardMessage">forwardMessage</option>
+        <option value="saveDraft">saveDraft</option>
+        <option value="createContact">createContact</option>
+        <option value="updateContact">updateContact</option>
+        <option value="deleteContact">deleteContact</option>
+      </select>
+    </label>
+    <button id="refreshAuditBtn">Refresh</button>
+    <button id="clearAuditBtn">Clear log</button>
+    <span id="auditStatus" class="save-status"></span>
+  </div>
+  <div id="auditEntries" class="audit-entries">Loading...</div>
 </div>
+
+<style>
+  .audit-controls { margin: 8px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .audit-entries { font-family: monospace; font-size: 12px; max-height: 360px; overflow-y: auto; border: 1px solid #ccc; padding: 8px; background: #f8f8f8; }
+  .audit-entry { padding: 4px 0; border-bottom: 1px solid #eee; word-break: break-word; }
+  .audit-entry:last-child { border-bottom: none; }
+  .audit-ts { color: #666; }
+  .audit-tool { font-weight: bold; }
+  .audit-empty { color: #999; font-style: italic; }
+</style>
 
 <script src="options.js"></script>
 </body>

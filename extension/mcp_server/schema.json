@@ -127,6 +127,34 @@
         ]
       },
       {
+        "name": "readAuditLog",
+        "type": "function",
+        "async": true,
+        "description": "Read parsed entries from the audit log newest-first",
+        "parameters": [
+          {
+            "name": "maxEntries",
+            "type": "integer",
+            "optional": true,
+            "description": "Max entries to return (default 500, hard cap 10000)"
+          },
+          {
+            "name": "filter",
+            "type": "object",
+            "optional": true,
+            "additionalProperties": true,
+            "description": "Optional filter: { tool?: string, since?: ISO string, until?: ISO string }"
+          }
+        ]
+      },
+      {
+        "name": "clearAuditLog",
+        "type": "function",
+        "async": true,
+        "description": "Truncate both audit.log and audit.log.1. Returns bytesRemoved.",
+        "parameters": []
+      },
+      {
         "name": "getStableAuthToken",
         "type": "function",
         "async": true,
