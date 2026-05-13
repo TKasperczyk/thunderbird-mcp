@@ -777,12 +777,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "refreshFolder",
         group: "messages", crud: "read",
         title: "Refresh Folder",
-        description: "Force an IMAP fetch on the given folder so the server-side state syncs to Thunderbird's local cache. Without this, IMAP folders only refresh when the user clicks them in the UI, which means recently-arrived mail is invisible to searchMessages / getRecentMessages until then. Call refreshFolder before a query when you know new traffic just arrived (e.g. after sending and waiting for a reply, or after another mail client wrote to the folder). Non-IMAP folders return success without doing anything.",
+        description: "Force an IMAP fetch on the given folder so the server-side state syncs to Thunderbird's local cache. Without this, IMAP folders only refresh when the user clicks them in the UI, which means recently-arrived mail is invisible to searchMessages / getRecentMessages until then. Call refreshFolder before a query when you know new traffic just arrived. Non-IMAP folders return success without doing anything. Note: very large IMAP folders like Gmail [Gmail]/Todos (All Mail) may not finish within the timeout cap; consider refreshing the specific subfolder where the message landed (INBOX, a label) instead.",
         inputSchema: {
           type: "object",
           properties: {
             folderPath: { type: "string", description: "Folder URI (from listFolders) to refresh" },
-            timeoutMs: { type: "integer", description: "Max ms to wait for the fetch to complete (default 15000)" },
+            timeoutMs: { type: "integer", description: "Max ms to wait for the fetch to complete (default 15000). Hard-capped at 25000 to stay below the stdio bridge's HTTP request timeout (30000ms); larger values are clamped." },
           },
           required: ["folderPath"],
         },
@@ -6324,8 +6324,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return;
                   }
 
+                  // Stay under the bridge's HTTP REQUEST_TIMEOUT (30000ms). A
+                  // tool that took the full 30s would race the bridge into a
+                  // hard-fail "Request to Thunderbird timed out", losing the
+                  // structured timeout result we'd otherwise return. 25s gives
+                  // a 5s safety margin for the round-trip stdio I/O.
+                  const REFRESH_TIMEOUT_CAP_MS = 25000;
                   const limit = Number.isFinite(timeoutMs) && timeoutMs > 0
-                    ? Math.min(Math.floor(timeoutMs), 60000)
+                    ? Math.min(Math.floor(timeoutMs), REFRESH_TIMEOUT_CAP_MS)
                     : 15000;
 
                   let settled = false;
