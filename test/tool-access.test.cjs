@@ -77,6 +77,7 @@ const ALL_TOOLS = [
   { name: "getSenderHistory", group: "messages", crud: "read" },
   { name: "exportMailbox", group: "messages", crud: "read" },
   { name: "getRecentMessages", group: "messages", crud: "read" },
+  { name: "refreshFolder", group: "messages", crud: "read" },
   { name: "displayMessage", group: "messages", crud: "read" },
   { name: "dryRunCompose", group: "messages", crud: "read" },
   { name: "sendMail", group: "messages", crud: "create" },

@@ -774,6 +774,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "refreshFolder",
+        group: "messages", crud: "read",
+        title: "Refresh Folder",
+        description: "Force an IMAP fetch on the given folder so the server-side state syncs to Thunderbird's local cache. Without this, IMAP folders only refresh when the user clicks them in the UI, which means recently-arrived mail is invisible to searchMessages / getRecentMessages until then. Call refreshFolder before a query when you know new traffic just arrived (e.g. after sending and waiting for a reply, or after another mail client wrote to the folder). Non-IMAP folders return success without doing anything.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI (from listFolders) to refresh" },
+            timeoutMs: { type: "integer", description: "Max ms to wait for the fetch to complete (default 15000)" },
+          },
+          required: ["folderPath"],
+        },
+      },
+      {
         name: "getRecentMessages",
         group: "messages", crud: "read",
         title: "Get Recent Messages",
@@ -2518,11 +2532,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc) {
               if (!composeWin) return;
-              const overrides = { identityKey: null };
+              // Build a recipients-only delta. Do NOT pass identityKey here --
+              // the compose window already has the identity from
+              // msgComposeParams, and including `identityKey: null` is sketchy:
+              // modern Thunderbird ignores it (`if (details.identityKey)`
+              // short-circuits on null), but a future TB version could
+              // interpret it as "clear the identity", which would also wipe
+              // the OpenPGP signing/encrypting state that depends on it.
+              const overrides = {};
               if (to) overrides.to = to;
               if (cc) overrides.cc = mergeAddressHeaders(getIdentityAutoRecipientHeader(identity, "cc"), cc);
               if (bcc) overrides.bcc = mergeAddressHeaders(getIdentityAutoRecipientHeader(identity, "bcc"), bcc);
-              if (Object.keys(overrides).length === 1) return;
+              if (Object.keys(overrides).length === 0) return;
 
               if (typeof composeWin.SetComposeDetails === "function") {
                 composeWin.SetComposeDetails(overrides);
@@ -6278,6 +6299,90 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { success: true, displayMode: mode, subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "" };
             }
 
+            /**
+             * Force the IMAP server-side state for `folderPath` to sync into
+             * Thunderbird's local cache. Non-IMAP folders short-circuit with
+             * success since there's nothing to fetch. Returns when the
+             * IMAP URL listener fires onStopRunningUrl (success or error),
+             * or when the timeout elapses.
+             *
+             * Without this, recently-arrived mail in IMAP folders is invisible
+             * to searchMessages / getRecentMessages until the user clicks the
+             * folder in Thunderbird's UI. README documents this as a known
+             * issue; refreshFolder is the programmatic fix.
+             */
+            function refreshFolder(folderPath, timeoutMs) {
+              return new Promise((resolve) => {
+                try {
+                  const result = getAccessibleFolder(folderPath);
+                  if (result.error) { resolve({ error: result.error }); return; }
+                  const folder = result.folder;
+                  // Non-IMAP folders (Local Folders, news, etc.) don't need
+                  // server-side refresh -- just return success.
+                  if (!folder.server || folder.server.type !== "imap") {
+                    resolve({ success: true, folderPath: folder.URI, skipped: "not an IMAP folder" });
+                    return;
+                  }
+
+                  const limit = Number.isFinite(timeoutMs) && timeoutMs > 0
+                    ? Math.min(Math.floor(timeoutMs), 60000)
+                    : 15000;
+
+                  let settled = false;
+                  const settle = (value) => {
+                    if (settled) return;
+                    settled = true;
+                    try { timer.cancel(); } catch {}
+                    resolve(value);
+                  };
+
+                  const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  timer.initWithCallback(
+                    { notify() { settle({ error: `refreshFolder timed out after ${limit}ms`, folderPath: folder.URI }); } },
+                    limit,
+                    Ci.nsITimer.TYPE_ONE_SHOT
+                  );
+
+                  const beforeCount = folder.getTotalMessages(false);
+                  const urlListener = {
+                    QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                    OnStartRunningUrl() {},
+                    OnStopRunningUrl(url, exitCode) {
+                      const ok = Components.isSuccessCode(exitCode);
+                      const afterCount = (() => {
+                        try { return folder.getTotalMessages(false); } catch { return null; }
+                      })();
+                      const newMessages = (afterCount !== null && typeof beforeCount === "number")
+                        ? Math.max(0, afterCount - beforeCount)
+                        : null;
+                      if (ok) {
+                        settle({
+                          success: true,
+                          folderPath: folder.URI,
+                          totalBefore: beforeCount,
+                          totalAfter: afterCount,
+                          newMessages,
+                        });
+                      } else {
+                        settle({
+                          error: `IMAP fetch failed (status 0x${exitCode.toString(16)})`,
+                          folderPath: folder.URI,
+                        });
+                      }
+                    },
+                  };
+
+                  try {
+                    folder.getNewMessages(null, urlListener);
+                  } catch (e) {
+                    settle({ error: e.toString(), folderPath: folder.URI });
+                  }
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
             function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
               const results = [];
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
@@ -7501,6 +7606,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.idempotencyKey);
                 case "getRecentMessages":
                   return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
+                case "refreshFolder":
+                  return await refreshFolder(args.folderPath, args.timeoutMs);
                 case "displayMessage":
                   return displayMessage(args.messageId, args.folderPath, args.displayMode);
                 case "deleteMessages":
