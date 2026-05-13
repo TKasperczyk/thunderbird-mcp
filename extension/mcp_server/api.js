@@ -144,6 +144,21 @@ function isSensitiveFilePath(attachmentPath) {
   const normalized = attachmentPath.replace(/\\/g, "/").toLowerCase();
   return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
 }
+
+/**
+ * Strip CR/LF (and other RFC 5322 forbidden chars) from a single-line header
+ * value before it reaches nsIMsgCompFields. Mozilla's C++ setters are expected
+ * to sanitize, but relying on undocumented downstream behavior is risky:
+ * a permissive build or future regression would let an MCP caller smuggle
+ * a hidden Bcc / extra To header through subject = "a\r\nBcc: x@y.z".
+ * This is defense in depth, not the only line of defense.
+ */
+function sanitizeHeaderLine(value) {
+  if (typeof value !== "string") return value;
+  // Replace runs of CR / LF / NUL with a single space rather than dropping
+  // them, so the result is still readable when a long subject got wrapped.
+  return value.replace(/[\r\n\0]+/g, " ");
+}
 let _tempFileCounter = 0;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
@@ -152,6 +167,12 @@ const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
 const PREF_STABLE_AUTH_TOKEN = "extensions.thunderbird-mcp.stableAuthToken";
 const PREF_GET_MESSAGES_LIMIT = "extensions.thunderbird-mcp.getMessagesLimit";
 const PREF_LISTEN_ALL = "extensions.thunderbird-mcp.listenAll";
+// Gate `forward` and `reply` actions on filter creation/update. Filters run on
+// every incoming message and never open a review UI, so a single createFilter
+// call can install a permanent silent-exfiltration rule. Default is to refuse
+// these action types via the MCP API; users who legitimately need them can
+// flip this pref or create the filter manually in Thunderbird.
+const PREF_BLOCK_FILTER_FORWARD_REPLY = "extensions.thunderbird-mcp.blockFilterForwardReply";
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
@@ -1289,6 +1310,96 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return result === 0;
             }
 
+            // Audit-log cap before rotation. 5 MB of JSON lines is roughly
+            // 10k-30k compose events depending on subject length; rotating to
+            // a single `.log.1` keeps disk use bounded without losing history.
+            const AUDIT_LOG_ROTATE_BYTES = 5 * 1024 * 1024;
+            const AUDIT_LOG_SUBDIR = "thunderbird-mcp";
+            const AUDIT_LOG_FILENAME = "audit.log";
+            const AUDIT_LOG_ROTATED_FILENAME = "audit.log.1";
+
+            /**
+             * Append a single JSON line describing an outbound-compose action
+             * (sendMail / replyToMessage / forwardMessage / saveDraft) to
+             * <ProfD>/thunderbird-mcp/audit.log. Best-effort: any failure is
+             * swallowed so disk errors never block a legitimate send.
+             *
+             * Logged fields are metadata only -- no body, no attachment
+             * content, no recipient lists beyond counts. The whole point is
+             * incident response, not message archival.
+             */
+            function appendComposeAudit(entry) {
+              try {
+                const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+                const auditDir = profDir.clone();
+                auditDir.append(AUDIT_LOG_SUBDIR);
+                if (!auditDir.exists()) {
+                  auditDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+                }
+
+                const logFile = auditDir.clone();
+                logFile.append(AUDIT_LOG_FILENAME);
+
+                // Rotate when the active log exceeds the cap.
+                if (logFile.exists()) {
+                  let size = 0;
+                  try { size = logFile.fileSize; } catch { size = 0; }
+                  if (size > AUDIT_LOG_ROTATE_BYTES) {
+                    const rotated = auditDir.clone();
+                    rotated.append(AUDIT_LOG_ROTATED_FILENAME);
+                    if (rotated.exists()) {
+                      try { rotated.remove(false); } catch { /* best-effort */ }
+                    }
+                    try { logFile.moveTo(auditDir, AUDIT_LOG_ROTATED_FILENAME); } catch { /* best-effort */ }
+                  }
+                }
+
+                const line = JSON.stringify({
+                  ts: new Date().toISOString(),
+                  ...entry,
+                }) + "\n";
+
+                const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                  .createInstance(Ci.nsIFileOutputStream);
+                // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x10 = O_APPEND
+                ostream.init(logFile, 0x02 | 0x08 | 0x10, 0o600, 0);
+                const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
+                  .createInstance(Ci.nsIConverterOutputStream);
+                converter.init(ostream, "UTF-8");
+                converter.writeString(line);
+                converter.close();
+              } catch (e) {
+                // Audit failure must never block a send. Surface it once on the
+                // console and move on; do NOT propagate.
+                try { console.warn("thunderbird-mcp: audit log write failed:", e); } catch { /* ignore */ }
+              }
+            }
+
+            /**
+             * Summarize attachment descriptors for the audit log without
+             * leaking content. Returns {count, names, totalBytes}.
+             */
+            function summarizeAttachmentsForAudit(descs) {
+              if (!Array.isArray(descs)) return { count: 0, names: [], totalBytes: 0 };
+              let total = 0;
+              const names = [];
+              for (const d of descs) {
+                if (d && typeof d.size === "number") total += d.size;
+                if (d && d.name) names.push(String(d.name).slice(0, 200));
+              }
+              return { count: descs.length, names, totalBytes: total };
+            }
+
+            /**
+             * Count comma-separated recipients in a free-form address string
+             * without keeping the addresses themselves. Used to log "this send
+             * went to N recipients" without retaining who.
+             */
+            function countRecipients(s) {
+              if (typeof s !== "string" || !s.trim()) return 0;
+              return s.split(",").map(p => p.trim()).filter(Boolean).length;
+            }
+
             /**
              * Get the list of allowed account IDs from preferences.
              * Returns an empty array if no restriction is set (all accounts allowed).
@@ -1336,6 +1447,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               } catch {
                 // Fail closed: if we can't read the pref, assume blocked so the
                 // user retains ability to review before send.
+                return true;
+              }
+            }
+
+            /**
+             * Check if the user has blocked `forward` and `reply` filter actions
+             * from the MCP API. Filters execute on every incoming message with
+             * no UI, so allowing an MCP caller to create one is equivalent to
+             * giving the LLM write access to a persistent silent-exfil channel.
+             * Default true.
+             */
+            function isFilterForwardReplyBlocked() {
+              try {
+                return Services.prefs.getBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, true);
+              } catch {
                 return true;
               }
             }
@@ -2521,25 +2647,53 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
+             * Wrap an attacker-controlled body snippet in explicit delimiters
+             * so an LLM consuming the MCP response has a structural cue that
+             * the wrapped region is data, not instructions. This is defense in
+             * depth against prompt injection -- a well-behaved LLM will be
+             * told by its system prompt to treat anything inside the markers
+             * as untrusted content. It does NOT prevent injection by itself.
+             *
+             * Applied only to text/markdown bodies returned to the model.
+             * Callers asking for raw HTML or rawSource get the unwrapped form
+             * because they are likely parsing it programmatically.
+             */
+            const UNTRUSTED_OPEN = "<untrusted_email_body>";
+            const UNTRUSTED_CLOSE = "</untrusted_email_body>";
+            function wrapUntrustedBody(text) {
+              if (typeof text !== "string" || !text) return text;
+              // Defang any existing close-marker the sender embedded so they
+              // cannot terminate the wrap and escape into instruction-land.
+              const safe = text.split(UNTRUSTED_CLOSE).join("</untrusted_email_body​>");
+              return `${UNTRUSTED_OPEN}\n${safe}\n${UNTRUSTED_CLOSE}`;
+            }
+
+            function wrapUntrustedPreview(text) {
+              if (typeof text !== "string" || !text) return text;
+              const safe = text.split(UNTRUSTED_CLOSE).join("</untrusted_email_body​>");
+              return `${UNTRUSTED_OPEN} ${safe} ${UNTRUSTED_CLOSE}`;
+            }
+
+            /**
              * Extracts body from a MIME message in the requested format.
              * For "text": uses coerceBodyToPlaintext fast path (original behavior).
              * For "markdown"/"html": walks MIME tree to find raw HTML content.
              */
             function extractFormattedBody(aMimeMsg, bodyFormat) {
               if (bodyFormat === "text") {
-                return { body: extractPlainTextBody(aMimeMsg), bodyIsHtml: false };
+                return { body: wrapUntrustedBody(extractPlainTextBody(aMimeMsg)), bodyIsHtml: false };
               }
               // For markdown/html: need raw MIME content, not coerced text
               const { text, isHtml } = extractBodyContent(aMimeMsg);
               if (!text) {
                 // MIME tree empty -- try coerce as last resort
                 const fallback = extractPlainTextBody(aMimeMsg);
-                return { body: fallback, bodyIsHtml: false };
+                return { body: wrapUntrustedBody(fallback), bodyIsHtml: false };
               }
-              if (!isHtml) return { body: text, bodyIsHtml: false };
+              if (!isHtml) return { body: wrapUntrustedBody(text), bodyIsHtml: false };
               if (bodyFormat === "html") return { body: text, bodyIsHtml: true };
               // Default: markdown
-              return { body: htmlToMarkdown(text), bodyIsHtml: false };
+              return { body: wrapUntrustedBody(htmlToMarkdown(text)), bodyIsHtml: false };
             }
 
             /**
@@ -2823,7 +2977,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             tags: msgTags,
                             _dateTs: msgDateTs
                           };
-                          if (preview) result.preview = preview;
+                          if (preview) result.preview = wrapUntrustedPreview(preview);
                           results.push(result);
                         }
 
@@ -2960,7 +3114,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tags: msgTags,
                       _dateTs: msgDateTs
                     };
-                    if (preview) result.preview = preview;
+                    if (preview) result.preview = wrapUntrustedPreview(preview);
                     results.push(result);
                   }
                 } catch {
@@ -4981,6 +5135,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (skipReview && isSkipReviewBlocked()) {
                   return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
                 }
+                appendComposeAudit({
+                  tool: "sendMail",
+                  skipReview: !!skipReview,
+                  isHtml: !!isHtml,
+                  from: typeof from === "string" ? from : null,
+                  to: countRecipients(to),
+                  cc: countRecipients(cc),
+                  bcc: countRecipients(bcc),
+                  subject: typeof subject === "string" ? subject.slice(0, 200) : null,
+                  attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                });
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
 
@@ -4990,7 +5155,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeFields.to = to || "";
                 composeFields.cc = cc || "";
                 composeFields.bcc = bcc || "";
-                composeFields.subject = subject || "";
+                composeFields.subject = sanitizeHeaderLine(subject || "");
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
@@ -5057,6 +5222,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments) {
               try {
+                appendComposeAudit({
+                  tool: "saveDraft",
+                  isHtml: !!isHtml,
+                  from: typeof from === "string" ? from : null,
+                  to: countRecipients(to),
+                  cc: countRecipients(cc),
+                  bcc: countRecipients(bcc),
+                  subject: typeof subject === "string" ? subject.slice(0, 200) : null,
+                  attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                });
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
 
@@ -5066,7 +5241,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeFields.to = to || "";
                 composeFields.cc = cc || "";
                 composeFields.bcc = bcc || "";
-                composeFields.subject = subject || "";
+                composeFields.subject = sanitizeHeaderLine(subject || "");
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
@@ -5125,6 +5300,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
 	                    return;
 	                  }
+	                  appendComposeAudit({
+	                    tool: "replyToMessage",
+	                    skipReview: !!skipReview,
+	                    replyAll: !!replyAll,
+	                    isHtml: !!isHtml,
+	                    from: typeof from === "string" ? from : null,
+	                    originalMessageId: typeof messageId === "string" ? messageId.slice(0, 256) : null,
+	                    to: countRecipients(to),
+	                    cc: countRecipients(cc),
+	                    bcc: countRecipients(bcc),
+	                    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+	                  });
 	                  const found = findMessage(messageId, folderPath);
 	                  if (found.error) {
 	                    resolve({ error: found.error });
@@ -5194,7 +5381,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
 	                        composeFields.bcc = bcc || "";
 
-	                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+	                        const origSubject = sanitizeHeaderLine(msgHdr.mime2DecodedSubject || msgHdr.subject || "");
 	                        composeFields.subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`;
 	                        composeFields.references = `<${messageId}>`;
 	                        composeFields.setHeader("In-Reply-To", `<${messageId}>`);
@@ -5291,6 +5478,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
                     return;
                   }
+                  appendComposeAudit({
+                    tool: "forwardMessage",
+                    skipReview: !!skipReview,
+                    isHtml: !!isHtml,
+                    from: typeof from === "string" ? from : null,
+                    originalMessageId: typeof messageId === "string" ? messageId.slice(0, 256) : null,
+                    to: countRecipients(to),
+                    cc: countRecipients(cc),
+                    bcc: countRecipients(bcc),
+                    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                  });
                   const found = findMessage(messageId, folderPath);
                   if (found.error) {
                     resolve({ error: found.error });
@@ -5344,7 +5542,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         composeFields.cc = cc || "";
                         composeFields.bcc = bcc || "";
 
-                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                        const origSubject = sanitizeHeaderLine(msgHdr.mime2DecodedSubject || msgHdr.subject || "");
                         composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
 
                         const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
@@ -5527,7 +5725,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tags: msgTags,
                       _dateTs: msgDateTs
                     };
-                    if (preview) result.preview = preview;
+                    if (preview) result.preview = wrapUntrustedPreview(preview);
                     results.push(result);
                   }
                 } catch {
@@ -6203,6 +6401,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   throw new Error(`Unknown action type: ${act.type}`);
                 }
                 const typeNum = ACTION_MAP[act.type];
+
+                // SECURITY: forward (0x0B) and reply (0x0A) filter actions run on
+                // every incoming message with no UI, so an MCP caller that can
+                // create one effectively installs a permanent silent-exfiltration
+                // rule. Block these action types unless the user has explicitly
+                // opted in via the options page. Move/copy/tag/markRead etc.
+                // remain available -- this only restricts the network-egress
+                // action types.
+                if ((typeNum === 0x0A || typeNum === 0x0B) && isFilterForwardReplyBlocked()) {
+                  throw new Error(
+                    `Filter action '${act.type}' is blocked by user preference. ` +
+                    `Forward/reply filter actions run silently on every message ` +
+                    `and are not permitted via the MCP API by default. ` +
+                    `Enable them in the extension options page if needed, ` +
+                    `or have the user create the filter directly in Thunderbird.`
+                  );
+                }
+
                 action.type = typeNum;
 
                 if (act.value) {
@@ -7290,6 +7506,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           // choice survives independent of the default we ship.
           Services.prefs.setBoolPref(PREF_BLOCK_SKIPREVIEW, blockSkipReview);
           return { success: true, blockSkipReview };
+        },
+
+        getBlockFilterForwardReply: async function() {
+          let blocked = true;
+          try {
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, true);
+          } catch { /* ignore */ }
+          return { blockFilterForwardReply: blocked };
+        },
+
+        setBlockFilterForwardReply: async function(blockFilterForwardReply) {
+          if (typeof blockFilterForwardReply !== "boolean") {
+            return { error: "blockFilterForwardReply must be a boolean" };
+          }
+          Services.prefs.setBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, blockFilterForwardReply);
+          return { success: true, blockFilterForwardReply };
         },
 
         getStableAuthToken: async function() {
