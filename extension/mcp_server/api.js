@@ -159,6 +159,33 @@ function sanitizeHeaderLine(value) {
   // them, so the result is still readable when a long subject got wrapped.
   return value.replace(/[\r\n\0]+/g, " ");
 }
+
+// URLs that are safe to fetch with the system principal: only Thunderbird's
+// own mail-store protocols. Anything outside this list (file:, chrome:, http:,
+// resource:, jar:) would let a Thunderbird regression or extension interaction
+// turn the attachment-save path into a confused-deputy fetch primitive. We
+// pin the channel construction to exactly these schemes.
+const SYSTEM_PRINCIPAL_FETCH_SCHEMES = new Set([
+  "mailbox",
+  "mailbox-message",
+  "imap",
+  "imap-message",
+  "news",
+  "news-message",
+]);
+
+/**
+ * Return true if `url` is one of the mail-store protocols safe to fetch with
+ * the system principal. Case-insensitive scheme match; everything else (file:,
+ * chrome:, http(s):, resource:, jar:, ftp:) is rejected.
+ */
+function isSystemPrincipalFetchAllowed(url) {
+  if (typeof url !== "string" || !url) return false;
+  const colon = url.indexOf(":");
+  if (colon <= 0) return false;
+  const scheme = url.slice(0, colon).toLowerCase();
+  return SYSTEM_PRINCIPAL_FETCH_SCHEMES.has(scheme);
+}
 let _tempFileCounter = 0;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
@@ -173,6 +200,13 @@ const PREF_LISTEN_ALL = "extensions.thunderbird-mcp.listenAll";
 // these action types via the MCP API; users who legitimately need them can
 // flip this pref or create the filter manually in Thunderbird.
 const PREF_BLOCK_FILTER_FORWARD_REPLY = "extensions.thunderbird-mcp.blockFilterForwardReply";
+// Gate write operations on address books. createContact / updateContact /
+// deleteContact have no UI confirmation, span every address book the user has
+// configured, and could be used to spoof an existing contact (change Boss's
+// email to attacker@evil.com) so the user's future replies are silently
+// misrouted. Default is to refuse contact writes; users who want LLM-driven
+// contact management opt in via the options page.
+const PREF_BLOCK_CONTACT_WRITES = "extensions.thunderbird-mcp.blockContactWrites";
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
@@ -1461,6 +1495,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function isFilterForwardReplyBlocked() {
               try {
                 return Services.prefs.getBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, true);
+              } catch {
+                return true;
+              }
+            }
+
+            /**
+             * Check if the user has blocked address-book write operations from
+             * the MCP API (createContact / updateContact / deleteContact).
+             * Contact writes are persistent, cross every configured address
+             * book, and have no UI confirmation -- enabling a "spoof a known
+             * sender" attack where the LLM edits Boss's email to attacker's.
+             * Default true.
+             */
+            function isContactWritesBlocked() {
+              try {
+                return Services.prefs.getBoolPref(PREF_BLOCK_CONTACT_WRITES, true);
               } catch {
                 return true;
               }
@@ -3222,9 +3272,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function createContact(email, displayName, firstName, lastName, addressBookId) {
               try {
+                if (isContactWritesBlocked()) {
+                  return { error: "User preference blocks contact writes via MCP. Enable 'Allow contact writes' in the extension options page if you trust this MCP client to manage your address book." };
+                }
                 if (typeof email !== "string" || !email) {
                   return { error: "email must be a non-empty string" };
                 }
+                appendComposeAudit({
+                  tool: "createContact",
+                  email: typeof email === "string" ? email.slice(0, 200) : null,
+                  addressBookId: typeof addressBookId === "string" ? addressBookId : null,
+                });
 
                 // Find the target address book
                 let targetBook = null;
@@ -3273,6 +3331,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function updateContact(contactId, email, displayName, firstName, lastName) {
               try {
+                if (isContactWritesBlocked()) {
+                  return { error: "User preference blocks contact writes via MCP. Enable 'Allow contact writes' in the extension options page if you trust this MCP client to manage your address book." };
+                }
                 if (typeof contactId !== "string" || !contactId) {
                   return { error: "contactId must be a non-empty string" };
                 }
@@ -3280,6 +3341,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const found = findContactByUID(contactId);
                 if (found.error) return found;
                 const { card, book } = found;
+
+                // Log the change BEFORE mutating so the audit captures the old
+                // email -- crucial when an attacker repoints "Boss" at their
+                // own address. Persist as much identifying detail as we can
+                // without storing the full contact card.
+                appendComposeAudit({
+                  tool: "updateContact",
+                  contactId,
+                  bookName: book.dirName,
+                  bookURI: book.URI,
+                  oldEmail: card.primaryEmail || null,
+                  newEmail: typeof email === "string" ? email.slice(0, 200) : null,
+                });
 
                 if (email !== undefined) card.primaryEmail = email;
                 if (displayName !== undefined) card.displayName = displayName;
@@ -3302,6 +3376,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function deleteContact(contactId) {
               try {
+                if (isContactWritesBlocked()) {
+                  return { error: "User preference blocks contact writes via MCP. Enable 'Allow contact writes' in the extension options page if you trust this MCP client to manage your address book." };
+                }
                 if (typeof contactId !== "string" || !contactId) {
                   return { error: "contactId must be a non-empty string" };
                 }
@@ -3309,6 +3386,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const found = findContactByUID(contactId);
                 if (found.error) return found;
                 const { card, book } = found;
+
+                appendComposeAudit({
+                  tool: "deleteContact",
+                  contactId,
+                  bookName: book.dirName,
+                  bookURI: book.URI,
+                  email: card.primaryEmail || null,
+                  displayName: card.displayName || null,
+                });
 
                 book.deleteCards([card]);
                 return {
@@ -4698,9 +4784,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           try {
                             const svc = MailServices.messageServiceFromURI(msgUri);
                             const baseUri = svc.getUrlForUri(msgUri);
-                            // Append part parameter to the resolved fetchable URL
+                            // Append part parameter to the resolved fetchable URL.
+                            // URL-encode partName: it is structural (e.g. "1.2.1")
+                            // in current Thunderbird but encoding it costs nothing
+                            // and closes any future regression where a non-digit
+                            // character could land inside a URL query value.
                             const sep = baseUri.spec.includes("?") ? "&" : "?";
-                            partUrl = `${baseUri.spec}${sep}part=${part.partName}`;
+                            partUrl = `${baseUri.spec}${sep}part=${encodeURIComponent(part.partName)}`;
                           } catch {
                             partUrl = "";
                           }
@@ -4949,6 +5039,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             return;
                           }
 
+                          // SECURITY: the channel uses the system principal so
+                          // mail-store protocols (mailbox:, imap-message:, ...)
+                          // can be fetched without sandboxing. That privilege
+                          // would let a file:// or chrome:// URL slipping into
+                          // `url` exfiltrate arbitrary local files or read
+                          // internal browser resources, so we hard-require an
+                          // allow-listed mail-store scheme here. This is
+                          // defense in depth: Thunderbird itself supplies the
+                          // URLs we feed into this code path, but if a future
+                          // regression or extension interaction ever returned
+                          // a non-mail scheme, this check refuses to fetch it.
+                          if (!isSystemPrincipalFetchAllowed(url)) {
+                            info.error = `Refusing to fetch attachment from non-mail-store URL: ${String(url).slice(0, 80)}`;
+                            try { file.remove(false); } catch {}
+                            done();
+                            return;
+                          }
                           const channel = NetUtil.newChannel({
                             uri: url,
                             loadUsingSystemPrincipal: true
@@ -7522,6 +7629,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           }
           Services.prefs.setBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, blockFilterForwardReply);
           return { success: true, blockFilterForwardReply };
+        },
+
+        getBlockContactWrites: async function() {
+          let blocked = true;
+          try {
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_CONTACT_WRITES, true);
+          } catch { /* ignore */ }
+          return { blockContactWrites: blocked };
+        },
+
+        setBlockContactWrites: async function(blockContactWrites) {
+          if (typeof blockContactWrites !== "boolean") {
+            return { error: "blockContactWrites must be a boolean" };
+          }
+          Services.prefs.setBoolPref(PREF_BLOCK_CONTACT_WRITES, blockContactWrites);
+          return { success: true, blockContactWrites };
         },
 
         getStableAuthToken: async function() {

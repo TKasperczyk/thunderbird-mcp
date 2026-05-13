@@ -1309,3 +1309,162 @@ describe('isSkipReviewBlocked: default-true regression (S1a)', () => {
     assert.equal(readSkipReviewBlocked(undefined, true), true);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// isContactWritesBlocked + contact-write gate (F3). Same default-true / fail-
+// closed shape as isSkipReviewBlocked and isFilterForwardReplyBlocked.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function readContactWritesBlocked(prefValue, throwOnRead = false) {
+  try {
+    if (throwOnRead) throw new Error('boom');
+    return prefValue === undefined ? true : !!prefValue;
+  } catch {
+    return true;
+  }
+}
+
+function maybeRejectContactWrite(prefValue) {
+  if (readContactWritesBlocked(prefValue)) {
+    return { error: "User preference blocks contact writes via MCP." };
+  }
+  return null;
+}
+
+describe('isContactWritesBlocked: default-true (F3)', () => {
+  it('blocks contact writes when no user pref is set', () => {
+    assert.equal(readContactWritesBlocked(undefined), true);
+  });
+
+  it('blocks contact writes when pref is explicitly true', () => {
+    assert.equal(readContactWritesBlocked(true), true);
+  });
+
+  it('allows contact writes only when user opted in', () => {
+    assert.equal(readContactWritesBlocked(false), false);
+  });
+
+  it('fails closed when reading the pref throws', () => {
+    assert.equal(readContactWritesBlocked(undefined, true), true);
+  });
+});
+
+describe('Contact-write gate: createContact / updateContact / deleteContact', () => {
+  it('default install rejects createContact', () => {
+    const r = maybeRejectContactWrite(undefined);
+    assert.ok(r && /blocks contact writes/.test(r.error), `got: ${JSON.stringify(r)}`);
+  });
+
+  it('default install rejects updateContact', () => {
+    const r = maybeRejectContactWrite(undefined);
+    assert.ok(r && /blocks contact writes/.test(r.error));
+  });
+
+  it('default install rejects deleteContact', () => {
+    const r = maybeRejectContactWrite(undefined);
+    assert.ok(r && /blocks contact writes/.test(r.error));
+  });
+
+  it('user opt-in (pref = false) lets writes through', () => {
+    assert.equal(maybeRejectContactWrite(false), null);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// isSystemPrincipalFetchAllowed: scheme allow-list for the privileged
+// attachment-fetch channel. Mirrors the production helper exactly.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SYSTEM_PRINCIPAL_FETCH_SCHEMES = new Set([
+  'mailbox',
+  'mailbox-message',
+  'imap',
+  'imap-message',
+  'news',
+  'news-message',
+]);
+
+function isSystemPrincipalFetchAllowed(url) {
+  if (typeof url !== 'string' || !url) return false;
+  const colon = url.indexOf(':');
+  if (colon <= 0) return false;
+  const scheme = url.slice(0, colon).toLowerCase();
+  return SYSTEM_PRINCIPAL_FETCH_SCHEMES.has(scheme);
+}
+
+describe('isSystemPrincipalFetchAllowed: allow mail-store protocols only', () => {
+  it('accepts mailbox / imap / news family schemes', () => {
+    assert.equal(isSystemPrincipalFetchAllowed('mailbox:///Users/x/Local Folders/INBOX?number=1'), true);
+    assert.equal(isSystemPrincipalFetchAllowed('mailbox-message://imap-host/INBOX?number=1&part=1.2'), true);
+    assert.equal(isSystemPrincipalFetchAllowed('imap://user@host/INBOX/;UID=42'), true);
+    assert.equal(isSystemPrincipalFetchAllowed('imap-message://user@host/INBOX#42?part=1.2'), true);
+    assert.equal(isSystemPrincipalFetchAllowed('news://news.example.com/foo.bar.baz'), true);
+    assert.equal(isSystemPrincipalFetchAllowed('news-message://news.example/group#42'), true);
+  });
+
+  it('rejects file:// (the local-file exfil vector)', () => {
+    assert.equal(isSystemPrincipalFetchAllowed('file:///etc/passwd'), false);
+    assert.equal(isSystemPrincipalFetchAllowed('file:///C:/Users/x/.ssh/id_rsa'), false);
+    assert.equal(isSystemPrincipalFetchAllowed('FILE:///etc/shadow'), false);
+  });
+
+  it('rejects chrome:// and resource:// (privileged browser internals)', () => {
+    assert.equal(isSystemPrincipalFetchAllowed('chrome://global/content/'), false);
+    assert.equal(isSystemPrincipalFetchAllowed('resource://gre/modules/'), false);
+    assert.equal(isSystemPrincipalFetchAllowed('jar:file:///x.jar!/y'), false);
+  });
+
+  it('rejects http and https (network egress)', () => {
+    assert.equal(isSystemPrincipalFetchAllowed('http://attacker.com/x'), false);
+    assert.equal(isSystemPrincipalFetchAllowed('https://attacker.com/x'), false);
+    assert.equal(isSystemPrincipalFetchAllowed('ftp://attacker.com/x'), false);
+  });
+
+  it('rejects garbage / missing schemes / non-strings', () => {
+    assert.equal(isSystemPrincipalFetchAllowed(''), false);
+    assert.equal(isSystemPrincipalFetchAllowed('not-a-url'), false);
+    assert.equal(isSystemPrincipalFetchAllowed(':no-scheme'), false);
+    assert.equal(isSystemPrincipalFetchAllowed(null), false);
+    assert.equal(isSystemPrincipalFetchAllowed(undefined), false);
+    assert.equal(isSystemPrincipalFetchAllowed(123), false);
+  });
+
+  it('is case-insensitive on the scheme', () => {
+    assert.equal(isSystemPrincipalFetchAllowed('MAILBOX:///x'), true);
+    assert.equal(isSystemPrincipalFetchAllowed('Imap-Message://host/x'), true);
+  });
+
+  it('does not accept embedded mail-store schemes inside a non-mail URL', () => {
+    // A naive substring check would let http://x/mailbox: through.
+    assert.equal(isSystemPrincipalFetchAllowed('http://attacker.com/mailbox:'), false);
+    assert.equal(isSystemPrincipalFetchAllowed('http://attacker.com/?next=imap://x'), false);
+  });
+});
+
+describe('Inline-image partUrl construction: URL encoding', () => {
+  // Mirrors the production concatenation. Verifies that even an exotic
+  // partName cannot inject extra query parameters.
+  function buildPartUrl(baseSpec, partName) {
+    const sep = baseSpec.includes('?') ? '&' : '?';
+    return `${baseSpec}${sep}part=${encodeURIComponent(partName)}`;
+  }
+
+  it('appends a single part= query parameter for normal structural names', () => {
+    const url = buildPartUrl('mailbox:///INBOX?number=1', '1.2.3');
+    assert.equal(url, 'mailbox:///INBOX?number=1&part=1.2.3');
+  });
+
+  it('uses ? when no query exists yet', () => {
+    const url = buildPartUrl('imap-message://x/y', '1');
+    assert.equal(url, 'imap-message://x/y?part=1');
+  });
+
+  it('encodes a hypothetical partName containing & to defeat parameter injection', () => {
+    const evil = '1&injected=evil';
+    const url = buildPartUrl('mailbox:///INBOX?number=1', evil);
+    // The injected `&injected=evil` must end up percent-encoded inside the
+    // part= value, not as a sibling parameter.
+    assert.ok(!url.includes('&injected=evil'), `injection should have been encoded, got: ${url}`);
+    assert.ok(url.endsWith('part=1%26injected%3Devil'));
+  });
+});
