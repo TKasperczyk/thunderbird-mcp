@@ -241,6 +241,68 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getSenderHistory",
+        group: "messages", crud: "read",
+        title: "Get Sender History",
+        description: "Return recent message headers from a given email address, scanned across the inbox of every accessible account. Useful for 'have I corresponded with this person before?' or 'have we already approached this outreach target?' decisions before drafting a reply.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            email: { type: "string", description: "Sender email address to match (case-insensitive substring match against the author field)" },
+            maxResults: { type: "integer", description: "Cap on returned headers (default 50, max 200)" },
+            scanCap: { type: "integer", description: "Hard cap on messages enumerated per folder before stopping (default 5000, max 50000)" },
+            sinceDays: { type: "integer", description: "Restrict to messages from the last N days (default unlimited)" },
+          },
+          required: ["email"],
+        },
+      },
+      {
+        name: "searchAttachments",
+        group: "messages", crud: "read",
+        title: "Search Attachments",
+        description: "Find messages with attachments matching a filename substring and/or MIME-type pattern. Walks messages in the chosen folder (or the inbox of every accessible account when folderPath is omitted) and inspects allUserAttachments metadata. Returns header objects with the matching attachment names attached. Capped to avoid mailbox scans.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            nameContains: { type: "string", description: "Case-insensitive substring matched against the attachment filename (e.g. 'invoice', '.pdf')" },
+            contentType: { type: "string", description: "Case-insensitive prefix matched against the attachment Content-Type (e.g. 'application/pdf', 'image/')" },
+            folderPath: { type: "string", description: "Optional folder URI to limit the search. Omitted = scan inbox of each accessible account." },
+            maxResults: { type: "integer", description: "Cap on matching messages (default 50, max 200)" },
+            scanCap: { type: "integer", description: "Hard cap on messages enumerated per folder before stopping (default 5000, max 50000). Prevents the LLM from accidentally walking a 200k-message archive." },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "searchByThread",
+        group: "messages", crud: "read",
+        title: "Search By Thread",
+        description: "Given any messageId + folderPath, return headers for every other message in the same thread. Uses msgHdr.threadId. Results are headers-only -- call getMessage on a specific id for its body.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "Any message in the thread you want to fetch" },
+            folderPath: { type: "string", description: "Folder URI containing the message" },
+            maxResults: { type: "integer", description: "Cap on returned headers (default 100, max 500)" },
+          },
+          required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "batchGetMessageHeaders",
+        group: "messages", crud: "read",
+        title: "Batch Get Message Headers",
+        description: "Fetch headers for up to 200 messages in a single round-trip. Returns a map of messageId -> { header object | { error: ... } }. Pair with searchMessages to enrich a result set without N round-trips.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs to fetch headers for (hard cap 200)" },
+            folderPath: { type: "string", description: "Folder URI shared by all of the IDs" },
+          },
+          required: ["messageIds", "folderPath"],
+        },
+      },
+      {
         name: "getServerCapabilities",
         group: "system", crud: "read",
         title: "Get Server Capabilities",
@@ -2982,10 +3044,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
 	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody) {
-	              // Gloda full-body search path (async)
+	              // Gloda full-body search path (async).
+	              //
+	              // SECURITY: GlodaMsgSearcher passes the query through to a
+	              // tokenizer that supports boolean operators (AND / OR / NOT
+	              // / *). We restrict the API surface to plain keyword search
+	              // so an MCP caller can't (a) probe the index via wildcards
+	              // they don't have rights to, (b) write surprisingly broad
+	              // queries that scan the whole mailbox. Reject any token-
+	              // level Gloda operator with a clear error rather than
+	              // silently stripping -- the caller deserves to know their
+	              // query was mangled.
 	              if (searchBody) {
 	                if (!GlodaMsgSearcher) return { error: "Gloda full-text index is not available" };
 	                if (!query) return { error: "searchBody requires a non-empty query" };
+	                const dangerous = /(?:^|\s)(?:AND|OR|NOT)(?:\s|$)|[*"()]/;
+	                if (dangerous.test(query)) {
+	                  return {
+	                    error: "searchBody query must be plain keywords. Gloda operators (AND, OR, NOT, *, \", parentheses) are rejected by this MCP API.",
+	                  };
+	                }
 	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly);
 	              }
 	              const results = [];
@@ -4126,7 +4204,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	            function getMessageHeaders(messageId, folderPath) {
 	              const found = findMessage(messageId, folderPath);
 	              if (found.error) return { error: found.error };
-	              const { msgHdr } = found;
+	              return msgHdrToHeaderObject(found.msgHdr);
+	            }
+
+	            // Shared shape extraction so getMessageHeaders and
+	            // batchGetMessageHeaders return identical fields.
+	            function msgHdrToHeaderObject(msgHdr) {
 	              return {
 	                id: msgHdr.messageId,
 	                subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "",
@@ -4142,6 +4225,297 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                inReplyTo: msgHdr.getStringProperty("in-reply-to") || "",
 	                size: typeof msgHdr.messageSize === "number" ? msgHdr.messageSize : null,
 	              };
+	            }
+
+	            /**
+	             * Recent messages from a given sender, across the inbox of
+	             * every accessible account. Uses substring match against the
+	             * author field (which contains "Name <email>" -- so email
+	             * matches naturally). Newest-first.
+	             */
+	            function getSenderHistory(email, maxResults, scanCap, sinceDays) {
+	              if (typeof email !== "string" || !email.trim()) {
+	                return { error: "email must be a non-empty string" };
+	              }
+	              const wantLower = email.toLowerCase();
+	              const cap = Number.isFinite(maxResults) && maxResults > 0
+	                ? Math.min(Math.floor(maxResults), 200)
+	                : 50;
+	              const scanLimit = Number.isFinite(scanCap) && scanCap > 0
+	                ? Math.min(Math.floor(scanCap), 50000)
+	                : 5000;
+	              const sinceMicros = Number.isFinite(sinceDays) && sinceDays > 0
+	                ? (Date.now() - sinceDays * 86400 * 1000) * 1000
+	                : null;
+
+	              const FLAG_INBOX = 0x1000;
+	              const results = [];
+	              let totalScanned = 0;
+	              for (const account of getAccessibleAccounts()) {
+	                if (results.length >= cap) break;
+	                let inbox = null;
+	                try {
+	                  const root = account.incomingServer && account.incomingServer.rootFolder;
+	                  if (!root) continue;
+	                  if (typeof root.getFolderWithFlags === "function") {
+	                    try { inbox = root.getFolderWithFlags(FLAG_INBOX); } catch { /* ignore */ }
+	                  }
+	                  if (!inbox) inbox = root;
+	                  const db = inbox.msgDatabase;
+	                  if (!db) continue;
+	                  let scanned = 0;
+	                  for (const hdr of db.enumerateMessages()) {
+	                    scanned++;
+	                    totalScanned++;
+	                    if (scanned > scanLimit) break;
+	                    if (sinceMicros !== null && hdr.date && hdr.date < sinceMicros) continue;
+	                    const author = (hdr.mime2DecodedAuthor || hdr.author || "").toLowerCase();
+	                    if (!author.includes(wantLower)) continue;
+	                    const obj = msgHdrToHeaderObject(hdr);
+	                    obj.folderPath = inbox.URI;
+	                    obj._ts = hdr.date ? hdr.date / 1000 : 0;
+	                    results.push(obj);
+	                    if (results.length >= cap * 2) break; // generous pre-sort buffer
+	                  }
+	                } catch { /* skip inaccessible account */ }
+	              }
+
+	              results.sort((a, b) => (b._ts || 0) - (a._ts || 0));
+	              const trimmed = results.slice(0, cap).map(({ _ts, ...rest }) => rest);
+	              return {
+	                sender: email,
+	                messages: trimmed,
+	                totalScanned,
+	                truncated: results.length > cap,
+	              };
+	            }
+
+	            /**
+	             * Find messages with attachments matching a filename substring
+	             * and/or MIME-type prefix. Works by pre-filtering to messages
+	             * that have the Attachment flag set, then walking
+	             * allUserAttachments via MsgHdrToMimeMessage. Async because
+	             * MIME parse is async.
+	             *
+	             * Scoped to a specific folder, or fans out across the inbox of
+	             * every accessible account when folderPath is omitted.
+	             */
+	            function searchAttachments(nameContains, contentType, folderPath, maxResults, scanCap) {
+	              return new Promise((resolve) => {
+	                try {
+	                  if (!nameContains && !contentType) {
+	                    resolve({ error: "Provide at least one of nameContains or contentType" });
+	                    return;
+	                  }
+	                  const wantName = nameContains ? String(nameContains).toLowerCase() : null;
+	                  const wantType = contentType ? String(contentType).toLowerCase() : null;
+	                  const cap = Number.isFinite(maxResults) && maxResults > 0
+	                    ? Math.min(Math.floor(maxResults), 200)
+	                    : 50;
+	                  const scanLimit = Number.isFinite(scanCap) && scanCap > 0
+	                    ? Math.min(Math.floor(scanCap), 50000)
+	                    : 5000;
+
+	                  // Build the list of folders to scan.
+	                  const folders = [];
+	                  if (folderPath) {
+	                    const opened = openFolder(folderPath);
+	                    if (opened.error) { resolve({ error: opened.error }); return; }
+	                    folders.push(opened.folder);
+	                  } else {
+	                    for (const account of getAccessibleAccounts()) {
+	                      try {
+	                        const root = account.incomingServer && account.incomingServer.rootFolder;
+	                        if (!root) continue;
+	                        // Pick the inbox if present, else the root.
+	                        let inbox = null;
+	                        if (typeof root.getFolderWithFlags === "function") {
+	                          try {
+	                            const FLAG_INBOX = 0x1000; // nsMsgFolderFlags.Inbox
+	                            inbox = root.getFolderWithFlags(FLAG_INBOX);
+	                          } catch { /* ignore */ }
+	                        }
+	                        folders.push(inbox || root);
+	                      } catch { /* skip inaccessible accounts */ }
+	                    }
+	                  }
+
+	                  // Collect candidate headers (those with the Attachment flag).
+	                  const FLAG_ATTACH = 0x10000000; // nsMsgMessageFlags.Attachment
+	                  const candidates = [];
+	                  let totalScanned = 0;
+	                  for (const folder of folders) {
+	                    if (candidates.length >= cap * 4) break; // generous pre-MIME buffer
+	                    let db;
+	                    try { db = folder.msgDatabase; } catch { continue; }
+	                    if (!db) continue;
+	                    let scannedHere = 0;
+	                    for (const hdr of db.enumerateMessages()) {
+	                      scannedHere++;
+	                      totalScanned++;
+	                      if (scannedHere > scanLimit) break;
+	                      if ((hdr.flags & FLAG_ATTACH) !== 0) {
+	                        candidates.push({ hdr, folder });
+	                        if (candidates.length >= cap * 4) break;
+	                      }
+	                    }
+	                  }
+
+	                  if (candidates.length === 0) {
+	                    resolve({ matches: [], totalScanned, candidates: 0 });
+	                    return;
+	                  }
+
+	                  // MIME-parse each candidate; collect matches.
+	                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+	                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+	                  );
+
+	                  const matches = [];
+	                  let remaining = candidates.length;
+	                  const finish = () => {
+	                    matches.sort((a, b) => (b._ts || 0) - (a._ts || 0));
+	                    const trimmed = matches.slice(0, cap).map(({ _ts, ...rest }) => rest);
+	                    resolve({
+	                      matches: trimmed,
+	                      totalScanned,
+	                      candidates: candidates.length,
+	                      truncated: matches.length > cap,
+	                    });
+	                  };
+
+	                  for (const { hdr, folder } of candidates) {
+	                    MsgHdrToMimeMessage(hdr, null, (aMsgHdr, aMimeMsg) => {
+	                      try {
+	                        const atts = aMimeMsg && aMimeMsg.allUserAttachments ? aMimeMsg.allUserAttachments : [];
+	                        const matched = [];
+	                        for (const att of atts) {
+	                          const name = (att && att.name) ? String(att.name).toLowerCase() : "";
+	                          const ct = (att && att.contentType) ? String(att.contentType).toLowerCase() : "";
+	                          const nameOk = !wantName || name.includes(wantName);
+	                          const typeOk = !wantType || ct.startsWith(wantType);
+	                          if (nameOk && typeOk) {
+	                            matched.push({
+	                              name: att.name || "",
+	                              contentType: att.contentType || "",
+	                              size: typeof att.size === "number" ? att.size : null,
+	                            });
+	                          }
+	                        }
+	                        if (matched.length > 0) {
+	                          const headerObj = msgHdrToHeaderObject(hdr);
+	                          headerObj.matchingAttachments = matched;
+	                          headerObj._ts = hdr.date ? hdr.date / 1000 : 0;
+	                          headerObj.folderPath = folder.URI;
+	                          matches.push(headerObj);
+	                        }
+	                      } catch { /* skip parse errors */ }
+	                      remaining--;
+	                      if (remaining === 0) finish();
+	                    });
+	                  }
+	                } catch (e) {
+	                  resolve({ error: e.toString() });
+	                }
+	              });
+	            }
+
+	            /**
+	             * Walk a folder once and return all headers that share the
+	             * threadId of the anchor message. The anchor itself is included.
+	             * Newest-first.
+	             */
+	            function searchByThread(messageId, folderPath, maxResults) {
+	              const found = findMessage(messageId, folderPath);
+	              if (found.error) return { error: found.error };
+	              const { msgHdr: anchor, folder, db } = found;
+	              const threadId = anchor.threadId;
+	              if (!threadId) {
+	                return { thread: [msgHdrToHeaderObject(anchor)], threadId: null, anchored: true };
+	              }
+	              const cap = Number.isFinite(maxResults) && maxResults > 0
+	                ? Math.min(Math.floor(maxResults), 500)
+	                : 100;
+	              const results = [];
+	              const SCAN_CAP = 50000;
+	              let scanned = 0;
+	              for (const hdr of db.enumerateMessages()) {
+	                scanned++;
+	                if (scanned > SCAN_CAP) break;
+	                if (hdr.threadId === threadId) {
+	                  results.push({ _hdr: hdr, _ts: hdr.date ? hdr.date / 1000 : 0 });
+	                  if (results.length >= cap) break;
+	                }
+	              }
+	              results.sort((a, b) => b._ts - a._ts);
+	              return {
+	                threadId: String(threadId),
+	                anchorId: anchor.messageId,
+	                thread: results.map(r => msgHdrToHeaderObject(r._hdr)),
+	                truncated: results.length >= cap,
+	                scanned,
+	              };
+	            }
+
+	            /**
+	             * Resolve N message IDs against a single folder in one pass.
+	             * Returns { headers: { [id]: headerObj | {error} }, total, failed }.
+	             * Hard cap of 200 -- search-result pages are typically smaller
+	             * and this keeps the round-trip JSON bounded.
+	             */
+	            function batchGetMessageHeaders(messageIds, folderPath) {
+	              if (!Array.isArray(messageIds)) return { error: "messageIds must be an array" };
+	              if (messageIds.length === 0) return { headers: {}, total: 0, failed: 0 };
+	              if (messageIds.length > 200) {
+	                return { error: `Too many ids: ${messageIds.length}. Hard cap is 200; call multiple times if needed.` };
+	              }
+	              const opened = openFolder(folderPath);
+	              if (opened.error) return { error: opened.error };
+	              const { folder, db } = opened;
+
+	              // Build a single id -> hdr map by enumerating ONCE rather than
+	              // calling findMessage N times. For an inbox with M messages
+	              // this is O(M) instead of O(M*N).
+	              const wanted = new Set(messageIds);
+	              const found = new Map();
+	              const hasDirect = typeof db.getMsgHdrForMessageID === "function";
+	              if (hasDirect) {
+	                for (const id of messageIds) {
+	                  try {
+	                    const h = db.getMsgHdrForMessageID(id);
+	                    if (h) found.set(id, h);
+	                  } catch { /* ignore */ }
+	                }
+	              }
+	              // Anything still unresolved gets one linear enumeration pass.
+	              const missing = messageIds.filter(id => !found.has(id));
+	              if (missing.length > 0) {
+	                const missSet = new Set(missing);
+	                let scanned = 0;
+	                const SCAN_CAP = 50000;
+	                for (const hdr of db.enumerateMessages()) {
+	                  scanned++;
+	                  if (scanned > SCAN_CAP) break;
+	                  if (missSet.has(hdr.messageId)) {
+	                    found.set(hdr.messageId, hdr);
+	                    missSet.delete(hdr.messageId);
+	                    if (missSet.size === 0) break;
+	                  }
+	                }
+	              }
+
+	              const headers = Object.create(null);
+	              let failed = 0;
+	              for (const id of messageIds) {
+	                const h = found.get(id);
+	                if (!h) {
+	                  headers[id] = { error: "not found in this folder" };
+	                  failed++;
+	                } else {
+	                  headers[id] = msgHdrToHeaderObject(h);
+	                }
+	              }
+	              return { headers, total: messageIds.length, failed };
 	            }
 
 	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource) {
@@ -6496,6 +6870,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
                 case "getMessageHeaders":
                   return getMessageHeaders(args.messageId, args.folderPath);
+                case "batchGetMessageHeaders":
+                  return batchGetMessageHeaders(args.messageIds, args.folderPath);
+                case "searchByThread":
+                  return searchByThread(args.messageId, args.folderPath, args.maxResults);
+                case "searchAttachments":
+                  return await searchAttachments(args.nameContains, args.contentType, args.folderPath, args.maxResults, args.scanCap);
+                case "getSenderHistory":
+                  return getSenderHistory(args.email, args.maxResults, args.scanCap, args.sinceDays);
                 case "dryRunCompose":
                   return dryRunCompose(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "getServerCapabilities":
