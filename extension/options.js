@@ -488,9 +488,15 @@ async function loadAuditLog() {
   auditEntriesEl.textContent = "Loading...";
   auditStatusEl.textContent = "";
   auditStatusEl.className = "save-status";
-  const tool = auditToolFilter.value || undefined;
+  const tool = auditToolFilter.value || "";
   try {
-    const result = await browser.mcpServer.readAuditLog(200, tool ? { tool } : undefined);
+    // Avoid passing `undefined` for the second arg -- some WebExtensions
+    // schema validators reject explicit-undefined even when the parameter
+    // is declared optional. Call with one arg when there's no filter, two
+    // args when there is.
+    const result = tool
+      ? await browser.mcpServer.readAuditLog(200, { tool })
+      : await browser.mcpServer.readAuditLog(200);
     auditEntriesEl.innerHTML = "";
     if (!result || !Array.isArray(result.entries) || result.entries.length === 0) {
       const empty = document.createElement("div");

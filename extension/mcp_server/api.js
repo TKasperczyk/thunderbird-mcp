@@ -8041,13 +8041,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
         readAuditLog: async function(maxEntries, filter) {
           // Defensive normalization of the filter object so a malformed call
-          // from options.html cannot crash the experiment-API scope.
-          const safeFilter = (filter && typeof filter === "object" && !Array.isArray(filter)) ? filter : null;
-          return readAuditLog(maxEntries, safeFilter);
+          // from options.html cannot crash the experiment-API scope. Any
+          // throw inside readAuditLog is reduced to a structured error so
+          // the options page sees a useful message instead of the generic
+          // "An unexpected error occurred" that Mozilla wraps thrown
+          // experiment-API errors in.
+          try {
+            const safeFilter = (filter && typeof filter === "object" && !Array.isArray(filter)) ? filter : null;
+            return readAuditLog(maxEntries, safeFilter);
+          } catch (e) {
+            return { entries: [], totalScanned: 0, truncated: false, errors: [{ reason: String(e) }] };
+          }
         },
 
         clearAuditLog: async function() {
-          return clearAuditLog();
+          try { return clearAuditLog(); }
+          catch (e) { return { error: String(e) }; }
         },
 
         getStableAuthToken: async function() {

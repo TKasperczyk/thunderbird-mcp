@@ -162,7 +162,7 @@
             "name": "filter",
             "type": "object",
             "optional": true,
-            "additionalProperties": true,
+            "additionalProperties": { "type": "any" },
             "description": "Optional filter: { tool?: string, since?: ISO string, until?: ISO string }"
           }
         ]
