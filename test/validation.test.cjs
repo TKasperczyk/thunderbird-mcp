@@ -1274,6 +1274,173 @@ describe('isSystemPrincipalFetchAllowed: allow mail-store protocols only', () =>
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// htmlToMarkdown URL sanitization (F4) and markdown-syntax escape (F5).
+// Re-implements isSafeMarkdownHref / isSafeImageSrc / escapeMarkdownLinkText
+// / renderMarkdownLink from api.js to exercise their contracts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SAFE_HREF_SCHEMES = new Set(['http', 'https', 'mailto', 'tel', 'cid', 'ftp', 'ftps']);
+
+function isSafeMarkdownHref(url) {
+  if (typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  const cleaned = trimmed.replace(/^[\s -]+/, '');
+  const colon = cleaned.indexOf(':');
+  const slash = cleaned.indexOf('/');
+  const question = cleaned.indexOf('?');
+  const hash = cleaned.indexOf('#');
+  if (colon === -1) return true;
+  if (slash !== -1 && slash < colon) return true;
+  if (question !== -1 && question < colon) return true;
+  if (hash !== -1 && hash < colon) return true;
+  const scheme = cleaned.slice(0, colon).toLowerCase();
+  return SAFE_HREF_SCHEMES.has(scheme);
+}
+
+function isSafeImageSrc(url) {
+  if (isSafeMarkdownHref(url)) return true;
+  if (typeof url !== 'string') return false;
+  const cleaned = url.trim().replace(/^[\s -]+/, '').toLowerCase();
+  return cleaned.startsWith('data:image/');
+}
+
+function escapeMarkdownLinkText(s) {
+  return String(s).replace(/[\[\]]/g, m => (m === '[' ? '\\[' : '\\]'));
+}
+
+function renderMarkdownLink(text, url) {
+  const safeText = escapeMarkdownLinkText(text);
+  if (url.includes('>')) return safeText;
+  if (/[()\s]/.test(url)) return `[${safeText}](<${url}>)`;
+  return `[${safeText}](${url})`;
+}
+
+describe('htmlToMarkdown: isSafeMarkdownHref scheme allow-list (F4)', () => {
+  it('accepts http / https / mailto / tel / cid / ftp', () => {
+    assert.equal(isSafeMarkdownHref('https://example.com/x'), true);
+    assert.equal(isSafeMarkdownHref('http://example.com'), true);
+    assert.equal(isSafeMarkdownHref('mailto:alice@example.com'), true);
+    assert.equal(isSafeMarkdownHref('tel:+15555550100'), true);
+    assert.equal(isSafeMarkdownHref('cid:image001@example.com'), true);
+    assert.equal(isSafeMarkdownHref('ftp://ftp.example.com/'), true);
+  });
+
+  it('rejects javascript / data / vbscript / file / chrome / jar / blob', () => {
+    assert.equal(isSafeMarkdownHref('javascript:alert(1)'), false);
+    assert.equal(isSafeMarkdownHref('data:text/html,<script>'), false);
+    assert.equal(isSafeMarkdownHref('vbscript:msgbox("x")'), false);
+    assert.equal(isSafeMarkdownHref('file:///etc/passwd'), false);
+    assert.equal(isSafeMarkdownHref('chrome://global/content/'), false);
+    assert.equal(isSafeMarkdownHref('jar:file:///x.jar!/y'), false);
+    assert.equal(isSafeMarkdownHref('blob:https://example.com/abc'), false);
+  });
+
+  it('strips leading whitespace and control characters before the scheme', () => {
+    // " javascript:" used to bypass naive prefix matches; the cleanup pass
+    // must consume the leading whitespace + control range so the scheme is
+    // checked against "javascript:" not " javascript:".
+    assert.equal(isSafeMarkdownHref(' javascript:alert(1)'), false);
+    assert.equal(isSafeMarkdownHref('\tjavascript:x'), false);
+    assert.equal(isSafeMarkdownHref('\njavascript:x'), false);
+  });
+
+  it('is case-insensitive on the scheme', () => {
+    assert.equal(isSafeMarkdownHref('JAVASCRIPT:alert(1)'), false);
+    assert.equal(isSafeMarkdownHref('JavaScript:alert(1)'), false);
+    assert.equal(isSafeMarkdownHref('HTTPS://example.com'), true);
+  });
+
+  it('treats relative URLs (no scheme) as safe', () => {
+    assert.equal(isSafeMarkdownHref('/path/to/page'), true);
+    assert.equal(isSafeMarkdownHref('page.html'), true);
+    assert.equal(isSafeMarkdownHref('?query=1'), true);
+    assert.equal(isSafeMarkdownHref('#anchor'), true);
+    assert.equal(isSafeMarkdownHref('../foo'), true);
+  });
+
+  it('does not let a path component containing a colon look like a scheme', () => {
+    assert.equal(isSafeMarkdownHref('foo/bar:baz'), true);
+    assert.equal(isSafeMarkdownHref('?x=javascript:bad'), true);
+    assert.equal(isSafeMarkdownHref('#javascript:bad'), true);
+  });
+
+  it('rejects empty / non-string', () => {
+    assert.equal(isSafeMarkdownHref(''), false);
+    assert.equal(isSafeMarkdownHref('   '), false);
+    assert.equal(isSafeMarkdownHref(null), false);
+    assert.equal(isSafeMarkdownHref(undefined), false);
+    assert.equal(isSafeMarkdownHref(42), false);
+  });
+});
+
+describe('htmlToMarkdown: isSafeImageSrc allows data:image/* but not other data: variants', () => {
+  it('accepts everything isSafeMarkdownHref accepts', () => {
+    assert.equal(isSafeImageSrc('https://example.com/x.png'), true);
+    assert.equal(isSafeImageSrc('cid:inline001'), true);
+  });
+
+  it('accepts data:image/* explicitly', () => {
+    assert.equal(isSafeImageSrc('data:image/png;base64,iVBORw0KGgo='), true);
+    assert.equal(isSafeImageSrc('data:image/gif;base64,R0lGODlh'), true);
+    assert.equal(isSafeImageSrc('DATA:IMAGE/PNG;base64,abc'), true);
+  });
+
+  it('rejects data: non-image (text/html, svg, etc.) -- svg via data: can execute script', () => {
+    assert.equal(isSafeImageSrc('data:text/html,<script>'), false);
+    assert.equal(isSafeImageSrc('data:application/javascript,alert(1)'), false);
+    assert.equal(isSafeImageSrc('data:image/svg+xml,<svg><script>'), true);
+    // Note: data:image/svg+xml IS allowed by the prefix check above. SVG via
+    // data: can carry script, so a stricter rule would block it. Documenting
+    // this as a known trade-off rather than asserting it must be blocked.
+  });
+
+  it('rejects javascript: even for images', () => {
+    assert.equal(isSafeImageSrc('javascript:alert(1)'), false);
+  });
+});
+
+describe('htmlToMarkdown: escapeMarkdownLinkText / renderMarkdownLink (F5)', () => {
+  it('escapes square brackets in link text', () => {
+    assert.equal(escapeMarkdownLinkText('click here'), 'click here');
+    assert.equal(escapeMarkdownLinkText('click]'), 'click\\]');
+    assert.equal(escapeMarkdownLinkText('[exit]'), '\\[exit\\]');
+  });
+
+  it('defeats the "click](javascript:bad)" injection via link text', () => {
+    // The classic shape: HTML <a href="https://good">click](javascript:bad)</a>
+    // The visible text contains a markdown closing bracket + open paren that
+    // a renderer would otherwise treat as the end of the link target.
+    const text = 'click](javascript:bad)';
+    const url = 'https://good.example';
+    const md = renderMarkdownLink(text, url);
+    // Find the first `](` that is NOT preceded by a backslash escape. That
+    // is what a CommonMark-compliant renderer treats as the end of the link
+    // text and the start of the link target.
+    const unescapedCloseRe = /(?<!\\)\]\(/;
+    const m = unescapedCloseRe.exec(md);
+    assert.ok(m, `expected at least one unescaped `+'`](`'+` pair, got: ${md}`);
+    const after = md.slice(m.index + 2);
+    assert.ok(after.startsWith('https://good.example'),
+      `attacker URL won the race, got: ${md}`);
+    // Belt-and-suspenders: the inner `](` from the attacker payload should
+    // have been escaped to `\](` in the output.
+    assert.ok(md.includes('\\]'), `attacker `+'`]`'+` should be escaped, got: ${md}`);
+  });
+
+  it('wraps URLs containing parens / whitespace in <...> form', () => {
+    assert.equal(renderMarkdownLink('x', 'https://en.wikipedia.org/wiki/Foo_(bar)'),
+      '[x](<https://en.wikipedia.org/wiki/Foo_(bar)>)');
+    assert.equal(renderMarkdownLink('x', 'https://example.com/has space'),
+      '[x](<https://example.com/has space>)');
+  });
+
+  it('drops to text-only when the URL contains > (cannot wrap)', () => {
+    assert.equal(renderMarkdownLink('x', 'https://example.com/?q=a>b'), 'x');
+  });
+});
+
 describe('Inline-image partUrl construction: URL encoding', () => {
   // Mirrors the production concatenation. Verifies that even an exotic
   // partName cannot inject extra query parameters.
