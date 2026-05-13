@@ -68,9 +68,78 @@ const _tempAttachFiles = new Set();
 // WeakSet so entries are collected automatically when the window is destroyed.
 const _claimedComposeWindows = new WeakSet();
 const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
+// Cap file-path attachments to the same magnitude as saved-message attachments.
+// Prevents an MCP caller from attaching multi-GB files to a single outgoing message.
+const MAX_FILE_PATH_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 // Must be large enough to carry MAX_BASE64_SIZE plus JSON-RPC framing overhead.
 // The httpd.sys.mjs pre-buffer cap uses the same value.
 const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP request bodies
+
+// File paths that an MCP caller must never be allowed to attach to outbound
+// mail. Protects against the LLM-confused-deputy chain where attacker-controlled
+// email content prompt-injects an assistant into running
+// sendMail({attachments: ["/home/user/.ssh/id_rsa"], skipReview: true}).
+//
+// Patterns match the path AFTER backslashes are normalized to forward slashes
+// and the whole string is lower-cased, so a single set covers POSIX and Windows.
+// This is a deny-list, not an allow-list -- it intentionally errs toward
+// blocking known-sensitive locations rather than restricting users to a
+// downloads-only sandbox. Extend it as new high-value targets surface.
+const SENSITIVE_ATTACHMENT_PATTERNS = [
+  // SSH / PGP / cloud / kube / docker credentials
+  /\/\.ssh(\/|$)/,
+  /\/\.gnupg(\/|$)/,
+  /\/\.aws(\/|$)/,
+  /\/\.azure(\/|$)/,
+  /\/\.config\/gcloud(\/|$)/,
+  /\/\.kube(\/|$)/,
+  /\/\.docker(\/|$)/,
+  /\/\.netrc$/,
+  /\/\.npmrc$/,
+  /\/\.pypirc$/,
+  // Common key / secret file extensions anywhere on disk
+  /\/id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/,
+  /\.pem$/,
+  /\.pfx$/,
+  /\.p12$/,
+  /\.kdbx$/,
+  /\.key$/,
+  /\.asc$/,
+  /\.gpg$/,
+  // Linux / macOS system directories
+  /^\/etc\//,
+  /^\/proc\//,
+  /^\/sys\//,
+  /^\/root\//,
+  /^\/var\/log\//,
+  /^\/var\/lib\/sudo\//,
+  // macOS keychain locations
+  /\/library\/keychains\//,
+  // Windows system directories
+  /^[a-z]:\/windows\//,
+  /^[a-z]:\/programdata\/microsoft\/(crypto|protect)\//,
+  /\/appdata\/(local|roaming)\/microsoft\/(credentials|crypto|protect|vault)(\/|$)/,
+  // Browser credential stores (Firefox / Chrome / Edge)
+  /\/(logins\.json|key3\.db|key4\.db|cookies(\.sqlite)?|login data)$/,
+  // Thunderbird's own profile (contains the user's entire mail store + prefs).
+  // Linux uses ~/.thunderbird (dot-prefixed), macOS uses ~/Library/Thunderbird,
+  // Windows uses %APPDATA%/Roaming/Thunderbird; cover all three.
+  /\/\.?thunderbird\/profiles?(\/|$)/,
+  /\/library\/thunderbird(\/|$)/,
+  /\/appdata\/roaming\/thunderbird(\/|$)/,
+];
+
+/**
+ * Return true if `attachmentPath` looks like a credential, secret, or system
+ * file that an MCP caller should not be able to attach to outgoing mail.
+ * Path is normalized (backslashes → forward slashes, lower-cased) before
+ * matching so the same pattern set works on POSIX and Windows.
+ */
+function isSensitiveFilePath(attachmentPath) {
+  if (typeof attachmentPath !== "string" || !attachmentPath) return false;
+  const normalized = attachmentPath.replace(/\\/g, "/").toLowerCase();
+  return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
+}
 let _tempFileCounter = 0;
 // Delay before injecting attachments into a newly opened compose window.
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
@@ -1010,6 +1079,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
               } else if (tmpDir.isSymlink()) {
                 throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
+              } else {
+                // POSIX hardening: on a shared /tmp another local user could
+                // pre-create the directory with group/world bits set, then race
+                // the connection file. The O_EXCL on the file itself blocks a
+                // straight overwrite, but a permissive directory still lets the
+                // attacker read or rename our file. Force perms back to 0o700.
+                // permissions is 0 on platforms that don't expose POSIX modes
+                // (Windows ACLs), so the chmod is a no-op there.
+                try {
+                  const mode = tmpDir.permissions;
+                  if (mode && (mode & 0o077) !== 0) {
+                    try { tmpDir.permissions = 0o700; } catch { /* best-effort */ }
+                    if ((tmpDir.permissions & 0o077) !== 0) {
+                      throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
+                    }
+                  }
+                } catch (e) {
+                  if (e && e.message && e.message.startsWith("thunderbird-mcp tmp directory")) throw e;
+                  // ignore: permissions accessor unsupported on this platform
+                }
               }
               const connFile = tmpDir.clone();
               connFile.append("connection.json");
@@ -1098,12 +1187,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             /**
              * Check if the user has disabled the skipReview shortcut.
-             * When true, send/reply/forward tools must open the review window even
-             * if the caller passed skipReview: true.
+             * When true, send/reply/forward/createEvent/createTask tools must open
+             * the review window/dialog even if the caller passed skipReview: true.
+             *
+             * Default is true: an LLM that reads attacker-controlled email content
+             * can be prompt-injected into invoking sendMail with skipReview, so the
+             * safe default is to require human review. Users can explicitly opt
+             * into silent sends from the options page.
              */
             function isSkipReviewBlocked() {
               try {
-                return Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, false);
+                return Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, true);
               } catch {
                 // Fail closed: if we can't read the pref, assume blocked so the
                 // user retains ability to review before send.
@@ -1380,13 +1474,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               for (const entry of filePaths) {
                 try {
                   if (typeof entry === "string") {
-                    // File path attachment
-                    const file = createLocalFile(entry);
-                    if (file.exists()) {
-                      descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: file.fileSize });
-                    } else {
-                      failed.push(entry);
+                    // File path attachment.
+                    //
+                    // SECURITY: reject paths that point at credentials, system
+                    // files, or browser/mail profile data BEFORE touching the
+                    // filesystem. This is the LLM-confused-deputy defense:
+                    // attacker-controlled email content can prompt-inject an
+                    // assistant into calling sendMail with attachments=["/path/to/id_rsa"]
+                    // and we never want that to succeed regardless of skipReview.
+                    if (isSensitiveFilePath(entry)) {
+                      failed.push(`${entry} (sensitive path blocked)`);
+                      continue;
                     }
+                    const file = createLocalFile(entry);
+                    if (!file.exists()) {
+                      failed.push(entry);
+                      continue;
+                    }
+                    // Size cap mirrors the saved-attachment ceiling and avoids
+                    // ballooning outgoing messages when a caller points at a huge file.
+                    let fileSize = 0;
+                    try { fileSize = file.fileSize; } catch { fileSize = 0; }
+                    if (fileSize > MAX_FILE_PATH_ATTACHMENT_BYTES) {
+                      failed.push(`${entry} (exceeds ${MAX_FILE_PATH_ATTACHMENT_BYTES / 1024 / 1024}MB size limit)`);
+                      continue;
+                    }
+                    descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: fileSize });
                   } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
                     // Inline base64 attachment — decode and write to temp file
                     const b64Data = entry.base64 || entry.content;
@@ -2941,6 +3054,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
+              if (skipReview && isSkipReviewBlocked()) {
+                return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review dialog instead." };
+              }
               try {
                 const win = Services.wm.getMostRecentWindow("mail:3pane");
                 if (!win && !skipReview) {
@@ -3627,6 +3743,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             async function createTask(title, dueDate, calendarId, description, priority, categories, skipReview) {
               if (!cal || !CalTodo) return { error: "Calendar module not available" };
+              if (skipReview && isSkipReviewBlocked()) {
+                return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review dialog instead." };
+              }
               try {
                 let dueDt = null;
                 if (dueDate) {
@@ -5802,13 +5921,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function buildTerms(filter, conditions) {
               for (const cond of conditions) {
                 const term = filter.createTerm();
-                const attribNum = ATTRIB_MAP[cond.attrib] ?? parseInt(cond.attrib);
-                if (isNaN(attribNum)) throw new Error(`Unknown attribute: ${cond.attrib}`);
-                term.attrib = attribNum;
+                // SECURITY: strict allow-list. The previous `?? parseInt(...)`
+                // fallback let callers pass raw nsMsgSearchAttrib enum values that
+                // aren't in ATTRIB_MAP, bypassing the intended named-action set.
+                if (!Object.prototype.hasOwnProperty.call(ATTRIB_MAP, cond.attrib)) {
+                  throw new Error(`Unknown attribute: ${cond.attrib}`);
+                }
+                term.attrib = ATTRIB_MAP[cond.attrib];
 
-                const opNum = OP_MAP[cond.op] ?? parseInt(cond.op);
-                if (isNaN(opNum)) throw new Error(`Unknown operator: ${cond.op}`);
-                term.op = opNum;
+                if (!Object.prototype.hasOwnProperty.call(OP_MAP, cond.op)) {
+                  throw new Error(`Unknown operator: ${cond.op}`);
+                }
+                term.op = OP_MAP[cond.op];
 
                 const value = term.value;
                 value.attrib = term.attrib;
@@ -5824,8 +5948,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function buildActions(filter, actions) {
               for (const act of actions) {
                 const action = filter.createAction();
-                const typeNum = ACTION_MAP[act.type] ?? parseInt(act.type);
-                if (isNaN(typeNum)) throw new Error(`Unknown action type: ${act.type}`);
+                // SECURITY: strict allow-list. The previous `?? parseInt(...)`
+                // fallback accepted any numeric nsMsgFilterAction value, which
+                // would auto-expose new (or legacy) action types we never
+                // intended to surface -- including historic "run program" flavors.
+                if (!Object.prototype.hasOwnProperty.call(ACTION_MAP, act.type)) {
+                  throw new Error(`Unknown action type: ${act.type}`);
+                }
+                const typeNum = ACTION_MAP[act.type];
                 action.type = typeNum;
 
                 if (act.value) {
@@ -6179,6 +6309,85 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * and rejects unknown properties.
              * Returns an array of error strings (empty = valid).
              */
+            /**
+             * Walk a JSON-Schema subtree and report any errors against `value`.
+             * Not a full JSON Schema implementation -- intentionally minimal --
+             * but covers the keywords actually used by toolSchemas:
+             *   - type (string/number/integer/boolean/array/object)
+             *   - enum
+             *   - properties + required + additionalProperties (on objects)
+             *   - items (on arrays), including a single-branch oneOf with type
+             *     discrimination, which is how the attachments array is described.
+             * `path` is the dotted property path used in error messages.
+             */
+            function validateAgainstSchema(value, schema, path, errors) {
+              if (!schema || value === undefined || value === null) return;
+
+              const expectedType = schema.type;
+              if (expectedType === "array") {
+                if (!Array.isArray(value)) {
+                  errors.push(`Parameter '${path}' must be an array, got ${typeof value}`);
+                  return;
+                }
+                if (schema.items) {
+                  for (let i = 0; i < value.length; i++) {
+                    validateAgainstSchema(value[i], schema.items, `${path}[${i}]`, errors);
+                  }
+                }
+              } else if (expectedType === "object") {
+                if (typeof value !== "object" || Array.isArray(value)) {
+                  errors.push(`Parameter '${path}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
+                  return;
+                }
+                const nestedProps = schema.properties || {};
+                const nestedRequired = schema.required || [];
+                for (const r of nestedRequired) {
+                  if (value[r] === undefined || value[r] === null) {
+                    errors.push(`Missing required parameter: ${path}.${r}`);
+                  }
+                }
+                for (const [k, v] of Object.entries(value)) {
+                  const has = Object.prototype.hasOwnProperty.call(nestedProps, k);
+                  if (!has) {
+                    if (schema.additionalProperties === false) {
+                      errors.push(`Unknown parameter: ${path}.${k}`);
+                    }
+                    continue;
+                  }
+                  validateAgainstSchema(v, nestedProps[k], `${path}.${k}`, errors);
+                }
+              } else if (expectedType === "integer") {
+                if (typeof value !== "number" || !Number.isInteger(value)) {
+                  errors.push(`Parameter '${path}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
+                  return;
+                }
+              } else if (expectedType && typeof value !== expectedType) {
+                errors.push(`Parameter '${path}' must be ${expectedType}, got ${typeof value}`);
+                return;
+              }
+
+              // oneOf: accept the value if exactly one branch validates clean.
+              // Used by the attachments array items (string | object).
+              if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
+                let matched = 0;
+                for (const branch of schema.oneOf) {
+                  const branchErrors = [];
+                  validateAgainstSchema(value, branch, path, branchErrors);
+                  if (branchErrors.length === 0) matched++;
+                }
+                if (matched === 0) {
+                  errors.push(`Parameter '${path}' did not match any allowed schema variant`);
+                } else if (matched > 1) {
+                  errors.push(`Parameter '${path}' matched more than one schema variant`);
+                }
+              }
+
+              // enum: explicit value allow-list (e.g. bodyFormat).
+              if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
+                errors.push(`Parameter '${path}' must be one of ${JSON.stringify(schema.enum)}, got ${JSON.stringify(value)}`);
+              }
+            }
+
             function validateToolArgs(name, args) {
               const schema = toolSchemas[name];
               if (!schema) return [`Unknown tool: ${name}`];
@@ -6205,24 +6414,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (value === undefined || value === null) continue;
 
-                const expectedType = propSchema.type;
-                if (expectedType === "array") {
-                  if (!Array.isArray(value)) {
-                    errors.push(`Parameter '${key}' must be an array, got ${typeof value}`);
-                  }
-                } else if (expectedType === "object") {
-                  if (typeof value !== "object" || Array.isArray(value)) {
-                    errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
-                  }
-                } else if (expectedType === "integer") {
-                  // JSON Schema "integer" is a whole number. typeof reports
-                  // "number" for both integers and floats, so check explicitly.
-                  if (typeof value !== "number" || !Number.isInteger(value)) {
-                    errors.push(`Parameter '${key}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
-                  }
-                } else if (expectedType && typeof value !== expectedType) {
-                  errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
-                }
+                validateAgainstSchema(value, propSchema, key, errors);
               }
 
               return errors;
@@ -6786,9 +6978,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         getBlockSkipReview: async function() {
-          let blocked = false;
+          let blocked = true;
           try {
-            blocked = Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, false);
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, true);
           } catch { /* ignore */ }
           return { blockSkipReview: blocked };
         },
@@ -6797,11 +6989,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           if (typeof blockSkipReview !== "boolean") {
             return { error: "blockSkipReview must be a boolean" };
           }
-          if (blockSkipReview) {
-            Services.prefs.setBoolPref(PREF_BLOCK_SKIPREVIEW, true);
-          } else {
-            try { Services.prefs.clearUserPref(PREF_BLOCK_SKIPREVIEW); } catch { /* ignore */ }
-          }
+          // Default is true; persist the explicit value either way so the user's
+          // choice survives independent of the default we ship.
+          Services.prefs.setBoolPref(PREF_BLOCK_SKIPREVIEW, blockSkipReview);
           return { success: true, blockSkipReview };
         },
 
