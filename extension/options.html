@@ -236,17 +236,46 @@
 </div>
 
 <div class="section">
-  <h2>Send Safety</h2>
+  <h2>Safeguards</h2>
   <p class="mode-note">
-    When enabled, MCP clients requesting <code>skipReview: true</code> on sendMail,
-    replyToMessage, or forwardMessage are rejected. The client can still compose
-    messages -- they just always open a review window before sending.
+    These switches gate operations that an LLM consuming attacker-controlled
+    email content could be tricked into performing silently. Disabling them
+    re-enables the corresponding capabilities for MCP clients you trust.
   </p>
   <ul class="account-list">
     <li>
       <label>
         <input type="checkbox" id="blockSkipReview">
-        <span>Block <code>skipReview</code> -- require a review window before sending</span>
+        <span>
+          Block <code>skipReview</code> on outbound mail and calendar items.
+          When on, <code>sendMail</code> / <code>replyToMessage</code> /
+          <code>forwardMessage</code> / <code>createEvent</code> /
+          <code>createTask</code> always open a review window even if the
+          caller passes <code>skipReview: true</code>.
+        </span>
+      </label>
+    </li>
+    <li>
+      <label>
+        <input type="checkbox" id="blockFilterForwardReply">
+        <span>
+          Block <code>forward</code> and <code>reply</code> filter actions
+          via MCP. Filters run on every incoming message with no UI, so a
+          single <code>createFilter</code> call could install a permanent
+          silent-forwarding rule. Leave on unless you specifically need
+          your assistant to author auto-forwarders.
+        </span>
+      </label>
+    </li>
+    <li>
+      <label>
+        <input type="checkbox" id="blockContactWrites">
+        <span>
+          Block address-book writes via MCP. When on,
+          <code>createContact</code> / <code>updateContact</code> /
+          <code>deleteContact</code> are refused. Stops a tricked LLM
+          from silently repointing "Boss" at an attacker's address.
+        </span>
       </label>
     </li>
   </ul>

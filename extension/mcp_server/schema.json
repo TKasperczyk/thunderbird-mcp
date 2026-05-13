@@ -87,6 +87,46 @@
         ]
       },
       {
+        "name": "getBlockFilterForwardReply",
+        "type": "function",
+        "async": true,
+        "description": "Get whether filter forward/reply actions are blocked by user preference",
+        "parameters": []
+      },
+      {
+        "name": "setBlockFilterForwardReply",
+        "type": "function",
+        "async": true,
+        "description": "Set whether filter forward/reply actions are blocked by user preference",
+        "parameters": [
+          {
+            "name": "blockFilterForwardReply",
+            "type": "boolean",
+            "description": "When true, createFilter / updateFilter refuse 'forward' and 'reply' action types."
+          }
+        ]
+      },
+      {
+        "name": "getBlockContactWrites",
+        "type": "function",
+        "async": true,
+        "description": "Get whether contact write operations are blocked by user preference",
+        "parameters": []
+      },
+      {
+        "name": "setBlockContactWrites",
+        "type": "function",
+        "async": true,
+        "description": "Set whether contact write operations are blocked by user preference",
+        "parameters": [
+          {
+            "name": "blockContactWrites",
+            "type": "boolean",
+            "description": "When true, createContact / updateContact / deleteContact are refused."
+          }
+        ]
+      },
+      {
         "name": "getStableAuthToken",
         "type": "function",
         "async": true,

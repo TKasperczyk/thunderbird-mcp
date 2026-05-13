@@ -14,75 +14,30 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const helpers = require('../extension/mcp_server/security_helpers.js');
 
-/**
- * Exact copy of validateToolArgs / validateAgainstSchema from api.js.
- * Kept in sync manually — if the logic in api.js changes, update here too.
- */
-function validateAgainstSchema(value, schema, path, errors) {
-  if (!schema || value === undefined || value === null) return;
+// Pull shared helpers into bare-name scope so existing test bodies can keep
+// calling validateAgainstSchema / isSensitiveFilePath / etc. directly. The
+// test now exercises the SAME code that ships in production rather than a
+// parallel re-implementation that could drift.
+const {
+  isSensitiveFilePath,
+  sanitizeHeaderLine,
+  UNTRUSTED_OPEN,
+  UNTRUSTED_CLOSE,
+  wrapUntrustedBody,
+  wrapUntrustedPreview,
+  countRecipients,
+  isSafeMarkdownHref,
+  isSafeImageSrc,
+  escapeMarkdownLinkText,
+  renderMarkdownLink,
+  isSystemPrincipalFetchAllowed,
+  validateAgainstSchema,
+} = helpers;
 
-  const expectedType = schema.type;
-  if (expectedType === "array") {
-    if (!Array.isArray(value)) {
-      errors.push(`Parameter '${path}' must be an array, got ${typeof value}`);
-      return;
-    }
-    if (schema.items) {
-      for (let i = 0; i < value.length; i++) {
-        validateAgainstSchema(value[i], schema.items, `${path}[${i}]`, errors);
-      }
-    }
-  } else if (expectedType === "object") {
-    if (typeof value !== "object" || Array.isArray(value)) {
-      errors.push(`Parameter '${path}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
-      return;
-    }
-    const nestedProps = schema.properties || {};
-    const nestedRequired = schema.required || [];
-    for (const r of nestedRequired) {
-      if (value[r] === undefined || value[r] === null) {
-        errors.push(`Missing required parameter: ${path}.${r}`);
-      }
-    }
-    for (const [k, v] of Object.entries(value)) {
-      const has = Object.prototype.hasOwnProperty.call(nestedProps, k);
-      if (!has) {
-        if (schema.additionalProperties === false) {
-          errors.push(`Unknown parameter: ${path}.${k}`);
-        }
-        continue;
-      }
-      validateAgainstSchema(v, nestedProps[k], `${path}.${k}`, errors);
-    }
-  } else if (expectedType === "integer") {
-    if (typeof value !== "number" || !Number.isInteger(value)) {
-      errors.push(`Parameter '${path}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
-      return;
-    }
-  } else if (expectedType && typeof value !== expectedType) {
-    errors.push(`Parameter '${path}' must be ${expectedType}, got ${typeof value}`);
-    return;
-  }
 
-  if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
-    let matched = 0;
-    for (const branch of schema.oneOf) {
-      const branchErrors = [];
-      validateAgainstSchema(value, branch, path, branchErrors);
-      if (branchErrors.length === 0) matched++;
-    }
-    if (matched === 0) {
-      errors.push(`Parameter '${path}' did not match any allowed schema variant`);
-    } else if (matched > 1) {
-      errors.push(`Parameter '${path}' matched more than one schema variant`);
-    }
-  }
 
-  if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
-    errors.push(`Parameter '${path}' must be one of ${JSON.stringify(schema.enum)}, got ${JSON.stringify(value)}`);
-  }
-}
 
 function createValidator(tools) {
   const toolSchemas = Object.create(null);
@@ -701,46 +656,9 @@ describe('Validator: integer type', () => {
 // against the normalized (lower-cased, forward-slash) match form.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SENSITIVE_ATTACHMENT_PATTERNS = [
-  /\/\.ssh(\/|$)/,
-  /\/\.gnupg(\/|$)/,
-  /\/\.aws(\/|$)/,
-  /\/\.azure(\/|$)/,
-  /\/\.config\/gcloud(\/|$)/,
-  /\/\.kube(\/|$)/,
-  /\/\.docker(\/|$)/,
-  /\/\.netrc$/,
-  /\/\.npmrc$/,
-  /\/\.pypirc$/,
-  /\/id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/,
-  /\.pem$/,
-  /\.pfx$/,
-  /\.p12$/,
-  /\.kdbx$/,
-  /\.key$/,
-  /\.asc$/,
-  /\.gpg$/,
-  /^\/etc\//,
-  /^\/proc\//,
-  /^\/sys\//,
-  /^\/root\//,
-  /^\/var\/log\//,
-  /^\/var\/lib\/sudo\//,
-  /\/library\/keychains\//,
-  /^[a-z]:\/windows\//,
-  /^[a-z]:\/programdata\/microsoft\/(crypto|protect)\//,
-  /\/appdata\/(local|roaming)\/microsoft\/(credentials|crypto|protect|vault)(\/|$)/,
-  /\/(logins\.json|key3\.db|key4\.db|cookies(\.sqlite)?|login data)$/,
-  /\/\.?thunderbird\/profiles?(\/|$)/,
-  /\/library\/thunderbird(\/|$)/,
-  /\/appdata\/roaming\/thunderbird(\/|$)/,
-];
 
-function isSensitiveFilePath(attachmentPath) {
-  if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
-  const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
-  return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
-}
+
+
 
 describe('isSensitiveFilePath: credential and key files', () => {
   it('blocks SSH private keys in ~/.ssh/', () => {
@@ -876,10 +794,7 @@ describe('isSensitiveFilePath: case insensitivity and slash normalization', () =
 // the contracts the production code relies on.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function sanitizeHeaderLine(value) {
-  if (typeof value !== 'string') return value;
-  return value.replace(/[\r\n\0]+/g, ' ');
-}
+
 
 describe('sanitizeHeaderLine: CRLF stripping for single-line headers', () => {
   it('collapses CR / LF / NUL into a single space', () => {
@@ -912,18 +827,10 @@ describe('sanitizeHeaderLine: CRLF stripping for single-line headers', () => {
   });
 });
 
-const UNTRUSTED_OPEN = '<untrusted_email_body>';
-const UNTRUSTED_CLOSE = '</untrusted_email_body>';
-function wrapUntrustedBody(text) {
-  if (typeof text !== 'string' || !text) return text;
-  const safe = text.split(UNTRUSTED_CLOSE).join('</untrusted_email_body​>');
-  return `${UNTRUSTED_OPEN}\n${safe}\n${UNTRUSTED_CLOSE}`;
-}
-function wrapUntrustedPreview(text) {
-  if (typeof text !== 'string' || !text) return text;
-  const safe = text.split(UNTRUSTED_CLOSE).join('</untrusted_email_body​>');
-  return `${UNTRUSTED_OPEN} ${safe} ${UNTRUSTED_CLOSE}`;
-}
+
+
+
+
 
 describe('wrapUntrustedBody: prompt-injection delimiters', () => {
   it('wraps plain text in open / close markers', () => {
@@ -956,10 +863,7 @@ describe('wrapUntrustedBody: prompt-injection delimiters', () => {
   });
 });
 
-function countRecipients(s) {
-  if (typeof s !== 'string' || !s.trim()) return 0;
-  return s.split(',').map(p => p.trim()).filter(Boolean).length;
-}
+
 
 describe('countRecipients: audit-log helper', () => {
   it('returns 0 for empty / null / non-string', () => {
@@ -1208,22 +1112,9 @@ describe('Contact-write gate: createContact / updateContact / deleteContact', ()
 // attachment-fetch channel. Mirrors the production helper exactly.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SYSTEM_PRINCIPAL_FETCH_SCHEMES = new Set([
-  'mailbox',
-  'mailbox-message',
-  'imap',
-  'imap-message',
-  'news',
-  'news-message',
-]);
 
-function isSystemPrincipalFetchAllowed(url) {
-  if (typeof url !== 'string' || !url) return false;
-  const colon = url.indexOf(':');
-  if (colon <= 0) return false;
-  const scheme = url.slice(0, colon).toLowerCase();
-  return SYSTEM_PRINCIPAL_FETCH_SCHEMES.has(scheme);
-}
+
+
 
 describe('isSystemPrincipalFetchAllowed: allow mail-store protocols only', () => {
   it('accepts mailbox / imap / news family schemes', () => {
@@ -1280,42 +1171,15 @@ describe('isSystemPrincipalFetchAllowed: allow mail-store protocols only', () =>
 // / renderMarkdownLink from api.js to exercise their contracts.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SAFE_HREF_SCHEMES = new Set(['http', 'https', 'mailto', 'tel', 'cid', 'ftp', 'ftps']);
 
-function isSafeMarkdownHref(url) {
-  if (typeof url !== 'string') return false;
-  const trimmed = url.trim();
-  if (!trimmed) return false;
-  const cleaned = trimmed.replace(/^[\s -]+/, '');
-  const colon = cleaned.indexOf(':');
-  const slash = cleaned.indexOf('/');
-  const question = cleaned.indexOf('?');
-  const hash = cleaned.indexOf('#');
-  if (colon === -1) return true;
-  if (slash !== -1 && slash < colon) return true;
-  if (question !== -1 && question < colon) return true;
-  if (hash !== -1 && hash < colon) return true;
-  const scheme = cleaned.slice(0, colon).toLowerCase();
-  return SAFE_HREF_SCHEMES.has(scheme);
-}
 
-function isSafeImageSrc(url) {
-  if (isSafeMarkdownHref(url)) return true;
-  if (typeof url !== 'string') return false;
-  const cleaned = url.trim().replace(/^[\s -]+/, '').toLowerCase();
-  return cleaned.startsWith('data:image/');
-}
 
-function escapeMarkdownLinkText(s) {
-  return String(s).replace(/[\[\]]/g, m => (m === '[' ? '\\[' : '\\]'));
-}
 
-function renderMarkdownLink(text, url) {
-  const safeText = escapeMarkdownLinkText(text);
-  if (url.includes('>')) return safeText;
-  if (/[()\s]/.test(url)) return `[${safeText}](<${url}>)`;
-  return `[${safeText}](${url})`;
-}
+
+
+
+
+
 
 describe('htmlToMarkdown: isSafeMarkdownHref scheme allow-list (F4)', () => {
   it('accepts http / https / mailto / tel / cid / ftp', () => {

@@ -75,113 +75,10 @@ const MAX_FILE_PATH_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 // The httpd.sys.mjs pre-buffer cap uses the same value.
 const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP request bodies
 
-// File paths that an MCP caller must never be allowed to attach to outbound
-// mail. Protects against the LLM-confused-deputy chain where attacker-controlled
-// email content prompt-injects an assistant into running
-// sendMail({attachments: ["/home/user/.ssh/id_rsa"], skipReview: true}).
-//
-// Patterns match the path AFTER backslashes are normalized to forward slashes
-// and the whole string is lower-cased, so a single set covers POSIX and Windows.
-// This is a deny-list, not an allow-list -- it intentionally errs toward
-// blocking known-sensitive locations rather than restricting users to a
-// downloads-only sandbox. Extend it as new high-value targets surface.
-const SENSITIVE_ATTACHMENT_PATTERNS = [
-  // SSH / PGP / cloud / kube / docker credentials
-  /\/\.ssh(\/|$)/,
-  /\/\.gnupg(\/|$)/,
-  /\/\.aws(\/|$)/,
-  /\/\.azure(\/|$)/,
-  /\/\.config\/gcloud(\/|$)/,
-  /\/\.kube(\/|$)/,
-  /\/\.docker(\/|$)/,
-  /\/\.netrc$/,
-  /\/\.npmrc$/,
-  /\/\.pypirc$/,
-  // Common key / secret file extensions anywhere on disk
-  /\/id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/,
-  /\.pem$/,
-  /\.pfx$/,
-  /\.p12$/,
-  /\.kdbx$/,
-  /\.key$/,
-  /\.asc$/,
-  /\.gpg$/,
-  // Linux / macOS system directories
-  /^\/etc\//,
-  /^\/proc\//,
-  /^\/sys\//,
-  /^\/root\//,
-  /^\/var\/log\//,
-  /^\/var\/lib\/sudo\//,
-  // macOS keychain locations
-  /\/library\/keychains\//,
-  // Windows system directories
-  /^[a-z]:\/windows\//,
-  /^[a-z]:\/programdata\/microsoft\/(crypto|protect)\//,
-  /\/appdata\/(local|roaming)\/microsoft\/(credentials|crypto|protect|vault)(\/|$)/,
-  // Browser credential stores (Firefox / Chrome / Edge)
-  /\/(logins\.json|key3\.db|key4\.db|cookies(\.sqlite)?|login data)$/,
-  // Thunderbird's own profile (contains the user's entire mail store + prefs).
-  // Linux uses ~/.thunderbird (dot-prefixed), macOS uses ~/Library/Thunderbird,
-  // Windows uses %APPDATA%/Roaming/Thunderbird; cover all three.
-  /\/\.?thunderbird\/profiles?(\/|$)/,
-  /\/library\/thunderbird(\/|$)/,
-  /\/appdata\/roaming\/thunderbird(\/|$)/,
-];
-
-/**
- * Return true if `attachmentPath` looks like a credential, secret, or system
- * file that an MCP caller should not be able to attach to outgoing mail.
- * Path is normalized (backslashes → forward slashes, lower-cased) before
- * matching so the same pattern set works on POSIX and Windows.
- */
-function isSensitiveFilePath(attachmentPath) {
-  if (typeof attachmentPath !== "string" || !attachmentPath) return false;
-  const normalized = attachmentPath.replace(/\\/g, "/").toLowerCase();
-  return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
-}
-
-/**
- * Strip CR/LF (and other RFC 5322 forbidden chars) from a single-line header
- * value before it reaches nsIMsgCompFields. Mozilla's C++ setters are expected
- * to sanitize, but relying on undocumented downstream behavior is risky:
- * a permissive build or future regression would let an MCP caller smuggle
- * a hidden Bcc / extra To header through subject = "a\r\nBcc: x@y.z".
- * This is defense in depth, not the only line of defense.
- */
-function sanitizeHeaderLine(value) {
-  if (typeof value !== "string") return value;
-  // Replace runs of CR / LF / NUL with a single space rather than dropping
-  // them, so the result is still readable when a long subject got wrapped.
-  return value.replace(/[\r\n\0]+/g, " ");
-}
-
-// URLs that are safe to fetch with the system principal: only Thunderbird's
-// own mail-store protocols. Anything outside this list (file:, chrome:, http:,
-// resource:, jar:) would let a Thunderbird regression or extension interaction
-// turn the attachment-save path into a confused-deputy fetch primitive. We
-// pin the channel construction to exactly these schemes.
-const SYSTEM_PRINCIPAL_FETCH_SCHEMES = new Set([
-  "mailbox",
-  "mailbox-message",
-  "imap",
-  "imap-message",
-  "news",
-  "news-message",
-]);
-
-/**
- * Return true if `url` is one of the mail-store protocols safe to fetch with
- * the system principal. Case-insensitive scheme match; everything else (file:,
- * chrome:, http(s):, resource:, jar:, ftp:) is rejected.
- */
-function isSystemPrincipalFetchAllowed(url) {
-  if (typeof url !== "string" || !url) return false;
-  const colon = url.indexOf(":");
-  if (colon <= 0) return false;
-  const scheme = url.slice(0, colon).toLowerCase();
-  return SYSTEM_PRINCIPAL_FETCH_SCHEMES.has(scheme);
-}
+// Pure helpers (deny-list, header sanitizer, URL allow-lists, schema walker,
+// audit helpers) live in security_helpers.js so the Node test suite can
+// exercise the same code that ships in production. The module is loaded
+// inside getAPI() below because resource:// URIs aren't usable at file scope.
 let _tempFileCounter = 0;
 // Delay before injecting attachments into a newly opened compose window.
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
@@ -231,6 +128,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       extensionRoot,
       resProto.ALLOW_CONTENT_ACCESS
     );
+
+    // Load pure helpers from security_helpers.js. We pass a scope object with
+    // a `module.exports` shim so the file can use standard CommonJS exports
+    // syntax; that lets the Node test suite require() it directly without a
+    // dual-format wrapper.
+    const __helperScope = { module: { exports: {} } };
+    Services.scriptloader.loadSubScript(
+      "resource://thunderbird-mcp/mcp_server/security_helpers.js?" + Date.now(),
+      __helperScope
+    );
+    const {
+      isSensitiveFilePath,
+      sanitizeHeaderLine,
+      UNTRUSTED_CLOSE,
+      wrapUntrustedBody,
+      wrapUntrustedPreview,
+      countRecipients,
+      summarizeAttachmentsForAudit,
+      isSafeMarkdownHref,
+      isSafeImageSrc,
+      escapeMarkdownLinkText,
+      renderMarkdownLink,
+      isSystemPrincipalFetchAllowed,
+      validateAgainstSchema,
+    } = __helperScope.module.exports;
 
     const tools = [
       {
@@ -294,6 +216,58 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             rawSource: { type: "boolean", description: "If true, return the full raw RFC 2822 message source (all headers + MIME parts). Useful for extracting calendar invites, S/MIME data, or debugging. Other fields (body, attachments) are omitted when this is set. Note: requires local/offline message copy; IMAP messages not cached offline may fail." },
           },
           required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "getMessageHeaders",
+        group: "messages", crud: "read",
+        title: "Get Message Headers",
+        description: "Read message headers only (subject, author, recipients, date, tags, threading headers) without decoding the body or attachments. Much cheaper than getMessage when you only need to triage or quote a small set of messages.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The message ID (from searchMessages results)" },
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+          },
+          required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "dryRunCompose",
+        group: "messages", crud: "read",
+        title: "Dry-Run Compose",
+        description: "Validate compose parameters WITHOUT sending or saving. Resolves the from identity, parses recipient counts, evaluates every attachment through the same path / size / deny-list pipeline that sendMail uses, and reports the rendered subject (after header sanitization). Useful for an agent that wants to self-check a compose call before triggering the review window or skipReview send.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient email address" },
+            subject: { type: "string", description: "Email subject line" },
+            body: { type: "string", description: "Email body text (length is reported back; content is not echoed)" },
+            cc: { type: "string", description: "CC recipients (comma-separated)" },
+            bcc: { type: "string", description: "BCC recipients (comma-separated)" },
+            isHtml: { type: "boolean", description: "Treat body as HTML (default: false)" },
+            from: { type: "string", description: "Sender identity (email address or identity ID)" },
+            attachments: {
+              type: "array",
+              description: "Attachments to evaluate (same shape as sendMail). Each entry is checked but neither read nor copied; only path/size/deny-list status is returned.",
+              items: {
+                oneOf: [
+                  { type: "string", description: "Absolute file path to attach" },
+                  {
+                    type: "object",
+                    properties: {
+                      name: { type: "string" },
+                      contentType: { type: "string" },
+                      base64: { type: "string" },
+                    },
+                    required: ["name", "base64"],
+                    additionalProperties: false,
+                  },
+                ],
+              },
+            },
+          },
+          required: ["to", "subject", "body"],
         },
       },
       {
@@ -1274,30 +1248,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            /**
-             * Summarize attachment descriptors for the audit log without
-             * leaking content. Returns {count, names, totalBytes}.
-             */
-            function summarizeAttachmentsForAudit(descs) {
-              if (!Array.isArray(descs)) return { count: 0, names: [], totalBytes: 0 };
-              let total = 0;
-              const names = [];
-              for (const d of descs) {
-                if (d && typeof d.size === "number") total += d.size;
-                if (d && d.name) names.push(String(d.name).slice(0, 200));
-              }
-              return { count: descs.length, names, totalBytes: total };
-            }
-
-            /**
-             * Count comma-separated recipients in a free-form address string
-             * without keeping the addresses themselves. Used to log "this send
-             * went to N recipients" without retaining who.
-             */
-            function countRecipients(s) {
-              if (typeof s !== "string" || !s.trim()) return 0;
-              return s.split(",").map(p => p.trim()).filter(Boolean).length;
-            }
+            // summarizeAttachmentsForAudit + countRecipients live in
+            // security_helpers.js; loaded above and destructured into scope.
 
             /**
              * Get the list of allowed account IDs from preferences.
@@ -2407,84 +2359,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return text;
             }
 
-            // URL schemes that are safe to surface verbatim inside markdown
-            // [text](url) and ![alt](src) constructs. Email bodies routinely
-            // contain links to web pages, mailto: addresses, and inline CID
-            // image references; everything else (javascript:, data: non-image,
-            // vbscript:, file:, chrome:, jar:, blob:, ...) gets dropped to
-            // plain text so a downstream markdown renderer cannot produce a
-            // clickable javascript: link.
-            const SAFE_HREF_SCHEMES = new Set(["http", "https", "mailto", "tel", "cid", "ftp", "ftps"]);
+            // SAFE_HREF_SCHEMES lives in security_helpers.js.
 
-            /**
-             * Return true if `url` is acceptable as the target of a markdown
-             * link or image. Plain relative URLs (no scheme) are accepted --
-             * a downstream renderer will resolve them relative to nothing,
-             * which is harmless. Anything with an unknown or dangerous scheme
-             * is rejected.
-             */
-            function isSafeMarkdownHref(url) {
-              if (typeof url !== "string") return false;
-              const trimmed = url.trim();
-              if (!trimmed) return false;
-              // Strip leading whitespace + control chars before the scheme so
-              // " javascript:..." with NBSP/tab/CR/LF can't slip through.
-              const cleaned = trimmed.replace(/^[\s -]+/, "");
-              const colon = cleaned.indexOf(":");
-              const slash = cleaned.indexOf("/");
-              const question = cleaned.indexOf("?");
-              const hash = cleaned.indexOf("#");
-              // No colon, or the first colon comes after a path separator
-              // (e.g. "foo/bar:baz") -- treat as a relative URL.
-              if (colon === -1) return true;
-              if (slash !== -1 && slash < colon) return true;
-              if (question !== -1 && question < colon) return true;
-              if (hash !== -1 && hash < colon) return true;
-              const scheme = cleaned.slice(0, colon).toLowerCase();
-              return SAFE_HREF_SCHEMES.has(scheme);
-            }
-
-            /**
-             * Same as isSafeMarkdownHref, but `data:image/...` is also allowed
-             * because inline images are a legitimate email pattern. Other
-             * data: payloads remain blocked.
-             */
-            function isSafeImageSrc(url) {
-              if (isSafeMarkdownHref(url)) return true;
-              if (typeof url !== "string") return false;
-              const cleaned = url.trim().replace(/^[\s -]+/, "").toLowerCase();
-              return cleaned.startsWith("data:image/");
-            }
-
-            /**
-             * Escape characters that would let attacker-controlled `<a>` text
-             * close the visible-text bracket and rebind to a different URL.
-             * <a href="https://good">click](javascript:bad)</a> would otherwise
-             * produce [click](javascript:bad)](https://good) -- the first
-             * `](` pair wins in most markdown renderers.
-             */
-            function escapeMarkdownLinkText(s) {
-              return String(s).replace(/[\[\]]/g, m => m === "[" ? "\\[" : "\\]");
-            }
-
-            /**
-             * Pick the URL form for a markdown link. If the URL contains
-             * parentheses or whitespace the parenthesized form `[text](url)`
-             * is ambiguous, so wrap the URL in angle brackets `<url>` per
-             * CommonMark. If it contains `>` the wrap would also break, in
-             * which case drop the link target and keep just the visible text.
-             */
-            function renderMarkdownLink(text, url) {
-              const safeText = escapeMarkdownLinkText(text);
-              if (url.includes(">")) {
-                // Cannot safely wrap; fall back to text-only.
-                return safeText;
-              }
-              if (/[()\s]/.test(url)) {
-                return `[${safeText}](<${url}>)`;
-              }
-              return `[${safeText}](${url})`;
-            }
+            // isSafeMarkdownHref / isSafeImageSrc / escapeMarkdownLinkText /
+            // renderMarkdownLink live in security_helpers.js.
 
             /**
              * Converts HTML to markdown using DOMParser for structure-preserving
@@ -2651,33 +2529,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return isHtml ? stripHtml(text) : text;
             }
 
-            /**
-             * Wrap an attacker-controlled body snippet in explicit delimiters
-             * so an LLM consuming the MCP response has a structural cue that
-             * the wrapped region is data, not instructions. This is defense in
-             * depth against prompt injection -- a well-behaved LLM will be
-             * told by its system prompt to treat anything inside the markers
-             * as untrusted content. It does NOT prevent injection by itself.
-             *
-             * Applied only to text/markdown bodies returned to the model.
-             * Callers asking for raw HTML or rawSource get the unwrapped form
-             * because they are likely parsing it programmatically.
-             */
-            const UNTRUSTED_OPEN = "<untrusted_email_body>";
-            const UNTRUSTED_CLOSE = "</untrusted_email_body>";
-            function wrapUntrustedBody(text) {
-              if (typeof text !== "string" || !text) return text;
-              // Defang any existing close-marker the sender embedded so they
-              // cannot terminate the wrap and escape into instruction-land.
-              const safe = text.split(UNTRUSTED_CLOSE).join("</untrusted_email_body​>");
-              return `${UNTRUSTED_OPEN}\n${safe}\n${UNTRUSTED_CLOSE}`;
-            }
-
-            function wrapUntrustedPreview(text) {
-              if (typeof text !== "string" || !text) return text;
-              const safe = text.split(UNTRUSTED_CLOSE).join("</untrusted_email_body​>");
-              return `${UNTRUSTED_OPEN} ${safe} ${UNTRUSTED_CLOSE}`;
-            }
+            // UNTRUSTED_OPEN/CLOSE + wrapUntrustedBody/Preview live in security_helpers.js.
 
             /**
              * Extracts body from a MIME message in the requested format.
@@ -4455,6 +4307,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return results;
             }
             // END RAW MIME ATTACHMENT HELPERS
+	            /**
+	             * Cheap headers-only variant of getMessage. Returns the same
+	             * structural fields searchMessages returns plus references and
+	             * in-reply-to, without paying the MIME parse / body decode cost.
+	             * Useful when the LLM is triaging a list and only needs to know
+	             * "who, when, what subject" before deciding whether to fetch full.
+	             */
+	            function getMessageHeaders(messageId, folderPath) {
+	              const found = findMessage(messageId, folderPath);
+	              if (found.error) return { error: found.error };
+	              const { msgHdr } = found;
+	              return {
+	                id: msgHdr.messageId,
+	                subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "",
+	                author: msgHdr.mime2DecodedAuthor || msgHdr.author || "",
+	                recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients || "",
+	                ccList: msgHdr.ccList || "",
+	                date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+	                tags: getUserTags(msgHdr),
+	                isRead: msgHdr.isRead,
+	                isFlagged: msgHdr.isFlagged,
+	                threadId: msgHdr.threadId ? String(msgHdr.threadId) : null,
+	                references: msgHdr.getStringProperty("references") || "",
+	                inReplyTo: msgHdr.getStringProperty("in-reply-to") || "",
+	                size: typeof msgHdr.messageSize === "number" ? msgHdr.messageSize : null,
+	              };
+	            }
 
 	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource) {
 	              return new Promise((resolve) => {
@@ -5094,6 +4973,124 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                }
 	              });
 	            }
+
+            /**
+             * Validate compose parameters without sending. Mirrors the
+             * argument shape of composeMail and reports what WOULD happen:
+             * resolved identity, recipient counts, attachment status per
+             * entry (resolved size, sensitive-path verdict, oversize
+             * verdict, success/failure), rendered subject after header
+             * sanitization, and the skipReview-block pref state.
+             *
+             * Pure read-only -- nothing is queued, drafted, or sent. Useful
+             * for an agent that wants to self-check a compose call before
+             * committing to it.
+             */
+            function dryRunCompose(to, subject, body, cc, bcc, isHtml, from, attachments) {
+              const result = {
+                wouldSucceed: true,
+                blockers: [],
+                resolvedIdentity: null,
+                isHtml: !!isHtml,
+                subjectAfterSanitization: sanitizeHeaderLine(subject || ""),
+                bodyLength: typeof body === "string" ? body.length : 0,
+                recipients: {
+                  to: countRecipients(to),
+                  cc: countRecipients(cc),
+                  bcc: countRecipients(bcc),
+                },
+                attachments: [],
+                skipReviewBlocked: isSkipReviewBlocked(),
+              };
+
+              // Resolve identity through the same accessible-account path used
+              // by composeMail, but never fall back silently to the default --
+              // if `from` is set and doesn't match, surface the same error
+              // sendMail would return.
+              try {
+                if (from) {
+                  const identity = findIdentity(from);
+                  if (!identity) {
+                    result.blockers.push(`from identity not found or not accessible: ${from}`);
+                    result.wouldSucceed = false;
+                  } else {
+                    result.resolvedIdentity = {
+                      key: identity.key,
+                      email: identity.email,
+                      fullName: identity.fullName || null,
+                    };
+                  }
+                } else {
+                  // Default identity preview: first accessible identity.
+                  const accounts = getAccessibleAccounts();
+                  const firstIdentity = accounts[0] && accounts[0].defaultIdentity;
+                  if (firstIdentity) {
+                    result.resolvedIdentity = {
+                      key: firstIdentity.key,
+                      email: firstIdentity.email,
+                      fullName: firstIdentity.fullName || null,
+                      isDefault: true,
+                    };
+                  }
+                }
+              } catch (e) {
+                result.blockers.push(`identity resolution failed: ${e.message || e}`);
+                result.wouldSucceed = false;
+              }
+
+              // Per-attachment evaluation. Mirrors filePathsToAttachDescs but
+              // never copies / decodes / writes anything; only reports verdict.
+              if (Array.isArray(attachments)) {
+                for (const entry of attachments) {
+                  const att = { kind: null, name: null, status: "ok", reason: null, size: null };
+                  if (typeof entry === "string") {
+                    att.kind = "path";
+                    att.name = entry;
+                    if (isSensitiveFilePath(entry)) {
+                      att.status = "blocked";
+                      att.reason = "sensitive path";
+                    } else {
+                      try {
+                        const file = createLocalFile(entry);
+                        if (!file.exists()) {
+                          att.status = "missing";
+                          att.reason = "file does not exist";
+                        } else {
+                          try { att.size = file.fileSize; } catch { att.size = null; }
+                          if (att.size !== null && att.size > MAX_FILE_PATH_ATTACHMENT_BYTES) {
+                            att.status = "blocked";
+                            att.reason = `exceeds ${MAX_FILE_PATH_ATTACHMENT_BYTES / 1024 / 1024}MB cap`;
+                          }
+                        }
+                      } catch (e) {
+                        att.status = "error";
+                        att.reason = e.message || String(e);
+                      }
+                    }
+                  } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
+                    att.kind = "inline";
+                    att.name = entry.name;
+                    const b64 = entry.base64 || entry.content;
+                    att.size = typeof b64 === "string" ? Math.floor((b64.length * 3) / 4) : null;
+                    if (typeof b64 === "string" && b64.length > MAX_BASE64_SIZE) {
+                      att.status = "blocked";
+                      att.reason = `inline base64 exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB`;
+                    }
+                  } else {
+                    att.kind = "invalid";
+                    att.name = typeof entry === "object" ? JSON.stringify(entry).slice(0, 80) : String(entry);
+                    att.status = "blocked";
+                    att.reason = "neither a file path nor an inline {name, base64} object";
+                  }
+                  if (att.status !== "ok") {
+                    result.wouldSucceed = false;
+                  }
+                  result.attachments.push(att);
+                }
+              }
+
+              return result;
+            }
 
             /**
              * Composes a new email. Opens a compose window for review, or sends
@@ -6733,84 +6730,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * and rejects unknown properties.
              * Returns an array of error strings (empty = valid).
              */
-            /**
-             * Walk a JSON-Schema subtree and report any errors against `value`.
-             * Not a full JSON Schema implementation -- intentionally minimal --
-             * but covers the keywords actually used by toolSchemas:
-             *   - type (string/number/integer/boolean/array/object)
-             *   - enum
-             *   - properties + required + additionalProperties (on objects)
-             *   - items (on arrays), including a single-branch oneOf with type
-             *     discrimination, which is how the attachments array is described.
-             * `path` is the dotted property path used in error messages.
-             */
-            function validateAgainstSchema(value, schema, path, errors) {
-              if (!schema || value === undefined || value === null) return;
-
-              const expectedType = schema.type;
-              if (expectedType === "array") {
-                if (!Array.isArray(value)) {
-                  errors.push(`Parameter '${path}' must be an array, got ${typeof value}`);
-                  return;
-                }
-                if (schema.items) {
-                  for (let i = 0; i < value.length; i++) {
-                    validateAgainstSchema(value[i], schema.items, `${path}[${i}]`, errors);
-                  }
-                }
-              } else if (expectedType === "object") {
-                if (typeof value !== "object" || Array.isArray(value)) {
-                  errors.push(`Parameter '${path}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
-                  return;
-                }
-                const nestedProps = schema.properties || {};
-                const nestedRequired = schema.required || [];
-                for (const r of nestedRequired) {
-                  if (value[r] === undefined || value[r] === null) {
-                    errors.push(`Missing required parameter: ${path}.${r}`);
-                  }
-                }
-                for (const [k, v] of Object.entries(value)) {
-                  const has = Object.prototype.hasOwnProperty.call(nestedProps, k);
-                  if (!has) {
-                    if (schema.additionalProperties === false) {
-                      errors.push(`Unknown parameter: ${path}.${k}`);
-                    }
-                    continue;
-                  }
-                  validateAgainstSchema(v, nestedProps[k], `${path}.${k}`, errors);
-                }
-              } else if (expectedType === "integer") {
-                if (typeof value !== "number" || !Number.isInteger(value)) {
-                  errors.push(`Parameter '${path}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
-                  return;
-                }
-              } else if (expectedType && typeof value !== expectedType) {
-                errors.push(`Parameter '${path}' must be ${expectedType}, got ${typeof value}`);
-                return;
-              }
-
-              // oneOf: accept the value if exactly one branch validates clean.
-              // Used by the attachments array items (string | object).
-              if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
-                let matched = 0;
-                for (const branch of schema.oneOf) {
-                  const branchErrors = [];
-                  validateAgainstSchema(value, branch, path, branchErrors);
-                  if (branchErrors.length === 0) matched++;
-                }
-                if (matched === 0) {
-                  errors.push(`Parameter '${path}' did not match any allowed schema variant`);
-                } else if (matched > 1) {
-                  errors.push(`Parameter '${path}' matched more than one schema variant`);
-                }
-              }
-
-              // enum: explicit value allow-list (e.g. bodyFormat).
-              if (Array.isArray(schema.enum) && !schema.enum.includes(value)) {
-                errors.push(`Parameter '${path}' must be one of ${JSON.stringify(schema.enum)}, got ${JSON.stringify(value)}`);
-              }
-            }
+            // validateAgainstSchema lives in security_helpers.js.
 
             function validateToolArgs(name, args) {
               const schema = toolSchemas[name];
@@ -6895,6 +6815,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
+                case "getMessageHeaders":
+                  return getMessageHeaders(args.messageId, args.folderPath);
+                case "dryRunCompose":
+                  return dryRunCompose(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
                 case "createContact":

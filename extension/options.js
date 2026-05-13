@@ -398,17 +398,25 @@ saveToolsBtn.addEventListener("click", async () => {
 });
 
 const blockSkipReviewCheckbox = document.getElementById("blockSkipReview");
+const blockFilterForwardReplyCheckbox = document.getElementById("blockFilterForwardReply");
+const blockContactWritesCheckbox = document.getElementById("blockContactWrites");
 const saveSkipReviewBtn = document.getElementById("saveSkipReviewBtn");
 const saveSkipReviewStatus = document.getElementById("saveSkipReviewStatus");
 
-async function loadSkipReviewPref() {
+async function loadSafeguardPrefs() {
   try {
-    const { blockSkipReview } = await browser.mcpServer.getBlockSkipReview();
-    blockSkipReviewCheckbox.checked = !!blockSkipReview;
+    const [skip, filter, contacts] = await Promise.all([
+      browser.mcpServer.getBlockSkipReview(),
+      browser.mcpServer.getBlockFilterForwardReply(),
+      browser.mcpServer.getBlockContactWrites(),
+    ]);
+    blockSkipReviewCheckbox.checked = !!skip.blockSkipReview;
+    blockFilterForwardReplyCheckbox.checked = !!filter.blockFilterForwardReply;
+    blockContactWritesCheckbox.checked = !!contacts.blockContactWrites;
     saveSkipReviewBtn.disabled = false;
     saveSkipReviewStatus.textContent = "";
   } catch (e) {
-    saveSkipReviewStatus.textContent = "Error loading setting: " + e.message;
+    saveSkipReviewStatus.textContent = "Error loading settings: " + e.message;
     saveSkipReviewStatus.className = "save-status error";
   }
 }
@@ -418,9 +426,17 @@ saveSkipReviewBtn.addEventListener("click", async () => {
   saveSkipReviewStatus.textContent = "Saving...";
   saveSkipReviewStatus.className = "save-status";
   try {
-    const result = await browser.mcpServer.setBlockSkipReview(blockSkipReviewCheckbox.checked);
-    if (result.error) {
-      saveSkipReviewStatus.textContent = result.error;
+    // Persist all three in parallel so one click writes a consistent state.
+    // If any individual setter returns an error, surface it but continue
+    // saving the others -- partial application is better than total revert.
+    const results = await Promise.all([
+      browser.mcpServer.setBlockSkipReview(blockSkipReviewCheckbox.checked),
+      browser.mcpServer.setBlockFilterForwardReply(blockFilterForwardReplyCheckbox.checked),
+      browser.mcpServer.setBlockContactWrites(blockContactWritesCheckbox.checked),
+    ]);
+    const errors = results.filter(r => r && r.error).map(r => r.error);
+    if (errors.length > 0) {
+      saveSkipReviewStatus.textContent = errors.join("; ");
       saveSkipReviewStatus.className = "save-status error";
     } else {
       saveSkipReviewStatus.textContent = "Saved.";
@@ -436,4 +452,4 @@ loadServerInfo().catch(e => console.error("thunderbird-mcp options:", "loadServe
 loadAuthenticationConfig().catch(e => console.error("thunderbird-mcp options:", "loadAuthenticationConfig failed:", e));
 loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAccountAccess failed:", e));
 loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
-loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
+loadSafeguardPrefs().catch(e => console.error("thunderbird-mcp options:", "loadSafeguardPrefs failed:", e));
