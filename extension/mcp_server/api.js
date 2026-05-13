@@ -303,6 +303,30 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "listTemplates",
+        group: "system", crud: "read",
+        title: "List Compose Templates",
+        description: "List user-authored compose templates stored under <ProfD>/thunderbird-mcp/templates/*.md. Each file has YAML-style frontmatter (---\\nname: short-id\\ndescription: ...\\nsubject: ...\\nisHtml: false\\nvars: [target, contact_name]\\n---) followed by the body. The variable names listed in `vars` are the placeholders renderTemplate accepts.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "renderTemplate",
+        group: "system", crud: "read",
+        title: "Render Compose Template",
+        description: "Render a template by name with the supplied variable bindings. Returns { subject, body, isHtml } ready to feed into sendMail. Pure read-only -- nothing is sent. Use this to standardize outreach / reply patterns so the LLM doesn't drift across messages.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Template `name` value from its frontmatter" },
+            vars: {
+              type: "object",
+              description: "Variable bindings; keys must match the template's declared `vars` list. Unknown keys are silently ignored; missing required keys produce an error.",
+            },
+          },
+          required: ["name"],
+        },
+      },
+      {
         name: "getServerCapabilities",
         group: "system", crud: "read",
         title: "Get Server Capabilities",
@@ -489,7 +513,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "updateEvent",
         group: "calendar", crud: "update",
         title: "Update Event",
-        description: "Update an existing calendar event's title, dates, location, or description",
+        description: "Update an existing calendar event's title, dates, location, or description. For recurring events, recurringScope must be supplied explicitly: 'series' edits the entire series, no other scopes are currently supported. The call FAILS for recurring events when recurringScope is omitted, so the agent cannot accidentally rewrite years of past occurrences.",
         inputSchema: {
           type: "object",
           properties: {
@@ -501,6 +525,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             location: { type: "string", description: "New event location (optional)" },
             description: { type: "string", description: "New event description (optional)" },
             status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
+            recurringScope: { type: "string", enum: ["series"], description: "Required for recurring events. 'series' rewrites every occurrence past and future. Per-occurrence editing is not supported through this API; use Thunderbird's UI." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -509,12 +534,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "deleteEvent",
         group: "calendar", crud: "delete",
         title: "Delete Event",
-        description: "Delete a calendar event",
+        description: "Delete a calendar event. For recurring events, recurringScope must be supplied explicitly: 'series' deletes the entire series. The call FAILS for recurring events when recurringScope is omitted, so the agent cannot accidentally nuke a long-running series.",
         inputSchema: {
           type: "object",
           properties: {
             eventId: { type: "string", description: "The event ID (from listEvents results)" },
             calendarId: { type: "string", description: "The calendar ID containing the event (from listEvents results)" },
+            recurringScope: { type: "string", enum: ["series"], description: "Required for recurring events. 'series' deletes every occurrence. Per-occurrence deletion is not supported through this API; use Thunderbird's UI." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -1449,6 +1475,161 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
               return null;
+            }
+
+            // ─── Compose templates ────────────────────────────────────────
+            //
+            // Templates live in <ProfD>/thunderbird-mcp/templates/*.md so they
+            // are user-owned, survive extension reinstall, and never leak
+            // through the public extension build. Each file uses Jekyll-style
+            // YAML frontmatter for metadata; the body below the second ---
+            // is the message body. Variables look like {{name}} and are
+            // substituted by renderTemplate.
+
+            const TEMPLATES_SUBDIR = "templates";
+
+            function templatesDir() {
+              const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+              const auditDir = profDir.clone();
+              auditDir.append(AUDIT_LOG_SUBDIR);
+              auditDir.append(TEMPLATES_SUBDIR);
+              return auditDir;
+            }
+
+            function readTextFile(file) {
+              const fis = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
+              fis.init(file, 0x01, 0, 0);
+              const cis = Cc["@mozilla.org/intl/converter-input-stream;1"].createInstance(Ci.nsIConverterInputStream);
+              cis.init(fis, "UTF-8", 0, 0);
+              let text = "";
+              const buf = {};
+              while (cis.readString(65536, buf) > 0) text += buf.value;
+              cis.close();
+              return text;
+            }
+
+            /**
+             * Parse Jekyll-style frontmatter. Accepts a minimal YAML subset:
+             * `key: value` per line for strings / numbers / booleans, and
+             * `key: [a, b]` for one-line arrays. Anything more elaborate
+             * (multi-line arrays, nested mappings) is intentionally not
+             * supported -- the format stays predictable for the LLM.
+             */
+            function parseFrontmatter(raw) {
+              if (!raw.startsWith("---")) return { meta: {}, body: raw };
+              const end = raw.indexOf("\n---", 3);
+              if (end < 0) return { meta: {}, body: raw };
+              const yamlBlock = raw.slice(3, end).trim();
+              let body = raw.slice(end + 4);
+              if (body.startsWith("\n")) body = body.slice(1);
+              const meta = Object.create(null);
+              for (const line of yamlBlock.split(/\r?\n/)) {
+                const stripped = line.trim();
+                if (!stripped || stripped.startsWith("#")) continue;
+                const m = stripped.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
+                if (!m) continue;
+                const key = m[1];
+                let val = m[2].trim();
+                if (val === "true") meta[key] = true;
+                else if (val === "false") meta[key] = false;
+                else if (/^-?\d+(\.\d+)?$/.test(val)) meta[key] = Number(val);
+                else if (val.startsWith("[") && val.endsWith("]")) {
+                  meta[key] = val.slice(1, -1).split(",").map(s => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+                } else {
+                  // Strip surrounding quotes if present
+                  if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                    val = val.slice(1, -1);
+                  }
+                  meta[key] = val;
+                }
+              }
+              return { meta, body };
+            }
+
+            function loadTemplate(name) {
+              if (typeof name !== "string" || !name) return { error: "name must be a non-empty string" };
+              if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+                return { error: "name must match /^[A-Za-z0-9._-]+$/ (no path separators)" };
+              }
+              const dir = templatesDir();
+              if (!dir.exists()) {
+                return { error: `Templates directory not found: ${dir.path}. Create it and add <name>.md files.` };
+              }
+              // Try <name>.md and <name> with no extension.
+              for (const candidate of [name + ".md", name]) {
+                const f = dir.clone();
+                f.append(candidate);
+                if (f.exists() && f.isFile()) {
+                  try {
+                    const raw = readTextFile(f);
+                    const parsed = parseFrontmatter(raw);
+                    parsed.file = f.path;
+                    return parsed;
+                  } catch (e) {
+                    return { error: `Failed to read template '${name}': ${e}` };
+                  }
+                }
+              }
+              return { error: `Template not found: ${name}` };
+            }
+
+            function listTemplates() {
+              const dir = templatesDir();
+              if (!dir.exists()) {
+                return { templates: [], note: `Templates directory does not exist yet. Create ${dir.path} and drop *.md files inside.` };
+              }
+              const out = [];
+              let entries;
+              try {
+                entries = dir.directoryEntries;
+              } catch (e) {
+                return { error: `Failed to list templates: ${e}` };
+              }
+              while (entries.hasMoreElements()) {
+                const f = entries.getNext().QueryInterface(Ci.nsIFile);
+                if (!f.isFile()) continue;
+                if (!/\.md$/i.test(f.leafName)) continue;
+                try {
+                  const raw = readTextFile(f);
+                  const { meta } = parseFrontmatter(raw);
+                  out.push({
+                    name: typeof meta.name === "string" && meta.name ? meta.name : f.leafName.replace(/\.md$/i, ""),
+                    description: typeof meta.description === "string" ? meta.description : "",
+                    subject: typeof meta.subject === "string" ? meta.subject : "",
+                    isHtml: !!meta.isHtml,
+                    vars: Array.isArray(meta.vars) ? meta.vars : [],
+                    file: f.path,
+                  });
+                } catch { /* skip unreadable templates */ }
+              }
+              return { templates: out };
+            }
+
+            function renderTemplate(name, vars) {
+              const tpl = loadTemplate(name);
+              if (tpl.error) return tpl;
+              const declaredVars = Array.isArray(tpl.meta.vars) ? tpl.meta.vars : [];
+              const bindings = (vars && typeof vars === "object" && !Array.isArray(vars)) ? vars : {};
+              // Required-var enforcement: every declared var must be supplied.
+              const missing = declaredVars.filter(v => !(v in bindings));
+              if (missing.length > 0) {
+                return { error: `Missing required variables: ${missing.join(", ")}` };
+              }
+              function substitute(text) {
+                return String(text).replace(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g, (_, key) => {
+                  if (key in bindings) return String(bindings[key]);
+                  // Unknown placeholder -> leave as literal so the caller
+                  // notices instead of silently producing an empty value.
+                  return `{{${key}}}`;
+                });
+              }
+              return {
+                name: tpl.meta.name || name,
+                subject: substitute(tpl.meta.subject || ""),
+                body: substitute(tpl.body),
+                isHtml: !!tpl.meta.isHtml,
+                file: tpl.file,
+              };
             }
 
             /**
@@ -4070,7 +4251,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurringScope) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -4091,6 +4272,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   oldItem = all.find(i => i.id === eventId) || null;
                 }
                 if (!oldItem) return { error: `Event not found: ${eventId}` };
+
+                // SAFETY: refuse to silently rewrite an entire recurring
+                // series. updateItem on a recurring master applies the
+                // change to every past and future occurrence, which is
+                // surprising and rarely what an agent intended. Require
+                // the caller to explicitly opt in via recurringScope.
+                if (oldItem.recurrenceInfo && recurringScope !== "series") {
+                  return {
+                    error: "Refusing to update a recurring event without an explicit recurringScope. Pass recurringScope: 'series' to rewrite the entire series. Per-occurrence updates are not supported via this API; use Thunderbird's UI.",
+                  };
+                }
 
                 const newItem = oldItem.clone();
                 const changes = [];
@@ -4161,7 +4353,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function deleteEvent(eventId, calendarId) {
+            async function deleteEvent(eventId, calendarId, recurringScope) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -4182,10 +4374,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!item) return { error: `Event not found: ${eventId}` };
 
                 const isRecurring = !!item.recurrenceInfo;
+                if (isRecurring && recurringScope !== "series") {
+                  return {
+                    error: "Refusing to delete a recurring event without an explicit recurringScope. Pass recurringScope: 'series' to delete every occurrence. Per-occurrence deletion is not supported via this API; use Thunderbird's UI.",
+                  };
+                }
+
                 await calendar.deleteItem(item);
                 const result = { success: true, deleted: eventId };
                 if (isRecurring) {
-                  result.warning = "This was a recurring event -- the entire series was deleted.";
+                  result.warning = "The entire series was deleted.";
                 }
                 return result;
               } catch (e) {
@@ -7504,6 +7702,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return dryRunCompose(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "getServerCapabilities":
                   return getServerCapabilities();
+                case "listTemplates":
+                  return listTemplates();
+                case "renderTemplate":
+                  return renderTemplate(args.name, args.vars);
                 case "getAuditLog": {
                   const filter = {};
                   if (typeof args.tool === "string") filter.tool = args.tool;
@@ -7527,9 +7729,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurringScope);
                 case "deleteEvent":
-                  return await deleteEvent(args.eventId, args.calendarId);
+                  return await deleteEvent(args.eventId, args.calendarId, args.recurringScope);
                 case "listCategories":
                   return listCategories();
                 case "createTask":
