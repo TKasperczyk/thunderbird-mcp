@@ -2407,12 +2407,96 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return text;
             }
 
+            // URL schemes that are safe to surface verbatim inside markdown
+            // [text](url) and ![alt](src) constructs. Email bodies routinely
+            // contain links to web pages, mailto: addresses, and inline CID
+            // image references; everything else (javascript:, data: non-image,
+            // vbscript:, file:, chrome:, jar:, blob:, ...) gets dropped to
+            // plain text so a downstream markdown renderer cannot produce a
+            // clickable javascript: link.
+            const SAFE_HREF_SCHEMES = new Set(["http", "https", "mailto", "tel", "cid", "ftp", "ftps"]);
+
+            /**
+             * Return true if `url` is acceptable as the target of a markdown
+             * link or image. Plain relative URLs (no scheme) are accepted --
+             * a downstream renderer will resolve them relative to nothing,
+             * which is harmless. Anything with an unknown or dangerous scheme
+             * is rejected.
+             */
+            function isSafeMarkdownHref(url) {
+              if (typeof url !== "string") return false;
+              const trimmed = url.trim();
+              if (!trimmed) return false;
+              // Strip leading whitespace + control chars before the scheme so
+              // " javascript:..." with NBSP/tab/CR/LF can't slip through.
+              const cleaned = trimmed.replace(/^[\s -]+/, "");
+              const colon = cleaned.indexOf(":");
+              const slash = cleaned.indexOf("/");
+              const question = cleaned.indexOf("?");
+              const hash = cleaned.indexOf("#");
+              // No colon, or the first colon comes after a path separator
+              // (e.g. "foo/bar:baz") -- treat as a relative URL.
+              if (colon === -1) return true;
+              if (slash !== -1 && slash < colon) return true;
+              if (question !== -1 && question < colon) return true;
+              if (hash !== -1 && hash < colon) return true;
+              const scheme = cleaned.slice(0, colon).toLowerCase();
+              return SAFE_HREF_SCHEMES.has(scheme);
+            }
+
+            /**
+             * Same as isSafeMarkdownHref, but `data:image/...` is also allowed
+             * because inline images are a legitimate email pattern. Other
+             * data: payloads remain blocked.
+             */
+            function isSafeImageSrc(url) {
+              if (isSafeMarkdownHref(url)) return true;
+              if (typeof url !== "string") return false;
+              const cleaned = url.trim().replace(/^[\s -]+/, "").toLowerCase();
+              return cleaned.startsWith("data:image/");
+            }
+
+            /**
+             * Escape characters that would let attacker-controlled `<a>` text
+             * close the visible-text bracket and rebind to a different URL.
+             * <a href="https://good">click](javascript:bad)</a> would otherwise
+             * produce [click](javascript:bad)](https://good) -- the first
+             * `](` pair wins in most markdown renderers.
+             */
+            function escapeMarkdownLinkText(s) {
+              return String(s).replace(/[\[\]]/g, m => m === "[" ? "\\[" : "\\]");
+            }
+
+            /**
+             * Pick the URL form for a markdown link. If the URL contains
+             * parentheses or whitespace the parenthesized form `[text](url)`
+             * is ambiguous, so wrap the URL in angle brackets `<url>` per
+             * CommonMark. If it contains `>` the wrap would also break, in
+             * which case drop the link target and keep just the visible text.
+             */
+            function renderMarkdownLink(text, url) {
+              const safeText = escapeMarkdownLinkText(text);
+              if (url.includes(">")) {
+                // Cannot safely wrap; fall back to text-only.
+                return safeText;
+              }
+              if (/[()\s]/.test(url)) {
+                return `[${safeText}](<${url}>)`;
+              }
+              return `[${safeText}](${url})`;
+            }
+
             /**
              * Converts HTML to markdown using DOMParser for structure-preserving
              * body extraction. Handles headings, links, bold/italic, lists,
              * blockquotes, code blocks, images, and horizontal rules. Email
              * tables (usually layout, not data) are flattened to text.
              * Falls back to stripHtml if DOMParser is unavailable.
+             *
+             * SECURITY: `<a href>` and `<img src>` values come from sender-
+             * controlled HTML, so we strip dangerous schemes (javascript:,
+             * data: non-image, etc.) and defang markdown-syntax injection in
+             * the link text before emitting the final markdown.
              */
             function htmlToMarkdown(html) {
               if (!html) return "";
@@ -2452,23 +2536,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return t ? "*" + t + "*" : "";
                     }
                     case "a": {
-                      const href = node.getAttribute("href") || "";
+                      const rawHref = node.getAttribute("href") || "";
                       const text = inner().trim();
-                      // Skip empty/anchor-only links and mailto: without text
-                      if (!text && !href) return "";
-                      if (href && text && text !== href) return `[${text}](${href})`;
-                      return text || href;
+                      // Skip empty/anchor-only links
+                      if (!text && !rawHref) return "";
+                      // Drop unsafe href schemes (javascript:, data: non-image,
+                      // vbscript:, file:, chrome:, jar:, blob:, ...). Fall back
+                      // to the visible text so the message stays readable.
+                      if (rawHref && !isSafeMarkdownHref(rawHref)) {
+                        return escapeMarkdownLinkText(text || rawHref);
+                      }
+                      if (rawHref && text && text !== rawHref) {
+                        return renderMarkdownLink(text, rawHref);
+                      }
+                      return escapeMarkdownLinkText(text || rawHref);
                     }
                     case "img": {
                       const alt = node.getAttribute("alt") || "";
-                      const src = node.getAttribute("src") || "";
+                      const rawSrc = node.getAttribute("src") || "";
                       // Skip tracking pixels (1x1, tiny, or data: without alt)
                       const w = parseInt(node.getAttribute("width")) || 0;
                       const h = parseInt(node.getAttribute("height")) || 0;
                       if ((w > 0 && w <= 3) || (h > 0 && h <= 3)) return "";
-                      if (src.startsWith("data:") && !alt) return "";
-                      if (src) return `![${alt}](${src})`;
-                      return alt;
+                      if (rawSrc.startsWith("data:") && !alt) return "";
+                      // Allow http(s):, cid:, mailto: (rare), and data:image/*.
+                      // Anything else (javascript:, data: non-image, file:, ...)
+                      // is dropped to alt text.
+                      if (rawSrc && !isSafeImageSrc(rawSrc)) {
+                        return escapeMarkdownLinkText(alt);
+                      }
+                      if (!rawSrc) return escapeMarkdownLinkText(alt);
+                      const safeAlt = escapeMarkdownLinkText(alt);
+                      if (rawSrc.includes(">")) return safeAlt;
+                      const srcForMd = /[()\s]/.test(rawSrc) ? `<${rawSrc}>` : rawSrc;
+                      return `![${safeAlt}](${srcForMd})`;
                     }
                     case "code": return "`" + node.textContent + "`";
                     case "pre": return "\n\n```\n" + node.textContent.trim() + "\n```\n\n";
