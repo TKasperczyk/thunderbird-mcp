@@ -328,6 +328,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; use listCategories to get exact existing names before setting." },
+            onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). The join URL is returned in the response and embedded in the event description." },
             skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
           },
           required: ["title", "startDate"],
@@ -367,6 +368,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Pass null to clear TRANSP only. Explicit status parameter overrides the STATUS coupling." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; pass an empty array to clear all categories. Use listCategories to get exact existing names before setting." },
+            onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). Pass false to remove an existing Teams link." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -2998,7 +3000,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories) {
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -3099,6 +3101,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 event.setProperty("STATUS", normalizedStatus);
                 event.setProperty("TRANSP", showAs === "free" ? "TRANSPARENT" : "OPAQUE");
                 if (categories && categories.length > 0) event.setCategories(categories);
+                if (onlineMeeting) event.setProperty("X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
 
                 // Find target calendar
                 const calendars = cal.manager.getCalendars();
@@ -3206,6 +3209,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // as implicit -- Thunderbird renders it like confirmed).
                 status: (item.getProperty("STATUS") || "").toLowerCase(),
                 categories: item.getCategories(),
+                onlineMeetingURL: item.getProperty("X-MICROSOFT-SKYPETEAMSMEETINGURL") || null,
                 allDay,
                 isRecurring: !!item.recurrenceInfo,
               };
@@ -3537,7 +3541,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -3629,6 +3633,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (Array.isArray(categories)) {
                   newItem.setCategories(categories);
                   changes.push("categories");
+                }
+                if (onlineMeeting !== undefined) {
+                  if (onlineMeeting) {
+                    newItem.setProperty("X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
+                  } else {
+                    newItem.deleteProperty("X-ONLINE-MEETING-PROVIDER");
+                    newItem.deleteProperty("X-MICROSOFT-SKYPETEAMSMEETINGURL");
+                  }
+                  changes.push("onlineMeeting");
                 }
 
                 if (changes.length === 0) return { error: "No changes specified" };
@@ -6444,11 +6457,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories, args.onlineMeeting);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId);
                 case "listCategories":
