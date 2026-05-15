@@ -518,3 +518,46 @@ loadAuthenticationConfig().catch(e => console.error("thunderbird-mcp options:", 
 loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAccountAccess failed:", e));
 loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
 loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
+loadListenAllPref();
+
+const listenAllCheckbox = document.getElementById("listenAll");
+const listenAllWarning = document.getElementById("listenAllWarning");
+const saveListenAllBtn = document.getElementById("saveListenAllBtn");
+const saveListenAllStatus = document.getElementById("saveListenAllStatus");
+
+async function loadListenAllPref() {
+  try {
+    const { listenAll } = await browser.mcpServer.getListenAll();
+    listenAllCheckbox.checked = !!listenAll;
+    listenAllWarning.style.display = listenAllCheckbox.checked ? "block" : "none";
+    saveListenAllBtn.disabled = false;
+    saveListenAllStatus.textContent = "";
+  } catch (e) {
+    saveListenAllStatus.textContent = "Error loading setting: " + e.message;
+    saveListenAllStatus.className = "save-status error";
+  }
+}
+
+listenAllCheckbox.addEventListener("change", () => {
+  listenAllWarning.style.display = listenAllCheckbox.checked ? "block" : "none";
+});
+
+saveListenAllBtn.addEventListener("click", async () => {
+  saveListenAllBtn.disabled = true;
+  saveListenAllStatus.textContent = "Saving...";
+  saveListenAllStatus.className = "save-status";
+  try {
+    const result = await browser.mcpServer.setListenAll(listenAllCheckbox.checked);
+    if (result.error) {
+      saveListenAllStatus.textContent = result.error;
+      saveListenAllStatus.className = "save-status error";
+    } else {
+      saveListenAllStatus.textContent = "Saved.";
+      await loadServerInfo();
+    }
+  } catch (e) {
+    saveListenAllStatus.textContent = "Error: " + e.message;
+    saveListenAllStatus.className = "save-status error";
+  }
+  saveListenAllBtn.disabled = false;
+});
