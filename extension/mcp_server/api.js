@@ -273,6 +273,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
             status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
             skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
+            attendees: { type: "array", items: { type: "object", properties: { email: { type: "string", description: "Attendee email address" }, name: { type: "string", description: "Display name (optional)" }, role: { type: "string", enum: ["required", "optional"], description: "Defaults to required" } }, required: ["email"] }, description: "List of attendees to invite (optional). Supported on Exchange/OWL calendars — Exchange sends meeting invitation emails automatically." },
           },
           required: ["title", "startDate"],
         },
@@ -309,6 +310,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             location: { type: "string", description: "New event location (optional)" },
             description: { type: "string", description: "New event description (optional)" },
             status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
+            attendees: { type: "array", items: { type: "object", properties: { email: { type: "string", description: "Attendee email address" }, name: { type: "string", description: "Display name (optional)" }, role: { type: "string", enum: ["required", "optional"], description: "Defaults to required" } }, required: ["email"] }, description: "Replaces the full attendee list. Pass an empty array to remove all attendees. Supported on Exchange/OWL calendars." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -934,6 +936,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             let cal = null;
             let CalEvent = null;
             let CalTodo = null;
+            let CalAttendee = null;
             try {
               const calModule = ChromeUtils.importESModule(
                 "resource:///modules/calendar/calUtils.sys.mjs"
@@ -947,6 +950,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 "resource:///modules/CalTodo.sys.mjs"
               );
               CalTodo = CT;
+              const { CalAttendee: CA } = ChromeUtils.importESModule(
+                "resource:///modules/CalAttendee.sys.mjs"
+              );
+              CalAttendee = CA;
             } catch {
               // Calendar not available
             }
@@ -2910,7 +2917,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status) {
+            function buildAttendee(entry) {
+              const attendee = new CalAttendee();
+              attendee.id = entry.email.includes(":") ? entry.email : `mailto:${entry.email}`;
+              if (entry.name) attendee.commonName = entry.name;
+              attendee.role = (entry.role === "optional") ? "OPT-PARTICIPANT" : "REQ-PARTICIPANT";
+              attendee.participationStatus = "NEEDS-ACTION";
+              return attendee;
+            }
+
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, attendees) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -3004,6 +3020,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                   event.setProperty("STATUS", normalized);
                 }
+                if (attendees && attendees.length > 0) {
+                  for (const entry of attendees) event.addAttendee(buildAttendee(entry));
+                }
 
                 // Find target calendar
                 const calendars = cal.manager.getCalendars();
@@ -3024,6 +3043,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 event.calendar = targetCalendar;
+
+                // OWL's addItem strips attendees from new events unless organizer.id
+                // matches the calendar's organizerId property — it uses this to distinguish
+                // a new meeting (organizer = us) from a Lightning invitation being moved
+                // between calendars (which Exchange doesn't support). Set both explicitly.
+                if (event.getAttendees().length > 0) {
+                  try {
+                    const identityKey = targetCalendar.getProperty("imip.identity.key");
+                    if (identityKey) {
+                      const identity = MailServices.accounts.getIdentity(identityKey);
+                      if (identity && identity.email) {
+                        const organizerEmail = `mailto:${identity.email}`;
+                        if (!targetCalendar.getProperty("organizerId")) {
+                          targetCalendar.setProperty("organizerId", organizerEmail);
+                        }
+                        const organizer = new CalAttendee();
+                        organizer.id = organizerEmail;
+                        organizer.commonName = identity.fullName || identity.email;
+                        organizer.isOrganizer = true;
+                        organizer.role = "CHAIR";
+                        organizer.participationStatus = "ACCEPTED";
+                        event.organizer = organizer;
+                      }
+                    }
+                  } catch (e) { /* non-fatal: attendees may not propagate to Exchange */ }
+                }
 
                 if (skipReview) {
                   await targetCalendar.addItem(event);
@@ -3441,7 +3486,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, attendees) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -3512,6 +3557,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     newItem.setProperty("STATUS", normalized);
                   }
                   changes.push("status");
+                }
+                if (attendees !== undefined) {
+                  for (const a of newItem.getAttendees()) newItem.removeAttendee(a);
+                  for (const entry of (attendees || [])) newItem.addAttendee(buildAttendee(entry));
+                  changes.push("attendees");
                 }
 
                 if (changes.length === 0) return { error: "No changes specified" };
@@ -5802,11 +5852,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.attendees);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.attendees);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId);
                 case "listCategories":
