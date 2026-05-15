@@ -272,7 +272,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable calendar)" },
             allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
             status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
-            showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (blocks time, TRANSP:OPAQUE) or 'free' (TRANSP:TRANSPARENT). Defaults to 'busy'." },
+            showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; use listCategories to get exact existing names before setting." },
             skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
           },
@@ -311,7 +311,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             location: { type: "string", description: "New event location (optional)" },
             description: { type: "string", description: "New event description (optional)" },
             status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
-            showAs: { type: ["string", "null"], enum: ["busy", "free", null], description: "How the event appears in the calendar: 'busy' (TRANSP:OPAQUE) or 'free' (TRANSP:TRANSPARENT). Pass null to clear TRANSP." },
+            showAs: { type: ["string", "null"], enum: ["busy", "free", null], description: "How the event appears in the calendar: 'busy' (solid, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Pass null to clear TRANSP only. Explicit status parameter overrides the STATUS coupling." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; pass an empty array to clear all categories. Use listCategories to get exact existing names before setting." },
           },
           required: ["eventId", "calendarId"],
@@ -3028,18 +3028,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (location) event.setProperty("LOCATION", location);
                 if (description) event.setProperty("DESCRIPTION", description);
-                if (status !== undefined && status !== null && status !== "") {
-                  const normalized = normalizeEventStatus(status);
-                  if (!normalized) {
-                    return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
-                  }
-                  event.setProperty("STATUS", normalized);
+                if (showAs !== undefined && showAs !== null && showAs !== "busy" && showAs !== "free") {
+                  return { error: `Invalid showAs: "${showAs}". Expected "busy" or "free".` };
                 }
-                if (showAs !== undefined && showAs !== null) {
-                  if (showAs !== "busy" && showAs !== "free") {
-                    return { error: "showAs must be 'busy' or 'free'" };
-                  }
+                // STATUS: explicit param wins; otherwise derive from showAs so Thunderbird renders busy=solid, free=hatched
+                const effectiveStatus = (status !== undefined && status !== null && status !== "")
+                  ? status
+                  : (showAs === "free" ? "tentative" : "confirmed");
+                const normalizedStatus = normalizeEventStatus(effectiveStatus);
+                if (!normalizedStatus) {
+                  return { error: `Invalid status: "${effectiveStatus}". Expected tentative, confirmed, or cancelled.` };
                 }
+                event.setProperty("STATUS", normalizedStatus);
                 event.setProperty("TRANSP", showAs === "free" ? "TRANSPARENT" : "OPAQUE");
                 if (categories && categories.length > 0) event.setCategories(categories);
 
@@ -3557,8 +3557,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     newItem.deleteProperty("TRANSP");
                   } else if (showAs === "free") {
                     newItem.setProperty("TRANSP", "TRANSPARENT");
+                    // Also set STATUS:TENTATIVE for Thunderbird visual display unless caller overrides
+                    if (status === undefined) { newItem.setProperty("STATUS", "TENTATIVE"); changes.push("status"); }
                   } else if (showAs === "busy") {
                     newItem.setProperty("TRANSP", "OPAQUE");
+                    // Also set STATUS:CONFIRMED for Thunderbird visual display unless caller overrides
+                    if (status === undefined) { newItem.setProperty("STATUS", "CONFIRMED"); changes.push("status"); }
                   } else {
                     return { error: `Invalid showAs: "${showAs}". Expected "busy" or "free".` };
                   }
