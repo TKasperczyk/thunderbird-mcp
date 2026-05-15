@@ -273,6 +273,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
             status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
+            categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Use listCategories to get exact existing names before setting." },
             skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
           },
           required: ["title", "startDate"],
@@ -311,6 +312,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             description: { type: "string", description: "New event description (optional)" },
             status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Pass null to clear TRANSP only. Explicit status parameter overrides the STATUS coupling." },
+            categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Pass an empty array to clear all categories. Use listCategories to get exact existing names." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -2912,7 +2914,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs) {
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
               }
@@ -3009,6 +3011,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 event.setProperty("STATUS", normalizedStatus);
                 event.setProperty("TRANSP", showAs === "free" ? "TRANSPARENT" : "OPAQUE");
+                if (categories && categories.length > 0) event.setCategories(categories);
 
                 // Find target calendar
                 const calendars = cal.manager.getCalendars();
@@ -3115,6 +3118,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // when the event has no explicit status (iCal spec treats this
                 // as implicit -- Thunderbird renders it like confirmed).
                 status: (item.getProperty("STATUS") || "").toLowerCase(),
+                categories: item.getCategories(),
                 allDay,
                 isRecurring: !!item.recurrenceInfo,
               };
@@ -3446,7 +3450,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -3533,6 +3537,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return { error: `Invalid showAs: "${showAs}". Expected "busy" or "free".` };
                   }
                   changes.push("showAs");
+                }
+
+                if (categories !== undefined) {
+                  newItem.setCategories(categories || []);
+                  changes.push("categories");
                 }
 
                 if (changes.length === 0) return { error: "No changes specified" };
@@ -5823,11 +5832,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories);
                 case "deleteEvent":
                   return await deleteEvent(args.eventId, args.calendarId);
                 case "listCategories":
