@@ -259,8 +259,13 @@ const saveSkipReviewBtn = document.getElementById("saveSkipReviewBtn");
 const saveSkipReviewStatus = document.getElementById("saveSkipReviewStatus");
 
 const listenAllCheckbox = document.getElementById("listenAll");
+const listenAllWarning = document.getElementById("listenAllWarning");
 const saveListenAllBtn = document.getElementById("saveListenAllBtn");
 const saveListenAllStatus = document.getElementById("saveListenAllStatus");
+
+listenAllCheckbox.addEventListener("change", () => {
+  listenAllWarning.style.display = listenAllCheckbox.checked ? "block" : "none";
+});
 
 async function loadSkipReviewPref() {
   try {
@@ -278,6 +283,7 @@ async function loadListenAllPref() {
   try {
     const { listenAll } = await browser.mcpServer.getListenAll();
     listenAllCheckbox.checked = !!listenAll;
+    listenAllWarning.style.display = listenAllCheckbox.checked ? "block" : "none";
     saveListenAllBtn.disabled = false;
     saveListenAllStatus.textContent = "";
   } catch (e) {

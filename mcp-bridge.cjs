@@ -47,6 +47,19 @@ const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
 const CONNECTION_FILE_BASENAME = 'connection.json';
 
+// MCP protocol versions the bridge knows how to speak. Per lifecycle spec the
+// server MUST respond with the requested version if it supports it, otherwise
+// with the latest version it supports. The bridge is a transparent JSON-RPC
+// relay — behavior never changes by version — so it accepts every published
+// version, but it does NOT echo unknown future versions back as if it knew them.
+const SUPPORTED_PROTOCOL_VERSIONS = new Set([
+  '2024-11-05',
+  '2025-03-26',
+  '2025-06-18',
+  '2025-11-25',
+]);
+const LATEST_PROTOCOL_VERSION = '2025-11-25';
+
 let cachedConnectionInfo = null;
 let connectionCacheExpiry = 0;
 let lastDiscoveryAttempts = [];
@@ -547,16 +560,21 @@ async function handleMessage(line) {
   // Handle MCP lifecycle methods locally so the bridge can complete
   // handshake even when Thunderbird isn't running yet.
   switch (message.method) {
-    case 'initialize':
+    case 'initialize': {
+      const requested = message.params?.protocolVersion;
+      const negotiated = (typeof requested === 'string' && SUPPORTED_PROTOCOL_VERSIONS.has(requested))
+        ? requested
+        : LATEST_PROTOCOL_VERSION;
       return {
         jsonrpc: '2.0',
         id: message.id,
         result: {
-          protocolVersion: '2024-11-05',
+          protocolVersion: negotiated,
           capabilities: { tools: {} },
           serverInfo: { name: 'thunderbird-mcp', version: '0.1.0' }
         }
       };
+    }
     case 'ping':
       return { jsonrpc: '2.0', id: message.id, result: {} };
     case 'resources/list':

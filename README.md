@@ -192,7 +192,7 @@ Full setup guide: see [WSL-INSTALL.md](WSL-INSTALL.md).
 - **Dynamic port**: Tries ports 8765-8774, records the actual port in the connection file. No hardcoded port dependency.
 - **Account access control**: Restrict which email accounts are visible to MCP clients via the settings page. Changes take effect immediately.
 - **Tool access control**: Disable specific tools via the settings page. Disabled tools are hidden from `tools/list` and blocked at dispatch.
-- **Network binding**: By default the server listens on localhost only. The "Listen on all interfaces" option in settings binds to all interfaces (IPv4 & IPv6) for WSL, Docker, or remote access. Auth token is always required.
+- **Network binding**: By default the server listens on localhost only. The "Listen on all interfaces" option in settings binds to all interfaces (IPv4 & IPv6) for WSL, Docker, or remote access. **This exposes the MCP server to every device on your local network.** Only enable this on trusted networks where you control who can reach your machine. Auth token is always required, but network-level exposure means any device on the same network can attempt to authenticate.
 
 ---
 

@@ -5542,6 +5542,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             console.log(`Thunderbird MCP server listening on port ${boundPort}`);
             console.log(`Connection info written to ${connFilePath}`);
+            if (listenAll) {
+              console.error(`thunderbird-mcp: WARNING - server is listening on all interfaces (0.0.0.0/[::]). This exposes the MCP server to your local network. Only enable on trusted networks.`);
+            }
             return { success: true, port: boundPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
