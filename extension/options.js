@@ -518,7 +518,6 @@ loadAuthenticationConfig().catch(e => console.error("thunderbird-mcp options:", 
 loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAccountAccess failed:", e));
 loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
 loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
-loadListenAllPref();
 
 const listenAllCheckbox = document.getElementById("listenAll");
 const listenAllWarning = document.getElementById("listenAllWarning");
@@ -561,3 +560,5 @@ saveListenAllBtn.addEventListener("click", async () => {
   }
   saveListenAllBtn.disabled = false;
 });
+
+loadListenAllPref();
