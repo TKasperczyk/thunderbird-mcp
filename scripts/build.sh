@@ -43,16 +43,22 @@ mkdir -p "$DIST_DIR"
 # Remove old XPI to ensure a clean build
 rm -f "$DIST_DIR/thunderbird-mcp.xpi"
 
-# Stamp build version info (git-describe + timestamp) into buildinfo.json
-VERSION="unknown"
-if git -C "$PROJECT_DIR" describe --tags --always > /dev/null 2>&1; then
-  VERSION=$(git -C "$PROJECT_DIR" describe --tags --always)
-elif git -C "$PROJECT_DIR" rev-parse --short HEAD > /dev/null 2>&1; then
-  VERSION=$(git -C "$PROJECT_DIR" rev-parse --short HEAD)
-fi
-# Append +dirty if there are uncommitted changes
-if ! git -C "$PROJECT_DIR" diff --quiet 2>/dev/null || ! git -C "$PROJECT_DIR" diff --cached --quiet 2>/dev/null; then
-  VERSION="${VERSION}+dirty"
+# Stamp build version info into buildinfo.json
+# BUILD_VERSION (set by CI) takes precedence — avoids using the previous git tag
+# which would be off-by-one since the new tag is only created after the build step.
+if [ -n "${BUILD_VERSION:-}" ]; then
+  VERSION="v${BUILD_VERSION}"
+else
+  VERSION="unknown"
+  if git -C "$PROJECT_DIR" describe --tags --always > /dev/null 2>&1; then
+    VERSION=$(git -C "$PROJECT_DIR" describe --tags --always)
+  elif git -C "$PROJECT_DIR" rev-parse --short HEAD > /dev/null 2>&1; then
+    VERSION=$(git -C "$PROJECT_DIR" rev-parse --short HEAD)
+  fi
+  # Append +dirty if there are uncommitted changes
+  if ! git -C "$PROJECT_DIR" diff --quiet 2>/dev/null || ! git -C "$PROJECT_DIR" diff --cached --quiet 2>/dev/null; then
+    VERSION="${VERSION}+dirty"
+  fi
 fi
 BUILT_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 echo "{\"version\":\"$VERSION\",\"builtAt\":\"$BUILT_AT\"}" > "$EXTENSION_DIR/buildinfo.json"
