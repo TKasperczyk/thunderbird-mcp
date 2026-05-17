@@ -125,15 +125,7 @@ Download the latest `thunderbird-mcp.xpi` from the [Releases page](https://githu
 
 Then restart Thunderbird.
 
-### 2. Install the MCP bridge
-
-```bash
-npm install -g thunderbird-mcp
-```
-
-This installs the `thunderbird-mcp` CLI which runs the stdio↔HTTP bridge. No repository clone needed.
-
-### 3. Configure your MCP client
+### 2. Configure your MCP client
 
 **Claude Code** (`~/.claude.json`):
 
@@ -141,7 +133,8 @@ This installs the `thunderbird-mcp` CLI which runs the stdio↔HTTP bridge. No r
 {
   "mcpServers": {
     "thunderbird-mail": {
-      "command": "thunderbird-mcp"
+      "command": "npx",
+      "args": ["-y", "thunderbird-mcp"]
     }
   }
 }
@@ -154,33 +147,21 @@ This installs the `thunderbird-mcp` CLI which runs the stdio↔HTTP bridge. No r
   "servers": {
     "thunderbird-mail": {
       "type": "stdio",
-      "command": "thunderbird-mcp"
+      "command": "npx",
+      "args": ["-y", "thunderbird-mcp"]
     }
   }
 }
 ```
 
-If you installed the bridge manually (without `npm install -g`), use the full path instead:
-
-```json
-{
-  "mcpServers": {
-    "thunderbird-mail": {
-      "command": "node",
-      "args": ["/absolute/path/to/mcp-bridge.cjs"]
-    }
-  }
-}
-```
-
-### 4. Add the usage skill to Copilot (optional, recommended)
+### 3. Add the usage skill to Copilot (optional, recommended)
 
 This skill teaches Copilot how to archive emails and attachments with natural-language prompts.
 Place it in your global skills folder so it is available in every project:
 
 ```bash
 mkdir -p ~/.github/skills
-curl -L https://github.com/TKasperczyk/thunderbird-mcp/releases/latest/download/extension-usage-guide.md \
+curl -L https://github.com/the78mole/thunderbird-mcp/releases/latest/download/extension-usage-guide.md \
   -o ~/.github/skills/thunderbird-mcp.md
 ```
 
