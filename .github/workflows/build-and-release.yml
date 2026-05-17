@@ -52,6 +52,7 @@ jobs:
           prerelease: false
           files: |
             dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.xpi
+            dist/updates.json
             .github/skills/extension-usage-guide-${{ steps.semver.outputs.version }}.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

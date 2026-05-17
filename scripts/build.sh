@@ -37,6 +37,29 @@ else
   fi
 fi
 
+# Determine GitHub owner and repo name for addon ID and update URLs.
+# In CI $GITHUB_REPOSITORY is set (e.g. "the78mole/thunderbird-mcp").
+# Locally the value is parsed from the git remote URL.
+if [ -n "${GITHUB_REPOSITORY:-}" ]; then
+  GITHUB_OWNER="${GITHUB_REPOSITORY%%/*}"
+  GITHUB_REPO_NAME="${GITHUB_REPOSITORY##*/}"
+else
+  REMOTE_URL=$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || echo "")
+  if [[ "$REMOTE_URL" =~ github\.com[:/]([^/]+)/([^/.]+) ]]; then
+    GITHUB_OWNER="${BASH_REMATCH[1]}"
+    GITHUB_REPO_NAME="${BASH_REMATCH[2]}"
+  else
+    GITHUB_OWNER="unknown"
+    GITHUB_REPO_NAME="thunderbird-mcp"
+  fi
+fi
+ADDON_ID="thunderbird-mcp@${GITHUB_OWNER}.github.io"
+BASE_URL="https://github.com/${GITHUB_OWNER}/${GITHUB_REPO_NAME}"
+UPDATE_URL="${BASE_URL}/releases/latest/download/updates.json"
+UPDATE_LINK="${BASE_URL}/releases/download/v${PACKAGE_VERSION}/thunderbird-mcp-${PACKAGE_VERSION}.xpi"
+echo "Addon ID: $ADDON_ID"
+echo "Update URL: $UPDATE_URL"
+
 # Create dist directory
 mkdir -p "$DIST_DIR"
 
@@ -64,20 +87,41 @@ BUILT_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 echo "{\"version\":\"$VERSION\",\"builtAt\":\"$BUILT_AT\"}" > "$EXTENSION_DIR/buildinfo.json"
 echo "Build version: $VERSION"
 
-# Update manifest.json version from package.json
-if command -v node > /dev/null 2>&1; then
-  node -e "
-    const fs = require('fs');
-    const p = '$EXTENSION_DIR/manifest.json';
-    const m = JSON.parse(fs.readFileSync(p, 'utf8'));
-    m.version = '$PACKAGE_VERSION';
-    fs.writeFileSync(p, JSON.stringify(m, null, 2) + '\n');
-  "
-else
-  sed -i.bak "s/\"version\": *\"[^\"]*\"/\"version\": \"$PACKAGE_VERSION\"/" "$EXTENSION_DIR/manifest.json"
-  rm -f "$EXTENSION_DIR/manifest.json.bak"
-fi
-echo "Manifest version: $PACKAGE_VERSION"
+# Update manifest.json: version, addon ID and update_url
+node -e "
+  const fs = require('fs');
+  const p = '$EXTENSION_DIR/manifest.json';
+  const m = JSON.parse(fs.readFileSync(p, 'utf8'));
+  m.version = '$PACKAGE_VERSION';
+  m.browser_specific_settings = m.browser_specific_settings || {};
+  m.browser_specific_settings.gecko = m.browser_specific_settings.gecko || {};
+  m.browser_specific_settings.gecko.id = '$ADDON_ID';
+  m.browser_specific_settings.gecko.update_url = '$UPDATE_URL';
+  fs.writeFileSync(p, JSON.stringify(m, null, 2) + '
+');
+"
+echo "Manifest version: $PACKAGE_VERSION  id: $ADDON_ID"
+
+# Generate updates.json for Thunderbird auto-update
+node -e "
+  const fs = require('fs');
+  const updates = {
+    addons: {
+      '$ADDON_ID': {
+        updates: [
+          {
+            version: '$PACKAGE_VERSION',
+            target_platform: 'all',
+            update_link: '$UPDATE_LINK'
+          }
+        ]
+      }
+    }
+  };
+  fs.writeFileSync('$DIST_DIR/updates.json', JSON.stringify(updates, null, 2) + '
+');
+"
+echo "Generated: $DIST_DIR/updates.json"
 
 # Package extension
 cd "$EXTENSION_DIR"
