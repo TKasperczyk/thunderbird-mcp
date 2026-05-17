@@ -97,8 +97,7 @@ node -e "
   m.browser_specific_settings.gecko = m.browser_specific_settings.gecko || {};
   m.browser_specific_settings.gecko.id = '$ADDON_ID';
   m.browser_specific_settings.gecko.update_url = '$UPDATE_URL';
-  fs.writeFileSync(p, JSON.stringify(m, null, 2) + '
-');
+  fs.writeFileSync(p, JSON.stringify(m, null, 2) + '\n');
 "
 echo "Manifest version: $PACKAGE_VERSION  id: $ADDON_ID"
 
@@ -118,8 +117,7 @@ node -e "
       }
     }
   };
-  fs.writeFileSync('$DIST_DIR/updates.json', JSON.stringify(updates, null, 2) + '
-');
+  fs.writeFileSync('$DIST_DIR/updates.json', JSON.stringify(updates, null, 2) + '\n');
 "
 echo "Generated: $DIST_DIR/updates.json"
 
