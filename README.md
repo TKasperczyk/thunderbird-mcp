@@ -119,26 +119,75 @@ The same settings page has a "Send Safety" section: toggle **Block `skipReview`*
 
 ### 1. Install the extension
 
+Download the latest `thunderbird-mcp.xpi` from the [Releases page](https://github.com/TKasperczyk/thunderbird-mcp/releases/latest) and install it in Thunderbird:
+
+> **Tools → Add-ons and Themes → ⚙️ → Install Add-on From File**
+
+Then restart Thunderbird.
+
+### 2. Install the MCP bridge
+
 ```bash
-git clone https://github.com/TKasperczyk/thunderbird-mcp.git
+npm install -g thunderbird-mcp
 ```
 
-Install `dist/thunderbird-mcp.xpi` in Thunderbird (Tools > Add-ons > Install from File), then restart. A pre-built XPI is included in the repo -- no build step needed.
+This installs the `thunderbird-mcp` CLI which runs the stdio↔HTTP bridge. No repository clone needed.
 
-### 2. Configure your MCP client
+### 3. Configure your MCP client
 
-Add to your MCP client config (e.g. `~/.claude.json` for Claude Code):
+**Claude Code** (`~/.claude.json`):
+
+```json
+{
+  "mcpServers": {
+    "thunderbird-mail": {
+      "command": "thunderbird-mcp"
+    }
+  }
+}
+```
+
+**VS Code / GitHub Copilot** — add to your user `settings.json` or a workspace `.vscode/mcp.json`:
+
+```json
+{
+  "servers": {
+    "thunderbird-mail": {
+      "type": "stdio",
+      "command": "thunderbird-mcp"
+    }
+  }
+}
+```
+
+If you installed the bridge manually (without `npm install -g`), use the full path instead:
 
 ```json
 {
   "mcpServers": {
     "thunderbird-mail": {
       "command": "node",
-      "args": ["/absolute/path/to/thunderbird-mcp/mcp-bridge.cjs"]
+      "args": ["/absolute/path/to/mcp-bridge.cjs"]
     }
   }
 }
 ```
+
+### 4. Add the usage skill to Copilot (optional, recommended)
+
+This skill teaches Copilot how to archive emails and attachments with natural-language prompts.
+Place it in your global skills folder so it is available in every project:
+
+```bash
+mkdir -p ~/.github/skills
+curl -L https://github.com/TKasperczyk/thunderbird-mcp/releases/latest/download/extension-usage-guide.md \
+  -o ~/.github/skills/thunderbird-mcp.md
+```
+
+Copilot picks up all `.md` files under `~/.github/skills/` automatically. After adding the file you can ask things like:
+
+- *"Archive all emails from Alice in `Documents/Correspondence/Alice`"*
+- *"Save all insurance attachments for plate `AA-BB 123` to `Documents/Car/Porsche`"*
 
 ### Sandbox-aware connection discovery
 
