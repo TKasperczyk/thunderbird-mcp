@@ -1,6 +1,6 @@
 {
   "name": "thunderbird-mcp",
-  "version": "0.0.193",
+  "version": "99.9.9",
   "description": "MCP server for Thunderbird - enables AI assistants to access email, contacts, and calendars",
   "author": "Tomasz Kasperczyk",
   "license": "MIT",

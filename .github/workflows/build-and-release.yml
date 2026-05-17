@@ -25,8 +25,8 @@ jobs:
         with:
           tag_prefix: "v"
           version_format: "${major}.${minor}.${patch}"
-          bump_each_commit: true
-          initial_version: "0.1.0"
+          major_pattern: "/^(feat|fix|refactor)!:/"
+          minor_pattern: "/^feat:/"
       
       - name: Update package.json version
         run: |
@@ -58,11 +58,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
-      - name: Commit version update
-        run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git add package.json
-          git diff --quiet && git diff --staged --quiet || git commit -m "chore: bump version to ${{ steps.semver.outputs.version }} [skip ci]"
-          git push
-        continue-on-error: true
+
