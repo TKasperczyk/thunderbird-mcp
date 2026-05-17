@@ -28,21 +28,14 @@ jobs:
           major_pattern: "/^(feat|fix|refactor)!:/"
           minor_pattern: "/^feat:/"
       
-      - name: Update package.json version
-        run: |
-          node -e "
-            const fs = require('fs');
-            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-            pkg.version = '${{ steps.semver.outputs.version }}';
-            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
-      
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '18'
       
       - name: Build extension
+        env:
+          BUILD_VERSION: ${{ steps.semver.outputs.version }}
         run: bash scripts/build.sh
       
       - name: Create Release

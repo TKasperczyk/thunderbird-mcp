@@ -11,7 +11,10 @@ PACKAGE_JSON="$PROJECT_DIR/package.json"
 
 echo "Building Thunderbird MCP extension..."
 
-if command -v node > /dev/null 2>&1; then
+# BUILD_VERSION env var takes precedence (used by CI to avoid modifying package.json)
+if [ -n "${BUILD_VERSION:-}" ]; then
+  PACKAGE_VERSION="$BUILD_VERSION"
+elif command -v node > /dev/null 2>&1; then
   PACKAGE_VERSION=$(node -e "
     const fs = require('fs');
     const p = process.argv[1];
