@@ -38,6 +38,11 @@ jobs:
           BUILD_VERSION: ${{ steps.semver.outputs.version }}
         run: bash scripts/build.sh
       
+      - name: Rename release files
+        run: |
+          mv dist/thunderbird-mcp.xpi dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.xpi
+          cp .github/skills/extension-usage-guide.md .github/skills/extension-usage-guide-${{ steps.semver.outputs.version }}.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -46,8 +51,8 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            dist/thunderbird-mcp.xpi
-            .github/skills/extension-usage-guide.md
+            dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.xpi
+            .github/skills/extension-usage-guide-${{ steps.semver.outputs.version }}.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
