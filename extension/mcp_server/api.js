@@ -281,7 +281,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "listEvents",
         group: "calendar", crud: "read",
         title: "List Events",
-        description: "List calendar events within a date range",
+        description: "List calendar events within a date range. Each event includes its title, location, description, status and list of attendees.",
         inputSchema: {
           type: "object",
           properties: {
@@ -3097,6 +3097,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   endDateISO = raw.toISOString();
                 } catch { /* keep raw value */ }
               }
+
+              // Get the organiser attendees of the event, if any
+              const attendees = item.getAttendees ? item.getAttendees() : [];
+              const organizer = item.organizer;
+              const participantsMap = new Map();
+
+              // Make sure to add the organiser (who may not be in the list of attendees)
+              if (organizer) {
+                  participantsMap.set(organizer.id, {
+                      id: organizer.id,
+                      commonName: organizer.commonName,
+                      role: organizer.role,
+                      participationStatus: organizer.participationStatus,
+                      userType: organizer.userType,
+                      isOrganizer: true
+                  });
+              }
+              // Then add the other attendees
+              for (const a of attendees) {
+                  if (!participantsMap.has(a.id)) {
+                      participantsMap.set(a.id, {
+                          id: a.id,
+                          commonName: a.commonName,
+                          role: a.role,
+                          participationStatus: a.participationStatus,
+                          userType: a.userType,
+                          isOrganizer: false
+                      });
+                  }
+              }
+              const participants = [...participantsMap.values()];
+
               const result = {
                 id: item.id,
                 calendarId: calendar.id,
@@ -3112,6 +3144,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 status: (item.getProperty("STATUS") || "").toLowerCase(),
                 allDay,
                 isRecurring: !!item.recurrenceInfo,
+                attendees: participants,
               };
               // Occurrences of recurring events share the parent's id.
               // Include recurrenceId so callers can distinguish them.
