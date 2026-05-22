@@ -26,6 +26,7 @@ const stableAuthTokenStatus = document.getElementById("stableAuthTokenStatus");
 
 let currentAccounts = [];
 let currentTools = [];
+let getMessagesLimitInput = null;
 
 // CRUD labels for sub-group headers
 const CRUD_LABELS = { read: "Read", create: "Create", update: "Update", delete: "Delete" };
@@ -301,6 +302,7 @@ async function loadToolAccess() {
     }
 
     toolList.innerHTML = "";
+    getMessagesLimitInput = null;
 
     // Tools arrive pre-sorted by group then CRUD order from the server.
     // Build grouped structure from tool metadata.
@@ -331,6 +333,9 @@ async function loadToolAccess() {
       }
 
       const li = document.createElement("li");
+      if (tool.name === "getMessages") {
+        li.className = "tool-with-option";
+      }
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.id = "tool-" + tool.name;
@@ -341,6 +346,9 @@ async function loadToolAccess() {
       }
       checkbox.addEventListener("change", () => {
         saveToolsStatus.textContent = "";
+        if (tool.name === "getMessages" && getMessagesLimitInput) {
+          getMessagesLimitInput.disabled = !checkbox.checked;
+        }
       });
 
       const label = document.createElement("label");
@@ -355,6 +363,29 @@ async function loadToolAccess() {
 
       li.appendChild(checkbox);
       li.appendChild(label);
+      if (tool.name === "getMessages") {
+        const option = document.createElement("div");
+        option.className = "tool-option";
+
+        const limitLabel = document.createElement("label");
+        limitLabel.htmlFor = "getMessagesLimit";
+        limitLabel.textContent = "Max messages per call";
+
+        getMessagesLimitInput = document.createElement("input");
+        getMessagesLimitInput.type = "number";
+        getMessagesLimitInput.id = "getMessagesLimit";
+        getMessagesLimitInput.min = String(tool.getMessagesLimitMin || data.getMessagesLimitMin || 1);
+        getMessagesLimitInput.max = String(tool.getMessagesLimitMax || data.getMessagesLimitMax || 20);
+        getMessagesLimitInput.value = String(tool.getMessagesLimit || data.getMessagesLimit || 10);
+        getMessagesLimitInput.disabled = !checkbox.checked;
+        getMessagesLimitInput.addEventListener("input", () => {
+          saveToolsStatus.textContent = "";
+        });
+
+        option.appendChild(limitLabel);
+        option.appendChild(getMessagesLimitInput);
+        li.appendChild(option);
+      }
       toolList.appendChild(li);
     }
 
@@ -380,9 +411,21 @@ saveToolsBtn.addEventListener("click", async () => {
       disabled.push(cb.value);
     }
   }
+  let getMessagesLimit;
+  if (getMessagesLimitInput) {
+    getMessagesLimit = Number(getMessagesLimitInput.value);
+    const min = Number(getMessagesLimitInput.min);
+    const max = Number(getMessagesLimitInput.max);
+    if (!Number.isInteger(getMessagesLimit) || getMessagesLimit < min || getMessagesLimit > max) {
+      saveToolsStatus.textContent = `getMessages limit must be an integer from ${min} to ${max}.`;
+      saveToolsStatus.className = "save-status error";
+      saveToolsBtn.disabled = false;
+      return;
+    }
+  }
 
   try {
-    const result = await browser.mcpServer.setToolAccess(disabled);
+    const result = await browser.mcpServer.setToolAccess(disabled, getMessagesLimit);
     if (result.error) {
       saveToolsStatus.textContent = result.error;
       saveToolsStatus.className = "save-status error";

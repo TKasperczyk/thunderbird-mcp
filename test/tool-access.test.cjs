@@ -59,6 +59,16 @@ const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", 
 const VALID_CRUD = ["create", "read", "update", "delete"];
 const CRUD_ORDER = { read: 0, create: 1, update: 2, delete: 3 };
 const GROUP_ORDER = { system: 0, messages: 1, folders: 2, contacts: 3, calendar: 4, filters: 5 };
+const DEFAULT_GET_MESSAGES_LIMIT = 10;
+const MAX_GET_MESSAGES_LIMIT = 20;
+
+function normalizeGetMessagesLimit(value) {
+  const limit = Number(value);
+  if (!Number.isInteger(limit)) return DEFAULT_GET_MESSAGES_LIMIT;
+  if (limit < 1) return 1;
+  if (limit > MAX_GET_MESSAGES_LIMIT) return MAX_GET_MESSAGES_LIMIT;
+  return limit;
+}
 
 const ALL_TOOLS = [
   { name: "listAccounts", group: "system", crud: "read" },
@@ -413,6 +423,27 @@ describe("Tool access: setToolAccess validation", () => {
     const result = validateSetToolAccess(["sendMail", "__all__", "deleteMessages"]);
     assert.ok(result.error);
     assert.match(result.error, /__all__/);
+  });
+});
+
+describe("Tool access: getMessages limit normalization", () => {
+  it("uses the default for missing or invalid values", () => {
+    assert.equal(normalizeGetMessagesLimit(undefined), 10);
+    assert.equal(normalizeGetMessagesLimit("abc"), 10);
+    assert.equal(normalizeGetMessagesLimit(1.5), 10);
+  });
+
+  it("uses valid integer values", () => {
+    assert.equal(normalizeGetMessagesLimit(1), 1);
+    assert.equal(normalizeGetMessagesLimit(12), 12);
+    assert.equal(normalizeGetMessagesLimit("20"), 20);
+  });
+
+  it("clamps values outside the supported range", () => {
+    assert.equal(normalizeGetMessagesLimit(0), 1);
+    assert.equal(normalizeGetMessagesLimit(-5), 1);
+    assert.equal(normalizeGetMessagesLimit(21), 20);
+    assert.equal(normalizeGetMessagesLimit(100), 20);
   });
 });
 

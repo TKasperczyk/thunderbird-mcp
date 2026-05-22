@@ -49,6 +49,11 @@
             "type": "array",
             "items": { "type": "string" },
             "description": "Array of tool names to disable. Empty array means all tools enabled."
+          },
+          {
+            "name": "getMessagesLimit",
+            "type": "number",
+            "description": "Maximum number of messages getMessages may read in one call. Must be an integer from 1 to 20."
           }
         ]
       },

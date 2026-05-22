@@ -51,6 +51,13 @@ function createValidator(tools) {
       if (expectedType === "array") {
         if (!Array.isArray(value)) {
           errors.push(`Parameter '${key}' must be an array, got ${typeof value}`);
+        } else {
+          if (propSchema.minItems !== undefined && value.length < propSchema.minItems) {
+            errors.push(`Parameter '${key}' must contain at least ${propSchema.minItems} item(s)`);
+          }
+          if (propSchema.maxItems !== undefined && value.length > propSchema.maxItems) {
+            errors.push(`Parameter '${key}' must contain at most ${propSchema.maxItems} item(s)`);
+          }
         }
       } else if (expectedType === "object") {
         if (typeof value !== "object" || Array.isArray(value)) {
@@ -181,6 +188,31 @@ const sampleTools = [
         trash: { type: "boolean" },
       },
       required: ["folderPath"],
+    },
+  },
+  {
+    name: "getMessages",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messages: {
+          type: "array",
+          minItems: 1,
+          maxItems: 10,
+          items: {
+            type: "object",
+            properties: {
+              messageId: { type: "string" },
+              folderPath: { type: "string" },
+            },
+            required: ["messageId", "folderPath"],
+          },
+        },
+        saveAttachments: { type: "boolean" },
+        bodyFormat: { type: "string" },
+        rawSource: { type: "boolean" },
+      },
+      required: ["messages"],
     },
   },
   {
@@ -456,5 +488,36 @@ describe('Validation: account access control', () => {
     const errors = validate('getAccountAccess', { bogus: 'value' });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /Unknown parameter/);
+  });
+});
+
+describe('Validation: getMessages batch size', () => {
+  const messageRef = { messageId: "message-1", folderPath: "imap://user@server/INBOX" };
+
+  it('accepts messages at the configured cap', () => {
+    const errors = validate('getMessages', {
+      messages: Array.from({ length: 10 }, (_, index) => ({
+        ...messageRef,
+        messageId: `message-${index}`,
+      })),
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects empty messages arrays', () => {
+    const errors = validate('getMessages', { messages: [] });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at least 1/);
+  });
+
+  it('rejects messages arrays over the configured cap', () => {
+    const errors = validate('getMessages', {
+      messages: Array.from({ length: 11 }, (_, index) => ({
+        ...messageRef,
+        messageId: `message-${index}`,
+      })),
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /at most 10/);
   });
 });

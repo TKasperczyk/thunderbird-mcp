@@ -79,6 +79,7 @@ const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
 const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
 const PREF_STABLE_AUTH_TOKEN = "extensions.thunderbird-mcp.stableAuthToken";
+const PREF_GET_MESSAGES_LIMIT = "extensions.thunderbird-mcp.getMessagesLimit";
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
@@ -89,7 +90,9 @@ const CRUD_ORDER = { read: 0, create: 1, update: 2, delete: 3 };
 const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccess"]);
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 10000;
-const MAX_GET_MESSAGES = 10;
+const DEFAULT_GET_MESSAGES_LIMIT = 10;
+// 20 is a reasonable upper bound for now; adjust later if usage supports it.
+const MAX_GET_MESSAGES_LIMIT = 20;
 // Internal IMAP/Thunderbird keywords that should not appear as user-visible tags
 const INTERNAL_KEYWORDS = new Set([
   "junk", "notjunk", "$forwarded", "$replied",
@@ -109,7 +112,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       resProto.ALLOW_CONTENT_ACCESS
     );
 
-    const tools = [
+    function normalizeGetMessagesLimit(value) {
+      const limit = Number(value);
+      if (!Number.isInteger(limit)) return DEFAULT_GET_MESSAGES_LIMIT;
+      if (limit < 1) return 1;
+      if (limit > MAX_GET_MESSAGES_LIMIT) return MAX_GET_MESSAGES_LIMIT;
+      return limit;
+    }
+
+    function getConfiguredGetMessagesLimit() {
+      try {
+        return normalizeGetMessagesLimit(
+          Services.prefs.getIntPref(PREF_GET_MESSAGES_LIMIT, DEFAULT_GET_MESSAGES_LIMIT)
+        );
+      } catch {
+        return DEFAULT_GET_MESSAGES_LIMIT;
+      }
+    }
+
+    function buildTools() {
+      const getMessagesLimit = getConfiguredGetMessagesLimit();
+      return [
       {
         name: "listAccounts",
         group: "system", crud: "read",
@@ -177,13 +200,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "getMessages",
         group: "messages", crud: "read",
         title: "Get Messages",
-        description: "Read full email content for up to 10 messages in one call. Each item needs messageId and folderPath from searchMessages/getRecentMessages results.",
+        description: `Read full email content for up to ${getMessagesLimit} messages in one call. Each item needs messageId and folderPath from searchMessages/getRecentMessages results.`,
         inputSchema: {
           type: "object",
           properties: {
             messages: {
               type: "array",
-              description: "Messages to read, max 10. Each item is { messageId, folderPath }.",
+              minItems: 1,
+              maxItems: getMessagesLimit,
+              description: `Messages to read, max ${getMessagesLimit}. Each item is { messageId, folderPath }.`,
               items: {
                 type: "object",
                 properties: {
@@ -857,7 +882,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         description: "Get the current account access control list. Shows which accounts the MCP server can access. Account access is configured by the user in the extension settings page (Tools > Add-ons > Thunderbird MCP > Options) and cannot be changed via MCP tools.",
         inputSchema: { type: "object", properties: {}, required: [] },
       },
-    ];
+      ];
+    }
+
+    const tools = buildTools();
 
     // Validate tool metadata: every tool must have valid group and crud fields.
     // This prevents tools from being silently hidden in the settings UI.
@@ -4173,8 +4201,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (!Array.isArray(messages) || messages.length === 0) {
                 return { error: "messages must be a non-empty array of { messageId, folderPath } objects" };
               }
-              if (messages.length > MAX_GET_MESSAGES) {
-                return { error: `getMessages accepts at most ${MAX_GET_MESSAGES} messages per call` };
+              const getMessagesLimit = getConfiguredGetMessagesLimit();
+              if (messages.length > getMessagesLimit) {
+                return { error: `getMessages accepts at most ${getMessagesLimit} messages per call` };
               }
 
               const results = [];
@@ -4222,7 +4251,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 requested: messages.length,
                 succeeded: results.length - failed,
                 failed,
-                max: MAX_GET_MESSAGES,
+                max: getMessagesLimit,
               };
             }
 
@@ -5767,21 +5796,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Build a lookup from tool name to inputSchema for fast validation.
-             */
-            const toolSchemas = Object.create(null);
-            for (const t of tools) {
-              toolSchemas[t.name] = t.inputSchema;
-            }
-
-            /**
              * Validate tool arguments against the tool's inputSchema.
              * Checks required fields, types (string, number, boolean, array, object),
              * and rejects unknown properties.
              * Returns an array of error strings (empty = valid).
              */
             function validateToolArgs(name, args) {
-              const schema = toolSchemas[name];
+              const tool = buildTools().find(t => t.name === name);
+              const schema = tool?.inputSchema;
               if (!schema) return [`Unknown tool: ${name}`];
 
               const errors = [];
@@ -5810,6 +5832,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (expectedType === "array") {
                   if (!Array.isArray(value)) {
                     errors.push(`Parameter '${key}' must be an array, got ${typeof value}`);
+                  } else {
+                    if (propSchema.minItems !== undefined && value.length < propSchema.minItems) {
+                      errors.push(`Parameter '${key}' must contain at least ${propSchema.minItems} item(s)`);
+                    }
+                    if (propSchema.maxItems !== undefined && value.length > propSchema.maxItems) {
+                      errors.push(`Parameter '${key}' must contain at most ${propSchema.maxItems} item(s)`);
+                    }
                   }
                 } else if (expectedType === "object") {
                   if (typeof value !== "object" || Array.isArray(value)) {
@@ -5836,7 +5865,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Mutates and returns the args object.
              */
             function coerceToolArgs(name, args) {
-              const schema = toolSchemas[name];
+              const tool = buildTools().find(t => t.name === name);
+              const schema = tool?.inputSchema;
               if (!schema) return args;
               const props = schema.properties || {};
               for (const [key, value] of Object.entries(args)) {
@@ -6087,7 +6117,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       break;
                     case "tools/list":
                       // Strip internal metadata (group, crud, title) — only expose MCP-spec fields
-                      result = { tools: tools.filter(t => isToolEnabled(t.name)).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) };
+                      result = { tools: buildTools().filter(t => isToolEnabled(t.name)).map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) };
                       break;
                     case "tools/call":
                       if (!params?.name) {
@@ -6304,13 +6334,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           }
 
           // Build tool list with group/crud metadata, sorted by group then CRUD order
-          const toolList = tools
+          const getMessagesLimit = getConfiguredGetMessagesLimit();
+          const toolList = buildTools()
             .map(t => ({
               name: t.name,
               group: t.group,
               crud: t.crud,
               enabled: corrupt ? UNDISABLEABLE_TOOLS.has(t.name) : !disabled.includes(t.name),
               undisableable: UNDISABLEABLE_TOOLS.has(t.name),
+              ...(t.name === "getMessages" ? {
+                getMessagesLimit,
+                getMessagesLimitMin: 1,
+                getMessagesLimitMax: MAX_GET_MESSAGES_LIMIT,
+              } : {}),
             }))
             .sort((a, b) => {
               const gA = GROUP_ORDER[a.group] ?? 99;
@@ -6322,6 +6358,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             mode: corrupt ? "error" : (disabled.length === 0 ? "all" : "restricted"),
             disabledTools: disabled,
             groups: GROUP_LABELS,
+            getMessagesLimit,
+            getMessagesLimitMin: 1,
+            getMessagesLimitMax: MAX_GET_MESSAGES_LIMIT,
             tools: toolList,
           };
           if (corrupt) {
@@ -6330,7 +6369,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           return result;
         },
 
-        setToolAccess: async function(disabledTools) {
+        setToolAccess: async function(disabledTools, getMessagesLimit) {
           if (!Array.isArray(disabledTools)) {
             return { error: "disabledTools must be an array" };
           }
@@ -6348,15 +6387,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             return { error: `Cannot disable infrastructure tools: ${blocked.join(", ")}` };
           }
 
+          let requestedLimit = null;
+          if (getMessagesLimit !== undefined && getMessagesLimit !== null && getMessagesLimit !== "") {
+            requestedLimit = Number(getMessagesLimit);
+            if (!Number.isInteger(requestedLimit)) {
+              return { error: "getMessagesLimit must be an integer" };
+            }
+            if (requestedLimit < 1 || requestedLimit > MAX_GET_MESSAGES_LIMIT) {
+              return { error: `getMessagesLimit must be between 1 and ${MAX_GET_MESSAGES_LIMIT}` };
+            }
+          }
+
           if (disabledTools.length === 0) {
             try { Services.prefs.clearUserPref(PREF_DISABLED_TOOLS); } catch { /* ignore */ }
           } else {
             Services.prefs.setStringPref(PREF_DISABLED_TOOLS, JSON.stringify(disabledTools));
           }
+          if (requestedLimit !== null) {
+            if (requestedLimit === DEFAULT_GET_MESSAGES_LIMIT) {
+              try { Services.prefs.clearUserPref(PREF_GET_MESSAGES_LIMIT); } catch { /* ignore */ }
+            } else {
+              Services.prefs.setIntPref(PREF_GET_MESSAGES_LIMIT, requestedLimit);
+            }
+          }
           return {
             success: true,
             mode: disabledTools.length === 0 ? "all" : "restricted",
             disabledTools,
+            getMessagesLimit: getConfiguredGetMessagesLimit(),
           };
         },
 
