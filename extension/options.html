@@ -135,11 +135,28 @@
       color: #5b5b66;
       font-size: 13px;
     }
-    .tool-option input[type="number"] {
-      width: 72px;
+    .tool-option label {
+      flex: 0 0 auto;
+    }
+    .tool-option input {
+      width: 56px;
       padding: 4px 6px;
       border: 1px solid #cfcfd8;
       border-radius: 4px;
+    }
+    .tool-option input[aria-invalid="true"] {
+      border-color: #d70022;
+      box-shadow: 0 0 0 1px #d70022;
+    }
+    .tool-option .range-note {
+      color: #5b5b66;
+      font-size: 12px;
+    }
+    .tool-limit-error {
+      flex: 1 0 100%;
+      margin-left: 24px;
+      color: #d70022;
+      font-size: 12px;
     }
     .save-row {
       display: flex;
