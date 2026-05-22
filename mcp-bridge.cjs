@@ -700,6 +700,25 @@ function tryAllHosts(hosts, postData, port, token) {
   return tryNext(hosts);
 }
 
+function compactToolResultJsonText(response) {
+  const content = response?.result?.content;
+  if (!Array.isArray(content)) {
+    return response;
+  }
+
+  for (const item of content) {
+    if (item?.type !== 'text' || typeof item.text !== 'string') {
+      continue;
+    }
+    try {
+      item.text = JSON.stringify(JSON.parse(item.text));
+    } catch {
+      // Non-JSON text content is already the compact representation.
+    }
+  }
+  return response;
+}
+
 async function forwardToThunderbird(message) {
   const postData = JSON.stringify(message);
 
@@ -809,7 +828,7 @@ function startBridge() {
     handleMessage(line)
       .then(async (response) => {
         if (response !== null) {
-          await writeOutput(JSON.stringify(response) + '\n');
+          await writeOutput(JSON.stringify(compactToolResultJsonText(response)) + '\n');
           debugLog(`send id=${messageId} method=${messageMethod}`);
         }
       })
@@ -873,6 +892,7 @@ module.exports = {
   findMacOsConnectionCandidates,
   findSnapConnectionCandidates,
   formatDiscoveryAttempts,
+  compactToolResultJsonText,
   isValidAuthToken,
   readConnectionInfo,
   startBridge,
