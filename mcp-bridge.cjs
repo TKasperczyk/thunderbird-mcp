@@ -706,17 +706,28 @@ function compactToolResultJsonText(response) {
     return response;
   }
 
-  for (const item of content) {
+  let changed = false;
+  const compactedContent = content.map((item) => {
     if (item?.type !== 'text' || typeof item.text !== 'string') {
-      continue;
+      return item;
     }
     try {
-      item.text = JSON.stringify(JSON.parse(item.text));
+      const compactedText = JSON.stringify(JSON.parse(item.text));
+      if (compactedText === item.text) {
+        return item;
+      }
+      changed = true;
+      return { ...item, text: compactedText };
     } catch {
       // Non-JSON text content is already the compact representation.
+      return item;
     }
+  });
+
+  if (!changed) {
+    return response;
   }
-  return response;
+  return { ...response, result: { ...response.result, content: compactedContent } };
 }
 
 async function forwardToThunderbird(message) {

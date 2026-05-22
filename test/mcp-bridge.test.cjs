@@ -104,24 +104,27 @@ describe('Auth token validation', () => {
 });
 
 describe('Tool result serialization', () => {
-  it('compacts JSON text content without changing the parsed value', () => {
+  it('compacts JSON text content without mutating the original response', () => {
+    const originalText = JSON.stringify([{ name: 'INBOX', unreadMessages: 3 }], null, 2);
     const response = {
       jsonrpc: '2.0',
       id: 2,
       result: {
         content: [{
           type: 'text',
-          text: JSON.stringify([{ name: 'INBOX', unreadMessages: 3 }], null, 2),
+          text: originalText,
         }],
       },
     };
 
     const compacted = compactToolResultJsonText(response);
 
+    assert.notStrictEqual(compacted, response);
     assert.deepStrictEqual(
       JSON.parse(compacted.result.content[0].text),
-      JSON.parse(response.result.content[0].text)
+      JSON.parse(originalText)
     );
+    assert.equal(response.result.content[0].text, originalText);
     assert.equal(compacted.result.content[0].text.includes('\n'), false);
   });
 });
