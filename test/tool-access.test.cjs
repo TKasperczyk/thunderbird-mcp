@@ -66,6 +66,7 @@ const ALL_TOOLS = [
   { name: "getAccountAccess", group: "system", crud: "read" },
   { name: "searchMessages", group: "messages", crud: "read" },
   { name: "getMessage", group: "messages", crud: "read" },
+  { name: "getMessages", group: "messages", crud: "read" },
   { name: "getRecentMessages", group: "messages", crud: "read" },
   { name: "displayMessage", group: "messages", crud: "read" },
   { name: "sendMail", group: "messages", crud: "create" },
@@ -827,5 +828,19 @@ describe("Structural: test data matches production source", () => {
     const prodCrud = m[1].match(/"([^"]+)"/g).map(s => s.replace(/"/g, "")).sort();
     const testCrud = [...VALID_CRUD].sort();
     assert.deepStrictEqual(testCrud, prodCrud, "Test VALID_CRUD doesn't match production");
+  });
+});
+
+// ── Structural: getMessages batch retrieval contract ─────────────────
+
+describe("Structural: getMessages batch retrieval", () => {
+  it("exposes getMessages with a conservative 10-message cap", () => {
+    const apiPath = path.join(__dirname, "..", "extension", "mcp_server", "api.js");
+    const src = fs.readFileSync(apiPath, "utf8");
+
+    assert.match(src, /const MAX_GET_MESSAGES\s*=\s*10;/);
+    assert.match(src, /name:\s*"getMessages"/);
+    assert.match(src, /function getMessages\(/);
+    assert.match(src, /case "getMessages":/);
   });
 });

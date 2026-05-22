@@ -89,6 +89,7 @@ const CRUD_ORDER = { read: 0, create: 1, update: 2, delete: 3 };
 const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccess"]);
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 10000;
+const MAX_GET_MESSAGES = 10;
 // Internal IMAP/Thunderbird keywords that should not appear as user-visible tags
 const INTERNAL_KEYWORDS = new Set([
   "junk", "notjunk", "$forwarded", "$replied",
@@ -170,6 +171,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             rawSource: { type: "boolean", description: "If true, return the full raw RFC 2822 message source (all headers + MIME parts). Useful for extracting calendar invites, S/MIME data, or debugging. Other fields (body, attachments) are omitted when this is set. Note: requires local/offline message copy; IMAP messages not cached offline may fail." },
           },
           required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "getMessages",
+        group: "messages", crud: "read",
+        title: "Get Messages",
+        description: "Read full email content for up to 10 messages in one call. Each item needs messageId and folderPath from searchMessages/getRecentMessages results.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messages: {
+              type: "array",
+              description: "Messages to read, max 10. Each item is { messageId, folderPath }.",
+              items: {
+                type: "object",
+                properties: {
+                  messageId: { type: "string", description: "The message ID" },
+                  folderPath: { type: "string", description: "The folder URI path containing the message" },
+                },
+                required: ["messageId", "folderPath"],
+                additionalProperties: false,
+              },
+            },
+            saveAttachments: { type: "boolean", description: "If true, save attachments for each message and include filePath in attachment metadata (default: false)" },
+            bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format shared by all messages: 'markdown' (default), 'text', or 'html'" },
+            rawSource: { type: "boolean", description: "If true, return raw RFC 2822 source for each message instead of parsed body fields" },
+          },
+          required: ["messages"],
         },
       },
       {
@@ -4137,6 +4166,66 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              });
 	            }
 
+            async function getMessages(messages, saveAttachments, bodyFormat, rawSource) {
+              if (typeof messages === "string") {
+                try { messages = JSON.parse(messages); } catch { /* leave as-is */ }
+              }
+              if (!Array.isArray(messages) || messages.length === 0) {
+                return { error: "messages must be a non-empty array of { messageId, folderPath } objects" };
+              }
+              if (messages.length > MAX_GET_MESSAGES) {
+                return { error: `getMessages accepts at most ${MAX_GET_MESSAGES} messages per call` };
+              }
+
+              const results = [];
+              for (let i = 0; i < messages.length; i++) {
+                const ref = messages[i];
+                if (!ref || typeof ref !== "object" || Array.isArray(ref)) {
+                  results.push({
+                    index: i,
+                    error: "Message reference must be an object with messageId and folderPath",
+                  });
+                  continue;
+                }
+
+                const { messageId, folderPath } = ref;
+                if (typeof messageId !== "string" || !messageId) {
+                  results.push({
+                    index: i,
+                    folderPath,
+                    error: "messageId must be a non-empty string",
+                  });
+                  continue;
+                }
+                if (typeof folderPath !== "string" || !folderPath) {
+                  results.push({
+                    index: i,
+                    messageId,
+                    error: "folderPath must be a non-empty string",
+                  });
+                  continue;
+                }
+
+                const result = await getMessage(
+                  messageId,
+                  folderPath,
+                  saveAttachments,
+                  bodyFormat,
+                  rawSource
+                );
+                results.push({ index: i, messageId, folderPath, ...result });
+              }
+
+              const failed = results.filter(result => result.error).length;
+              return {
+                messages: results,
+                requested: messages.length,
+                succeeded: results.length - failed,
+                failed,
+                max: MAX_GET_MESSAGES,
+              };
+            }
+
             /**
              * Composes a new email. Opens a compose window for review, or sends
              * directly when skipReview is true.
@@ -5791,6 +5880,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
+                case "getMessages":
+                  return await getMessages(args.messages, args.saveAttachments, args.bodyFormat, args.rawSource);
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
                 case "createContact":
