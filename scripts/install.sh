@@ -33,29 +33,162 @@ profile_name() {
 
 platform_profile_roots() {
     case "$(uname -s)" in
-        Darwin)
-            printf '%s\n' \
-                "$HOME/Library/Thunderbird/Profiles" \
-                "$HOME/Library/Application Support/Thunderbird/Profiles"
-            ;;
-        Linux)
-            printf '%s\n' \
-                "$HOME/.thunderbird" \
-                "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird" \
-                "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird" \
-                "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
-            ;;
-        *)
-            echo "Error: Unsupported platform: $(uname -s)" >&2
-            exit 1
-            ;;
+    Darwin)
+        printf '%s\n' \
+            "$HOME/Library/Thunderbird/Profiles" \
+            "$HOME/Library/Application Support/Thunderbird/Profiles"
+        ;;
+    Linux)
+        printf '%s\n' \
+            "$HOME/.thunderbird" \
+            "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird" \
+            "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird" \
+            "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
+        ;;
+    *)
+        echo "Error: Unsupported platform: $(uname -s)" >&2
+        exit 1
+        ;;
     esac
+}
+
+platform_profile_config_dirs() {
+    case "$(uname -s)" in
+    Darwin)
+        printf '%s\n' \
+            "$HOME/Library/Thunderbird" \
+            "$HOME/Library/Application Support/Thunderbird"
+        ;;
+    Linux)
+        printf '%s\n' \
+            "$HOME/.thunderbird" \
+            "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird" \
+            "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird" \
+            "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
+        ;;
+    *)
+        echo "Error: Unsupported platform: $(uname -s)" >&2
+        exit 1
+        ;;
+    esac
+}
+
+emit_profile_if_valid() {
+    local profile_dir="$1"
+
+    if [[ -d "$profile_dir" && -f "$profile_dir/prefs.js" ]]; then
+        echo "$profile_dir"
+    fi
+}
+
+resolve_profile_path() {
+    local config_dir="$1"
+    local is_relative="$2"
+    local profile_path="$3"
+
+    if [[ "$is_relative" == "1" ]]; then
+        echo "$config_dir/$profile_path"
+    else
+        echo "$profile_path"
+    fi
+}
+
+find_profiles_from_ini() {
+    local config_dir
+    local ini_file
+
+    while IFS= read -r config_dir; do
+        ini_file="$config_dir/profiles.ini"
+        if [[ -f "$ini_file" ]]; then
+            parse_profiles_ini "$config_dir" "$ini_file"
+        fi
+    done < <(platform_profile_config_dirs)
+}
+
+parse_profiles_ini() {
+    local config_dir="$1"
+    local ini_file="$2"
+    local in_profile=0
+    local is_relative=""
+    local profile_path=""
+    local is_default=""
+    local default_profiles=()
+    local other_profiles=()
+    local resolved_profile
+    local line
+
+    add_ini_profile() {
+        if [[ "$in_profile" -eq 1 && -n "$profile_path" ]]; then
+            resolved_profile="$(resolve_profile_path "$config_dir" "$is_relative" "$profile_path")"
+            if [[ -d "$resolved_profile" && -f "$resolved_profile/prefs.js" ]]; then
+                if [[ "$is_default" == "1" ]]; then
+                    default_profiles+=("$resolved_profile")
+                else
+                    other_profiles+=("$resolved_profile")
+                fi
+            fi
+        fi
+
+        is_relative=""
+        profile_path=""
+        is_default=""
+    }
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+        "[Profile"*"]")
+            add_ini_profile
+            in_profile=1
+            ;;
+        "["*"]")
+            add_ini_profile
+            in_profile=0
+            ;;
+        IsRelative=*)
+            if [[ "$in_profile" -eq 1 ]]; then
+                is_relative="${line#IsRelative=}"
+            fi
+            ;;
+        Path=*)
+            if [[ "$in_profile" -eq 1 ]]; then
+                profile_path="${line#Path=}"
+            fi
+            ;;
+        Default=*)
+            if [[ "$in_profile" -eq 1 ]]; then
+                is_default="${line#Default=}"
+            fi
+            ;;
+        esac
+    done <"$ini_file"
+
+    add_ini_profile
+
+    if [[ "${#default_profiles[@]}" -gt 0 ]]; then
+        printf '%s\n' "${default_profiles[@]}"
+    fi
+    if [[ "${#other_profiles[@]}" -gt 0 ]]; then
+        printf '%s\n' "${other_profiles[@]}"
+    fi
 }
 
 find_profile_dirs() {
     local roots=()
     local root
     local profile
+    local ini_profiles=()
+
+    while IFS= read -r profile; do
+        if [[ -z "$profile" ]]; then
+            continue
+        fi
+        ini_profiles+=("$profile")
+    done < <(find_profiles_from_ini)
+
+    if [[ "${#ini_profiles[@]}" -gt 0 ]]; then
+        printf '%s\n' "${ini_profiles[@]}"
+        return
+    fi
 
     while IFS= read -r root; do
         roots+=("$root")
@@ -67,25 +200,25 @@ find_profile_dirs() {
         fi
 
         while IFS= read -r profile; do
-            echo "$profile"
+            emit_profile_if_valid "$profile"
         done < <(
             find "$root" \
                 -maxdepth 1 \
                 -type d \
-                \( -name "*.default-release" -o -name "*.default" \) \
-                | sort
+                \( -name "*.default-release" -o -name "*.default" \) |
+                sort
         )
 
         while IFS= read -r profile; do
-            echo "$profile"
+            emit_profile_if_valid "$profile"
         done < <(
             find "$root" \
                 -maxdepth 1 \
                 -type d \
                 ! -path "$root" \
                 ! -name "*.default-release" \
-                ! -name "*.default" \
-                | sort
+                ! -name "*.default" |
+                sort
         )
     done
 }
@@ -115,7 +248,9 @@ read_default_profile() {
 save_default_profile() {
     local profile_dir="$1"
 
-    printf '%s\n' "$profile_dir" > "$DEFAULT_PROFILE_FILE"
+    if ! printf '%s\n' "$profile_dir" >"$DEFAULT_PROFILE_FILE"; then
+        echo "Warning: Could not save default profile to $DEFAULT_PROFILE_FILE" >&2
+    fi
 }
 
 select_profile() {
@@ -124,8 +259,8 @@ select_profile() {
     local index
     local choice
 
-    if default_profile="$(read_default_profile)" \
-        && profile_is_available "$default_profile" "${profiles[@]}"; then
+    if default_profile="$(read_default_profile)" &&
+        profile_is_available "$default_profile" "${profiles[@]}"; then
         echo "$default_profile"
         return
     fi
@@ -134,6 +269,13 @@ select_profile() {
         save_default_profile "${profiles[0]}"
         echo "${profiles[0]}"
         return
+    fi
+
+    if [[ ! -t 0 ]]; then
+        echo "Error: Found multiple Thunderbird profiles and cannot prompt" \
+            "in non-interactive mode." >&2
+        echo "Run scripts/install.sh interactively once to choose and save a default profile." >&2
+        exit 1
     fi
 
     echo "Found ${#profiles[@]} Thunderbird profiles:" >&2
@@ -147,11 +289,14 @@ select_profile() {
 
     while true; do
         printf 'Select profile to install into [1-%d]: ' "${#profiles[@]}" >&2
-        read -r choice
+        if ! read -r choice; then
+            echo "Error: Could not read profile selection." >&2
+            exit 1
+        fi
 
-        if [[ "$choice" =~ ^[0-9]+$ ]] \
-            && (( choice >= 1 )) \
-            && (( choice <= ${#profiles[@]} )); then
+        if [[ "$choice" =~ ^[0-9]+$ ]] &&
+            ((choice >= 1)) &&
+            ((choice <= ${#profiles[@]})); then
             save_default_profile "${profiles[$((choice - 1))]}"
             echo "${profiles[$((choice - 1))]}"
             return
