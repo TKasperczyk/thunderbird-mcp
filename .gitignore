@@ -20,6 +20,9 @@ Thumbs.db
 # Local dev notes (agent/developer orientation, not for upstream)
 DEV_NOTES.md
 
+# Local installer state
+scripts/default-profile
+
 # Node.js
 node_modules/
 package-lock.json
