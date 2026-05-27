@@ -37,6 +37,10 @@ const MCP_LATEST_PROTOCOL_VERSION = "2025-11-25";
 // Bridged into serverInfo.version on initialize. Resolved lazily from the
 // extension manifest so a single bump in extension/manifest.json propagates here.
 let _cachedExtVersion = null;
+function isListenAllEnabled() {
+  try { return Services.prefs.getBoolPref(PREF_LISTEN_ALL, false); } catch { return false; }
+}
+
 function getExtVersion() {
   if (_cachedExtVersion) return _cachedExtVersion;
   try {
@@ -80,6 +84,7 @@ const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
 const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
 const PREF_STABLE_AUTH_TOKEN = "extensions.thunderbird-mcp.stableAuthToken";
 const PREF_GET_MESSAGES_LIMIT = "extensions.thunderbird-mcp.getMessagesLimit";
+const PREF_LISTEN_ALL = "extensions.thunderbird-mcp.listenAll";
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
@@ -6707,10 +6712,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // Try the default port first, then fall back to nearby ports
             let boundPort = null;
+            const listenAll = isListenAllEnabled();
             for (let attempt = 0; attempt < MCP_MAX_PORT_ATTEMPTS; attempt++) {
               const tryPort = MCP_DEFAULT_PORT + attempt;
               try {
-                server.start(tryPort);
+                if (listenAll) {
+                  server.startAll(tryPort);
+                } else {
+                  server.start(tryPort);
+                }
                 boundPort = tryPort;
                 break;
               } catch (portErr) {
@@ -6733,6 +6743,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             console.log(`Thunderbird MCP server listening on port ${boundPort}`);
             console.log(`Connection info written to ${connFilePath}`);
+            if (listenAll) {
+              console.error(`thunderbird-mcp: WARNING - server is listening on all interfaces (0.0.0.0/[::]). This exposes the MCP server to your local network. Only enable on trusted networks.`);
+            }
             return { success: true, port: boundPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
@@ -7022,6 +7035,53 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
         generateAuthToken: async function() {
           return { authToken: generateAuthToken() };
+        },
+
+        getListenAll: async function() {
+          let listenAll = false;
+          try {
+            listenAll = Services.prefs.getBoolPref(PREF_LISTEN_ALL, false);
+          } catch { /* ignore */ }
+          return { listenAll };
+        },
+
+        setListenAll: async function(listenAll) {
+          if (typeof listenAll !== "boolean") {
+            return { error: "listenAll must be a boolean" };
+          }
+          console.log(`[MCP] setListenAll called with: ${listenAll}`);
+          if (listenAll) {
+            Services.prefs.setBoolPref(PREF_LISTEN_ALL, true);
+          } else {
+            try { Services.prefs.clearUserPref(PREF_LISTEN_ALL); } catch { /* ignore */ }
+          }
+
+          // Stop existing server
+          if (globalThis.__tbMcpServer) {
+            const stopServer = globalThis.__tbMcpServer;
+            globalThis.__tbMcpServer = null;
+            // Wait for the socket close callback before rebinding the port.
+            try {
+              await new Promise((resolve) => {
+                try { stopServer.stop(resolve); } catch { resolve(); }
+              });
+            } catch { /* ignore */ }
+          }
+          // Clear sentinels so start() can reinitialize
+          globalThis.__tbMcpStartPromise = null;
+
+          // Remove stale connection file
+          try {
+            const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+            tmpDir.append("thunderbird-mcp");
+            const connFile = tmpDir.clone();
+            connFile.append("connection.json");
+            if (connFile.exists()) connFile.remove(false);
+          } catch { /* best-effort cleanup */ }
+
+          // Restart server with new binding
+          console.log(`[MCP] Restarting server...`);
+          return await this.start();
         },
       }
     };

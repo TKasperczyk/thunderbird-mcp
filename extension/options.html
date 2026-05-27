@@ -204,6 +204,21 @@
     <span class="info-label">Build:</span>
     <span id="buildInfo" class="info-value">--</span>
   </div>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="listenAll">
+        <span>Listen on all interfaces</span>
+      </label>
+    </li>
+  </ul>
+  <p class="mode-note" id="listenAllWarning" style="display:none; color: #d70022;">
+    Warning: this exposes the MCP server to every device on your local network. Enable only on trusted networks.
+  </p>
+  <div class="save-row">
+    <button id="saveListenAllBtn" disabled>Save</button>
+    <span id="saveListenAllStatus" class="save-status"></span>
+  </div>
 </div>
 
 <div class="section">

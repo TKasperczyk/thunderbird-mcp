@@ -179,7 +179,7 @@ That's it. Your AI can now access Thunderbird.
 - **Dynamic port**: Tries ports 8765-8774, records the actual port in the connection file. No hardcoded port dependency.
 - **Account access control**: Restrict which email accounts are visible to MCP clients via the settings page. Changes take effect immediately.
 - **Tool access control**: Disable specific tools via the settings page. Disabled tools are hidden from `tools/list` and blocked at dispatch.
-- **Localhost only**: No remote access. The bridge fails closed -- refuses to forward requests without a valid token.
+- **Localhost only**: By default, the server binds to localhost only. The "Listen on all interfaces" option in settings binds to all IPv4 interfaces for WSL, Docker, or remote access. **This exposes the MCP server to every device on your local network.** Only enable on trusted networks. Auth token is always required.
 
 ---
 

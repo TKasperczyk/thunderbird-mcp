@@ -500,6 +500,11 @@ nsHttpServer.prototype = {
     this._start(port, "[::1]", true);
   },
 
+  // Bind to all interfaces (0.0.0.0 + [::]) for WSL/Docker/remote access.
+  startAll(port) {
+    this._start(port, "0.0.0.0");
+  },
+
   _start(port, host, dualStack) {
     if (this._socket) {
       throw Components.Exception("", Cr.NS_ERROR_ALREADY_INITIALIZED);
