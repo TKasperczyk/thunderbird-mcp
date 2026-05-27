@@ -7058,8 +7058,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
           // Stop existing server
           if (globalThis.__tbMcpServer) {
-            try { globalThis.__tbMcpServer.stop(() => {}); } catch { /* ignore */ }
+            const stopServer = globalThis.__tbMcpServer;
             globalThis.__tbMcpServer = null;
+            // Wait for the socket close callback before rebinding the port.
+            try {
+              await new Promise((resolve) => {
+                try { stopServer.stop(resolve); } catch { resolve(); }
+              });
+            } catch { /* ignore */ }
           }
           // Clear sentinels so start() can reinitialize
           globalThis.__tbMcpStartPromise = null;
