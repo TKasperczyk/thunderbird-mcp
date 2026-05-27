@@ -1,0 +1,851 @@
+/**
+ * Calendar domain module for the Thunderbird MCP server.
+ *
+ * Implements the calendar and task tools: listCalendars, createEvent,
+ * listEvents, updateEvent, deleteEvent, listCategories, createTask,
+ * listTasks, updateTask, plus their internal helpers (getCalendarItems,
+ * calDateToISO, normalizeEventStatus, formatEvent, formatTask,
+ * descriptionToHTML) and the VEVENT_STATUS_MAP constant.
+ *
+ * Loaded by api.js via Services.scriptloader.loadSubScript with a
+ * { module: { exports: {} } } scope, exactly like security_helpers.js.
+ * register(ctx) destructures the shared dependencies (the calendar XPCOM
+ * bindings cal/CalEvent/CalTodo, Services, and the infra helper
+ * isSkipReviewBlocked) from ctx, defines the functions verbatim from the
+ * original monolithic api.js, and assigns the tool functions back onto ctx
+ * for the dispatch switch.
+ *
+ * NOTE: function bodies are copied byte-for-byte from the monolith (original
+ * indentation preserved) so runtime behavior is identical.
+ */
+"use strict";
+
+module.exports = function register(ctx) {
+  const {
+    cal,
+    CalEvent,
+    CalTodo,
+    Services,
+    isSkipReviewBlocked,
+  } = ctx;
+
+            function listCalendars() {
+              if (!cal) {
+                return { error: "Calendar not available" };
+              }
+              try {
+                return cal.manager.getCalendars().map(c => ({
+                  id: c.id,
+                  name: c.name,
+                  type: c.type,
+                  readOnly: c.readOnly,
+                  supportsEvents: c.getProperty("capabilities.events.supported") !== false,
+                  supportsTasks: c.getProperty("capabilities.tasks.supported") !== false,
+                }));
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status) {
+              if (!cal || !CalEvent) {
+                return { error: "Calendar module not available" };
+              }
+              if (skipReview && isSkipReviewBlocked()) {
+                return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review dialog instead." };
+              }
+              try {
+                const win = Services.wm.getMostRecentWindow("mail:3pane");
+                if (!win && !skipReview) {
+                  return { error: "No Thunderbird window found" };
+                }
+
+                const startJs = new Date(startDate);
+                if (isNaN(startJs.getTime())) {
+                  return { error: `Invalid startDate: ${startDate}` };
+                }
+
+                let endJs = endDate ? new Date(endDate) : null;
+                if (endDate && (!endJs || isNaN(endJs.getTime()))) {
+                  return { error: `Invalid endDate: ${endDate}` };
+                }
+
+                if (endJs) {
+                  if (allDay) {
+                    const startDay = new Date(startJs.getFullYear(), startJs.getMonth(), startJs.getDate());
+                    const endDay = new Date(endJs.getFullYear(), endJs.getMonth(), endJs.getDate());
+                    if (endDay.getTime() < startDay.getTime()) {
+                      return { error: "endDate must not be before startDate" };
+                    }
+                  } else if (endJs.getTime() <= startJs.getTime()) {
+                    return { error: "endDate must be after startDate" };
+                  }
+                }
+
+                const event = new CalEvent();
+                event.title = title;
+
+                if (allDay) {
+                  const startDt = cal.createDateTime();
+                  startDt.resetTo(startJs.getFullYear(), startJs.getMonth(), startJs.getDate(), 0, 0, 0, cal.dtz.floating);
+                  startDt.isDate = true;
+                  event.startDate = startDt;
+
+                  const endDt = cal.createDateTime();
+                  if (endJs) {
+                    endDt.resetTo(endJs.getFullYear(), endJs.getMonth(), endJs.getDate(), 0, 0, 0, cal.dtz.floating);
+                    endDt.isDate = true;
+                    // iCal DTEND is exclusive — bump if same as start
+                    if (endDt.compare(startDt) <= 0) {
+                      const bumpedEnd = new Date(endJs.getFullYear(), endJs.getMonth(), endJs.getDate());
+                      bumpedEnd.setDate(bumpedEnd.getDate() + 1);
+                      endDt.resetTo(
+                        bumpedEnd.getFullYear(),
+                        bumpedEnd.getMonth(),
+                        bumpedEnd.getDate(),
+                        0,
+                        0,
+                        0,
+                        cal.dtz.floating
+                      );
+                      endDt.isDate = true;
+                    }
+                  } else {
+                    const defaultEnd = new Date(startJs.getTime());
+                    defaultEnd.setDate(defaultEnd.getDate() + 1);
+                    endDt.resetTo(
+                      defaultEnd.getFullYear(),
+                      defaultEnd.getMonth(),
+                      defaultEnd.getDate(),
+                      0,
+                      0,
+                      0,
+                      cal.dtz.floating
+                    );
+                    endDt.isDate = true;
+                  }
+                  event.endDate = endDt;
+                } else {
+                  event.startDate = cal.dtz.jsDateToDateTime(startJs, cal.dtz.defaultTimezone);
+                  if (endJs) {
+                    event.endDate = cal.dtz.jsDateToDateTime(endJs, cal.dtz.defaultTimezone);
+                  } else {
+                    const defaultEnd = new Date(startJs.getTime() + 3600000);
+                    event.endDate = cal.dtz.jsDateToDateTime(defaultEnd, cal.dtz.defaultTimezone);
+                  }
+                }
+
+                if (location) event.setProperty("LOCATION", location);
+                if (description) event.setProperty("DESCRIPTION", description);
+                if (status !== undefined && status !== null && status !== "") {
+                  const normalized = normalizeEventStatus(status);
+                  if (!normalized) {
+                    return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
+                  }
+                  event.setProperty("STATUS", normalized);
+                }
+
+                // Find target calendar
+                const calendars = cal.manager.getCalendars();
+                let targetCalendar = null;
+                if (calendarId) {
+                  targetCalendar = calendars.find(c => c.id === calendarId);
+                  if (!targetCalendar) {
+                    return { error: `Calendar not found: ${calendarId}` };
+                  }
+                  if (targetCalendar.readOnly) {
+                    return { error: `Calendar is read-only: ${targetCalendar.name}` };
+                  }
+                } else {
+                  targetCalendar = calendars.find(c => !c.readOnly);
+                  if (!targetCalendar) {
+                    return { error: "No writable calendar found" };
+                  }
+                }
+
+                event.calendar = targetCalendar;
+
+                if (skipReview) {
+                  await targetCalendar.addItem(event);
+                  return { success: true, message: `Event "${title}" added to calendar "${targetCalendar.name}"` };
+                }
+
+                const args = {
+                  calendarEvent: event,
+                  calendar: targetCalendar,
+                  mode: "new",
+                  inTab: false,
+                  onOk(item, calendar) {
+                    calendar.addItem(item);
+                  },
+                };
+
+                win.openDialog(
+                  "chrome://calendar/content/calendar-event-dialog.xhtml",
+                  "_blank",
+                  "centerscreen,chrome,titlebar,toolbar,resizable",
+                  args
+                );
+
+                return { success: true, message: `Event dialog opened for "${title}" on calendar "${targetCalendar.name}"` };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function getCalendarItems(calendar, rangeStart, rangeEnd) {
+              const FILTER_EVENT = 1 << 3;
+              if (typeof calendar.getItemsAsArray === "function") {
+                return await calendar.getItemsAsArray(FILTER_EVENT, 0, rangeStart, rangeEnd);
+              }
+              // Fallback for older Thunderbird versions using ReadableStream
+              const items = [];
+              const stream = cal.iterate.streamValues(calendar.getItems(FILTER_EVENT, 0, rangeStart, rangeEnd));
+              for await (const chunk of stream) {
+                for (const i of chunk) items.push(i);
+              }
+              return items;
+            }
+
+            function calDateToISO(dt) {
+              if (!dt) return null;
+              try { return new Date(dt.nativeTime / 1000).toISOString(); }
+              catch { return dt.icalString || null; }
+            }
+
+            // VEVENT STATUS values per iCal RFC 5545 § 3.8.1.11.
+            const VEVENT_STATUS_MAP = {
+              tentative: "TENTATIVE",
+              confirmed: "CONFIRMED",
+              cancelled: "CANCELLED",
+              canceled: "CANCELLED",
+            };
+            function normalizeEventStatus(status) {
+              if (status === undefined || status === null) return null;
+              return VEVENT_STATUS_MAP[String(status).trim().toLowerCase()] || null;
+            }
+
+            function formatEvent(item, calendar) {
+              const allDay = item.startDate ? item.startDate.isDate : false;
+              // For all-day events, iCal DTEND is exclusive. Convert to inclusive
+              // (last day of event) so the API is intuitive and round-trips correctly.
+              let endDateISO = calDateToISO(item.endDate);
+              if (allDay && item.endDate) {
+                try {
+                  const raw = new Date(item.endDate.nativeTime / 1000);
+                  raw.setDate(raw.getDate() - 1);
+                  endDateISO = raw.toISOString();
+                } catch { /* keep raw value */ }
+              }
+              const result = {
+                id: item.id,
+                calendarId: calendar.id,
+                calendarName: calendar.name,
+                title: item.title || "",
+                startDate: calDateToISO(item.startDate),
+                endDate: endDateISO,
+                location: item.getProperty("LOCATION") || "",
+                description: item.getProperty("DESCRIPTION") || "",
+                // VEVENT STATUS (tentative/confirmed/cancelled). Empty string
+                // when the event has no explicit status (iCal spec treats this
+                // as implicit -- Thunderbird renders it like confirmed).
+                status: (item.getProperty("STATUS") || "").toLowerCase(),
+                allDay,
+                isRecurring: !!item.recurrenceInfo,
+              };
+              // Occurrences of recurring events share the parent's id.
+              // Include recurrenceId so callers can distinguish them.
+              if (item.recurrenceId) {
+                result.recurrenceId = calDateToISO(item.recurrenceId);
+              }
+              return result;
+            }
+
+            function formatTask(item, calendar) {
+              const completed = item.isCompleted || (item.percentComplete === 100);
+              const priority = item.priority || 0; // 0=undefined, 1=high, 5=normal, 9=low per iCal
+              return {
+                id: item.id,
+                calendarId: calendar.id,
+                calendarName: calendar.name,
+                title: item.title || "",
+                dueDate: calDateToISO(item.dueDate),
+                startDate: calDateToISO(item.entryDate),
+                completedDate: calDateToISO(item.completedDate),
+                completed,
+                percentComplete: item.percentComplete || 0,
+                priority,
+                description: item.getProperty("DESCRIPTION") || "",
+              };
+            }
+
+            async function updateTask(taskId, calendarId, title, dueDate, description, completed, percentComplete, priority) {
+              if (!cal) return { error: "Calendar not available" };
+              try {
+                if (!taskId) return { error: "taskId is required" };
+                if (!calendarId) return { error: "calendarId is required" };
+
+                const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
+                if (!calendar) return { error: `Calendar not found: ${calendarId}` };
+                if (calendar.readOnly) return { error: `Calendar is read-only: ${calendar.name}` };
+                if (calendar.getProperty("capabilities.tasks.supported") === false) {
+                  return { error: `Calendar "${calendar.name}" does not support tasks. Use listCalendars to find one with supportsTasks=true.` };
+                }
+
+                // Try direct lookup first, then fall back to scanning all tasks
+                let oldItem = null;
+                if (typeof calendar.getItem === "function") {
+                  try { oldItem = await calendar.getItem(taskId); } catch {}
+                }
+                if (!oldItem) {
+                  const FILTER_TODO = 1 << 2;
+                  const COMPLETED_YES = 1 << 0;
+                  const COMPLETED_NO = 1 << 1;
+                  let items;
+                  if (typeof calendar.getItemsAsArray === "function") {
+                    items = await calendar.getItemsAsArray(FILTER_TODO | COMPLETED_YES | COMPLETED_NO, 0, null, null);
+                  } else {
+                    items = [];
+                    const stream = cal.iterate.streamValues(calendar.getItems(FILTER_TODO | COMPLETED_YES | COMPLETED_NO, 0, null, null));
+                    for await (const chunk of stream) {
+                      for (const i of chunk) items.push(i);
+                    }
+                  }
+                  oldItem = items.find(i => i.id === taskId) || null;
+                }
+                if (!oldItem) return { error: `Task not found: ${taskId}` };
+
+                const newItem = oldItem.clone();
+                const changes = [];
+
+                if (title !== undefined) { newItem.title = title; changes.push("title"); }
+                if (description !== undefined) { newItem.descriptionHTML = descriptionToHTML(description); changes.push("description"); }
+                if (priority !== undefined) {
+                  if (priority !== null && (!Number.isInteger(priority) || priority < 0 || priority > 9)) {
+                    return { error: "priority must be an integer between 0 and 9 (0=unset, 1=high, 5=normal, 9=low)" };
+                  }
+                  newItem.priority = priority ?? 0;
+                  changes.push("priority");
+                }
+
+                if (dueDate !== undefined) {
+                  // Explicit null or empty string clears the due date.
+                  // Without this, `new Date(null).getTime() === 0` would
+                  // silently write Unix epoch (1970-01-01) instead.
+                  if (dueDate === null || dueDate === "") {
+                    newItem.dueDate = null;
+                  } else {
+                    const js = new Date(dueDate);
+                    if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
+                    if (/^\d{4}-\d{2}-\d{2}$/.test(dueDate.trim())) {
+                      const dt = cal.createDateTime();
+                      dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                      dt.isDate = true;
+                      newItem.dueDate = dt;
+                    } else {
+                      newItem.dueDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                    }
+                  }
+                  changes.push("dueDate");
+                }
+
+                // 'completed' and 'percentComplete' both control completion state.
+                // Reject ambiguous input rather than guessing precedence.
+                if (completed !== undefined && percentComplete !== undefined) {
+                  return { error: "Specify either 'completed' or 'percentComplete', not both" };
+                }
+
+                // Apply completion state keeping STATUS, PERCENT-COMPLETE, and
+                // COMPLETED consistent per iCal RFC 5545 VTODO rules -- so
+                // Thunderbird's UI and other consumers see a valid task state.
+                function applyCompletionState(pct) {
+                  const clamped = Math.min(100, Math.max(0, pct));
+                  newItem.percentComplete = clamped;
+                  if (clamped === 100) {
+                    newItem.setProperty("STATUS", "COMPLETED");
+                    newItem.completedDate = cal.dtz.jsDateToDateTime(new Date(), cal.dtz.defaultTimezone);
+                  } else if (clamped === 0) {
+                    newItem.setProperty("STATUS", "NEEDS-ACTION");
+                    newItem.completedDate = null;
+                  } else {
+                    newItem.setProperty("STATUS", "IN-PROCESS");
+                    newItem.completedDate = null;
+                  }
+                }
+
+                if (percentComplete !== undefined) {
+                  applyCompletionState(percentComplete);
+                  changes.push("percentComplete");
+                }
+
+                if (completed !== undefined) {
+                  applyCompletionState(completed ? 100 : 0);
+                  changes.push("completed");
+                }
+
+                if (changes.length === 0) return { error: "No changes specified" };
+
+                await calendar.modifyItem(newItem, oldItem);
+                const result = { success: true, updated: changes, task: formatTask(newItem, calendar) };
+                if (newItem.recurrenceInfo) {
+                  result.warning = "This is a recurring task -- changes apply to the entire series.";
+                }
+                return result;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function listEvents(calendarId, startDate, endDate, maxResults) {
+              if (!cal) {
+                return { error: "Calendar not available" };
+              }
+              try {
+                const calendars = cal.manager.getCalendars();
+                let targets = calendars;
+                if (calendarId) {
+                  const found = calendars.find(c => c.id === calendarId);
+                  if (!found) return { error: `Calendar not found: ${calendarId}` };
+                  targets = [found];
+                }
+
+                const startJs = startDate ? new Date(startDate) : new Date();
+                if (isNaN(startJs.getTime())) return { error: `Invalid startDate: ${startDate}` };
+                const endJs = endDate ? new Date(endDate) : new Date(startJs.getTime() + 30 * 86400000);
+                if (isNaN(endJs.getTime())) return { error: `Invalid endDate: ${endDate}` };
+
+                const rangeStart = cal.dtz.jsDateToDateTime(startJs, cal.dtz.defaultTimezone);
+                const rangeEnd = cal.dtz.jsDateToDateTime(endJs, cal.dtz.defaultTimezone);
+                const limit = Math.min(Math.max(maxResults || 100, 1), 500);
+
+                // Two-phase query to correctly handle recurring events.
+                //
+                // The FILTER_OCCURRENCES flag is intended to make the storage layer
+                // expand recurring masters and return individual occurrences within the
+                // date range. In practice this does not work for offline-backed calendars
+                // (e.g. OWL/Exchange): recurring masters are stored with event_start set
+                // to their original first occurrence date, which is typically outside the
+                // queried range, so a date-range query never returns them and the manual
+                // expansion at the call site never runs.
+                //
+                // Fix — Phase 1: fetch non-recurring events and modified-occurrence
+                // exceptions within the date range (their event_start is inside the
+                // range). Phase 2: fetch ALL recurring masters without a date filter,
+                // then expand each with recurrenceInfo.getOccurrences() and keep only
+                // occurrences that fall within the queried range.
+                const FILTER_EVENT = 1 << 3;
+                const results = [];
+                for (const calendar of targets) {
+                  // Phase 1: non-recurring events + modified-occurrence exceptions.
+                  // Bounded by the date range so no expansion cap is needed here --
+                  // applying one would risk starving Phase 2 on wide ranges.
+                  const rangeItems = await getCalendarItems(calendar, rangeStart, rangeEnd);
+                  for (const item of rangeItems) {
+                    if (!item.recurrenceInfo) results.push(formatEvent(item, calendar));
+                  }
+
+                  // Phase 2: all recurring masters (no date filter) → manual expansion.
+                  let allItems = [];
+                  try {
+                    if (typeof calendar.getItemsAsArray === "function") {
+                      allItems = await calendar.getItemsAsArray(FILTER_EVENT, 0, null, null);
+                    } else {
+                      const stream = cal.iterate.streamValues(calendar.getItems(FILTER_EVENT, 0, null, null));
+                      for await (const chunk of stream) {
+                        for (const i of chunk) allItems.push(i);
+                      }
+                    }
+                  } catch {
+                    allItems = rangeItems;
+                  }
+
+                  // Cap recurring expansion to prevent a malformed daily-over-decades
+                  // master from blowing up the result. Tracked independently of Phase 1
+                  // so a busy date range cannot starve recurring expansion.
+                  const OCCURRENCE_EXPANSION_CAP = limit * 10;
+                  let expanded = 0;
+                  for (const item of allItems) {
+                    if (expanded >= OCCURRENCE_EXPANSION_CAP) break;
+                    if (!item.recurrenceInfo) continue;
+                    try {
+                      const occurrences = item.recurrenceInfo.getOccurrences(rangeStart, rangeEnd, 0);
+                      for (const occ of occurrences) {
+                        if (expanded >= OCCURRENCE_EXPANSION_CAP) break;
+                        results.push(formatEvent(occ, calendar));
+                        expanded++;
+                      }
+                    } catch (e) {
+                      // Don't push the master on failure -- its event_start is the original
+                      // first-occurrence date and is almost certainly outside the queried
+                      // range, which would pollute results with stale events.
+                      console.warn("thunderbird-mcp: recurrence expansion failed for", item.id || item.title, e);
+                    }
+                  }
+                }
+
+                results.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+                return results.slice(0, limit);
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function listCategories() {
+              try {
+                return cal.category.fromPrefs().sort((a, b) => a.localeCompare(b));
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function listTasks(calendarId, completed, dueBefore, maxResults) {
+              if (!cal) return { error: "Calendar not available" };
+              try {
+                const calendars = cal.manager.getCalendars();
+                let targets = calendars.filter(c =>
+                  c.getProperty("capabilities.tasks.supported") !== false
+                );
+                if (calendarId) {
+                  const found = calendars.find(c => c.id === calendarId);
+                  if (!found) return { error: `Calendar not found: ${calendarId}` };
+                  if (found.getProperty("capabilities.tasks.supported") === false) {
+                    return { error: `Calendar "${found.name}" does not support tasks` };
+                  }
+                  targets = [found];
+                }
+
+                let dueBeforeDt = null;
+                if (dueBefore) {
+                  const js = new Date(dueBefore);
+                  if (isNaN(js.getTime())) return { error: `Invalid dueBefore: ${dueBefore}` };
+                  dueBeforeDt = js;
+                }
+
+                const limit = Math.min(Math.max(maxResults || 100, 1), 500);
+                // Thunderbird calICalendar filter bits:
+                // TYPE_TODO = 1<<2, COMPLETED_YES = 1<<0, COMPLETED_NO = 1<<1
+                const FILTER_TODO = 1 << 2;
+                const COMPLETED_YES = 1 << 0;
+                const COMPLETED_NO = 1 << 1;
+                let itemFilter = FILTER_TODO;
+                if (completed === true) {
+                  itemFilter |= COMPLETED_YES;
+                } else if (completed === false) {
+                  itemFilter |= COMPLETED_NO;
+                } else {
+                  itemFilter |= COMPLETED_YES | COMPLETED_NO;
+                }
+                const TASK_COLLECTION_CAP = limit * 10;
+                const results = [];
+
+                for (const calendar of targets) {
+                  let items;
+                  try {
+                    if (typeof calendar.getItemsAsArray === "function") {
+                      items = await calendar.getItemsAsArray(itemFilter, 0, null, null);
+                    } else {
+                      items = [];
+                      const stream = cal.iterate.streamValues(calendar.getItems(itemFilter, 0, null, null));
+                      for await (const chunk of stream) {
+                        for (const i of chunk) items.push(i);
+                      }
+                    }
+                  } catch {
+                    continue; // Skip calendars that fail to query
+                  }
+
+                  for (const item of items) {
+                    if (results.length >= TASK_COLLECTION_CAP) break;
+                    // Filter by due date -- exclude undated tasks when dueBefore is set
+                    if (dueBeforeDt) {
+                      if (!item.dueDate) continue;
+                      try {
+                        const due = new Date(item.dueDate.nativeTime / 1000);
+                        if (due >= dueBeforeDt) continue;
+                      } catch { /* include if we can't parse */ }
+                    }
+                    results.push(formatTask(item, calendar));
+                  }
+                }
+
+                // Sort by dueDate (nulls last), then title
+                results.sort((a, b) => {
+                  if (a.dueDate && b.dueDate) return new Date(a.dueDate) - new Date(b.dueDate);
+                  if (a.dueDate) return -1;
+                  if (b.dueDate) return 1;
+                  return (a.title || "").localeCompare(b.title || "");
+                });
+                return results.slice(0, limit);
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurringScope) {
+              if (!cal) return { error: "Calendar not available" };
+              try {
+                if (!eventId) return { error: "eventId is required" };
+                if (!calendarId) return { error: "calendarId is required" };
+
+                const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
+                if (!calendar) return { error: `Calendar not found: ${calendarId}` };
+                if (calendar.readOnly) return { error: `Calendar is read-only: ${calendar.name}` };
+
+                // Use getItem API if available, else scan
+                let oldItem = null;
+                if (typeof calendar.getItem === "function") {
+                  try { oldItem = await calendar.getItem(eventId); } catch {}
+                }
+                if (!oldItem) {
+                  // Fallback: scan all events
+                  const all = await getCalendarItems(calendar, null, null);
+                  oldItem = all.find(i => i.id === eventId) || null;
+                }
+                if (!oldItem) return { error: `Event not found: ${eventId}` };
+
+                // SAFETY: refuse to silently rewrite an entire recurring
+                // series. updateItem on a recurring master applies the
+                // change to every past and future occurrence, which is
+                // surprising and rarely what an agent intended. Require
+                // the caller to explicitly opt in via recurringScope.
+                if (oldItem.recurrenceInfo && recurringScope !== "series") {
+                  return {
+                    error: "Refusing to update a recurring event without an explicit recurringScope. Pass recurringScope: 'series' to rewrite the entire series. Per-occurrence updates are not supported via this API; use Thunderbird's UI.",
+                  };
+                }
+
+                const newItem = oldItem.clone();
+                const changes = [];
+
+                if (title !== undefined) { newItem.title = title; changes.push("title"); }
+
+                if (startDate !== undefined) {
+                  const js = new Date(startDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid startDate: ${startDate}` };
+                  if (newItem.startDate && newItem.startDate.isDate) {
+                    const dt = cal.createDateTime();
+                    dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                    dt.isDate = true;
+                    newItem.startDate = dt;
+                  } else {
+                    newItem.startDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  }
+                  changes.push("startDate");
+                }
+
+                if (endDate !== undefined) {
+                  const js = new Date(endDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid endDate: ${endDate}` };
+                  if (newItem.endDate && newItem.endDate.isDate) {
+                    const dt = cal.createDateTime();
+                    // iCal DTEND is exclusive for all-day -- bump by 1 day
+                    const next = new Date(js.getFullYear(), js.getMonth(), js.getDate());
+                    next.setDate(next.getDate() + 1);
+                    dt.resetTo(next.getFullYear(), next.getMonth(), next.getDate(), 0, 0, 0, cal.dtz.floating);
+                    dt.isDate = true;
+                    newItem.endDate = dt;
+                  } else {
+                    newItem.endDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  }
+                  changes.push("endDate");
+                }
+
+                if (location !== undefined) { newItem.setProperty("LOCATION", location); changes.push("location"); }
+                if (description !== undefined) { newItem.setProperty("DESCRIPTION", description); changes.push("description"); }
+                if (status !== undefined) {
+                  if (status === null || status === "") {
+                    newItem.deleteProperty("STATUS");
+                  } else {
+                    const normalized = normalizeEventStatus(status);
+                    if (!normalized) {
+                      return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
+                    }
+                    newItem.setProperty("STATUS", normalized);
+                  }
+                  changes.push("status");
+                }
+
+                if (changes.length === 0) return { error: "No changes specified" };
+
+                // Validate end > start after all changes
+                if (newItem.startDate && newItem.endDate && newItem.endDate.compare(newItem.startDate) <= 0) {
+                  return { error: "endDate must be after startDate" };
+                }
+
+                await calendar.modifyItem(newItem, oldItem);
+                const result = { success: true, updated: changes };
+                if (oldItem.recurrenceInfo) {
+                  result.warning = "This is a recurring event -- changes apply to the entire series.";
+                }
+                return result;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            async function deleteEvent(eventId, calendarId, recurringScope) {
+              if (!cal) return { error: "Calendar not available" };
+              try {
+                if (!eventId) return { error: "eventId is required" };
+                if (!calendarId) return { error: "calendarId is required" };
+
+                const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
+                if (!calendar) return { error: `Calendar not found: ${calendarId}` };
+                if (calendar.readOnly) return { error: `Calendar is read-only: ${calendar.name}` };
+
+                let item = null;
+                if (typeof calendar.getItem === "function") {
+                  try { item = await calendar.getItem(eventId); } catch {}
+                }
+                if (!item) {
+                  const all = await getCalendarItems(calendar, null, null);
+                  item = all.find(i => i.id === eventId) || null;
+                }
+                if (!item) return { error: `Event not found: ${eventId}` };
+
+                const isRecurring = !!item.recurrenceInfo;
+                if (isRecurring && recurringScope !== "series") {
+                  return {
+                    error: "Refusing to delete a recurring event without an explicit recurringScope. Pass recurringScope: 'series' to delete every occurrence. Per-occurrence deletion is not supported via this API; use Thunderbird's UI.",
+                  };
+                }
+
+                await calendar.deleteItem(item);
+                const result = { success: true, deleted: eventId };
+                if (isRecurring) {
+                  result.warning = "The entire series was deleted.";
+                }
+                return result;
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function descriptionToHTML(text) {
+              if (text == null || text === "") return "";
+              // Strip null bytes so the sentinel below can't collide with user input.
+              const input = String(text).replace(/\x00/g, "");
+              const escapeText = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+              const escapeAttr = s => escapeText(s).replace(/"/g, "&quot;");
+              const SAFE_HREF = /^(?:https?:|mailto:)/i;
+
+              // Stash sanitized anchors so the global HTML-escape doesn't double-escape
+              // them. Anchors with unsafe (e.g. javascript:, data:) or missing href are
+              // dropped to plain text -- TB's task UI sanitizes on render but the raw
+              // markup is persisted in ALTREP and may be consumed by other clients.
+              const anchors = [];
+              let processed = input.replace(/<a\b[^>]*>([\s\S]*?)<\/a>/gi, (whole, inner) => {
+                const hrefMatch = whole.match(/href\s*=\s*(['"])([^'"]*)\1/i);
+                const innerText = escapeText(inner.replace(/<[^>]+>/g, ""));
+                if (!hrefMatch || !SAFE_HREF.test(hrefMatch[2].trim())) {
+                  return innerText;
+                }
+                anchors.push(`<a href="${escapeAttr(hrefMatch[2].trim())}">${innerText}</a>`);
+                return `\x00ANCHOR${anchors.length - 1}\x00`;
+              });
+
+              // Escape remaining plain text, then auto-link bare URLs.
+              processed = escapeText(processed).replace(
+                /https?:\/\/[^\s<>"]+/g,
+                url => `<a href="${escapeAttr(url)}">${url}</a>`
+              );
+
+              // Restore sanitized anchors and convert newlines.
+              processed = processed.replace(/\x00ANCHOR(\d+)\x00/g, (_, i) => anchors[i]);
+              return `<html><body><div>${processed.replace(/\n/g, "<br>")}</div></body></html>`;
+            }
+
+            async function createTask(title, dueDate, calendarId, description, priority, categories, skipReview) {
+              if (!cal || !CalTodo) return { error: "Calendar module not available" };
+              if (skipReview && isSkipReviewBlocked()) {
+                return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review dialog instead." };
+              }
+              try {
+                let dueDt = null;
+                if (dueDate) {
+                  const js = new Date(dueDate);
+                  if (isNaN(js.getTime())) return { error: `Invalid dueDate: ${dueDate}` };
+                  // Date-only string (YYYY-MM-DD) means all-day
+                  if (/^\d{4}-\d{2}-\d{2}$/.test(dueDate.trim())) {
+                    dueDt = cal.createDateTime();
+                    dueDt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
+                    dueDt.isDate = true;
+                  } else {
+                    dueDt = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                  }
+                }
+
+                // Find target calendar (must support tasks)
+                let targetCalendar = null;
+                if (calendarId) {
+                  targetCalendar = cal.manager.getCalendars().find(c => c.id === calendarId);
+                  if (!targetCalendar) return { error: `Calendar not found: ${calendarId}` };
+                  if (targetCalendar.readOnly) return { error: `Calendar is read-only: ${targetCalendar.name}` };
+                  if (targetCalendar.getProperty("capabilities.tasks.supported") === false) {
+                    return { error: `Calendar "${targetCalendar.name}" does not support tasks. Use listCalendars to find one with supportsTasks=true.` };
+                  }
+                }
+
+                // Build a fully-populated CalTodo. The extension runs in addon_parent
+                // (main-process privileged context) and imports CalTodo from the same
+                // resource:/// ESModule singleton as the chrome, so the object is fully
+                // interoperable with createTodoWithDialog and the task edit dialog.
+                if (priority !== undefined && priority !== null) {
+                  if (!Number.isInteger(priority) || priority < 0 || priority > 9) {
+                    return { error: "priority must be an integer between 0 and 9 (0=unset, 1=high, 5=normal, 9=low)" };
+                  }
+                }
+
+                const todo = new CalTodo();
+                todo.title = title;
+                if (dueDt) todo.dueDate = dueDt;
+                if (description) todo.descriptionHTML = descriptionToHTML(description);
+                if (priority !== undefined && priority !== null) todo.priority = priority;
+                if (categories && categories.length > 0) todo.setCategories(categories);
+                if (targetCalendar) todo.calendar = targetCalendar;
+
+                if (skipReview) {
+                  if (!targetCalendar) {
+                    targetCalendar = cal.manager.getCalendars().find(
+                      c => !c.readOnly && c.getProperty("capabilities.tasks.supported") !== false
+                    );
+                    if (!targetCalendar) return { error: "No writable task-capable calendar found" };
+                    todo.calendar = targetCalendar;
+                  }
+                  await targetCalendar.addItem(todo);
+                  return { success: true, message: `Task "${title}" created in calendar "${targetCalendar.name}"` };
+                }
+
+                const win = Services.wm.getMostRecentWindow("mail:3pane");
+                if (!win) return { error: "No Thunderbird window found" };
+
+                // Pass the pre-populated CalTodo to the dialog. createTodoWithDialog
+                // clones it (clearing the id) before opening, so all fields are
+                // pre-filled and the user can review or cancel without side effects.
+                win.createTodoWithDialog(targetCalendar, dueDt, null, todo);
+
+                return { success: true, message: `Task dialog opened for "${title}"` };
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+  Object.assign(ctx, {
+    listCalendars,
+    createEvent,
+    getCalendarItems,
+    calDateToISO,
+    normalizeEventStatus,
+    formatEvent,
+    formatTask,
+    updateTask,
+    listEvents,
+    listCategories,
+    listTasks,
+    updateEvent,
+    deleteEvent,
+    descriptionToHTML,
+    createTask,
+  });
+};
+
