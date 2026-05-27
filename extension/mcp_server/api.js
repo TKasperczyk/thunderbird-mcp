@@ -5129,11 +5129,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // Use Thunderbird's native emptyTrash when available (handles
                   // IMAP expunge, subfolders, and compaction correctly)
                   if (typeof trash.emptyTrash === "function") {
-                    const win = Services.wm.getMostRecentWindow("mail:3pane");
-                    trash.emptyTrash(win?.msgWindow ?? null, null);
+                    try {
+                      // TB 128+ dropped msgWindow arg
+                      trash.emptyTrash(null);
+                    } catch (e) {
+                      const isArgError = (e && (e.result === 0x80570001 || e.result === 0x80570009)) ||
+                        String(e).includes("Not enough arguments") ||
+                        String(e).includes("Could not convert JavaScript argument");
+                      if (isArgError) {
+                        const win = Services.wm.getMostRecentWindow("mail:3pane");
+                        trash.emptyTrash(win?.msgWindow ?? null, null);
+                      } else {
+                        throw e;
+                      }
+                    }
                     results.push({ account: account.key, folder: trash.URI, status: "emptied" });
                   } else {
-                    // Fallback: manually delete messages in folder + subfolders
                     const deleted = deleteAllMessagesRecursive(trash);
                     results.push({ account: account.key, folder: trash.URI, deleted });
                   }
