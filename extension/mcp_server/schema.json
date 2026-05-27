@@ -87,6 +87,94 @@
         ]
       },
       {
+        "name": "getBlockFilterForwardReply",
+        "type": "function",
+        "async": true,
+        "description": "Get whether filter forward/reply actions are blocked by user preference",
+        "parameters": []
+      },
+      {
+        "name": "setBlockFilterForwardReply",
+        "type": "function",
+        "async": true,
+        "description": "Set whether filter forward/reply actions are blocked by user preference",
+        "parameters": [
+          {
+            "name": "blockFilterForwardReply",
+            "type": "boolean",
+            "description": "When true, createFilter / updateFilter refuse 'forward' and 'reply' action types."
+          }
+        ]
+      },
+      {
+        "name": "getBlockContactWrites",
+        "type": "function",
+        "async": true,
+        "description": "Get whether contact write operations are blocked by user preference",
+        "parameters": []
+      },
+      {
+        "name": "setBlockContactWrites",
+        "type": "function",
+        "async": true,
+        "description": "Set whether contact write operations are blocked by user preference",
+        "parameters": [
+          {
+            "name": "blockContactWrites",
+            "type": "boolean",
+            "description": "When true, createContact / updateContact / deleteContact are refused."
+          }
+        ]
+      },
+      {
+        "name": "getBlockMailboxExport",
+        "type": "function",
+        "async": true,
+        "description": "Get whether bulk mailbox export is blocked by user preference",
+        "parameters": []
+      },
+      {
+        "name": "setBlockMailboxExport",
+        "type": "function",
+        "async": true,
+        "description": "Set whether bulk mailbox export is blocked by user preference",
+        "parameters": [
+          {
+            "name": "blockMailboxExport",
+            "type": "boolean",
+            "description": "When true, exportMailbox refuses to run."
+          }
+        ]
+      },
+      {
+        "name": "readAuditLog",
+        "type": "function",
+        "async": true,
+        "description": "Read parsed entries from the audit log newest-first",
+        "parameters": [
+          {
+            "name": "maxEntries",
+            "type": "integer",
+            "optional": true,
+            "description": "Max entries to return (default 500, hard cap 10000)"
+          },
+          {
+            "name": "filter",
+            "type": "object",
+            "optional": true,
+            "additionalProperties": { "type": "any" },
+            "description": "Optional filter: { tool?: string, since?: ISO string, until?: ISO string }"
+          }
+        ]
+      },
+      {
+        "name": "clearAuditLog",
+        "type": "function",
+        "async": true,
+        "description": "Truncate both audit.log and audit.log.1. Returns bytesRemoved.",
+        "parameters": []
+      },
+      {
         "name": "getStableAuthToken",
         "type": "function",
         "async": true,

@@ -68,9 +68,17 @@ const _tempAttachFiles = new Set();
 // WeakSet so entries are collected automatically when the window is destroyed.
 const _claimedComposeWindows = new WeakSet();
 const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
+// Cap file-path attachments to the same magnitude as saved-message attachments.
+// Prevents an MCP caller from attaching multi-GB files to a single outgoing message.
+const MAX_FILE_PATH_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 // Must be large enough to carry MAX_BASE64_SIZE plus JSON-RPC framing overhead.
 // The httpd.sys.mjs pre-buffer cap uses the same value.
 const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP request bodies
+
+// Pure helpers (deny-list, header sanitizer, URL allow-lists, schema walker,
+// audit helpers) live in security_helpers.js so the Node test suite can
+// exercise the same code that ships in production. The module is loaded
+// inside getAPI() below because resource:// URIs aren't usable at file scope.
 let _tempFileCounter = 0;
 // Delay before injecting attachments into a newly opened compose window.
 const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
@@ -79,6 +87,23 @@ const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
 const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
 const PREF_STABLE_AUTH_TOKEN = "extensions.thunderbird-mcp.stableAuthToken";
+// Gate `forward` and `reply` actions on filter creation/update. Filters run on
+// every incoming message and never open a review UI, so a single createFilter
+// call can install a permanent silent-exfiltration rule. Default is to refuse
+// these action types via the MCP API; users who legitimately need them can
+// flip this pref or create the filter manually in Thunderbird.
+const PREF_BLOCK_FILTER_FORWARD_REPLY = "extensions.thunderbird-mcp.blockFilterForwardReply";
+// Gate write operations on address books. createContact / updateContact /
+// deleteContact have no UI confirmation, span every address book the user has
+// configured, and could be used to spoof an existing contact (change Boss's
+// email to attacker@evil.com) so the user's future replies are silently
+// misrouted. Default is to refuse contact writes; users who want LLM-driven
+// contact management opt in via the options page.
+const PREF_BLOCK_CONTACT_WRITES = "extensions.thunderbird-mcp.blockContactWrites";
+// Gate exportMailbox. Bulk-exports walk thousands of messages, may run for
+// many seconds, and write the user's mail content to a JSON file on disk.
+// Default off-by-pref so an LLM cannot mass-extract mailbox content silently.
+const PREF_BLOCK_MAILBOX_EXPORT = "extensions.thunderbird-mcp.blockMailboxExport";
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
@@ -107,6 +132,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       extensionRoot,
       resProto.ALLOW_CONTENT_ACCESS
     );
+
+    // Load pure helpers from security_helpers.js. We pass a scope object with
+    // a `module.exports` shim so the file can use standard CommonJS exports
+    // syntax; that lets the Node test suite require() it directly without a
+    // dual-format wrapper.
+    const __helperScope = { module: { exports: {} } };
+    Services.scriptloader.loadSubScript(
+      "resource://thunderbird-mcp/mcp_server/security_helpers.js?" + Date.now(),
+      __helperScope
+    );
+    const {
+      isSensitiveFilePath,
+      sanitizeHeaderLine,
+      UNTRUSTED_CLOSE,
+      wrapUntrustedBody,
+      wrapUntrustedPreview,
+      countRecipients,
+      summarizeAttachmentsForAudit,
+      isSafeMarkdownHref,
+      isSafeImageSrc,
+      escapeMarkdownLinkText,
+      renderMarkdownLink,
+      isSystemPrincipalFetchAllowed,
+      validateAgainstSchema,
+      createRateLimiterState,
+      consumeRateLimit,
+      inspectRateLimits,
+    } = __helperScope.module.exports;
+
+    // One rate-limiter state per server instance. Resets on extension reload
+    // -- intentional: that's typically a developer action and we don't want a
+    // restart to feel "stuck" for the windowMs duration.
+    const __rateLimiterState = createRateLimiterState();
 
     const tools = [
       {
@@ -173,6 +231,185 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getMessageHeaders",
+        group: "messages", crud: "read",
+        title: "Get Message Headers",
+        description: "Read message headers only (subject, author, recipients, date, tags, threading headers) without decoding the body or attachments. Much cheaper than getMessage when you only need to triage or quote a small set of messages.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The message ID (from searchMessages results)" },
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+          },
+          required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "exportMailbox",
+        group: "messages", crud: "read",
+        title: "Export Mailbox",
+        description: "Stream a folder's messages to a JSON-lines file under <ProfD>/thunderbird-mcp/exports/. Default mode is headers-only; pass includeBody:true to also embed each message's plain-text body and attachment metadata (slower). The destination file is named with a UTC timestamp and a sanitized folder name; the path is returned so the caller knows where to find it. Disabled by default via extensions.thunderbird-mcp.blockMailboxExport -- enable it in the options page when you actually need a bulk export.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI to export (required). Subfolders are NOT recursed -- call once per folder." },
+            maxMessages: { type: "integer", description: "Cap on exported messages (default 1000, hard cap 50000). Use sortOrder:'desc' (default) to take the newest N." },
+            includeBody: { type: "boolean", description: "If true, extract each message's plain-text body and embed it on the JSON line. Default false. Adds a MIME parse per message so a 5000-message export takes substantially longer." },
+            includeAttachmentMeta: { type: "boolean", description: "If true and includeBody is true, embed attachment {name, contentType, size} metadata too. Attachment CONTENT is never written -- only metadata. Default false." },
+            scanCap: { type: "integer", description: "Hard cap on messages enumerated before stopping (default 50000). Prevents the LLM from walking a 200k-message archive forever." },
+            sortOrder: { type: "string", enum: ["asc", "desc"], description: "Date sort order before applying maxMessages. 'desc' (default) = newest first." },
+          },
+          required: ["folderPath"],
+        },
+      },
+      {
+        name: "getSenderHistory",
+        group: "messages", crud: "read",
+        title: "Get Sender History",
+        description: "Return recent message headers from a given email address, scanned across the inbox of every accessible account. Useful for 'have I corresponded with this person before?' or 'have we already approached this outreach target?' decisions before drafting a reply.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            email: { type: "string", description: "Sender email address to match (case-insensitive substring match against the author field)" },
+            maxResults: { type: "integer", description: "Cap on returned headers (default 50, max 200)" },
+            scanCap: { type: "integer", description: "Hard cap on messages enumerated per folder before stopping (default 5000, max 50000)" },
+            sinceDays: { type: "integer", description: "Restrict to messages from the last N days (default unlimited)" },
+          },
+          required: ["email"],
+        },
+      },
+      {
+        name: "searchAttachments",
+        group: "messages", crud: "read",
+        title: "Search Attachments",
+        description: "Find messages with attachments matching a filename substring and/or MIME-type pattern. Walks messages in the chosen folder (or the inbox of every accessible account when folderPath is omitted) and inspects allUserAttachments metadata. Returns header objects with the matching attachment names attached. Capped to avoid mailbox scans.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            nameContains: { type: "string", description: "Case-insensitive substring matched against the attachment filename (e.g. 'invoice', '.pdf')" },
+            contentType: { type: "string", description: "Case-insensitive prefix matched against the attachment Content-Type (e.g. 'application/pdf', 'image/')" },
+            folderPath: { type: "string", description: "Optional folder URI to limit the search. Omitted = scan inbox of each accessible account." },
+            maxResults: { type: "integer", description: "Cap on matching messages (default 50, max 200)" },
+            scanCap: { type: "integer", description: "Hard cap on messages enumerated per folder before stopping (default 5000, max 50000). Prevents the LLM from accidentally walking a 200k-message archive." },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "searchByThread",
+        group: "messages", crud: "read",
+        title: "Search By Thread",
+        description: "Given any messageId + folderPath, return headers for every other message in the same thread. Uses msgHdr.threadId. Results are headers-only -- call getMessage on a specific id for its body.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "Any message in the thread you want to fetch" },
+            folderPath: { type: "string", description: "Folder URI containing the message" },
+            maxResults: { type: "integer", description: "Cap on returned headers (default 100, max 500)" },
+          },
+          required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "batchGetMessageHeaders",
+        group: "messages", crud: "read",
+        title: "Batch Get Message Headers",
+        description: "Fetch headers for up to 200 messages in a single round-trip. Returns a map of messageId -> { header object | { error: ... } }. Pair with searchMessages to enrich a result set without N round-trips.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs to fetch headers for (hard cap 200)" },
+            folderPath: { type: "string", description: "Folder URI shared by all of the IDs" },
+          },
+          required: ["messageIds", "folderPath"],
+        },
+      },
+      {
+        name: "listTemplates",
+        group: "system", crud: "read",
+        title: "List Compose Templates",
+        description: "List user-authored compose templates stored under <ProfD>/thunderbird-mcp/templates/*.md. Each file has YAML-style frontmatter (---\\nname: short-id\\ndescription: ...\\nsubject: ...\\nisHtml: false\\nvars: [target, contact_name]\\n---) followed by the body. The variable names listed in `vars` are the placeholders renderTemplate accepts.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "renderTemplate",
+        group: "system", crud: "read",
+        title: "Render Compose Template",
+        description: "Render a template by name with the supplied variable bindings. Returns { subject, body, isHtml } ready to feed into sendMail. Pure read-only -- nothing is sent. Use this to standardize outreach / reply patterns so the LLM doesn't drift across messages.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: { type: "string", description: "Template `name` value from its frontmatter" },
+            vars: {
+              type: "object",
+              description: "Variable bindings; keys must match the template's declared `vars` list. Unknown keys are silently ignored; missing required keys produce an error.",
+            },
+          },
+          required: ["name"],
+        },
+      },
+      {
+        name: "getServerCapabilities",
+        group: "system", crud: "read",
+        title: "Get Server Capabilities",
+        description: "Return a snapshot of the LLM's sandbox: enabled / disabled tool names, accessible account IDs, current safeguard pref states (blockSkipReview, blockFilterForwardReply, blockContactWrites), current rate-limit bucket states with remaining slots per tool, server version, and audit-log location. Call this once at the start of an agent loop so you know what you can do before you try things that will fail.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "getAuditLog",
+        group: "system", crud: "read",
+        title: "Get Audit Log",
+        description: "Read parsed entries from the MCP audit log newest-first. Every outbound compose (sendMail / replyToMessage / forwardMessage / saveDraft) and every contact write are recorded as JSON lines with timestamp + tool + metadata (no body, no attachment content, no recipient addresses beyond counts). Useful for the agent to answer 'what did I send today?' or 'have I already contacted this target?'",
+        inputSchema: {
+          type: "object",
+          properties: {
+            maxEntries: { type: "integer", description: "Max entries to return (default 200, hard cap 10000)" },
+            tool: { type: "string", description: "Filter by exact tool name (e.g. 'sendMail')" },
+            since: { type: "string", description: "Filter to entries on or after this ISO 8601 timestamp" },
+            until: { type: "string", description: "Filter to entries on or before this ISO 8601 timestamp" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "dryRunCompose",
+        group: "messages", crud: "read",
+        title: "Dry-Run Compose",
+        description: "Validate compose parameters WITHOUT sending or saving. Resolves the from identity, parses recipient counts, evaluates every attachment through the same path / size / deny-list pipeline that sendMail uses, and reports the rendered subject (after header sanitization). Useful for an agent that wants to self-check a compose call before triggering the review window or skipReview send.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient email address" },
+            subject: { type: "string", description: "Email subject line" },
+            body: { type: "string", description: "Email body text (length is reported back; content is not echoed)" },
+            cc: { type: "string", description: "CC recipients (comma-separated)" },
+            bcc: { type: "string", description: "BCC recipients (comma-separated)" },
+            isHtml: { type: "boolean", description: "Treat body as HTML (default: false)" },
+            from: { type: "string", description: "Sender identity (email address or identity ID)" },
+            attachments: {
+              type: "array",
+              description: "Attachments to evaluate (same shape as sendMail). Each entry is checked but neither read nor copied; only path/size/deny-list status is returned.",
+              items: {
+                oneOf: [
+                  { type: "string", description: "Absolute file path to attach" },
+                  {
+                    type: "object",
+                    properties: {
+                      name: { type: "string" },
+                      contentType: { type: "string" },
+                      base64: { type: "string" },
+                    },
+                    required: ["name", "base64"],
+                    additionalProperties: false,
+                  },
+                ],
+              },
+            },
+          },
+          required: ["to", "subject", "body"],
+        },
+      },
+      {
         name: "sendMail",
         group: "messages", crud: "create",
         title: "Compose Mail",
@@ -188,6 +425,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "If true, send the message directly without opening a compose window (default: false)" },
+            idempotencyKey: { type: "string", description: "Optional client-supplied key (max 256 chars). If sendMail was previously called with this same key within the last 24 hours AND succeeded, the prior result is returned instead of sending again. Use this to make retries safe across crashes / network errors -- especially for outreach where re-sending to a real target is costly." },
             attachments: {
               type: "array",
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
@@ -297,7 +535,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "updateEvent",
         group: "calendar", crud: "update",
         title: "Update Event",
-        description: "Update an existing calendar event's title, dates, location, or description",
+        description: "Update an existing calendar event's title, dates, location, or description. For recurring events, recurringScope must be supplied explicitly: 'series' edits the entire series, no other scopes are currently supported. The call FAILS for recurring events when recurringScope is omitted, so the agent cannot accidentally rewrite years of past occurrences.",
         inputSchema: {
           type: "object",
           properties: {
@@ -309,6 +547,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             location: { type: "string", description: "New event location (optional)" },
             description: { type: "string", description: "New event description (optional)" },
             status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
+            recurringScope: { type: "string", enum: ["series"], description: "Required for recurring events. 'series' rewrites every occurrence past and future. Per-occurrence editing is not supported through this API; use Thunderbird's UI." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -317,12 +556,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "deleteEvent",
         group: "calendar", crud: "delete",
         title: "Delete Event",
-        description: "Delete a calendar event",
+        description: "Delete a calendar event. For recurring events, recurringScope must be supplied explicitly: 'series' deletes the entire series. The call FAILS for recurring events when recurringScope is omitted, so the agent cannot accidentally nuke a long-running series.",
         inputSchema: {
           type: "object",
           properties: {
             eventId: { type: "string", description: "The event ID (from listEvents results)" },
             calendarId: { type: "string", description: "The calendar ID containing the event (from listEvents results)" },
+            recurringScope: { type: "string", enum: ["series"], description: "Required for recurring events. 'series' deletes every occurrence. Per-occurrence deletion is not supported through this API; use Thunderbird's UI." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -468,6 +708,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "If true, send the reply directly without opening a compose window (default: false)" },
+            idempotencyKey: { type: "string", description: "Optional dedup key (max 256 chars). See sendMail for semantics." },
             attachments: {
               type: "array",
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
@@ -508,6 +749,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "If true, send the forward directly without opening a compose window (default: false)" },
+            idempotencyKey: { type: "string", description: "Optional dedup key (max 256 chars). See sendMail for semantics." },
             attachments: {
               type: "array",
               description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})",
@@ -529,6 +771,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             },
           },
           required: ["messageId", "folderPath", "to"],
+        },
+      },
+      {
+        name: "refreshFolder",
+        group: "messages", crud: "read",
+        title: "Refresh Folder",
+        description: "Force an IMAP fetch on the given folder so the server-side state syncs to Thunderbird's local cache. Without this, IMAP folders only refresh when the user clicks them in the UI, which means recently-arrived mail is invisible to searchMessages / getRecentMessages until then. Call refreshFolder before a query when you know new traffic just arrived. Non-IMAP folders return success without doing anything. Note: very large IMAP folders like Gmail [Gmail]/Todos (All Mail) may not finish within the timeout cap; consider refreshing the specific subfolder where the message landed (INBOX, a label) instead.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI (from listFolders) to refresh" },
+            timeoutMs: { type: "integer", description: "Max ms to wait for the fetch to complete (default 15000). Hard-capped at 25000 to stay below the stdio bridge's HTTP request timeout (30000ms); larger values are clamped." },
+          },
+          required: ["folderPath"],
         },
       },
       {
@@ -1010,6 +1266,37 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
               } else if (tmpDir.isSymlink()) {
                 throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
+              } else {
+                // POSIX hardening: on a shared /tmp another local user could
+                // pre-create the directory with group/world bits set, then race
+                // the connection file. The O_EXCL on the file itself blocks a
+                // straight overwrite, but a permissive directory still lets the
+                // attacker read or rename our file. Force perms back to 0o700.
+                //
+                // Windows uses ACLs, not POSIX modes. The bits reported by
+                // nsIFile.permissions on Windows do not correspond to the
+                // group/world semantics this check assumes -- a normal Temp
+                // subfolder reads as 0o666 or similar and trips a false
+                // positive. Skip the chmod entirely on Windows; the POSIX
+                // attack model (shared /tmp other-user race) does not apply
+                // there anyway since %LOCALAPPDATA%\Temp is per-user.
+                const isWindows = (() => {
+                  try { return Services.appinfo.OS === "WINNT"; } catch { return false; }
+                })();
+                if (!isWindows) {
+                  try {
+                    const mode = tmpDir.permissions;
+                    if (mode && (mode & 0o077) !== 0) {
+                      try { tmpDir.permissions = 0o700; } catch { /* best-effort */ }
+                      if ((tmpDir.permissions & 0o077) !== 0) {
+                        throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
+                      }
+                    }
+                  } catch (e) {
+                    if (e && e.message && e.message.startsWith("thunderbird-mcp tmp directory")) throw e;
+                    // ignore: permissions accessor unsupported on this platform
+                  }
+                }
               }
               const connFile = tmpDir.clone();
               connFile.append("connection.json");
@@ -1065,25 +1352,604 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return result === 0;
             }
 
+            // Audit-log cap before rotation. 5 MB of JSON lines is roughly
+            // 10k-30k compose events depending on subject length; rotating to
+            // a single `.log.1` keeps disk use bounded without losing history.
+            const AUDIT_LOG_ROTATE_BYTES = 5 * 1024 * 1024;
+            const AUDIT_LOG_SUBDIR = "thunderbird-mcp";
+            const AUDIT_LOG_FILENAME = "audit.log";
+            const AUDIT_LOG_ROTATED_FILENAME = "audit.log.1";
+
+            /**
+             * Append a single JSON line describing an outbound-compose action
+             * (sendMail / replyToMessage / forwardMessage / saveDraft) to
+             * <ProfD>/thunderbird-mcp/audit.log. Best-effort: any failure is
+             * swallowed so disk errors never block a legitimate send.
+             *
+             * Logged fields are metadata only -- no body, no attachment
+             * content, no recipient lists beyond counts. The whole point is
+             * incident response, not message archival.
+             */
+            function appendComposeAudit(entry) {
+              try {
+                const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+                const auditDir = profDir.clone();
+                auditDir.append(AUDIT_LOG_SUBDIR);
+                if (!auditDir.exists()) {
+                  auditDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+                }
+
+                const logFile = auditDir.clone();
+                logFile.append(AUDIT_LOG_FILENAME);
+
+                // Rotate when the active log exceeds the cap.
+                if (logFile.exists()) {
+                  let size = 0;
+                  try { size = logFile.fileSize; } catch { size = 0; }
+                  if (size > AUDIT_LOG_ROTATE_BYTES) {
+                    const rotated = auditDir.clone();
+                    rotated.append(AUDIT_LOG_ROTATED_FILENAME);
+                    if (rotated.exists()) {
+                      try { rotated.remove(false); } catch { /* best-effort */ }
+                    }
+                    try { logFile.moveTo(auditDir, AUDIT_LOG_ROTATED_FILENAME); } catch { /* best-effort */ }
+                  }
+                }
+
+                const line = JSON.stringify({
+                  ts: new Date().toISOString(),
+                  ...entry,
+                }) + "\n";
+
+                const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                  .createInstance(Ci.nsIFileOutputStream);
+                // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x10 = O_APPEND
+                ostream.init(logFile, 0x02 | 0x08 | 0x10, 0o600, 0);
+                const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
+                  .createInstance(Ci.nsIConverterOutputStream);
+                converter.init(ostream, "UTF-8");
+                converter.writeString(line);
+                converter.close();
+              } catch (e) {
+                // Audit failure must never block a send. Surface it once on the
+                // console and move on; do NOT propagate.
+                try { console.warn("thunderbird-mcp: audit log write failed:", e); } catch { /* ignore */ }
+              }
+            }
+
+            // summarizeAttachmentsForAudit + countRecipients live in
+            // security_helpers.js; loaded above and destructured into scope.
+
+            /**
+             * Read the audit log file(s) and return parsed JSON entries newest-
+             * first. Reads both audit.log and audit.log.1 if rotation happened
+             * so the caller sees the full bounded history.
+             *
+             * Returns { entries, totalScanned, truncated, errors }:
+             *   - entries: array of parsed log objects (most recent first)
+             *   - totalScanned: number of bytes read
+             *   - truncated: true if maxEntries cut the list
+             *   - errors: per-line parse failures (object with line + reason)
+             *
+             * filter is optional: { tool, since, until } where since/until are
+             * ISO timestamps and tool is an exact name match.
+             */
+            function readAuditLog(maxEntries, filter) {
+              const limit = Number.isFinite(maxEntries) && maxEntries > 0
+                ? Math.min(Math.floor(maxEntries), 10000)
+                : 500;
+              const wantTool = filter && typeof filter.tool === "string" ? filter.tool : null;
+              const sinceTs = filter && filter.since ? Date.parse(filter.since) : null;
+              const untilTs = filter && filter.until ? Date.parse(filter.until) : null;
+
+              const out = { entries: [], totalScanned: 0, truncated: false, errors: [] };
+              const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+              const auditDir = profDir.clone();
+              auditDir.append(AUDIT_LOG_SUBDIR);
+              if (!auditDir.exists()) return out;
+
+              // Read the active log first, then the rotated one. Newest-first
+              // means we read each file end-to-end, parse, reverse the file's
+              // entries, then append. The rotated file (.log.1) is older.
+              const fileNames = [AUDIT_LOG_FILENAME, AUDIT_LOG_ROTATED_FILENAME];
+              for (const fname of fileNames) {
+                if (out.entries.length >= limit) {
+                  out.truncated = true;
+                  break;
+                }
+                const f = auditDir.clone();
+                f.append(fname);
+                if (!f.exists()) continue;
+                let text = "";
+                try {
+                  const fis = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
+                  fis.init(f, 0x01, 0, 0);
+                  const cis = Cc["@mozilla.org/intl/converter-input-stream;1"].createInstance(Ci.nsIConverterInputStream);
+                  cis.init(fis, "UTF-8", 0, 0);
+                  const buf = {};
+                  let read;
+                  while ((read = cis.readString(65536, buf)) > 0) {
+                    text += buf.value;
+                  }
+                  cis.close();
+                  out.totalScanned += text.length;
+                } catch (e) {
+                  out.errors.push({ file: fname, reason: String(e) });
+                  continue;
+                }
+                const lines = text.split("\n");
+                // Reverse so newest-first; skip empty trailing line.
+                for (let i = lines.length - 1; i >= 0; i--) {
+                  const line = lines[i];
+                  if (!line) continue;
+                  let parsed;
+                  try { parsed = JSON.parse(line); }
+                  catch { out.errors.push({ line: line.slice(0, 80), reason: "parse failure" }); continue; }
+                  if (wantTool && parsed.tool !== wantTool) continue;
+                  if (sinceTs && parsed.ts && Date.parse(parsed.ts) < sinceTs) continue;
+                  if (untilTs && parsed.ts && Date.parse(parsed.ts) > untilTs) continue;
+                  out.entries.push(parsed);
+                  if (out.entries.length >= limit) {
+                    out.truncated = true;
+                    break;
+                  }
+                }
+              }
+              return out;
+            }
+
+            // Idempotency window: how far back to scan for a matching key
+            // before considering the new call a fresh send.
+            const IDEMPOTENCY_WINDOW_HOURS = 24;
+
+            /**
+             * Find a recent successful audit entry whose idempotencyKey
+             * matches `key`. Returns the entry's stored `result` object, or
+             * null if no match. Used by sendMail / replyToMessage /
+             * forwardMessage to skip duplicate sends after a crash or retry.
+             *
+             * Only entries with .success === true are considered hits --
+             * a previous error MUST allow the caller to retry.
+             */
+            function findIdempotentEntry(tool, key) {
+              if (typeof key !== "string" || !key) return null;
+              if (key.length > 256) return null; // schema caps caller input
+              const since = new Date(Date.now() - IDEMPOTENCY_WINDOW_HOURS * 3600 * 1000).toISOString();
+              const log = readAuditLog(1000, { tool, since });
+              for (const e of log.entries) {
+                if (e && e.idempotencyKey === key && e.success === true && e.result) {
+                  return e.result;
+                }
+              }
+              return null;
+            }
+
+            // ─── Bulk mailbox export ──────────────────────────────────────
+            //
+            // Streams headers (and optionally bodies) from a folder to a
+            // JSON-lines file under <ProfD>/thunderbird-mcp/exports/. Each
+            // line is written and flushed before the next message is parsed,
+            // so RAM usage stays flat regardless of folder size.
+
+            const EXPORTS_SUBDIR = "exports";
+            const EXPORT_DEFAULT_MAX = 1000;
+            const EXPORT_HARD_CAP = 50000;
+            const EXPORT_DEFAULT_SCAN_CAP = 50000;
+
+            function exportsDir() {
+              const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+              const d = profDir.clone();
+              d.append(AUDIT_LOG_SUBDIR);
+              d.append(EXPORTS_SUBDIR);
+              return d;
+            }
+
+            /**
+             * Build a safe destination filename for an export: ISO timestamp
+             * with `:` replaced (Windows-hostile) and a sanitized folder
+             * component derived from the folder URI's tail.
+             */
+            function buildExportFilename(folder) {
+              const ts = new Date().toISOString().replace(/[:]/g, "-");
+              const tail = folder.URI ? folder.URI.split("/").pop() : "folder";
+              const safeTail = String(tail || "folder").replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 80);
+              return `${ts}-${safeTail || "folder"}.jsonl`;
+            }
+
+            /**
+             * Async streaming export. Resolves once every message has been
+             * serialized and flushed to disk.
+             */
+            function exportMailbox(folderPath, maxMessages, includeBody, includeAttachmentMeta, scanCap, sortOrder) {
+              return new Promise((resolve) => {
+                try {
+                  if (isMailboxExportBlocked()) {
+                    resolve({ error: "User preference blocks mailbox export via MCP. Enable 'Allow mailbox export' in the extension options page if you trust this MCP client to bulk-export your mail." });
+                    return;
+                  }
+                  if (!folderPath) { resolve({ error: "folderPath is required" }); return; }
+                  const opened = openFolder(folderPath);
+                  if (opened.error) { resolve({ error: opened.error }); return; }
+                  const { folder, db } = opened;
+
+                  const cap = Number.isFinite(maxMessages) && maxMessages > 0
+                    ? Math.min(Math.floor(maxMessages), EXPORT_HARD_CAP)
+                    : EXPORT_DEFAULT_MAX;
+                  const scanLimit = Number.isFinite(scanCap) && scanCap > 0
+                    ? Math.min(Math.floor(scanCap), EXPORT_HARD_CAP)
+                    : EXPORT_DEFAULT_SCAN_CAP;
+                  const order = sortOrder === "asc" ? "asc" : "desc";
+
+                  // Walk + collect candidate headers with their timestamps.
+                  // We sort BEFORE applying `cap` so "newest N" semantics are
+                  // honored across the whole folder, not just the first N
+                  // enumerated. enumerateMessages doesn't guarantee an order.
+                  const candidates = [];
+                  let totalScanned = 0;
+                  for (const hdr of db.enumerateMessages()) {
+                    totalScanned++;
+                    if (totalScanned > scanLimit) break;
+                    candidates.push({ hdr, ts: hdr.date ? hdr.date / 1000 : 0 });
+                  }
+                  candidates.sort((a, b) => order === "asc" ? a.ts - b.ts : b.ts - a.ts);
+                  const slice = candidates.slice(0, cap);
+
+                  // Open the output file.
+                  const dir = exportsDir();
+                  if (!dir.exists()) {
+                    dir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+                  }
+                  const outFile = dir.clone();
+                  outFile.append(buildExportFilename(folder));
+                  const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                    .createInstance(Ci.nsIFileOutputStream);
+                  // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x20 = O_TRUNC. We always
+                  // start fresh -- the filename has an ISO timestamp so
+                  // collisions are essentially impossible.
+                  ostream.init(outFile, 0x02 | 0x08 | 0x20, 0o600, 0);
+                  const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
+                    .createInstance(Ci.nsIConverterOutputStream);
+                  converter.init(ostream, "UTF-8");
+
+                  let bytesWritten = 0;
+                  function writeLine(obj) {
+                    const line = JSON.stringify(obj) + "\n";
+                    converter.writeString(line);
+                    bytesWritten += line.length;
+                  }
+
+                  // Synchronous header-only path is straightforward.
+                  if (!includeBody) {
+                    for (const { hdr } of slice) {
+                      const obj = msgHdrToHeaderObject(hdr);
+                      obj.folderPath = folder.URI;
+                      writeLine(obj);
+                    }
+                    converter.close();
+                    appendComposeAudit({
+                      tool: "exportMailbox",
+                      folderPath: folder.URI,
+                      includeBody: false,
+                      exported: slice.length,
+                      scanned: totalScanned,
+                      filePath: outFile.path,
+                      bytesWritten,
+                    });
+                    resolve({
+                      filePath: outFile.path,
+                      folderPath: folder.URI,
+                      exported: slice.length,
+                      scanned: totalScanned,
+                      truncated: totalScanned > scanLimit || candidates.length > cap,
+                      bytesWritten,
+                      includeBody: false,
+                    });
+                    return;
+                  }
+
+                  // With-body path: MIME-parse one at a time, write line, then
+                  // schedule the next. Sequential to keep memory flat -- a
+                  // parallel fan-out would buffer N MimeMessage trees.
+                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+                  );
+
+                  let index = 0;
+                  function next() {
+                    if (index >= slice.length) {
+                      converter.close();
+                      appendComposeAudit({
+                        tool: "exportMailbox",
+                        folderPath: folder.URI,
+                        includeBody: true,
+                        exported: index,
+                        scanned: totalScanned,
+                        filePath: outFile.path,
+                        bytesWritten,
+                      });
+                      resolve({
+                        filePath: outFile.path,
+                        folderPath: folder.URI,
+                        exported: index,
+                        scanned: totalScanned,
+                        truncated: totalScanned > scanLimit || candidates.length > cap,
+                        bytesWritten,
+                        includeBody: true,
+                      });
+                      return;
+                    }
+                    const { hdr } = slice[index++];
+                    const obj = msgHdrToHeaderObject(hdr);
+                    obj.folderPath = folder.URI;
+                    MsgHdrToMimeMessage(hdr, null, (aMsgHdr, aMimeMsg) => {
+                      try {
+                        if (aMimeMsg) {
+                          obj.body = extractPlainTextBody(aMimeMsg);
+                          if (includeAttachmentMeta && aMimeMsg.allUserAttachments) {
+                            obj.attachments = aMimeMsg.allUserAttachments.map(a => ({
+                              name: a && a.name ? String(a.name) : "",
+                              contentType: a && a.contentType ? String(a.contentType) : "",
+                              size: typeof a?.size === "number" ? a.size : null,
+                            }));
+                          }
+                        }
+                      } catch (e) {
+                        obj.bodyError = String(e);
+                      }
+                      try { writeLine(obj); }
+                      catch (e) {
+                        converter.close();
+                        resolve({ error: `Write failed at message ${index}: ${e}`, filePath: outFile.path, exported: index - 1, bytesWritten });
+                        return;
+                      }
+                      next();
+                    });
+                  }
+                  next();
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
+            // ─── Compose templates ────────────────────────────────────────
+            //
+            // Templates live in <ProfD>/thunderbird-mcp/templates/*.md so they
+            // are user-owned, survive extension reinstall, and never leak
+            // through the public extension build. Each file uses Jekyll-style
+            // YAML frontmatter for metadata; the body below the second ---
+            // is the message body. Variables look like {{name}} and are
+            // substituted by renderTemplate.
+
+            const TEMPLATES_SUBDIR = "templates";
+
+            function templatesDir() {
+              const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+              const auditDir = profDir.clone();
+              auditDir.append(AUDIT_LOG_SUBDIR);
+              auditDir.append(TEMPLATES_SUBDIR);
+              return auditDir;
+            }
+
+            function readTextFile(file) {
+              const fis = Cc["@mozilla.org/network/file-input-stream;1"].createInstance(Ci.nsIFileInputStream);
+              fis.init(file, 0x01, 0, 0);
+              const cis = Cc["@mozilla.org/intl/converter-input-stream;1"].createInstance(Ci.nsIConverterInputStream);
+              cis.init(fis, "UTF-8", 0, 0);
+              let text = "";
+              const buf = {};
+              while (cis.readString(65536, buf) > 0) text += buf.value;
+              cis.close();
+              return text;
+            }
+
+            /**
+             * Parse Jekyll-style frontmatter. Accepts a minimal YAML subset:
+             * `key: value` per line for strings / numbers / booleans, and
+             * `key: [a, b]` for one-line arrays. Anything more elaborate
+             * (multi-line arrays, nested mappings) is intentionally not
+             * supported -- the format stays predictable for the LLM.
+             */
+            function parseFrontmatter(raw) {
+              if (!raw.startsWith("---")) return { meta: {}, body: raw };
+              const end = raw.indexOf("\n---", 3);
+              if (end < 0) return { meta: {}, body: raw };
+              const yamlBlock = raw.slice(3, end).trim();
+              let body = raw.slice(end + 4);
+              if (body.startsWith("\n")) body = body.slice(1);
+              const meta = Object.create(null);
+              for (const line of yamlBlock.split(/\r?\n/)) {
+                const stripped = line.trim();
+                if (!stripped || stripped.startsWith("#")) continue;
+                const m = stripped.match(/^([A-Za-z_][A-Za-z0-9_-]*)\s*:\s*(.*)$/);
+                if (!m) continue;
+                const key = m[1];
+                let val = m[2].trim();
+                if (val === "true") meta[key] = true;
+                else if (val === "false") meta[key] = false;
+                else if (/^-?\d+(\.\d+)?$/.test(val)) meta[key] = Number(val);
+                else if (val.startsWith("[") && val.endsWith("]")) {
+                  meta[key] = val.slice(1, -1).split(",").map(s => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+                } else {
+                  // Strip surrounding quotes if present
+                  if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                    val = val.slice(1, -1);
+                  }
+                  meta[key] = val;
+                }
+              }
+              return { meta, body };
+            }
+
+            function loadTemplate(name) {
+              if (typeof name !== "string" || !name) return { error: "name must be a non-empty string" };
+              if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+                return { error: "name must match /^[A-Za-z0-9._-]+$/ (no path separators)" };
+              }
+              const dir = templatesDir();
+              if (!dir.exists()) {
+                return { error: `Templates directory not found: ${dir.path}. Create it and add <name>.md files.` };
+              }
+              // Try <name>.md and <name> with no extension.
+              for (const candidate of [name + ".md", name]) {
+                const f = dir.clone();
+                f.append(candidate);
+                if (f.exists() && f.isFile()) {
+                  try {
+                    const raw = readTextFile(f);
+                    const parsed = parseFrontmatter(raw);
+                    parsed.file = f.path;
+                    return parsed;
+                  } catch (e) {
+                    return { error: `Failed to read template '${name}': ${e}` };
+                  }
+                }
+              }
+              return { error: `Template not found: ${name}` };
+            }
+
+            function listTemplates() {
+              const dir = templatesDir();
+              if (!dir.exists()) {
+                return { templates: [], note: `Templates directory does not exist yet. Create ${dir.path} and drop *.md files inside.` };
+              }
+              const out = [];
+              let entries;
+              try {
+                entries = dir.directoryEntries;
+              } catch (e) {
+                return { error: `Failed to list templates: ${e}` };
+              }
+              while (entries.hasMoreElements()) {
+                const f = entries.getNext().QueryInterface(Ci.nsIFile);
+                if (!f.isFile()) continue;
+                if (!/\.md$/i.test(f.leafName)) continue;
+                try {
+                  const raw = readTextFile(f);
+                  const { meta } = parseFrontmatter(raw);
+                  out.push({
+                    name: typeof meta.name === "string" && meta.name ? meta.name : f.leafName.replace(/\.md$/i, ""),
+                    description: typeof meta.description === "string" ? meta.description : "",
+                    subject: typeof meta.subject === "string" ? meta.subject : "",
+                    isHtml: !!meta.isHtml,
+                    vars: Array.isArray(meta.vars) ? meta.vars : [],
+                    file: f.path,
+                  });
+                } catch { /* skip unreadable templates */ }
+              }
+              return { templates: out };
+            }
+
+            function renderTemplate(name, vars) {
+              const tpl = loadTemplate(name);
+              if (tpl.error) return tpl;
+              const declaredVars = Array.isArray(tpl.meta.vars) ? tpl.meta.vars : [];
+              const bindings = (vars && typeof vars === "object" && !Array.isArray(vars)) ? vars : {};
+              // Required-var enforcement: every declared var must be supplied.
+              const missing = declaredVars.filter(v => !(v in bindings));
+              if (missing.length > 0) {
+                return { error: `Missing required variables: ${missing.join(", ")}` };
+              }
+              function substitute(text) {
+                return String(text).replace(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g, (_, key) => {
+                  if (key in bindings) return String(bindings[key]);
+                  // Unknown placeholder -> leave as literal so the caller
+                  // notices instead of silently producing an empty value.
+                  return `{{${key}}}`;
+                });
+              }
+              return {
+                name: tpl.meta.name || name,
+                subject: substitute(tpl.meta.subject || ""),
+                body: substitute(tpl.body),
+                isHtml: !!tpl.meta.isHtml,
+                file: tpl.file,
+              };
+            }
+
+            /**
+             * Truncate both audit.log and audit.log.1. Returns the number of
+             * bytes deleted. Best-effort; missing files are silent successes.
+             */
+            function clearAuditLog() {
+              let bytesRemoved = 0;
+              try {
+                const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+                const auditDir = profDir.clone();
+                auditDir.append(AUDIT_LOG_SUBDIR);
+                if (!auditDir.exists()) return { success: true, bytesRemoved: 0 };
+                for (const fname of [AUDIT_LOG_FILENAME, AUDIT_LOG_ROTATED_FILENAME]) {
+                  const f = auditDir.clone();
+                  f.append(fname);
+                  if (f.exists()) {
+                    try { bytesRemoved += f.fileSize; } catch { /* ignore */ }
+                    try { f.remove(false); } catch { /* ignore */ }
+                  }
+                }
+              } catch (e) {
+                return { error: String(e), bytesRemoved };
+              }
+              return { success: true, bytesRemoved };
+            }
+
+            // Pref-read cache. Services.prefs is hit on every tool dispatch
+            // (rate-limit, access-control, safeguards) and the cost adds up
+            // under search bursts. We cache the parsed value behind each
+            // pref name and register one observer per pref that flips the
+            // cached entry to undefined on change, forcing a re-read next
+            // call. Cheap: a few microseconds saved per call, but matters
+            // for batch tools like batchGetMessageHeaders.
+            const __prefCache = Object.create(null);
+            const __prefObservers = Object.create(null);
+
+            function __invalidatePrefCache(prefName) {
+              return {
+                observe(subject, topic, data) {
+                  if (topic === "nsPref:changed" && data === prefName) {
+                    delete __prefCache[prefName];
+                  }
+                },
+              };
+            }
+            function __ensurePrefObserver(prefName) {
+              if (__prefObservers[prefName]) return;
+              const obs = __invalidatePrefCache(prefName);
+              try {
+                Services.prefs.addObserver(prefName, obs, false);
+                __prefObservers[prefName] = obs;
+              } catch (e) {
+                console.warn("thunderbird-mcp: pref observer registration failed for", prefName, e);
+              }
+            }
+            function __cachedRead(prefName, reader) {
+              __ensurePrefObserver(prefName);
+              if (__prefCache[prefName] !== undefined) return __prefCache[prefName];
+              const value = reader();
+              __prefCache[prefName] = value;
+              return value;
+            }
+
             /**
              * Get the list of allowed account IDs from preferences.
              * Returns an empty array if no restriction is set (all accounts allowed).
              */
             function getAllowedAccountIds() {
-              try {
-                const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
-                if (!pref) return [];
-                const parsed = JSON.parse(pref);
-                if (!Array.isArray(parsed)) {
-                  console.error("thunderbird-mcp: allowed accounts pref is not an array, blocking all accounts");
+              return __cachedRead(PREF_ALLOWED_ACCOUNTS, () => {
+                try {
+                  const pref = Services.prefs.getStringPref(PREF_ALLOWED_ACCOUNTS, "");
+                  if (!pref) return [];
+                  const parsed = JSON.parse(pref);
+                  if (!Array.isArray(parsed)) {
+                    console.error("thunderbird-mcp: allowed accounts pref is not an array, blocking all accounts");
+                    return ["__invalid__"];
+                  }
+                  return parsed;
+                } catch (e) {
+                  // Fail closed: corrupt pref means block all accounts, not allow all
+                  console.error("thunderbird-mcp: failed to parse allowed accounts pref, blocking all accounts:", e);
                   return ["__invalid__"];
                 }
-                return parsed;
-              } catch (e) {
-                // Fail closed: corrupt pref means block all accounts, not allow all
-                console.error("thunderbird-mcp: failed to parse allowed accounts pref, blocking all accounts:", e);
-                return ["__invalid__"];
-              }
+              });
             }
 
             /**
@@ -1098,17 +1964,63 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             /**
              * Check if the user has disabled the skipReview shortcut.
-             * When true, send/reply/forward tools must open the review window even
-             * if the caller passed skipReview: true.
+             * When true, send/reply/forward/createEvent/createTask tools must open
+             * the review window/dialog even if the caller passed skipReview: true.
+             *
+             * Default is true: an LLM that reads attacker-controlled email content
+             * can be prompt-injected into invoking sendMail with skipReview, so the
+             * safe default is to require human review. Users can explicitly opt
+             * into silent sends from the options page.
              */
             function isSkipReviewBlocked() {
-              try {
-                return Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, false);
-              } catch {
-                // Fail closed: if we can't read the pref, assume blocked so the
-                // user retains ability to review before send.
-                return true;
-              }
+              return __cachedRead(PREF_BLOCK_SKIPREVIEW, () => {
+                try { return Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, true); }
+                catch { return true; }
+              });
+            }
+
+            /**
+             * Check if the user has blocked `forward` and `reply` filter actions
+             * from the MCP API. Filters execute on every incoming message with
+             * no UI, so allowing an MCP caller to create one is equivalent to
+             * giving the LLM write access to a persistent silent-exfil channel.
+             * Default true.
+             */
+            function isFilterForwardReplyBlocked() {
+              return __cachedRead(PREF_BLOCK_FILTER_FORWARD_REPLY, () => {
+                try { return Services.prefs.getBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, true); }
+                catch { return true; }
+              });
+            }
+
+            /**
+             * Check if the user has blocked address-book write operations from
+             * the MCP API (createContact / updateContact / deleteContact).
+             * Contact writes are persistent, cross every configured address
+             * book, and have no UI confirmation -- enabling a "spoof a known
+             * sender" attack where the LLM edits Boss's email to attacker's.
+             * Default true.
+             */
+            function isContactWritesBlocked() {
+              return __cachedRead(PREF_BLOCK_CONTACT_WRITES, () => {
+                try { return Services.prefs.getBoolPref(PREF_BLOCK_CONTACT_WRITES, true); }
+                catch { return true; }
+              });
+            }
+
+            /**
+             * Check if bulk mailbox export is blocked. Default true:
+             * exportMailbox writes the user's mail content to disk in a
+             * machine-readable format, which is an attractive primitive for
+             * an LLM that has been prompt-injected into "back up everything
+             * I have". Off-by-pref keeps it from being a one-call data
+             * exfil channel.
+             */
+            function isMailboxExportBlocked() {
+              return __cachedRead(PREF_BLOCK_MAILBOX_EXPORT, () => {
+                try { return Services.prefs.getBoolPref(PREF_BLOCK_MAILBOX_EXPORT, true); }
+                catch { return true; }
+              });
             }
 
             /**
@@ -1117,19 +2029,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Fails closed: corrupt pref disables all tools.
              */
             function getDisabledTools() {
-              try {
-                const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
-                if (!pref) return [];
-                const parsed = JSON.parse(pref);
-                if (!Array.isArray(parsed) || !parsed.every(v => typeof v === "string")) {
-                  console.error("thunderbird-mcp: disabled tools pref is invalid, disabling all tools");
+              return __cachedRead(PREF_DISABLED_TOOLS, () => {
+                try {
+                  const pref = Services.prefs.getStringPref(PREF_DISABLED_TOOLS, "");
+                  if (!pref) return [];
+                  const parsed = JSON.parse(pref);
+                  if (!Array.isArray(parsed) || !parsed.every(v => typeof v === "string")) {
+                    console.error("thunderbird-mcp: disabled tools pref is invalid, disabling all tools");
+                    return ["__all__"];
+                  }
+                  return parsed;
+                } catch (e) {
+                  console.error("thunderbird-mcp: failed to parse disabled tools pref, disabling all tools:", e);
                   return ["__all__"];
                 }
-                return parsed;
-              } catch (e) {
-                console.error("thunderbird-mcp: failed to parse disabled tools pref, disabling all tools:", e);
-                return ["__all__"];
-              }
+              });
             }
 
             /**
@@ -1380,13 +2294,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               for (const entry of filePaths) {
                 try {
                   if (typeof entry === "string") {
-                    // File path attachment
-                    const file = createLocalFile(entry);
-                    if (file.exists()) {
-                      descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: file.fileSize });
-                    } else {
-                      failed.push(entry);
+                    // File path attachment.
+                    //
+                    // SECURITY: reject paths that point at credentials, system
+                    // files, or browser/mail profile data BEFORE touching the
+                    // filesystem. This is the LLM-confused-deputy defense:
+                    // attacker-controlled email content can prompt-inject an
+                    // assistant into calling sendMail with attachments=["/path/to/id_rsa"]
+                    // and we never want that to succeed regardless of skipReview.
+                    if (isSensitiveFilePath(entry)) {
+                      failed.push(`${entry} (sensitive path blocked)`);
+                      continue;
                     }
+                    const file = createLocalFile(entry);
+                    if (!file.exists()) {
+                      failed.push(entry);
+                      continue;
+                    }
+                    // Size cap mirrors the saved-attachment ceiling and avoids
+                    // ballooning outgoing messages when a caller points at a huge file.
+                    let fileSize = 0;
+                    try { fileSize = file.fileSize; } catch { fileSize = 0; }
+                    if (fileSize > MAX_FILE_PATH_ATTACHMENT_BYTES) {
+                      failed.push(`${entry} (exceeds ${MAX_FILE_PATH_ATTACHMENT_BYTES / 1024 / 1024}MB size limit)`);
+                      continue;
+                    }
+                    descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: fileSize });
                   } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
                     // Inline base64 attachment — decode and write to temp file
                     const b64Data = entry.base64 || entry.content;
@@ -1599,11 +2532,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc) {
               if (!composeWin) return;
-              const overrides = { identityKey: null };
+              // Build a recipients-only delta. Do NOT pass identityKey here --
+              // the compose window already has the identity from
+              // msgComposeParams, and including `identityKey: null` is sketchy:
+              // modern Thunderbird ignores it (`if (details.identityKey)`
+              // short-circuits on null), but a future TB version could
+              // interpret it as "clear the identity", which would also wipe
+              // the OpenPGP signing/encrypting state that depends on it.
+              const overrides = {};
               if (to) overrides.to = to;
               if (cc) overrides.cc = mergeAddressHeaders(getIdentityAutoRecipientHeader(identity, "cc"), cc);
               if (bcc) overrides.bcc = mergeAddressHeaders(getIdentityAutoRecipientHeader(identity, "bcc"), bcc);
-              if (Object.keys(overrides).length === 1) return;
+              if (Object.keys(overrides).length === 0) return;
 
               if (typeof composeWin.SetComposeDetails === "function") {
                 composeWin.SetComposeDetails(overrides);
@@ -2118,12 +3058,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return text;
             }
 
+            // SAFE_HREF_SCHEMES lives in security_helpers.js.
+
+            // isSafeMarkdownHref / isSafeImageSrc / escapeMarkdownLinkText /
+            // renderMarkdownLink live in security_helpers.js.
+
             /**
              * Converts HTML to markdown using DOMParser for structure-preserving
              * body extraction. Handles headings, links, bold/italic, lists,
              * blockquotes, code blocks, images, and horizontal rules. Email
              * tables (usually layout, not data) are flattened to text.
              * Falls back to stripHtml if DOMParser is unavailable.
+             *
+             * SECURITY: `<a href>` and `<img src>` values come from sender-
+             * controlled HTML, so we strip dangerous schemes (javascript:,
+             * data: non-image, etc.) and defang markdown-syntax injection in
+             * the link text before emitting the final markdown.
              */
             function htmlToMarkdown(html) {
               if (!html) return "";
@@ -2163,23 +3113,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return t ? "*" + t + "*" : "";
                     }
                     case "a": {
-                      const href = node.getAttribute("href") || "";
+                      const rawHref = node.getAttribute("href") || "";
                       const text = inner().trim();
-                      // Skip empty/anchor-only links and mailto: without text
-                      if (!text && !href) return "";
-                      if (href && text && text !== href) return `[${text}](${href})`;
-                      return text || href;
+                      // Skip empty/anchor-only links
+                      if (!text && !rawHref) return "";
+                      // Drop unsafe href schemes (javascript:, data: non-image,
+                      // vbscript:, file:, chrome:, jar:, blob:, ...). Fall back
+                      // to the visible text so the message stays readable.
+                      if (rawHref && !isSafeMarkdownHref(rawHref)) {
+                        return escapeMarkdownLinkText(text || rawHref);
+                      }
+                      if (rawHref && text && text !== rawHref) {
+                        return renderMarkdownLink(text, rawHref);
+                      }
+                      return escapeMarkdownLinkText(text || rawHref);
                     }
                     case "img": {
                       const alt = node.getAttribute("alt") || "";
-                      const src = node.getAttribute("src") || "";
+                      const rawSrc = node.getAttribute("src") || "";
                       // Skip tracking pixels (1x1, tiny, or data: without alt)
                       const w = parseInt(node.getAttribute("width")) || 0;
                       const h = parseInt(node.getAttribute("height")) || 0;
                       if ((w > 0 && w <= 3) || (h > 0 && h <= 3)) return "";
-                      if (src.startsWith("data:") && !alt) return "";
-                      if (src) return `![${alt}](${src})`;
-                      return alt;
+                      if (rawSrc.startsWith("data:") && !alt) return "";
+                      // Allow http(s):, cid:, mailto: (rare), and data:image/*.
+                      // Anything else (javascript:, data: non-image, file:, ...)
+                      // is dropped to alt text.
+                      if (rawSrc && !isSafeImageSrc(rawSrc)) {
+                        return escapeMarkdownLinkText(alt);
+                      }
+                      if (!rawSrc) return escapeMarkdownLinkText(alt);
+                      const safeAlt = escapeMarkdownLinkText(alt);
+                      if (rawSrc.includes(">")) return safeAlt;
+                      const srcForMd = /[()\s]/.test(rawSrc) ? `<${rawSrc}>` : rawSrc;
+                      return `![${safeAlt}](${srcForMd})`;
                     }
                     case "code": return "`" + node.textContent + "`";
                     case "pre": return "\n\n```\n" + node.textContent.trim() + "\n```\n\n";
@@ -2261,6 +3228,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return isHtml ? stripHtml(text) : text;
             }
 
+            // UNTRUSTED_OPEN/CLOSE + wrapUntrustedBody/Preview live in security_helpers.js.
+
             /**
              * Extracts body from a MIME message in the requested format.
              * For "text": uses coerceBodyToPlaintext fast path (original behavior).
@@ -2268,19 +3237,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function extractFormattedBody(aMimeMsg, bodyFormat) {
               if (bodyFormat === "text") {
-                return { body: extractPlainTextBody(aMimeMsg), bodyIsHtml: false };
+                return { body: wrapUntrustedBody(extractPlainTextBody(aMimeMsg)), bodyIsHtml: false };
               }
               // For markdown/html: need raw MIME content, not coerced text
               const { text, isHtml } = extractBodyContent(aMimeMsg);
               if (!text) {
                 // MIME tree empty -- try coerce as last resort
                 const fallback = extractPlainTextBody(aMimeMsg);
-                return { body: fallback, bodyIsHtml: false };
+                return { body: wrapUntrustedBody(fallback), bodyIsHtml: false };
               }
-              if (!isHtml) return { body: text, bodyIsHtml: false };
+              if (!isHtml) return { body: wrapUntrustedBody(text), bodyIsHtml: false };
               if (bodyFormat === "html") return { body: text, bodyIsHtml: true };
               // Default: markdown
-              return { body: htmlToMarkdown(text), bodyIsHtml: false };
+              return { body: wrapUntrustedBody(htmlToMarkdown(text)), bodyIsHtml: false };
             }
 
             /**
@@ -2452,6 +3421,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return fallback;
             }
 
+	            // Hard cap on the linear-enumeration fallback when
+	            // getMsgHdrForMessageID misses. A 200k-message archive walked
+	            // header-by-header takes tens of seconds; we'd rather fail
+	            // fast and tell the caller to pass a smaller folderPath than
+	            // burn an agent's clock on a single lookup.
+	            const FIND_MESSAGE_SCAN_CAP = 50000;
+
 	            function findMessage(messageId, folderPath) {
 	              const opened = openFolder(folderPath);
 	              if (opened.error) return opened;
@@ -2469,11 +3445,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              }
 
 	              if (!msgHdr) {
+	                let scanned = 0;
+	                let capped = false;
 	                for (const hdr of db.enumerateMessages()) {
+	                  scanned++;
+	                  if (scanned > FIND_MESSAGE_SCAN_CAP) { capped = true; break; }
 	                  if (hdr.messageId === messageId) {
 	                    msgHdr = hdr;
 	                    break;
 	                  }
+	                }
+	                if (!msgHdr && capped) {
+	                  return {
+	                    error: `Message not found after scanning ${FIND_MESSAGE_SCAN_CAP} headers in this folder. Pass a more specific folderPath or use searchMessages first to locate the exact folder.`,
+	                  };
 	                }
 	              }
 
@@ -2572,7 +3557,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             tags: msgTags,
                             _dateTs: msgDateTs
                           };
-                          if (preview) result.preview = preview;
+                          if (preview) result.preview = wrapUntrustedPreview(preview);
                           results.push(result);
                         }
 
@@ -2596,10 +3581,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
 	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody) {
-	              // Gloda full-body search path (async)
+	              // Gloda full-body search path (async).
+	              //
+	              // SECURITY: GlodaMsgSearcher passes the query through to a
+	              // tokenizer that supports boolean operators (AND / OR / NOT
+	              // / *). We restrict the API surface to plain keyword search
+	              // so an MCP caller can't (a) probe the index via wildcards
+	              // they don't have rights to, (b) write surprisingly broad
+	              // queries that scan the whole mailbox. Reject any token-
+	              // level Gloda operator with a clear error rather than
+	              // silently stripping -- the caller deserves to know their
+	              // query was mangled.
 	              if (searchBody) {
 	                if (!GlodaMsgSearcher) return { error: "Gloda full-text index is not available" };
 	                if (!query) return { error: "searchBody requires a non-empty query" };
+	                const dangerous = /(?:^|\s)(?:AND|OR|NOT)(?:\s|$)|[*"()]/;
+	                if (dangerous.test(query)) {
+	                  return {
+	                    error: "searchBody query must be plain keywords. Gloda operators (AND, OR, NOT, *, \", parentheses) are rejected by this MCP API.",
+	                  };
+	                }
 	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly);
 	              }
 	              const results = [];
@@ -2715,7 +3716,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tags: msgTags,
                       _dateTs: msgDateTs
                     };
-                    if (preview) result.preview = preview;
+                    if (preview) result.preview = wrapUntrustedPreview(preview);
                     results.push(result);
                   }
                 } catch {
@@ -2821,9 +3822,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function createContact(email, displayName, firstName, lastName, addressBookId) {
               try {
+                if (isContactWritesBlocked()) {
+                  return { error: "User preference blocks contact writes via MCP. Enable 'Allow contact writes' in the extension options page if you trust this MCP client to manage your address book." };
+                }
                 if (typeof email !== "string" || !email) {
                   return { error: "email must be a non-empty string" };
                 }
+                appendComposeAudit({
+                  tool: "createContact",
+                  email: typeof email === "string" ? email.slice(0, 200) : null,
+                  addressBookId: typeof addressBookId === "string" ? addressBookId : null,
+                });
 
                 // Find the target address book
                 let targetBook = null;
@@ -2872,6 +3881,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function updateContact(contactId, email, displayName, firstName, lastName) {
               try {
+                if (isContactWritesBlocked()) {
+                  return { error: "User preference blocks contact writes via MCP. Enable 'Allow contact writes' in the extension options page if you trust this MCP client to manage your address book." };
+                }
                 if (typeof contactId !== "string" || !contactId) {
                   return { error: "contactId must be a non-empty string" };
                 }
@@ -2879,6 +3891,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const found = findContactByUID(contactId);
                 if (found.error) return found;
                 const { card, book } = found;
+
+                // Log the change BEFORE mutating so the audit captures the old
+                // email -- crucial when an attacker repoints "Boss" at their
+                // own address. Persist as much identifying detail as we can
+                // without storing the full contact card.
+                appendComposeAudit({
+                  tool: "updateContact",
+                  contactId,
+                  bookName: book.dirName,
+                  bookURI: book.URI,
+                  oldEmail: card.primaryEmail || null,
+                  newEmail: typeof email === "string" ? email.slice(0, 200) : null,
+                });
 
                 if (email !== undefined) card.primaryEmail = email;
                 if (displayName !== undefined) card.displayName = displayName;
@@ -2901,6 +3926,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function deleteContact(contactId) {
               try {
+                if (isContactWritesBlocked()) {
+                  return { error: "User preference blocks contact writes via MCP. Enable 'Allow contact writes' in the extension options page if you trust this MCP client to manage your address book." };
+                }
                 if (typeof contactId !== "string" || !contactId) {
                   return { error: "contactId must be a non-empty string" };
                 }
@@ -2908,6 +3936,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const found = findContactByUID(contactId);
                 if (found.error) return found;
                 const { card, book } = found;
+
+                appendComposeAudit({
+                  tool: "deleteContact",
+                  contactId,
+                  bookName: book.dirName,
+                  bookURI: book.URI,
+                  email: card.primaryEmail || null,
+                  displayName: card.displayName || null,
+                });
 
                 book.deleteCards([card]);
                 return {
@@ -2940,6 +3977,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
+              }
+              if (skipReview && isSkipReviewBlocked()) {
+                return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review dialog instead." };
               }
               try {
                 const win = Services.wm.getMostRecentWindow("mail:3pane");
@@ -3468,7 +4508,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status) {
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, recurringScope) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -3489,6 +4529,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   oldItem = all.find(i => i.id === eventId) || null;
                 }
                 if (!oldItem) return { error: `Event not found: ${eventId}` };
+
+                // SAFETY: refuse to silently rewrite an entire recurring
+                // series. updateItem on a recurring master applies the
+                // change to every past and future occurrence, which is
+                // surprising and rarely what an agent intended. Require
+                // the caller to explicitly opt in via recurringScope.
+                if (oldItem.recurrenceInfo && recurringScope !== "series") {
+                  return {
+                    error: "Refusing to update a recurring event without an explicit recurringScope. Pass recurringScope: 'series' to rewrite the entire series. Per-occurrence updates are not supported via this API; use Thunderbird's UI.",
+                  };
+                }
 
                 const newItem = oldItem.clone();
                 const changes = [];
@@ -3559,7 +4610,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function deleteEvent(eventId, calendarId) {
+            async function deleteEvent(eventId, calendarId, recurringScope) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -3580,10 +4631,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!item) return { error: `Event not found: ${eventId}` };
 
                 const isRecurring = !!item.recurrenceInfo;
+                if (isRecurring && recurringScope !== "series") {
+                  return {
+                    error: "Refusing to delete a recurring event without an explicit recurringScope. Pass recurringScope: 'series' to delete every occurrence. Per-occurrence deletion is not supported via this API; use Thunderbird's UI.",
+                  };
+                }
+
                 await calendar.deleteItem(item);
                 const result = { success: true, deleted: eventId };
                 if (isRecurring) {
-                  result.warning = "This was a recurring event -- the entire series was deleted.";
+                  result.warning = "The entire series was deleted.";
                 }
                 return result;
               } catch (e) {
@@ -3627,6 +4684,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             async function createTask(title, dueDate, calendarId, description, priority, categories, skipReview) {
               if (!cal || !CalTodo) return { error: "Calendar module not available" };
+              if (skipReview && isSkipReviewBlocked()) {
+                return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review dialog instead." };
+              }
               try {
                 let dueDt = null;
                 if (dueDate) {
@@ -3995,6 +5055,329 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return results;
             }
             // END RAW MIME ATTACHMENT HELPERS
+	            /**
+	             * Cheap headers-only variant of getMessage. Returns the same
+	             * structural fields searchMessages returns plus references and
+	             * in-reply-to, without paying the MIME parse / body decode cost.
+	             * Useful when the LLM is triaging a list and only needs to know
+	             * "who, when, what subject" before deciding whether to fetch full.
+	             */
+	            function getMessageHeaders(messageId, folderPath) {
+	              const found = findMessage(messageId, folderPath);
+	              if (found.error) return { error: found.error };
+	              return msgHdrToHeaderObject(found.msgHdr);
+	            }
+
+	            // Shared shape extraction so getMessageHeaders and
+	            // batchGetMessageHeaders return identical fields.
+	            function msgHdrToHeaderObject(msgHdr) {
+	              return {
+	                id: msgHdr.messageId,
+	                subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "",
+	                author: msgHdr.mime2DecodedAuthor || msgHdr.author || "",
+	                recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients || "",
+	                ccList: msgHdr.ccList || "",
+	                date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+	                tags: getUserTags(msgHdr),
+	                isRead: msgHdr.isRead,
+	                isFlagged: msgHdr.isFlagged,
+	                threadId: msgHdr.threadId ? String(msgHdr.threadId) : null,
+	                references: msgHdr.getStringProperty("references") || "",
+	                inReplyTo: msgHdr.getStringProperty("in-reply-to") || "",
+	                size: typeof msgHdr.messageSize === "number" ? msgHdr.messageSize : null,
+	              };
+	            }
+
+	            /**
+	             * Recent messages from a given sender, across the inbox of
+	             * every accessible account. Uses substring match against the
+	             * author field (which contains "Name <email>" -- so email
+	             * matches naturally). Newest-first.
+	             */
+	            function getSenderHistory(email, maxResults, scanCap, sinceDays) {
+	              if (typeof email !== "string" || !email.trim()) {
+	                return { error: "email must be a non-empty string" };
+	              }
+	              const wantLower = email.toLowerCase();
+	              const cap = Number.isFinite(maxResults) && maxResults > 0
+	                ? Math.min(Math.floor(maxResults), 200)
+	                : 50;
+	              const scanLimit = Number.isFinite(scanCap) && scanCap > 0
+	                ? Math.min(Math.floor(scanCap), 50000)
+	                : 5000;
+	              const sinceMicros = Number.isFinite(sinceDays) && sinceDays > 0
+	                ? (Date.now() - sinceDays * 86400 * 1000) * 1000
+	                : null;
+
+	              const FLAG_INBOX = 0x1000;
+	              const results = [];
+	              let totalScanned = 0;
+	              for (const account of getAccessibleAccounts()) {
+	                if (results.length >= cap) break;
+	                let inbox = null;
+	                try {
+	                  const root = account.incomingServer && account.incomingServer.rootFolder;
+	                  if (!root) continue;
+	                  if (typeof root.getFolderWithFlags === "function") {
+	                    try { inbox = root.getFolderWithFlags(FLAG_INBOX); } catch { /* ignore */ }
+	                  }
+	                  if (!inbox) inbox = root;
+	                  const db = inbox.msgDatabase;
+	                  if (!db) continue;
+	                  let scanned = 0;
+	                  for (const hdr of db.enumerateMessages()) {
+	                    scanned++;
+	                    totalScanned++;
+	                    if (scanned > scanLimit) break;
+	                    if (sinceMicros !== null && hdr.date && hdr.date < sinceMicros) continue;
+	                    const author = (hdr.mime2DecodedAuthor || hdr.author || "").toLowerCase();
+	                    if (!author.includes(wantLower)) continue;
+	                    const obj = msgHdrToHeaderObject(hdr);
+	                    obj.folderPath = inbox.URI;
+	                    obj._ts = hdr.date ? hdr.date / 1000 : 0;
+	                    results.push(obj);
+	                    if (results.length >= cap * 2) break; // generous pre-sort buffer
+	                  }
+	                } catch { /* skip inaccessible account */ }
+	              }
+
+	              results.sort((a, b) => (b._ts || 0) - (a._ts || 0));
+	              const trimmed = results.slice(0, cap).map(({ _ts, ...rest }) => rest);
+	              return {
+	                sender: email,
+	                messages: trimmed,
+	                totalScanned,
+	                truncated: results.length > cap,
+	              };
+	            }
+
+	            /**
+	             * Find messages with attachments matching a filename substring
+	             * and/or MIME-type prefix. Works by pre-filtering to messages
+	             * that have the Attachment flag set, then walking
+	             * allUserAttachments via MsgHdrToMimeMessage. Async because
+	             * MIME parse is async.
+	             *
+	             * Scoped to a specific folder, or fans out across the inbox of
+	             * every accessible account when folderPath is omitted.
+	             */
+	            function searchAttachments(nameContains, contentType, folderPath, maxResults, scanCap) {
+	              return new Promise((resolve) => {
+	                try {
+	                  if (!nameContains && !contentType) {
+	                    resolve({ error: "Provide at least one of nameContains or contentType" });
+	                    return;
+	                  }
+	                  const wantName = nameContains ? String(nameContains).toLowerCase() : null;
+	                  const wantType = contentType ? String(contentType).toLowerCase() : null;
+	                  const cap = Number.isFinite(maxResults) && maxResults > 0
+	                    ? Math.min(Math.floor(maxResults), 200)
+	                    : 50;
+	                  const scanLimit = Number.isFinite(scanCap) && scanCap > 0
+	                    ? Math.min(Math.floor(scanCap), 50000)
+	                    : 5000;
+
+	                  // Build the list of folders to scan.
+	                  const folders = [];
+	                  if (folderPath) {
+	                    const opened = openFolder(folderPath);
+	                    if (opened.error) { resolve({ error: opened.error }); return; }
+	                    folders.push(opened.folder);
+	                  } else {
+	                    for (const account of getAccessibleAccounts()) {
+	                      try {
+	                        const root = account.incomingServer && account.incomingServer.rootFolder;
+	                        if (!root) continue;
+	                        // Pick the inbox if present, else the root.
+	                        let inbox = null;
+	                        if (typeof root.getFolderWithFlags === "function") {
+	                          try {
+	                            const FLAG_INBOX = 0x1000; // nsMsgFolderFlags.Inbox
+	                            inbox = root.getFolderWithFlags(FLAG_INBOX);
+	                          } catch { /* ignore */ }
+	                        }
+	                        folders.push(inbox || root);
+	                      } catch { /* skip inaccessible accounts */ }
+	                    }
+	                  }
+
+	                  // Collect candidate headers (those with the Attachment flag).
+	                  const FLAG_ATTACH = 0x10000000; // nsMsgMessageFlags.Attachment
+	                  const candidates = [];
+	                  let totalScanned = 0;
+	                  for (const folder of folders) {
+	                    if (candidates.length >= cap * 4) break; // generous pre-MIME buffer
+	                    let db;
+	                    try { db = folder.msgDatabase; } catch { continue; }
+	                    if (!db) continue;
+	                    let scannedHere = 0;
+	                    for (const hdr of db.enumerateMessages()) {
+	                      scannedHere++;
+	                      totalScanned++;
+	                      if (scannedHere > scanLimit) break;
+	                      if ((hdr.flags & FLAG_ATTACH) !== 0) {
+	                        candidates.push({ hdr, folder });
+	                        if (candidates.length >= cap * 4) break;
+	                      }
+	                    }
+	                  }
+
+	                  if (candidates.length === 0) {
+	                    resolve({ matches: [], totalScanned, candidates: 0 });
+	                    return;
+	                  }
+
+	                  // MIME-parse each candidate; collect matches.
+	                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+	                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+	                  );
+
+	                  const matches = [];
+	                  let remaining = candidates.length;
+	                  const finish = () => {
+	                    matches.sort((a, b) => (b._ts || 0) - (a._ts || 0));
+	                    const trimmed = matches.slice(0, cap).map(({ _ts, ...rest }) => rest);
+	                    resolve({
+	                      matches: trimmed,
+	                      totalScanned,
+	                      candidates: candidates.length,
+	                      truncated: matches.length > cap,
+	                    });
+	                  };
+
+	                  for (const { hdr, folder } of candidates) {
+	                    MsgHdrToMimeMessage(hdr, null, (aMsgHdr, aMimeMsg) => {
+	                      try {
+	                        const atts = aMimeMsg && aMimeMsg.allUserAttachments ? aMimeMsg.allUserAttachments : [];
+	                        const matched = [];
+	                        for (const att of atts) {
+	                          const name = (att && att.name) ? String(att.name).toLowerCase() : "";
+	                          const ct = (att && att.contentType) ? String(att.contentType).toLowerCase() : "";
+	                          const nameOk = !wantName || name.includes(wantName);
+	                          const typeOk = !wantType || ct.startsWith(wantType);
+	                          if (nameOk && typeOk) {
+	                            matched.push({
+	                              name: att.name || "",
+	                              contentType: att.contentType || "",
+	                              size: typeof att.size === "number" ? att.size : null,
+	                            });
+	                          }
+	                        }
+	                        if (matched.length > 0) {
+	                          const headerObj = msgHdrToHeaderObject(hdr);
+	                          headerObj.matchingAttachments = matched;
+	                          headerObj._ts = hdr.date ? hdr.date / 1000 : 0;
+	                          headerObj.folderPath = folder.URI;
+	                          matches.push(headerObj);
+	                        }
+	                      } catch { /* skip parse errors */ }
+	                      remaining--;
+	                      if (remaining === 0) finish();
+	                    });
+	                  }
+	                } catch (e) {
+	                  resolve({ error: e.toString() });
+	                }
+	              });
+	            }
+
+	            /**
+	             * Walk a folder once and return all headers that share the
+	             * threadId of the anchor message. The anchor itself is included.
+	             * Newest-first.
+	             */
+	            function searchByThread(messageId, folderPath, maxResults) {
+	              const found = findMessage(messageId, folderPath);
+	              if (found.error) return { error: found.error };
+	              const { msgHdr: anchor, folder, db } = found;
+	              const threadId = anchor.threadId;
+	              if (!threadId) {
+	                return { thread: [msgHdrToHeaderObject(anchor)], threadId: null, anchored: true };
+	              }
+	              const cap = Number.isFinite(maxResults) && maxResults > 0
+	                ? Math.min(Math.floor(maxResults), 500)
+	                : 100;
+	              const results = [];
+	              const SCAN_CAP = 50000;
+	              let scanned = 0;
+	              for (const hdr of db.enumerateMessages()) {
+	                scanned++;
+	                if (scanned > SCAN_CAP) break;
+	                if (hdr.threadId === threadId) {
+	                  results.push({ _hdr: hdr, _ts: hdr.date ? hdr.date / 1000 : 0 });
+	                  if (results.length >= cap) break;
+	                }
+	              }
+	              results.sort((a, b) => b._ts - a._ts);
+	              return {
+	                threadId: String(threadId),
+	                anchorId: anchor.messageId,
+	                thread: results.map(r => msgHdrToHeaderObject(r._hdr)),
+	                truncated: results.length >= cap,
+	                scanned,
+	              };
+	            }
+
+	            /**
+	             * Resolve N message IDs against a single folder in one pass.
+	             * Returns { headers: { [id]: headerObj | {error} }, total, failed }.
+	             * Hard cap of 200 -- search-result pages are typically smaller
+	             * and this keeps the round-trip JSON bounded.
+	             */
+	            function batchGetMessageHeaders(messageIds, folderPath) {
+	              if (!Array.isArray(messageIds)) return { error: "messageIds must be an array" };
+	              if (messageIds.length === 0) return { headers: {}, total: 0, failed: 0 };
+	              if (messageIds.length > 200) {
+	                return { error: `Too many ids: ${messageIds.length}. Hard cap is 200; call multiple times if needed.` };
+	              }
+	              const opened = openFolder(folderPath);
+	              if (opened.error) return { error: opened.error };
+	              const { folder, db } = opened;
+
+	              // Build a single id -> hdr map by enumerating ONCE rather than
+	              // calling findMessage N times. For an inbox with M messages
+	              // this is O(M) instead of O(M*N).
+	              const wanted = new Set(messageIds);
+	              const found = new Map();
+	              const hasDirect = typeof db.getMsgHdrForMessageID === "function";
+	              if (hasDirect) {
+	                for (const id of messageIds) {
+	                  try {
+	                    const h = db.getMsgHdrForMessageID(id);
+	                    if (h) found.set(id, h);
+	                  } catch { /* ignore */ }
+	                }
+	              }
+	              // Anything still unresolved gets one linear enumeration pass.
+	              const missing = messageIds.filter(id => !found.has(id));
+	              if (missing.length > 0) {
+	                const missSet = new Set(missing);
+	                let scanned = 0;
+	                const SCAN_CAP = 50000;
+	                for (const hdr of db.enumerateMessages()) {
+	                  scanned++;
+	                  if (scanned > SCAN_CAP) break;
+	                  if (missSet.has(hdr.messageId)) {
+	                    found.set(hdr.messageId, hdr);
+	                    missSet.delete(hdr.messageId);
+	                    if (missSet.size === 0) break;
+	                  }
+	                }
+	              }
+
+	              const headers = Object.create(null);
+	              let failed = 0;
+	              for (const id of messageIds) {
+	                const h = found.get(id);
+	                if (!h) {
+	                  headers[id] = { error: "not found in this folder" };
+	                  failed++;
+	                } else {
+	                  headers[id] = msgHdrToHeaderObject(h);
+	                }
+	              }
+	              return { headers, total: messageIds.length, failed };
+	            }
 
 	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource) {
 	              return new Promise((resolve) => {
@@ -4247,9 +5630,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           try {
                             const svc = MailServices.messageServiceFromURI(msgUri);
                             const baseUri = svc.getUrlForUri(msgUri);
-                            // Append part parameter to the resolved fetchable URL
+                            // Append part parameter to the resolved fetchable URL.
+                            // URL-encode partName: it is structural (e.g. "1.2.1")
+                            // in current Thunderbird but encoding it costs nothing
+                            // and closes any future regression where a non-digit
+                            // character could land inside a URL query value.
                             const sep = baseUri.spec.includes("?") ? "&" : "?";
-                            partUrl = `${baseUri.spec}${sep}part=${part.partName}`;
+                            partUrl = `${baseUri.spec}${sep}part=${encodeURIComponent(part.partName)}`;
                           } catch {
                             partUrl = "";
                           }
@@ -4503,6 +5890,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             return;
                           }
 
+                          // SECURITY: the channel uses the system principal so
+                          // mail-store protocols (mailbox:, imap-message:, ...)
+                          // can be fetched without sandboxing. That privilege
+                          // would let a file:// or chrome:// URL slipping into
+                          // `url` exfiltrate arbitrary local files or read
+                          // internal browser resources, so we hard-require an
+                          // allow-listed mail-store scheme here. This is
+                          // defense in depth: Thunderbird itself supplies the
+                          // URLs we feed into this code path, but if a future
+                          // regression or extension interaction ever returned
+                          // a non-mail scheme, this check refuses to fetch it.
+                          if (!isSystemPrincipalFetchAllowed(url)) {
+                            info.error = `Refusing to fetch attachment from non-mail-store URL: ${String(url).slice(0, 80)}`;
+                            try { file.remove(false); } catch {}
+                            done();
+                            return;
+                          }
                           const channel = NetUtil.newChannel({
                             uri: url,
                             loadUsingSystemPrincipal: true
@@ -4615,6 +6019,156 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	            }
 
             /**
+             * Validate compose parameters without sending. Mirrors the
+             * argument shape of composeMail and reports what WOULD happen:
+             * resolved identity, recipient counts, attachment status per
+             * entry (resolved size, sensitive-path verdict, oversize
+             * verdict, success/failure), rendered subject after header
+             * sanitization, and the skipReview-block pref state.
+             *
+             * Pure read-only -- nothing is queued, drafted, or sent. Useful
+             * for an agent that wants to self-check a compose call before
+             * committing to it.
+             */
+
+            /**
+             * Snapshot of the agent's sandbox: what tools are available, what
+             * accounts are reachable, what gates are on, how much rate-limit
+             * budget remains. Designed for the LLM to call ONCE at the start
+             * of a session to plan around constraints rather than discovering
+             * them via failed calls.
+             */
+            function getServerCapabilities() {
+              const allTools = tools.map(t => t.name);
+              const enabled = allTools.filter(n => isToolEnabled(n));
+              const disabled = allTools.filter(n => !isToolEnabled(n));
+              const accessibleAccounts = getAccessibleAccounts().map(a => ({
+                id: a.key,
+                name: a.incomingServer && a.incomingServer.prettyName ? a.incomingServer.prettyName : a.key,
+              }));
+              const safeguards = {
+                blockSkipReview: isSkipReviewBlocked(),
+                blockFilterForwardReply: isFilterForwardReplyBlocked(),
+                blockContactWrites: isContactWritesBlocked(),
+              };
+              return {
+                serverVersion: getExtVersion(),
+                tools: { enabled, disabled, total: allTools.length },
+                accessibleAccounts,
+                accessMode: getAllowedAccountIds().length === 0 ? "all" : "restricted",
+                safeguards,
+                rateLimits: inspectRateLimits(__rateLimiterState),
+                auditLogPath: `<ProfD>/${AUDIT_LOG_SUBDIR}/${AUDIT_LOG_FILENAME}`,
+              };
+            }
+
+            function dryRunCompose(to, subject, body, cc, bcc, isHtml, from, attachments) {
+              const result = {
+                wouldSucceed: true,
+                blockers: [],
+                resolvedIdentity: null,
+                isHtml: !!isHtml,
+                subjectAfterSanitization: sanitizeHeaderLine(subject || ""),
+                bodyLength: typeof body === "string" ? body.length : 0,
+                recipients: {
+                  to: countRecipients(to),
+                  cc: countRecipients(cc),
+                  bcc: countRecipients(bcc),
+                },
+                attachments: [],
+                skipReviewBlocked: isSkipReviewBlocked(),
+              };
+
+              // Resolve identity through the same accessible-account path used
+              // by composeMail, but never fall back silently to the default --
+              // if `from` is set and doesn't match, surface the same error
+              // sendMail would return.
+              try {
+                if (from) {
+                  const identity = findIdentity(from);
+                  if (!identity) {
+                    result.blockers.push(`from identity not found or not accessible: ${from}`);
+                    result.wouldSucceed = false;
+                  } else {
+                    result.resolvedIdentity = {
+                      key: identity.key,
+                      email: identity.email,
+                      fullName: identity.fullName || null,
+                    };
+                  }
+                } else {
+                  // Default identity preview: first accessible identity.
+                  const accounts = getAccessibleAccounts();
+                  const firstIdentity = accounts[0] && accounts[0].defaultIdentity;
+                  if (firstIdentity) {
+                    result.resolvedIdentity = {
+                      key: firstIdentity.key,
+                      email: firstIdentity.email,
+                      fullName: firstIdentity.fullName || null,
+                      isDefault: true,
+                    };
+                  }
+                }
+              } catch (e) {
+                result.blockers.push(`identity resolution failed: ${e.message || e}`);
+                result.wouldSucceed = false;
+              }
+
+              // Per-attachment evaluation. Mirrors filePathsToAttachDescs but
+              // never copies / decodes / writes anything; only reports verdict.
+              if (Array.isArray(attachments)) {
+                for (const entry of attachments) {
+                  const att = { kind: null, name: null, status: "ok", reason: null, size: null };
+                  if (typeof entry === "string") {
+                    att.kind = "path";
+                    att.name = entry;
+                    if (isSensitiveFilePath(entry)) {
+                      att.status = "blocked";
+                      att.reason = "sensitive path";
+                    } else {
+                      try {
+                        const file = createLocalFile(entry);
+                        if (!file.exists()) {
+                          att.status = "missing";
+                          att.reason = "file does not exist";
+                        } else {
+                          try { att.size = file.fileSize; } catch { att.size = null; }
+                          if (att.size !== null && att.size > MAX_FILE_PATH_ATTACHMENT_BYTES) {
+                            att.status = "blocked";
+                            att.reason = `exceeds ${MAX_FILE_PATH_ATTACHMENT_BYTES / 1024 / 1024}MB cap`;
+                          }
+                        }
+                      } catch (e) {
+                        att.status = "error";
+                        att.reason = e.message || String(e);
+                      }
+                    }
+                  } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
+                    att.kind = "inline";
+                    att.name = entry.name;
+                    const b64 = entry.base64 || entry.content;
+                    att.size = typeof b64 === "string" ? Math.floor((b64.length * 3) / 4) : null;
+                    if (typeof b64 === "string" && b64.length > MAX_BASE64_SIZE) {
+                      att.status = "blocked";
+                      att.reason = `inline base64 exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB`;
+                    }
+                  } else {
+                    att.kind = "invalid";
+                    att.name = typeof entry === "object" ? JSON.stringify(entry).slice(0, 80) : String(entry);
+                    att.status = "blocked";
+                    att.reason = "neither a file path nor an inline {name, base64} object";
+                  }
+                  if (att.status !== "ok") {
+                    result.wouldSucceed = false;
+                  }
+                  result.attachments.push(att);
+                }
+              }
+
+              return result;
+            }
+
+            /**
              * Composes a new email. Opens a compose window for review, or sends
              * directly when skipReview is true.
              *
@@ -4623,11 +6177,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * 2. Encode non-ASCII as HTML entities - compose window has charset issues
              *    with emojis/unicode even with <meta charset="UTF-8">
              */
-            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview) {
+            function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview, idempotencyKey) {
               try {
                 if (skipReview && isSkipReviewBlocked()) {
                   return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
                 }
+                // Idempotency: if a prior successful sendMail with this key
+                // ran in the last 24h, return its result instead of sending
+                // again. The audit-log entry is the source of truth.
+                if (typeof idempotencyKey === "string" && idempotencyKey) {
+                  const prior = findIdempotentEntry("sendMail", idempotencyKey);
+                  if (prior) {
+                    return { ...prior, idempotent: true, idempotencyKey };
+                  }
+                }
+                appendComposeAudit({
+                  tool: "sendMail",
+                  skipReview: !!skipReview,
+                  isHtml: !!isHtml,
+                  from: typeof from === "string" ? from : null,
+                  to: countRecipients(to),
+                  cc: countRecipients(cc),
+                  bcc: countRecipients(bcc),
+                  subject: typeof subject === "string" ? subject.slice(0, 200) : null,
+                  attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                  idempotencyKey: typeof idempotencyKey === "string" ? idempotencyKey.slice(0, 256) : null,
+                });
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
 
@@ -4637,7 +6212,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeFields.to = to || "";
                 composeFields.cc = cc || "";
                 composeFields.bcc = bcc || "";
-                composeFields.subject = subject || "";
+                composeFields.subject = sanitizeHeaderLine(subject || "");
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
@@ -4668,6 +6243,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       let msg = "Message sent";
                       if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                       result.message = msg;
+                      // Idempotency: record the successful outcome so a retry
+                      // with the same key returns this result instead of
+                      // sending again. The pre-send audit entry only records
+                      // intent; findIdempotentEntry filters to success:true.
+                      if (typeof idempotencyKey === "string" && idempotencyKey) {
+                        appendComposeAudit({
+                          tool: "sendMail",
+                          success: true,
+                          idempotencyKey: idempotencyKey.slice(0, 256),
+                          result,
+                        });
+                      }
                     }
                     return result;
                   });
@@ -4694,6 +6281,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments) {
               try {
+                appendComposeAudit({
+                  tool: "saveDraft",
+                  isHtml: !!isHtml,
+                  from: typeof from === "string" ? from : null,
+                  to: countRecipients(to),
+                  cc: countRecipients(cc),
+                  bcc: countRecipients(bcc),
+                  subject: typeof subject === "string" ? subject.slice(0, 200) : null,
+                  attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                });
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
 
@@ -4703,7 +6300,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeFields.to = to || "";
                 composeFields.cc = cc || "";
                 composeFields.bcc = bcc || "";
-                composeFields.subject = subject || "";
+                composeFields.subject = sanitizeHeaderLine(subject || "");
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
@@ -4755,13 +6352,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * skipReview still uses direct send, so it keeps a manual quoted body
              * and manually marks the original as replied after a successful send.
              */
-	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview) {
+	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview, idempotencyKey) {
 	              return new Promise((resolve) => {
 	                try {
 	                  if (skipReview && isSkipReviewBlocked()) {
 	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
 	                    return;
 	                  }
+	                  if (typeof idempotencyKey === "string" && idempotencyKey) {
+	                    const prior = findIdempotentEntry("replyToMessage", idempotencyKey);
+	                    if (prior) {
+	                      resolve({ ...prior, idempotent: true, idempotencyKey });
+	                      return;
+	                    }
+	                  }
+	                  appendComposeAudit({
+	                    tool: "replyToMessage",
+	                    skipReview: !!skipReview,
+	                    replyAll: !!replyAll,
+	                    isHtml: !!isHtml,
+	                    from: typeof from === "string" ? from : null,
+	                    originalMessageId: typeof messageId === "string" ? messageId.slice(0, 256) : null,
+	                    to: countRecipients(to),
+	                    cc: countRecipients(cc),
+	                    bcc: countRecipients(bcc),
+	                    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+	                    idempotencyKey: typeof idempotencyKey === "string" ? idempotencyKey.slice(0, 256) : null,
+	                  });
 	                  const found = findMessage(messageId, folderPath);
 	                  if (found.error) {
 	                    resolve({ error: found.error });
@@ -4831,7 +6448,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
 	                        composeFields.bcc = bcc || "";
 
-	                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+	                        const origSubject = sanitizeHeaderLine(msgHdr.mime2DecodedSubject || msgHdr.subject || "");
 	                        composeFields.subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`;
 	                        composeFields.references = `<${messageId}>`;
 	                        composeFields.setHeader("In-Reply-To", `<${messageId}>`);
@@ -4870,6 +6487,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                            let msg = "Reply sent";
 	                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
 	                            result.message = msg;
+	                            if (typeof idempotencyKey === "string" && idempotencyKey) {
+	                              appendComposeAudit({
+	                                tool: "replyToMessage",
+	                                success: true,
+	                                idempotencyKey: idempotencyKey.slice(0, 256),
+	                                result,
+	                              });
+	                            }
 	                          }
 	                          resolve(result);
 	                        });
@@ -4921,13 +6546,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * block + auto-attaches originals from MsgHdrToMimeMessage + manually
              * marks the original as forwarded after a successful send.
              */
-            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
+            function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview, idempotencyKey) {
               return new Promise((resolve) => {
                 try {
                   if (skipReview && isSkipReviewBlocked()) {
                     resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
                     return;
                   }
+                  if (typeof idempotencyKey === "string" && idempotencyKey) {
+                    const prior = findIdempotentEntry("forwardMessage", idempotencyKey);
+                    if (prior) {
+                      resolve({ ...prior, idempotent: true, idempotencyKey });
+                      return;
+                    }
+                  }
+                  appendComposeAudit({
+                    tool: "forwardMessage",
+                    skipReview: !!skipReview,
+                    isHtml: !!isHtml,
+                    from: typeof from === "string" ? from : null,
+                    originalMessageId: typeof messageId === "string" ? messageId.slice(0, 256) : null,
+                    to: countRecipients(to),
+                    cc: countRecipients(cc),
+                    bcc: countRecipients(bcc),
+                    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                    idempotencyKey: typeof idempotencyKey === "string" ? idempotencyKey.slice(0, 256) : null,
+                  });
                   const found = findMessage(messageId, folderPath);
                   if (found.error) {
                     resolve({ error: found.error });
@@ -4981,7 +6625,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         composeFields.cc = cc || "";
                         composeFields.bcc = bcc || "";
 
-                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                        const origSubject = sanitizeHeaderLine(msgHdr.mime2DecodedSubject || msgHdr.subject || "");
                         composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
 
                         const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
@@ -5042,6 +6686,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             let msg = `Forward sent with ${allDescs.length} attachment(s)`;
                             if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                             result.message = msg;
+                            if (typeof idempotencyKey === "string" && idempotencyKey) {
+                              appendComposeAudit({
+                                tool: "forwardMessage",
+                                success: true,
+                                idempotencyKey: idempotencyKey.slice(0, 256),
+                                result,
+                              });
+                            }
                           }
                           resolve(result);
                         });
@@ -5123,6 +6775,96 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { success: true, displayMode: mode, subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "" };
             }
 
+            /**
+             * Force the IMAP server-side state for `folderPath` to sync into
+             * Thunderbird's local cache. Non-IMAP folders short-circuit with
+             * success since there's nothing to fetch. Returns when the
+             * IMAP URL listener fires onStopRunningUrl (success or error),
+             * or when the timeout elapses.
+             *
+             * Without this, recently-arrived mail in IMAP folders is invisible
+             * to searchMessages / getRecentMessages until the user clicks the
+             * folder in Thunderbird's UI. README documents this as a known
+             * issue; refreshFolder is the programmatic fix.
+             */
+            function refreshFolder(folderPath, timeoutMs) {
+              return new Promise((resolve) => {
+                try {
+                  const result = getAccessibleFolder(folderPath);
+                  if (result.error) { resolve({ error: result.error }); return; }
+                  const folder = result.folder;
+                  // Non-IMAP folders (Local Folders, news, etc.) don't need
+                  // server-side refresh -- just return success.
+                  if (!folder.server || folder.server.type !== "imap") {
+                    resolve({ success: true, folderPath: folder.URI, skipped: "not an IMAP folder" });
+                    return;
+                  }
+
+                  // Stay under the bridge's HTTP REQUEST_TIMEOUT (30000ms). A
+                  // tool that took the full 30s would race the bridge into a
+                  // hard-fail "Request to Thunderbird timed out", losing the
+                  // structured timeout result we'd otherwise return. 25s gives
+                  // a 5s safety margin for the round-trip stdio I/O.
+                  const REFRESH_TIMEOUT_CAP_MS = 25000;
+                  const limit = Number.isFinite(timeoutMs) && timeoutMs > 0
+                    ? Math.min(Math.floor(timeoutMs), REFRESH_TIMEOUT_CAP_MS)
+                    : 15000;
+
+                  let settled = false;
+                  const settle = (value) => {
+                    if (settled) return;
+                    settled = true;
+                    try { timer.cancel(); } catch {}
+                    resolve(value);
+                  };
+
+                  const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  timer.initWithCallback(
+                    { notify() { settle({ error: `refreshFolder timed out after ${limit}ms`, folderPath: folder.URI }); } },
+                    limit,
+                    Ci.nsITimer.TYPE_ONE_SHOT
+                  );
+
+                  const beforeCount = folder.getTotalMessages(false);
+                  const urlListener = {
+                    QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                    OnStartRunningUrl() {},
+                    OnStopRunningUrl(url, exitCode) {
+                      const ok = Components.isSuccessCode(exitCode);
+                      const afterCount = (() => {
+                        try { return folder.getTotalMessages(false); } catch { return null; }
+                      })();
+                      const newMessages = (afterCount !== null && typeof beforeCount === "number")
+                        ? Math.max(0, afterCount - beforeCount)
+                        : null;
+                      if (ok) {
+                        settle({
+                          success: true,
+                          folderPath: folder.URI,
+                          totalBefore: beforeCount,
+                          totalAfter: afterCount,
+                          newMessages,
+                        });
+                      } else {
+                        settle({
+                          error: `IMAP fetch failed (status 0x${exitCode.toString(16)})`,
+                          folderPath: folder.URI,
+                        });
+                      }
+                    },
+                  };
+
+                  try {
+                    folder.getNewMessages(null, urlListener);
+                  } catch (e) {
+                    settle({ error: e.toString(), folderPath: folder.URI });
+                  }
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
             function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
               const results = [];
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
@@ -5164,7 +6906,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tags: msgTags,
                       _dateTs: msgDateTs
                     };
-                    if (preview) result.preview = preview;
+                    if (preview) result.preview = wrapUntrustedPreview(preview);
                     results.push(result);
                   }
                 } catch {
@@ -5802,13 +7544,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function buildTerms(filter, conditions) {
               for (const cond of conditions) {
                 const term = filter.createTerm();
-                const attribNum = ATTRIB_MAP[cond.attrib] ?? parseInt(cond.attrib);
-                if (isNaN(attribNum)) throw new Error(`Unknown attribute: ${cond.attrib}`);
-                term.attrib = attribNum;
+                // SECURITY: strict allow-list. The previous `?? parseInt(...)`
+                // fallback let callers pass raw nsMsgSearchAttrib enum values that
+                // aren't in ATTRIB_MAP, bypassing the intended named-action set.
+                if (!Object.prototype.hasOwnProperty.call(ATTRIB_MAP, cond.attrib)) {
+                  throw new Error(`Unknown attribute: ${cond.attrib}`);
+                }
+                term.attrib = ATTRIB_MAP[cond.attrib];
 
-                const opNum = OP_MAP[cond.op] ?? parseInt(cond.op);
-                if (isNaN(opNum)) throw new Error(`Unknown operator: ${cond.op}`);
-                term.op = opNum;
+                if (!Object.prototype.hasOwnProperty.call(OP_MAP, cond.op)) {
+                  throw new Error(`Unknown operator: ${cond.op}`);
+                }
+                term.op = OP_MAP[cond.op];
 
                 const value = term.value;
                 value.attrib = term.attrib;
@@ -5824,8 +7571,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function buildActions(filter, actions) {
               for (const act of actions) {
                 const action = filter.createAction();
-                const typeNum = ACTION_MAP[act.type] ?? parseInt(act.type);
-                if (isNaN(typeNum)) throw new Error(`Unknown action type: ${act.type}`);
+                // SECURITY: strict allow-list. The previous `?? parseInt(...)`
+                // fallback accepted any numeric nsMsgFilterAction value, which
+                // would auto-expose new (or legacy) action types we never
+                // intended to surface -- including historic "run program" flavors.
+                if (!Object.prototype.hasOwnProperty.call(ACTION_MAP, act.type)) {
+                  throw new Error(`Unknown action type: ${act.type}`);
+                }
+                const typeNum = ACTION_MAP[act.type];
+
+                // SECURITY: forward (0x0B) and reply (0x0A) filter actions run on
+                // every incoming message with no UI, so an MCP caller that can
+                // create one effectively installs a permanent silent-exfiltration
+                // rule. Block these action types unless the user has explicitly
+                // opted in via the options page. Move/copy/tag/markRead etc.
+                // remain available -- this only restricts the network-egress
+                // action types.
+                if ((typeNum === 0x0A || typeNum === 0x0B) && isFilterForwardReplyBlocked()) {
+                  throw new Error(
+                    `Filter action '${act.type}' is blocked by user preference. ` +
+                    `Forward/reply filter actions run silently on every message ` +
+                    `and are not permitted via the MCP API by default. ` +
+                    `Enable them in the extension options page if needed, ` +
+                    `or have the user create the filter directly in Thunderbird.`
+                  );
+                }
+
                 action.type = typeNum;
 
                 if (act.value) {
@@ -6179,6 +7950,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * and rejects unknown properties.
              * Returns an array of error strings (empty = valid).
              */
+            // validateAgainstSchema lives in security_helpers.js.
+
             function validateToolArgs(name, args) {
               const schema = toolSchemas[name];
               if (!schema) return [`Unknown tool: ${name}`];
@@ -6205,24 +7978,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (value === undefined || value === null) continue;
 
-                const expectedType = propSchema.type;
-                if (expectedType === "array") {
-                  if (!Array.isArray(value)) {
-                    errors.push(`Parameter '${key}' must be an array, got ${typeof value}`);
-                  }
-                } else if (expectedType === "object") {
-                  if (typeof value !== "object" || Array.isArray(value)) {
-                    errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
-                  }
-                } else if (expectedType === "integer") {
-                  // JSON Schema "integer" is a whole number. typeof reports
-                  // "number" for both integers and floats, so check explicitly.
-                  if (typeof value !== "number" || !Number.isInteger(value)) {
-                    errors.push(`Parameter '${key}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
-                  }
-                } else if (expectedType && typeof value !== expectedType) {
-                  errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
-                }
+                validateAgainstSchema(value, propSchema, key, errors);
               }
 
               return errors;
@@ -6279,6 +8035,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
+                case "getMessageHeaders":
+                  return getMessageHeaders(args.messageId, args.folderPath);
+                case "batchGetMessageHeaders":
+                  return batchGetMessageHeaders(args.messageIds, args.folderPath);
+                case "searchByThread":
+                  return searchByThread(args.messageId, args.folderPath, args.maxResults);
+                case "searchAttachments":
+                  return await searchAttachments(args.nameContains, args.contentType, args.folderPath, args.maxResults, args.scanCap);
+                case "getSenderHistory":
+                  return getSenderHistory(args.email, args.maxResults, args.scanCap, args.sinceDays);
+                case "exportMailbox":
+                  return await exportMailbox(args.folderPath, args.maxMessages, args.includeBody, args.includeAttachmentMeta, args.scanCap, args.sortOrder);
+                case "dryRunCompose":
+                  return dryRunCompose(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
+                case "getServerCapabilities":
+                  return getServerCapabilities();
+                case "listTemplates":
+                  return listTemplates();
+                case "renderTemplate":
+                  return renderTemplate(args.name, args.vars);
+                case "getAuditLog": {
+                  const filter = {};
+                  if (typeof args.tool === "string") filter.tool = args.tool;
+                  if (typeof args.since === "string") filter.since = args.since;
+                  if (typeof args.until === "string") filter.until = args.until;
+                  const max = typeof args.maxEntries === "number" ? args.maxEntries : 200;
+                  return readAuditLog(max, filter);
+                }
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
                 case "createContact":
@@ -6294,9 +8078,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.recurringScope);
                 case "deleteEvent":
-                  return await deleteEvent(args.eventId, args.calendarId);
+                  return await deleteEvent(args.eventId, args.calendarId, args.recurringScope);
                 case "listCategories":
                   return listCategories();
                 case "createTask":
@@ -6306,15 +8090,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "updateTask":
                   return await updateTask(args.taskId, args.calendarId, args.title, args.dueDate, args.description, args.completed, args.percentComplete, args.priority);
                 case "sendMail":
-                  return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
+                  return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview, args.idempotencyKey);
                 case "saveDraft":
                   return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 case "replyToMessage":
-                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
+                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.idempotencyKey);
                 case "forwardMessage":
-                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
+                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.idempotencyKey);
                 case "getRecentMessages":
                   return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
+                case "refreshFolder":
+                  return await refreshFolder(args.folderPath, args.timeoutMs);
                 case "displayMessage":
                   return displayMessage(args.messageId, args.folderPath, args.displayMode);
                 case "deleteMessages":
@@ -6493,6 +8279,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       if (!isToolEnabled(params.name)) {
                         throw new Error(`Tool is disabled: ${params.name}`);
                       }
+                      // Rate-limit check. Runs BEFORE coerce/validate so an
+                      // agent stuck in a tight loop is throttled even if it
+                      // is sending malformed arguments.
+                      {
+                        const rl = consumeRateLimit(__rateLimiterState, params.name);
+                        if (!rl.allowed) {
+                          throw new Error(
+                            `Rate limit exceeded for '${params.name}': ` +
+                            `${rl.limit} calls per ${Math.round(rl.windowMs / 1000)}s. ` +
+                            `Retry in ${Math.ceil(rl.resetAfterMs / 1000)}s.`
+                          );
+                        }
+                      }
                       {
                         const toolArgs = coerceToolArgs(params.name, params.arguments || {});
                         const validationErrors = validateToolArgs(params.name, toolArgs);
@@ -6566,9 +8365,34 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             console.log(`Thunderbird MCP server listening on port ${boundPort}`);
             console.log(`Connection info written to ${connFilePath}`);
+            // Clear any prior start error now that we're fully up.
+            globalThis.__tbMcpStartError = null;
             return { success: true, port: boundPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
+            // Persist the error so getServerInfo can surface it in the
+            // options page; otherwise the user just sees "Running" forever
+            // while the actual error sits in the Error Console.
+            const errStr = e && e.toString ? e.toString() : String(e);
+            const stack = e && e.stack ? e.stack : "";
+            globalThis.__tbMcpStartError = errStr;
+            // Also write to <TmpD>/thunderbird-mcp/start-error.log so the
+            // error survives a TB restart and can be inspected from the
+            // host shell even when the Error Console isn't open. Best-
+            // effort; failures here must not mask the original problem.
+            try {
+              const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+              tmpDir.append("thunderbird-mcp");
+              if (!tmpDir.exists()) tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+              const f = tmpDir.clone();
+              f.append("start-error.log");
+              const out = Cc["@mozilla.org/network/file-output-stream;1"].createInstance(Ci.nsIFileOutputStream);
+              out.init(f, 0x02 | 0x08 | 0x20, 0o600, 0);
+              const conv = Cc["@mozilla.org/intl/converter-output-stream;1"].createInstance(Ci.nsIConverterOutputStream);
+              conv.init(out, "UTF-8");
+              conv.writeString(new Date().toISOString() + " " + errStr + "\n" + stack + "\n");
+              conv.close();
+            } catch { /* best-effort */ }
             // Stop server if it was started but something else failed
             if (globalThis.__tbMcpServer) {
               try { globalThis.__tbMcpServer.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
@@ -6627,12 +8451,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
           }
 
+          // `running` is true only when the HTTP server has been instantiated
+          // and the start promise resolved cleanly. Checking
+          // `!!globalThis.__tbMcpStartPromise` alone was misleading because a
+          // rejected promise is still truthy -- the page would say "Running"
+          // while the server had silently failed to bind. Surface the actual
+          // start error so the options page can show it.
+          const startError = globalThis.__tbMcpStartError || null;
+          const running = !!globalThis.__tbMcpServer && !startError;
           return {
-            running: !!globalThis.__tbMcpStartPromise,
+            running,
             port,
             connectionFile,
             buildVersion,
             buildDate,
+            startError,
           };
         },
 
@@ -6786,9 +8619,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         getBlockSkipReview: async function() {
-          let blocked = false;
+          let blocked = true;
           try {
-            blocked = Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, false);
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_SKIPREVIEW, true);
           } catch { /* ignore */ }
           return { blockSkipReview: blocked };
         },
@@ -6797,12 +8630,78 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           if (typeof blockSkipReview !== "boolean") {
             return { error: "blockSkipReview must be a boolean" };
           }
-          if (blockSkipReview) {
-            Services.prefs.setBoolPref(PREF_BLOCK_SKIPREVIEW, true);
-          } else {
-            try { Services.prefs.clearUserPref(PREF_BLOCK_SKIPREVIEW); } catch { /* ignore */ }
-          }
+          // Default is true; persist the explicit value either way so the user's
+          // choice survives independent of the default we ship.
+          Services.prefs.setBoolPref(PREF_BLOCK_SKIPREVIEW, blockSkipReview);
           return { success: true, blockSkipReview };
+        },
+
+        getBlockFilterForwardReply: async function() {
+          let blocked = true;
+          try {
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, true);
+          } catch { /* ignore */ }
+          return { blockFilterForwardReply: blocked };
+        },
+
+        setBlockFilterForwardReply: async function(blockFilterForwardReply) {
+          if (typeof blockFilterForwardReply !== "boolean") {
+            return { error: "blockFilterForwardReply must be a boolean" };
+          }
+          Services.prefs.setBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, blockFilterForwardReply);
+          return { success: true, blockFilterForwardReply };
+        },
+
+        getBlockContactWrites: async function() {
+          let blocked = true;
+          try {
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_CONTACT_WRITES, true);
+          } catch { /* ignore */ }
+          return { blockContactWrites: blocked };
+        },
+
+        setBlockContactWrites: async function(blockContactWrites) {
+          if (typeof blockContactWrites !== "boolean") {
+            return { error: "blockContactWrites must be a boolean" };
+          }
+          Services.prefs.setBoolPref(PREF_BLOCK_CONTACT_WRITES, blockContactWrites);
+          return { success: true, blockContactWrites };
+        },
+
+        getBlockMailboxExport: async function() {
+          let blocked = true;
+          try {
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_MAILBOX_EXPORT, true);
+          } catch { /* ignore */ }
+          return { blockMailboxExport: blocked };
+        },
+
+        setBlockMailboxExport: async function(blockMailboxExport) {
+          if (typeof blockMailboxExport !== "boolean") {
+            return { error: "blockMailboxExport must be a boolean" };
+          }
+          Services.prefs.setBoolPref(PREF_BLOCK_MAILBOX_EXPORT, blockMailboxExport);
+          return { success: true, blockMailboxExport };
+        },
+
+        readAuditLog: async function(maxEntries, filter) {
+          // Defensive normalization of the filter object so a malformed call
+          // from options.html cannot crash the experiment-API scope. Any
+          // throw inside readAuditLog is reduced to a structured error so
+          // the options page sees a useful message instead of the generic
+          // "An unexpected error occurred" that Mozilla wraps thrown
+          // experiment-API errors in.
+          try {
+            const safeFilter = (filter && typeof filter === "object" && !Array.isArray(filter)) ? filter : null;
+            return readAuditLog(maxEntries, safeFilter);
+          } catch (e) {
+            return { entries: [], totalScanned: 0, truncated: false, errors: [{ reason: String(e) }] };
+          }
+        },
+
+        clearAuditLog: async function() {
+          try { return clearAuditLog(); }
+          catch (e) { return { error: String(e) }; }
         },
 
         getStableAuthToken: async function() {

@@ -38,6 +38,12 @@ async function loadServerInfo() {
       statusText.textContent = "Running";
       serverPort.textContent = info.port || "--";
       connFile.textContent = info.connectionFile || "--";
+    } else if (info.startError) {
+      // Show the real error instead of a misleading "Running" label.
+      statusDot.className = "status-dot stopped";
+      statusText.textContent = "Failed: " + info.startError;
+      serverPort.textContent = "--";
+      connFile.textContent = info.connectionFile || "--";
     } else {
       statusDot.className = "status-dot stopped";
       statusText.textContent = "Not running";
@@ -398,17 +404,28 @@ saveToolsBtn.addEventListener("click", async () => {
 });
 
 const blockSkipReviewCheckbox = document.getElementById("blockSkipReview");
+const blockFilterForwardReplyCheckbox = document.getElementById("blockFilterForwardReply");
+const blockContactWritesCheckbox = document.getElementById("blockContactWrites");
+const blockMailboxExportCheckbox = document.getElementById("blockMailboxExport");
 const saveSkipReviewBtn = document.getElementById("saveSkipReviewBtn");
 const saveSkipReviewStatus = document.getElementById("saveSkipReviewStatus");
 
-async function loadSkipReviewPref() {
+async function loadSafeguardPrefs() {
   try {
-    const { blockSkipReview } = await browser.mcpServer.getBlockSkipReview();
-    blockSkipReviewCheckbox.checked = !!blockSkipReview;
+    const [skip, filter, contacts, exportPref] = await Promise.all([
+      browser.mcpServer.getBlockSkipReview(),
+      browser.mcpServer.getBlockFilterForwardReply(),
+      browser.mcpServer.getBlockContactWrites(),
+      browser.mcpServer.getBlockMailboxExport(),
+    ]);
+    blockSkipReviewCheckbox.checked = !!skip.blockSkipReview;
+    blockFilterForwardReplyCheckbox.checked = !!filter.blockFilterForwardReply;
+    blockContactWritesCheckbox.checked = !!contacts.blockContactWrites;
+    blockMailboxExportCheckbox.checked = !!exportPref.blockMailboxExport;
     saveSkipReviewBtn.disabled = false;
     saveSkipReviewStatus.textContent = "";
   } catch (e) {
-    saveSkipReviewStatus.textContent = "Error loading setting: " + e.message;
+    saveSkipReviewStatus.textContent = "Error loading settings: " + e.message;
     saveSkipReviewStatus.className = "save-status error";
   }
 }
@@ -418,9 +435,18 @@ saveSkipReviewBtn.addEventListener("click", async () => {
   saveSkipReviewStatus.textContent = "Saving...";
   saveSkipReviewStatus.className = "save-status";
   try {
-    const result = await browser.mcpServer.setBlockSkipReview(blockSkipReviewCheckbox.checked);
-    if (result.error) {
-      saveSkipReviewStatus.textContent = result.error;
+    // Persist all four in parallel so one click writes a consistent state.
+    // If any individual setter returns an error, surface it but continue
+    // saving the others -- partial application is better than total revert.
+    const results = await Promise.all([
+      browser.mcpServer.setBlockSkipReview(blockSkipReviewCheckbox.checked),
+      browser.mcpServer.setBlockFilterForwardReply(blockFilterForwardReplyCheckbox.checked),
+      browser.mcpServer.setBlockContactWrites(blockContactWritesCheckbox.checked),
+      browser.mcpServer.setBlockMailboxExport(blockMailboxExportCheckbox.checked),
+    ]);
+    const errors = results.filter(r => r && r.error).map(r => r.error);
+    if (errors.length > 0) {
+      saveSkipReviewStatus.textContent = errors.join("; ");
       saveSkipReviewStatus.className = "save-status error";
     } else {
       saveSkipReviewStatus.textContent = "Saved.";
@@ -432,8 +458,105 @@ saveSkipReviewBtn.addEventListener("click", async () => {
   saveSkipReviewBtn.disabled = false;
 });
 
+// ── Audit log viewer ─────────────────────────────────────────────────────────
+
+const auditToolFilter = document.getElementById("auditToolFilter");
+const refreshAuditBtn = document.getElementById("refreshAuditBtn");
+const clearAuditBtn = document.getElementById("clearAuditBtn");
+const auditEntriesEl = document.getElementById("auditEntries");
+const auditStatusEl = document.getElementById("auditStatus");
+
+function formatAuditEntry(entry) {
+  const ts = entry.ts || "(no ts)";
+  const tool = entry.tool || "(unknown tool)";
+  // Strip the well-known top-level fields and JSON-stringify the rest for
+  // free-form display. We deliberately do not deep-walk attempts to redact;
+  // appendComposeAudit already keeps fields metadata-only.
+  const { ts: _ts, tool: _tool, ...rest } = entry;
+  const detail = Object.keys(rest).length ? " " + JSON.stringify(rest) : "";
+  const div = document.createElement("div");
+  div.className = "audit-entry";
+  const tsSpan = document.createElement("span");
+  tsSpan.className = "audit-ts";
+  tsSpan.textContent = ts + "  ";
+  const toolSpan = document.createElement("span");
+  toolSpan.className = "audit-tool";
+  toolSpan.textContent = tool;
+  const detSpan = document.createElement("span");
+  detSpan.textContent = detail;
+  div.appendChild(tsSpan);
+  div.appendChild(toolSpan);
+  div.appendChild(detSpan);
+  return div;
+}
+
+async function loadAuditLog() {
+  auditEntriesEl.textContent = "Loading...";
+  auditStatusEl.textContent = "";
+  auditStatusEl.className = "save-status";
+  const tool = auditToolFilter.value || "";
+  try {
+    // Avoid passing `undefined` for the second arg -- some WebExtensions
+    // schema validators reject explicit-undefined even when the parameter
+    // is declared optional. Call with one arg when there's no filter, two
+    // args when there is.
+    const result = tool
+      ? await browser.mcpServer.readAuditLog(200, { tool })
+      : await browser.mcpServer.readAuditLog(200);
+    auditEntriesEl.innerHTML = "";
+    if (!result || !Array.isArray(result.entries) || result.entries.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "audit-empty";
+      empty.textContent = "(no entries)";
+      auditEntriesEl.appendChild(empty);
+      return;
+    }
+    for (const e of result.entries) {
+      auditEntriesEl.appendChild(formatAuditEntry(e));
+    }
+    if (result.truncated) {
+      const trunc = document.createElement("div");
+      trunc.className = "audit-empty";
+      trunc.textContent = "(more entries exist; showing newest " + result.entries.length + ")";
+      auditEntriesEl.appendChild(trunc);
+    }
+  } catch (e) {
+    auditEntriesEl.textContent = "";
+    auditStatusEl.textContent = "Error: " + e.message;
+    auditStatusEl.className = "save-status error";
+  }
+}
+
+refreshAuditBtn.addEventListener("click", () => {
+  loadAuditLog().catch(e => console.error("thunderbird-mcp options:", "audit refresh failed:", e));
+});
+auditToolFilter.addEventListener("change", () => {
+  loadAuditLog().catch(e => console.error("thunderbird-mcp options:", "audit refresh failed:", e));
+});
+clearAuditBtn.addEventListener("click", async () => {
+  if (!confirm("Delete the entire audit log? This cannot be undone.")) return;
+  clearAuditBtn.disabled = true;
+  auditStatusEl.textContent = "Clearing...";
+  auditStatusEl.className = "save-status";
+  try {
+    const result = await browser.mcpServer.clearAuditLog();
+    if (result && result.error) {
+      auditStatusEl.textContent = "Error: " + result.error;
+      auditStatusEl.className = "save-status error";
+    } else {
+      auditStatusEl.textContent = "Cleared (" + (result.bytesRemoved || 0) + " bytes removed).";
+    }
+  } catch (e) {
+    auditStatusEl.textContent = "Error: " + e.message;
+    auditStatusEl.className = "save-status error";
+  }
+  clearAuditBtn.disabled = false;
+  await loadAuditLog();
+});
+
 loadServerInfo().catch(e => console.error("thunderbird-mcp options:", "loadServerInfo failed:", e));
 loadAuthenticationConfig().catch(e => console.error("thunderbird-mcp options:", "loadAuthenticationConfig failed:", e));
 loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAccountAccess failed:", e));
 loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
-loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
+loadSafeguardPrefs().catch(e => console.error("thunderbird-mcp options:", "loadSafeguardPrefs failed:", e));
+loadAuditLog().catch(e => console.error("thunderbird-mcp options:", "loadAuditLog failed:", e));

@@ -236,17 +236,58 @@
 </div>
 
 <div class="section">
-  <h2>Send Safety</h2>
+  <h2>Safeguards</h2>
   <p class="mode-note">
-    When enabled, MCP clients requesting <code>skipReview: true</code> on sendMail,
-    replyToMessage, or forwardMessage are rejected. The client can still compose
-    messages -- they just always open a review window before sending.
+    These switches gate operations that an LLM consuming attacker-controlled
+    email content could be tricked into performing silently. Disabling them
+    re-enables the corresponding capabilities for MCP clients you trust.
   </p>
   <ul class="account-list">
     <li>
       <label>
         <input type="checkbox" id="blockSkipReview">
-        <span>Block <code>skipReview</code> -- require a review window before sending</span>
+        <span>
+          Block <code>skipReview</code> on outbound mail and calendar items.
+          When on, <code>sendMail</code> / <code>replyToMessage</code> /
+          <code>forwardMessage</code> / <code>createEvent</code> /
+          <code>createTask</code> always open a review window even if the
+          caller passes <code>skipReview: true</code>.
+        </span>
+      </label>
+    </li>
+    <li>
+      <label>
+        <input type="checkbox" id="blockFilterForwardReply">
+        <span>
+          Block <code>forward</code> and <code>reply</code> filter actions
+          via MCP. Filters run on every incoming message with no UI, so a
+          single <code>createFilter</code> call could install a permanent
+          silent-forwarding rule. Leave on unless you specifically need
+          your assistant to author auto-forwarders.
+        </span>
+      </label>
+    </li>
+    <li>
+      <label>
+        <input type="checkbox" id="blockContactWrites">
+        <span>
+          Block address-book writes via MCP. When on,
+          <code>createContact</code> / <code>updateContact</code> /
+          <code>deleteContact</code> are refused. Stops a tricked LLM
+          from silently repointing "Boss" at an attacker's address.
+        </span>
+      </label>
+    </li>
+    <li>
+      <label>
+        <input type="checkbox" id="blockMailboxExport">
+        <span>
+          Block bulk mailbox export via MCP. When on,
+          <code>exportMailbox</code> is refused. Bulk-exports stream
+          message content to a JSON-lines file on disk; an LLM that
+          gets prompt-injected into "back up everything" would
+          otherwise be a one-call data exfil channel.
+        </span>
       </label>
     </li>
   </ul>
@@ -254,7 +295,45 @@
     <button id="saveSkipReviewBtn" disabled>Save</button>
     <span id="saveSkipReviewStatus" class="save-status"></span>
   </div>
+
+  <h2>Audit log</h2>
+  <p class="mode-note">
+    Every outbound compose (<code>sendMail</code>, <code>replyToMessage</code>,
+    <code>forwardMessage</code>, <code>saveDraft</code>) and every contact
+    write goes to <code>&lt;profile&gt;/thunderbird-mcp/audit.log</code>
+    as a JSON line. Bodies and attachment contents are <em>not</em> recorded
+    -- only metadata. Newest entries first; the most recent 200 are shown.
+  </p>
+  <div class="audit-controls">
+    <label>
+      Filter by tool:
+      <select id="auditToolFilter">
+        <option value="">(all)</option>
+        <option value="sendMail">sendMail</option>
+        <option value="replyToMessage">replyToMessage</option>
+        <option value="forwardMessage">forwardMessage</option>
+        <option value="saveDraft">saveDraft</option>
+        <option value="createContact">createContact</option>
+        <option value="updateContact">updateContact</option>
+        <option value="deleteContact">deleteContact</option>
+      </select>
+    </label>
+    <button id="refreshAuditBtn">Refresh</button>
+    <button id="clearAuditBtn">Clear log</button>
+    <span id="auditStatus" class="save-status"></span>
+  </div>
+  <div id="auditEntries" class="audit-entries">Loading...</div>
 </div>
+
+<style>
+  .audit-controls { margin: 8px 0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .audit-entries { font-family: monospace; font-size: 12px; max-height: 360px; overflow-y: auto; border: 1px solid #ccc; padding: 8px; background: #f8f8f8; }
+  .audit-entry { padding: 4px 0; border-bottom: 1px solid #eee; word-break: break-word; }
+  .audit-entry:last-child { border-bottom: none; }
+  .audit-ts { color: #666; }
+  .audit-tool { font-weight: bold; }
+  .audit-empty { color: #999; font-style: italic; }
+</style>
 
 <script src="options.js"></script>
 </body>
