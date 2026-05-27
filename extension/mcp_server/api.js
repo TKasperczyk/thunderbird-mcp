@@ -272,7 +272,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable calendar)" },
             allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
             status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
-            categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Use listCategories to get exact existing names before setting." },
+            categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; use listCategories to get exact existing names before setting." },
             skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
           },
           required: ["title", "startDate"],
@@ -310,7 +310,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             location: { type: "string", description: "New event location (optional)" },
             description: { type: "string", description: "New event description (optional)" },
             status: { type: "string", description: "New VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled' (optional)" },
-            categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Pass an empty array to clear all categories. Use listCategories to get exact existing names." },
+            categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; pass an empty array to clear all categories. Use listCategories to get exact existing names before setting." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -3544,8 +3544,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                   changes.push("status");
                 }
-                if (categories !== undefined) {
-                  newItem.setCategories(categories || []);
+                // null/undefined preserves existing categories; empty array clears them.
+                if (Array.isArray(categories)) {
+                  newItem.setCategories(categories);
                   changes.push("categories");
                 }
 
