@@ -7,6 +7,7 @@ const path = require('path');
 const {
   advanceToNextCandidate,
   buildConnectionDiscoveryErrorMessage,
+  compactToolResultJsonText,
   clearConnectionCache,
   discoverConnectionInfo,
   isValidAuthToken,
@@ -99,6 +100,32 @@ describe('Auth token validation', () => {
     assert.equal(isValidAuthToken('g'.repeat(64)), false);
     assert.equal(isValidAuthToken(`${'a'.repeat(64)}\n`), false);
     assert.equal(isValidAuthToken(null), false);
+  });
+});
+
+describe('Tool result serialization', () => {
+  it('compacts JSON text content without mutating the original response', () => {
+    const originalText = JSON.stringify([{ name: 'INBOX', unreadMessages: 3 }], null, 2);
+    const response = {
+      jsonrpc: '2.0',
+      id: 2,
+      result: {
+        content: [{
+          type: 'text',
+          text: originalText,
+        }],
+      },
+    };
+
+    const compacted = compactToolResultJsonText(response);
+
+    assert.notStrictEqual(compacted, response);
+    assert.deepStrictEqual(
+      JSON.parse(compacted.result.content[0].text),
+      JSON.parse(originalText)
+    );
+    assert.equal(response.result.content[0].text, originalText);
+    assert.equal(compacted.result.content[0].text.includes('\n'), false);
   });
 });
 
