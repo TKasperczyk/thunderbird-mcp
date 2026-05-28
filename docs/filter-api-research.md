@@ -517,8 +517,11 @@ function createFilter(accountId, name, enabled, type, conditions, actions, inser
   const OP_MAP = {
     contains: 0, doesntContain: 1, is: 2, isnt: 3, isEmpty: 4,
     isBefore: 5, isAfter: 6, isHigherThan: 7, isLowerThan: 8,
-    beginsWith: 9, endsWith: 10, isInAB: 11, isntInAB: 12,
-    isGreaterThan: 13, isLessThan: 14, matches: 15, doesntMatch: 16,
+    beginsWith: 9, endsWith: 10,
+    soundsLike: 11, ldapDwim: 12,
+    isGreaterThan: 13, isLessThan: 14,
+    nameCompletion: 15, isInAB: 16, isntInAB: 17, isntEmpty: 18,
+    matches: 19, doesntMatch: 20,
   };
 
   for (const cond of conditions) {
