@@ -61,8 +61,6 @@ function getExtVersion() {
   }
   return _cachedExtVersion;
 }
-// Keep references to active attach timers to prevent GC before they fire.
-const _attachTimers = new Set();
 // Track temp files created for inline base64 attachments (cleaned up on shutdown).
 const _tempAttachFiles = new Set();
 // Track compose windows already claimed by an in-flight replyToMessage or
@@ -76,8 +74,6 @@ const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data 
 // The httpd.sys.mjs pre-buffer cap uses the same value.
 const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP request bodies
 let _tempFileCounter = 0;
-// Delay before injecting attachments into a newly opened compose window.
-const COMPOSE_WINDOW_LOAD_DELAY_MS = 1500;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
 const PREF_DISABLED_TOOLS = "extensions.thunderbird-mcp.disabledTools";
@@ -1530,21 +1526,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Injects attachment descriptors into the most recently opened compose window.
-             * Uses nsITimer so the window has time to finish loading before injection.
-             * Each call gets its own timer stored in _attachTimers to prevent GC.
-             *
-             * Known limitation: uses getMostRecentWindow("msgcompose") which is a race
-             * if two compose operations happen within COMPOSE_WINDOW_LOAD_DELAY_MS --
-             * attachments from the first may land on the second window.
-             * OpenComposeWindowWithParams doesn't return a window handle, so there's
-             * no reliable way to target a specific window. Injection failures are
-             * silent (callers report success based on pre-validated descriptor counts).
-             */
-            /**
              * Converts attachment descriptors to nsIMsgAttachment objects.
-             * Shared by injectAttachmentsAsync (compose window) and
-             * sendMessageDirectly (headless send).
+             * Shared by the new-compose path (composeFields.addAttachment),
+             * the reply/forward observer path (addAttachmentsToComposeWindow),
+             * and sendMessageDirectly (headless send).
              */
             function descsToMsgAttachments(attachDescs) {
               const result = [];
@@ -1579,26 +1564,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // surfacing failures — do not swallow here.
                 composeWin.AddAttachments(attachList);
               }
-            }
-
-            function injectAttachmentsAsync(attachDescs) {
-              if (!attachDescs || attachDescs.length === 0) return;
-              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-              _attachTimers.add(timer);
-              timer.initWithCallback({
-                notify() {
-                  _attachTimers.delete(timer);
-                  try {
-                    const composeWin = Services.wm.getMostRecentWindow("msgcompose");
-                    addAttachmentsToComposeWindow(composeWin, attachDescs);
-                  } catch (e) {
-                    // Fire-and-forget timer — no client to error back to.
-                    // Log loudly so users can find the cause in the Error Console
-                    // when an "email sent without attachments" report comes in.
-                    console.error("thunderbird-mcp: injectAttachmentsAsync failed:", e);
-                  }
-                }
-              }, COMPOSE_WINDOW_LOAD_DELAY_MS, Ci.nsITimer.TYPE_ONE_SHOT);
             }
 
             function splitAddressHeader(header) {
@@ -4841,11 +4806,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   });
                 }
 
+                // Attach via composeFields BEFORE opening the window so it
+                // renders with the attachments already present. This avoids the
+                // old getMostRecentWindow("msgcompose") race: that helper returns
+                // the most recently *focused* compose window, so a second
+                // sendMail call -- or the user simply clicking an older compose
+                // window while this one opens -- would steal or drop the
+                // attachments. composeFields binds them to this exact message,
+                // exactly like the direct-send path (sendMessageDirectly).
+                for (const att of descsToMsgAttachments(fileDescs)) {
+                  composeFields.addAttachment(att);
+                }
+
                 const msgComposeService = Cc["@mozilla.org/messengercompose;1"]
                   .getService(Ci.nsIMsgComposeService);
                 msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
-
-                injectAttachmentsAsync(fileDescs);
 
                 let msg = "Compose window opened";
                 if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
