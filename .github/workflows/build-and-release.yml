@@ -1,0 +1,63 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get semantic version
+        id: semver
+        uses: paulhatch/semantic-version@v5.0.3
+        with:
+          tag_prefix: "v"
+          version_format: "${major}.${minor}.${patch}"
+          major_pattern: "/^(feat|fix|refactor)!:/"
+          minor_pattern: "/^feat:/"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Build extension
+        run: bash scripts/build.sh
+
+      - name: Rename release files
+        run: mv dist/thunderbird-mcp.xpi dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.xpi
+
+      - name: Create source archives
+        run: |
+          VERSION=${{ steps.semver.outputs.version }}
+          tar -czf dist/thunderbird-mcp-${VERSION}.tar.gz \
+            --exclude='.git' --exclude='dist' --exclude='node_modules' \
+            --transform "s|^\.|thunderbird-mcp-${VERSION}|" .
+          zip -r dist/thunderbird-mcp-${VERSION}.zip . \
+            -x "*.git*" -x "dist/*" -x "node_modules/*"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ steps.semver.outputs.version }}
+          name: Release ${{ steps.semver.outputs.version }}
+          draft: false
+          prerelease: false
+          files: |
+            dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.xpi
+            dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.zip
+            dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
