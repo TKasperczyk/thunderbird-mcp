@@ -153,6 +153,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           properties: {
             accountId: { type: "string", description: "Optional account ID (from listAccounts) to limit results to a single account" },
             folderPath: { type: "string", description: "Optional folder URI (from listFolders) to list only that folder and its subfolders" },
+            format: { type: "string", enum: ["objects", "table"], description: "Response format: 'objects' (default, existing array of folder objects) or 'table' ({ columns, rows } compact form)" },
           },
           required: [],
         },
@@ -1243,6 +1244,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return result;
             }
 
+            /**
+             * Best-effort refresh for IMAP folders. updateFolder starts async work
+             * and may not complete before callers read from Thunderbird's cache.
+             */
+            function refreshImapFolderSync(folder) {
+              if (folder.server && folder.server.type === "imap") {
+                try {
+                  folder.updateFolder(null);
+                } catch {
+                  // updateFolder may fail, continue anyway
+                }
+              }
+            }
+
+            function toColumnarTable(items, keys) {
+              const columns = Array.from(keys).sort();
+              return {
+                columns,
+                rows: items.map(item => columns.map(column => item[column])),
+              };
+            }
+
             function listAccounts() {
               const accounts = [];
               for (const account of getAccessibleAccounts()) {
@@ -1292,8 +1315,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Lists all folders (optionally limited to a single account).
              * Depth is 0 for root children, increasing for subfolders.
              */
-            function listFolders(accountId, folderPath) {
+            function listFolders(accountId, folderPath, format) {
               const results = [];
+              const outputFormat = format == null ? "objects" : format;
+              const folderKeys = ["name", "path", "type", "accountId", "totalMessages", "unreadMessages", "depth"];
+
+              if (outputFormat !== "objects" && outputFormat !== "table") {
+                return { error: `Invalid format: "${outputFormat}". Must be one of: objects, table` };
+              }
+
+              function formatFolderResults() {
+                return outputFormat === "table" ? toColumnarTable(results, folderKeys) : results;
+              }
 
               function folderType(flags) {
                 if (flags & 0x00001000) return "inbox";
@@ -1322,8 +1355,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     unreadMessages: folder.getNumUnread(false),
                     depth
                   });
-                } catch {
-                  // Skip inaccessible folders
+                } catch (e) {
+                  console.warn("thunderbird-mcp: listFolders skipped inaccessible folder", folder?.URI || folder?.name, e);
                 }
 
                 try {
@@ -1332,8 +1365,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       walkFolder(subfolder, accountKey, depth + 1);
                     }
                   }
-                } catch {
-                  // Skip subfolder traversal errors
+                } catch (e) {
+                  console.warn("thunderbird-mcp: listFolders subfolder traversal failed for folder", folder?.URI || folder?.name, e);
                 }
               }
 
@@ -1346,7 +1379,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   ? (MailServices.accounts.findAccountForServer(folder.server)?.key || "unknown")
                   : "unknown";
                 walkFolder(folder, accountKey, 0);
-                return results;
+                return formatFolderResults();
               }
 
               if (accountId) {
@@ -1370,10 +1403,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       walkFolder(subfolder, target.key, 0);
                     }
                   }
-                } catch {
-                  // Skip inaccessible account
+                } catch (e) {
+                  console.warn("thunderbird-mcp: listFolders failed to enumerate account root", target.key || accountId, e);
                 }
-                return results;
+                return formatFolderResults();
               }
 
               for (const account of getAccessibleAccounts()) {
@@ -1385,12 +1418,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       walkFolder(subfolder, account.key, 0);
                     }
                   }
-                } catch {
-                  // Skip inaccessible accounts/folders
+                } catch (e) {
+                  console.warn("thunderbird-mcp: listFolders failed to enumerate account", account?.key, e);
                 }
               }
 
-              return results;
+              return formatFolderResults();
             }
 
             /**
@@ -2429,15 +2462,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                if (result.error) return result;
 	                const folder = result.folder;
 
-	                // Attempt to refresh IMAP folders. This is async and may not
-	                // complete before we read, but helps with stale data.
-	                if (folder.server && folder.server.type === "imap") {
-	                  try {
-	                    folder.updateFolder(null);
-	                  } catch {
-	                    // updateFolder may fail, continue anyway
-	                  }
-	                }
+	                refreshImapFolderSync(folder);
 
 	                const db = folder.msgDatabase;
 	                if (!db) {
@@ -2681,15 +2706,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (results.length >= SEARCH_COLLECTION_CAP) return;
 
                 try {
-                  // Attempt to refresh IMAP folders. This is async and may not
-                  // complete before we read, but helps with stale data.
-                  if (folder.server && folder.server.type === "imap") {
-                    try {
-                      folder.updateFolder(null);
-                    } catch {
-                      // updateFolder may fail, continue anyway
-                    }
-                  }
+                  refreshImapFolderSync(folder);
 
                   const db = folder.msgDatabase;
                   if (!db) return;
@@ -6423,7 +6440,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listAccounts":
                   return listAccounts();
                 case "listFolders":
-                  return listFolders(args.accountId, args.folderPath);
+                  return listFolders(args.accountId, args.folderPath, args.format);
                 case "searchMessages":
                   return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
                 case "getMessage":
