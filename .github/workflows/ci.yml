@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['18.x', '22.x', '24.x']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      # The test suite has zero runtime dependencies, so no install step.
+      - name: Run tests
+        run: npm test
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+      # No package-lock.json is committed, so install (not ci) for the devDeps.
+      - name: Install dev dependencies
+        run: npm install --no-package-lock
+      - name: Lint
+        run: npm run lint
+
+  version-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+      - name: Assert package.json and manifest versions match
+        run: |
+          PKG="$(node -p "require('./package.json').version")"
+          MAN="$(node -p "require('./extension/manifest.json').version")"
+          if [ "$PKG" != "$MAN" ]; then
+            echo "::error::package.json version ($PKG) does not match extension/manifest.json version ($MAN). They must stay in lockstep."
+            exit 1
+          fi
+          echo "Versions in sync: $PKG"
