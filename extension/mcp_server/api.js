@@ -179,6 +179,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             includeSubfolders: { type: "boolean", description: "If false, only search the specified folder — not its subfolders. Default: true." },
             countOnly: { type: "boolean", description: "If true, return only the match count instead of full results. Much faster for 'how many unread?' queries." },
             searchBody: { type: "boolean", description: "If true, search full message bodies using Thunderbird's Gloda index (slower but finds text beyond the ~200 char preview). Requires query. IMAP accounts need offline sync enabled for body indexing." },
+            dedupByMessageId: { type: "boolean", description: "If false, return every folder/label location for messages found in multiple folders. Default: true, which collapses the same RFC Message-ID into one row and lists the other folder paths in dupLocations." },
           },
           required: ["query"],
         },
@@ -1063,6 +1064,69 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 limit: effectiveLimit,
                 hasMore: effectiveOffset + effectiveLimit < results.length
               };
+            }
+
+            function normalizeMessageIdForDedup(value) {
+              // Compare RFC Message-IDs without surrounding angle brackets / whitespace.
+              // Case is preserved on purpose: the local part of a Message-ID is
+              // case-sensitive per RFC 5322, so lowercasing could collapse two
+              // genuinely-distinct messages and hide one. Showing a duplicate is the
+              // safe failure direction; hiding a message is not.
+              if (value === undefined || value === null) return "";
+              let normalized = String(value).trim();
+              if (!normalized) return "";
+              if (normalized.startsWith("<") && normalized.endsWith(">")) {
+                normalized = normalized.slice(1, -1).trim();
+              }
+              return normalized;
+            }
+
+            function dedupeSearchMessageResults(results) {
+              const seen = new Map();
+              const deduped = [];
+
+              function addDupLocation(survivor, folderPath) {
+                if (!folderPath || folderPath === survivor.folderPath) return;
+                if (!Array.isArray(survivor.dupLocations)) survivor.dupLocations = [];
+                if (!survivor.dupLocations.includes(folderPath)) {
+                  survivor.dupLocations.push(folderPath);
+                }
+              }
+
+              function mergeDupLocations(survivor, row) {
+                addDupLocation(survivor, row.folderPath);
+                if (Array.isArray(row.dupLocations)) {
+                  for (const folderPath of row.dupLocations) {
+                    addDupLocation(survivor, folderPath);
+                  }
+                }
+              }
+
+              for (const row of results) {
+                const normalizedId = normalizeMessageIdForDedup(row?.id);
+                if (!normalizedId) {
+                  deduped.push(row);
+                  continue;
+                }
+
+                const survivor = seen.get(normalizedId);
+                if (survivor) {
+                  mergeDupLocations(survivor, row);
+                  continue;
+                }
+
+                if (Array.isArray(row.dupLocations)) {
+                  const existingDupLocations = row.dupLocations;
+                  delete row.dupLocations;
+                  for (const folderPath of existingDupLocations) {
+                    addDupLocation(row, folderPath);
+                  }
+                }
+                seen.set(normalizedId, row);
+                deduped.push(row);
+              }
+
+              return deduped;
             }
 
             /**
@@ -2551,7 +2615,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * searchMessages. IMAP accounts need offline sync for body
              * indexing; without it only headers are searched.
              */
-            function glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly) {
+            function glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId) {
               const requestedLimit = Number(maxResults);
               const effectiveLimit = Math.min(
                 Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.floor(requestedLimit) : DEFAULT_MAX_RESULTS,
@@ -2636,12 +2700,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           results.push(result);
                         }
 
+                        const finalResults = dedupByMessageId !== false ? dedupeSearchMessageResults(results) : results;
+
                         if (countOnly) {
-                          resolve({ count: results.length });
+                          resolve({ count: finalResults.length });
                           return;
                         }
-                        results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
-                        resolve(paginate(results, offset, effectiveLimit));
+                        finalResults.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
+                        resolve(paginate(finalResults, offset, effectiveLimit));
                       } catch (e) {
                         resolve({ error: e.toString() });
                       }
@@ -2655,12 +2721,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody) {
+	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId) {
 	              // Gloda full-body search path (async)
 	              if (searchBody) {
 	                if (!GlodaMsgSearcher) return { error: "Gloda full-text index is not available" };
 	                if (!query) return { error: "searchBody requires a non-empty query" };
-	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly);
+	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId);
 	              }
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
@@ -2794,13 +2860,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
 
+              const finalResults = dedupByMessageId !== false ? dedupeSearchMessageResults(results) : results;
+
               if (countOnly) {
-                return { count: results.length };
+                return { count: finalResults.length };
               }
 
-              results.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
+              finalResults.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
 
-              return paginate(results, offset, effectiveLimit);
+              return paginate(finalResults, offset, effectiveLimit);
             }
 
             function searchContacts(query, maxResults) {
@@ -6442,7 +6510,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listFolders":
                   return listFolders(args.accountId, args.folderPath, args.format);
                 case "searchMessages":
-                  return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody);
+                  return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody, args.dedupByMessageId);
                 case "getMessage":
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
                 case "getMessages":

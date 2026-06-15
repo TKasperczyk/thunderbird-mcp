@@ -81,6 +81,7 @@ describe('Tagging: validation edge cases', () => {
           query: { type: "string" },
           tag: { type: "string" },
           maxResults: { type: "number" },
+          dedupByMessageId: { type: "boolean" },
         },
         required: ["query"],
       },
@@ -1073,6 +1074,7 @@ describe('Validation: adversarial and edge-case inputs', () => {
         query: { type: "string" }, folderPath: { type: "string" },
         maxResults: { type: "number" }, offset: { type: "number" },
         unreadOnly: { type: "boolean" },
+        dedupByMessageId: { type: "boolean" },
       },
       required: ["query"],
     }},
@@ -1209,6 +1211,7 @@ describe('Coercion: string-to-type conversion', () => {
         maxResults: { type: "number" },
         offset: { type: "number" },
         unreadOnly: { type: "boolean" },
+        dedupByMessageId: { type: "boolean" },
       },
       required: ["query"],
     },
@@ -1233,6 +1236,12 @@ describe('Coercion: string-to-type conversion', () => {
     const args = { query: 'test', unreadOnly: 'false' };
     coerceToolArgs('searchMessages', args, schemas);
     assert.strictEqual(args.unreadOnly, false);
+  });
+
+  it('coerces dedupByMessageId "false" string to boolean false', () => {
+    const args = { query: 'test', dedupByMessageId: 'false' };
+    coerceToolArgs('searchMessages', args, schemas);
+    assert.strictEqual(args.dedupByMessageId, false);
   });
 
   it('leaves non-boolean strings unchanged for boolean fields', () => {

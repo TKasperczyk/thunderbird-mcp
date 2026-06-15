@@ -85,6 +85,7 @@ const sampleTools = [
         offset: { type: "number" },
         unreadOnly: { type: "boolean" },
         tag: { type: "string" },
+        dedupByMessageId: { type: "boolean" },
       },
       required: ["query"],
     },
@@ -273,6 +274,14 @@ describe('Validation: updateMessage with tags', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must be string/);
+  });
+
+  it('accepts dedupByMessageId as boolean in searchMessages', () => {
+    const errors = validate('searchMessages', {
+      query: 'test',
+      dedupByMessageId: false,
+    });
+    assert.equal(errors.length, 0);
   });
 });
 
