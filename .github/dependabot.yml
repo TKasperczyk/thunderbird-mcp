@@ -34,7 +34,19 @@ updates:
       prefix-development: chore(deps-dev)
       include: scope
     groups:
-      # Single rollup PR per week for minor + patch bumps; majors stay
+      # eslint and its plugins move in lockstep -- group them (including
+      # majors) into one PR so a bump like eslint 9 -> 10 doesn't arrive as
+      # several separate, interdependent PRs.
+      eslint:
+        patterns:
+          - "eslint"
+          - "@eslint/*"
+          - "eslint-plugin-*"
+        update-types:
+          - major
+          - minor
+          - patch
+      # Single rollup PR per week for minor + patch bumps; other majors stay
       # individual so each one gets its own review.
       minor-and-patch:
         update-types:
