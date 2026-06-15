@@ -1,63 +1,68 @@
 name: Build and Release
 
+# Fires when a version tag is pushed (the maintainer's bump+tag step). Builds
+# the XPI from the tagged commit -- which already contains the bumped
+# package.json -- so the extension version always matches the tag, and attaches
+# it to the GitHub release. No version is threaded into build.sh; the tag is the
+# source of truth.
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
-
-    permissions:
-      contents: write
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get semantic version
-        id: semver
-        uses: paulhatch/semantic-version@v5.0.3
-        with:
-          tag_prefix: "v"
-          version_format: "${major}.${minor}.${patch}"
-          major_pattern: "/^(feat|fix|refactor)!:/"
-          minor_pattern: "/^feat:/"
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version: '20'
+
+      - name: Verify package.json version matches the tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (${TAG}) does not match package.json version ${PKG}. Bump package.json before tagging."
+            exit 1
+          fi
+          echo "Version OK: ${PKG}"
+
+      - name: Run tests
+        run: node --test test/*.cjs
 
       - name: Build extension
         run: bash scripts/build.sh
 
-      - name: Rename release files
-        run: mv dist/thunderbird-mcp.xpi dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.xpi
-
-      - name: Create source archives
+      - name: Verify built manifest version matches the tag
         run: |
-          VERSION=${{ steps.semver.outputs.version }}
-          tar -czf dist/thunderbird-mcp-${VERSION}.tar.gz \
-            --exclude='.git' --exclude='dist' --exclude='node_modules' \
-            --transform "s|^\.|thunderbird-mcp-${VERSION}|" .
-          zip -r dist/thunderbird-mcp-${VERSION}.zip . \
-            -x "*.git*" -x "dist/*" -x "node_modules/*"
+          TAG="${GITHUB_REF_NAME#v}"
+          MAN="$(node -p "require('./extension/manifest.json').version")"
+          if [ "$TAG" != "$MAN" ]; then
+            echo "::error::Built manifest version ${MAN} does not match tag ${TAG}."
+            exit 1
+          fi
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
+      - name: Rename XPI to versioned filename
+        run: mv dist/thunderbird-mcp.xpi "dist/thunderbird-mcp-${GITHUB_REF_NAME}.xpi"
+
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.semver.outputs.version }}
-          name: Release ${{ steps.semver.outputs.version }}
-          draft: false
-          prerelease: false
-          files: |
-            dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.xpi
-            dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.zip
-            dist/thunderbird-mcp-${{ steps.semver.outputs.version }}.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          fail_on_unmatched_files: true
+          files: dist/thunderbird-mcp-${{ github.ref_name }}.xpi
