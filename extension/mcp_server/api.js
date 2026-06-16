@@ -328,8 +328,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       name: { type: "string", description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
                       base64: { type: "string", description: "Base64-encoded file content" },
+                      content: { type: "string", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
                     },
-                    required: ["name", "base64"],
+                    required: ["name"],
                     additionalProperties: false,
                   },
                 ],
@@ -366,8 +367,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       name: { type: "string", description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
                       base64: { type: "string", description: "Base64-encoded file content" },
+                      content: { type: "string", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
                     },
-                    required: ["name", "base64"],
+                    required: ["name"],
                     additionalProperties: false,
                   },
                 ],
@@ -614,8 +616,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       name: { type: "string", description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
                       base64: { type: "string", description: "Base64-encoded file content" },
+                      content: { type: "string", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
                     },
-                    required: ["name", "base64"],
+                    required: ["name"],
                     additionalProperties: false,
                   },
                 ],
@@ -654,8 +657,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       name: { type: "string", description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
                       base64: { type: "string", description: "Base64-encoded file content" },
+                      content: { type: "string", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
                     },
-                    required: ["name", "base64"],
+                    required: ["name"],
                     additionalProperties: false,
                   },
                 ],
@@ -1652,6 +1656,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const file = createLocalFile(entry);
                     if (!file.exists()) {
                       failed.push(entry);
+                      continue;
+                    }
+                    // SECURITY: re-check the *resolved* path. The raw string can
+                    // look benign while pointing at a credential store through a
+                    // symlink (e.g. /tmp/report.pdf -> ~/.ssh/id_rsa). Canonicalize
+                    // (resolves symlinks + . / .. components) and re-run the
+                    // deny-list before reading the file.
+                    try { file.normalize(); } catch (_) { /* keep raw path if normalize fails */ }
+                    if (isSensitiveFilePath(file.path)) {
+                      failed.push(`${entry} (sensitive path blocked)`);
                       continue;
                     }
                     // Size cap mirrors the saved-attachment ceiling and avoids
@@ -6556,6 +6570,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (schema.items) {
                   for (let i = 0; i < value.length; i++) {
+                    // Array items are never nullable: validateAgainstSchema
+                    // returns early on null/undefined, so a null item would
+                    // otherwise skip the item schema entirely. Reject explicitly.
+                    if (value[i] === null || value[i] === undefined) {
+                      errors.push(`Parameter '${path}[${i}]' must not be null`);
+                      continue;
+                    }
                     validateAgainstSchema(value[i], schema.items, `${path}[${i}]`, errors);
                   }
                 }

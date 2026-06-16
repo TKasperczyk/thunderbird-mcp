@@ -30,6 +30,10 @@ function validateAgainstSchema(value, schema, path, errors) {
     }
     if (schema.items) {
       for (let i = 0; i < value.length; i++) {
+        if (value[i] === null || value[i] === undefined) {
+          errors.push(`Parameter '${path}[${i}]' must not be null`);
+          continue;
+        }
         validateAgainstSchema(value[i], schema.items, `${path}[${i}]`, errors);
       }
     }
@@ -155,7 +159,25 @@ const sampleTools = [
         to: { type: "string" },
         subject: { type: "string" },
         body: { type: "string" },
-        attachments: { type: "array", items: { oneOf: [{ type: "string" }, { type: "object" }] } },
+        attachments: {
+          type: "array",
+          items: {
+            oneOf: [
+              { type: "string" },
+              {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  contentType: { type: "string" },
+                  base64: { type: "string" },
+                  content: { type: "string" },
+                },
+                required: ["name"],
+                additionalProperties: false,
+              },
+            ],
+          },
+        },
       },
       required: ["to", "subject", "body"],
     },
@@ -480,6 +502,76 @@ describe('Validation: attachment sending', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must be an array/);
+  });
+
+  // Regression: the runtime accepts `content` as an alias for `base64`
+  // (entry.base64 || entry.content). Validation must not reject {name, content}.
+  it('accepts inline attachment using `content` as a base64 alias', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ name: 'file.pdf', content: 'AAAA' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  // Regression: contentType is optional at runtime; {name, base64} must pass.
+  it('accepts inline attachment with base64 and no contentType', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ name: 'file.pdf', base64: 'AAAA' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  // base64 + content together is accepted (runtime lets base64 win); validation
+  // must mirror that and not reject the redundant shape.
+  it('accepts inline attachment with both base64 and content set', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ name: 'file.pdf', base64: 'AAAA', content: 'BBBB' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects inline attachment missing name', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ base64: 'AAAA' }],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /did not match any allowed schema variant/);
+  });
+
+  it('rejects inline attachment with unknown property', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [{ name: 'file.pdf', base64: 'AAAA', evil: 'x' }],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /did not match any allowed schema variant/);
+  });
+
+  // Regression: validateAgainstSchema returns early on null, so a null array
+  // item used to skip the item schema entirely. Must be rejected explicitly.
+  it('rejects a null attachment item', () => {
+    const errors = validate('sendMail', {
+      to: 'user@example.com',
+      subject: 'test',
+      body: 'hello',
+      attachments: [null],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must not be null/);
   });
 });
 
