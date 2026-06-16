@@ -1,16 +1,13 @@
 # Automated dependency updates -- GitHub-native, no third-party app needed.
 # https://docs.github.com/en/code-security/dependabot
 #
-# Three ecosystems matter for this repo:
+# Two ecosystems matter for this repo:
 #   - npm: dev dependencies (acorn, eslint, better-sqlite3, etc).
 #     Production package.json `dependencies` is empty -- the extension
 #     itself ships no npm deps.
 #   - github-actions: pins on actions/checkout@vN, actions/setup-node@vN
 #     in .github/workflows/*.yml. Without this, action major versions
 #     silently drift and CI breaks on Node 20 -> Node 24 deprecation.
-#   - docker: docker/integration.Dockerfile pins greenmail + the base
-#     image for the integration tier. CVEs on the base image surface
-#     here as a PR instead of in the integration log.
 #
 # Schedule weekly so the PR backlog stays small. Grouped by ecosystem so
 # we don't get one PR per dep -- a single rollup PR per Monday morning.
@@ -71,20 +68,3 @@ updates:
       actions:
         patterns:
           - "*"
-
-  - package-ecosystem: docker
-    directory: /docker
-    schedule:
-      interval: weekly
-      day: monday
-      time: "06:00"
-      timezone: Europe/Warsaw
-    open-pull-requests-limit: 3
-    labels:
-      - dependencies
-      - docker
-    commit-message:
-      prefix: chore(docker)
-      include: scope
-    # No grouping -- base-image bumps and greenmail bumps deserve
-    # individual review (integration tier depends on both).
