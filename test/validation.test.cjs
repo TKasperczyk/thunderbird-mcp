@@ -63,6 +63,12 @@ function createValidator(tools) {
         if (typeof value !== "object" || Array.isArray(value)) {
           errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
         }
+      } else if (expectedType === "integer") {
+        // JSON Schema "integer" is a whole number. typeof reports
+        // "number" for both integers and floats, so check explicitly.
+        if (typeof value !== "number" || !Number.isInteger(value)) {
+          errors.push(`Parameter '${key}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
+        }
       } else if (expectedType && typeof value !== expectedType) {
         errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
       }
@@ -217,8 +223,58 @@ const sampleTools = [
     },
   },
   {
+    name: "getMessageHeaders",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string" },
+        folderPath: { type: "string" },
+      },
+      required: ["messageId", "folderPath"],
+    },
+  },
+  {
+    name: "batchGetMessageHeaders",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageIds: {
+          type: "array",
+          items: { type: "string" },
+        },
+        folderPath: { type: "string" },
+      },
+      required: ["messageIds", "folderPath"],
+    },
+  },
+  {
     name: "getAccountAccess",
     inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "getSenderHistory",
+    inputSchema: {
+      type: "object",
+      properties: {
+        email: { type: "string" },
+        maxResults: { type: "integer" },
+        scanCap: { type: "integer" },
+        sinceDays: { type: "integer" },
+      },
+      required: ["email"],
+    },
+  },
+  {
+    name: "searchByThread",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string" },
+        folderPath: { type: "string" },
+        maxResults: { type: "integer" },
+      },
+      required: ["messageId", "folderPath"],
+    },
   },
 ];
 
@@ -528,5 +584,229 @@ describe('Validation: getMessages batch size', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /at most 10/);
+  });
+});
+
+describe('Validation: getMessageHeaders', () => {
+  it('accepts messageId + folderPath', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects missing messageId', () => {
+    const errors = validate('getMessageHeaders', {
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: messageId/);
+  });
+
+  it('rejects missing folderPath', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: folderPath/);
+  });
+
+  it('rejects messageId of the wrong type', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: 42,
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+      headers: ['Subject'],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: headers/);
+  });
+});
+
+describe('Validation: batchGetMessageHeaders', () => {
+  it('accepts a valid batch', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: Array.from({ length: 10 }, (_, index) => `<message-${index}@example.com>`),
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  // No schema minItems: an empty array is valid at the dispatch layer; the
+  // handler short-circuits it to { headers: {}, total: 0, failed: 0 }.
+  it('accepts an empty messageIds array (handler returns the empty fast path)', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: [],
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  // No schema maxItems: the 200-id hard cap lives in the handler (returning a
+  // clear { error } value), not in validation, so large arrays pass validation.
+  it('does not bound messageIds at the schema level', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: Array.from({ length: 250 }, (_, index) => `<message-${index}@example.com>`),
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects messageIds passed as a non-array', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects missing folderPath', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: ['<abc@example.com>'],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: folderPath/);
+  });
+
+  // Validation is SHALLOW: it enforces the messageIds array type but does NOT
+  // recurse into items, so a null element passes top-level validation (per-id
+  // handling happens inside the handler, which records a per-item "not found in
+  // this folder" error rather than aborting the batch).
+  it('does not reject a null array item at the top level (shallow validation)', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: ['<abc@example.com>', null],
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+});
+
+describe('Validation: getSenderHistory', () => {
+  it('accepts a valid email-only call', () => {
+    const errors = validate('getSenderHistory', {
+      email: 'alice@example.com',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts the full set of integer caps', () => {
+    const errors = validate('getSenderHistory', {
+      email: 'alice@example.com',
+      maxResults: 50,
+      scanCap: 5000,
+      sinceDays: 30,
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects missing email', () => {
+    const errors = validate('getSenderHistory', {
+      maxResults: 50,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: email/);
+  });
+
+  it('rejects email passed as a non-string', () => {
+    const errors = validate('getSenderHistory', {
+      email: 123,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  // The "default 50, max 200" / "default 5000, max 50000" caps live in the
+  // handler (silent Math.min clamp + default), NOT the schema, so out-of-range
+  // integers pass validation and are clamped at runtime.
+  it('does not bound maxResults/scanCap at the schema level', () => {
+    const errors = validate('getSenderHistory', {
+      email: 'alice@example.com',
+      maxResults: 9999,
+      scanCap: 9999999,
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects a non-integer (float) maxResults', () => {
+    const errors = validate('getSenderHistory', {
+      email: 'alice@example.com',
+      maxResults: 12.5,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validate('getSenderHistory', {
+      email: 'alice@example.com',
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: folderPath/);
+  });
+});
+
+describe('Validation: searchByThread', () => {
+  it('accepts a valid messageId + folderPath call', () => {
+    const errors = validate('searchByThread', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts an explicit maxResults', () => {
+    const errors = validate('searchByThread', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+      maxResults: 100,
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects missing messageId', () => {
+    const errors = validate('searchByThread', {
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: messageId/);
+  });
+
+  it('rejects missing folderPath', () => {
+    const errors = validate('searchByThread', {
+      messageId: '<abc@example.com>',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: folderPath/);
+  });
+
+  it('rejects folderPath passed as a non-string', () => {
+    const errors = validate('searchByThread', {
+      messageId: '<abc@example.com>',
+      folderPath: 12345,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  // The "default 100, max 500" cap lives in the handler (silent clamp), not the
+  // schema, so an over-cap integer passes validation.
+  it('does not bound maxResults at the schema level', () => {
+    const errors = validate('searchByThread', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+      maxResults: 99999,
+    });
+    assert.deepStrictEqual(errors, []);
   });
 });
