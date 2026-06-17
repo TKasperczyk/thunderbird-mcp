@@ -7,7 +7,7 @@
     "gecko": {
       "id": "thunderbird-mcp@tkasperczyk.dev",
       "strict_min_version": "102.0",
-      "strict_max_version": "151.*"
+      "strict_max_version": "152.*"
     }
   },
   "icons": {
