@@ -264,6 +264,37 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getSenderHistory",
+        group: "messages", crud: "read",
+        title: "Get Sender History",
+        description: "Return recent message headers from a given email address, scanned across the inbox of every accessible account. Useful for 'have I corresponded with this person before?' or 'have we already approached this outreach target?' decisions before drafting a reply.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            email: { type: "string", description: "Sender email address to match (case-insensitive substring match against the author field)" },
+            maxResults: { type: "integer", description: "Cap on returned headers (default 50, max 200)" },
+            scanCap: { type: "integer", description: "Hard cap on messages enumerated per folder before stopping (default 5000, max 50000)" },
+            sinceDays: { type: "integer", description: "Restrict to messages from the last N days (default unlimited)" },
+          },
+          required: ["email"],
+        },
+      },
+      {
+        name: "searchByThread",
+        group: "messages", crud: "read",
+        title: "Search By Thread",
+        description: "Given any messageId + folderPath, return headers for every other message in the same thread. Uses msgHdr.threadId. Results are headers-only -- call getMessage on a specific id for its body.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "Any message in the thread you want to fetch" },
+            folderPath: { type: "string", description: "Folder URI containing the message" },
+            maxResults: { type: "integer", description: "Cap on returned headers (default 100, max 500)" },
+          },
+          required: ["messageId", "folderPath"],
+        },
+      },
+      {
         name: "sendMail",
         group: "messages", crud: "create",
         title: "Compose Mail",
@@ -5004,6 +5035,106 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
+             * Return recent message headers from a given email address, scanned
+             * across the inbox (or root fallback) of every accessible account.
+             * Case-insensitive substring match against the decoded author field.
+             * Synchronous. Newest-first.
+             */
+            function getSenderHistory(email, maxResults, scanCap, sinceDays) {
+              if (typeof email !== "string" || !email.trim()) {
+                return { error: "email must be a non-empty string" };
+              }
+              const wantLower = email.toLowerCase();
+              const cap = Number.isFinite(maxResults) && maxResults > 0
+                ? Math.min(Math.floor(maxResults), 200)
+                : 50;
+              const scanLimit = Number.isFinite(scanCap) && scanCap > 0
+                ? Math.min(Math.floor(scanCap), 50000)
+                : 5000;
+              const sinceMicros = Number.isFinite(sinceDays) && sinceDays > 0
+                ? (Date.now() - sinceDays * 86400 * 1000) * 1000
+                : null;
+
+              const FLAG_INBOX = 0x1000;
+              const results = [];
+              let totalScanned = 0;
+              for (const account of getAccessibleAccounts()) {
+                if (results.length >= cap) break;
+                let inbox = null;
+                try {
+                  const root = account.incomingServer && account.incomingServer.rootFolder;
+                  if (!root) continue;
+                  if (typeof root.getFolderWithFlags === "function") {
+                    try { inbox = root.getFolderWithFlags(FLAG_INBOX); } catch { /* ignore */ }
+                  }
+                  if (!inbox) inbox = root;
+                  const db = inbox.msgDatabase;
+                  if (!db) continue;
+                  let scanned = 0;
+                  for (const hdr of db.enumerateMessages()) {
+                    scanned++;
+                    totalScanned++;
+                    if (scanned > scanLimit) break;
+                    if (sinceMicros !== null && hdr.date && hdr.date < sinceMicros) continue;
+                    const author = (hdr.mime2DecodedAuthor || hdr.author || "").toLowerCase();
+                    if (!author.includes(wantLower)) continue;
+                    const obj = msgHdrToHeaderObject(hdr);
+                    obj.folderPath = inbox.URI;
+                    obj._ts = hdr.date ? hdr.date / 1000 : 0;
+                    results.push(obj);
+                    if (results.length >= cap * 2) break; // generous pre-sort buffer
+                  }
+                } catch { /* skip inaccessible account */ }
+              }
+
+              results.sort((a, b) => (b._ts || 0) - (a._ts || 0));
+              const trimmed = results.slice(0, cap).map(({ _ts, ...rest }) => rest);
+              return {
+                sender: email,
+                messages: trimmed,
+                totalScanned,
+                truncated: results.length > cap,
+              };
+            }
+
+            /**
+             * Walk a folder once and return all headers that share the
+             * threadId of the anchor message. The anchor itself is included.
+             * Newest-first.
+             */
+            function searchByThread(messageId, folderPath, maxResults) {
+              const found = findMessage(messageId, folderPath);
+              if (found.error) return { error: found.error };
+              const { msgHdr: anchor, db } = found;
+              const threadId = anchor.threadId;
+              if (!threadId) {
+                return { thread: [msgHdrToHeaderObject(anchor)], threadId: null, anchored: true };
+              }
+              const cap = Number.isFinite(maxResults) && maxResults > 0
+                ? Math.min(Math.floor(maxResults), 500)
+                : 100;
+              const results = [];
+              const SCAN_CAP = 50000;
+              let scanned = 0;
+              for (const hdr of db.enumerateMessages()) {
+                scanned++;
+                if (scanned > SCAN_CAP) break;
+                if (hdr.threadId === threadId) {
+                  results.push({ _hdr: hdr, _ts: hdr.date ? hdr.date / 1000 : 0 });
+                  if (results.length >= cap) break;
+                }
+              }
+              results.sort((a, b) => b._ts - a._ts);
+              return {
+                threadId: String(threadId),
+                anchorId: anchor.messageId,
+                thread: results.map(r => msgHdrToHeaderObject(r._hdr)),
+                truncated: results.length >= cap,
+                scanned,
+              };
+            }
+
+            /**
              * Composes a new email. Opens a compose window for review, or sends
              * directly when skipReview is true.
              *
@@ -6688,6 +6819,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return getMessageHeaders(args.messageId, args.folderPath);
                 case "batchGetMessageHeaders":
                   return batchGetMessageHeaders(args.messageIds, args.folderPath);
+                case "getSenderHistory":
+                  return getSenderHistory(args.email, args.maxResults, args.scanCap, args.sinceDays);
+                case "searchByThread":
+                  return searchByThread(args.messageId, args.folderPath, args.maxResults);
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
                 case "createContact":
