@@ -144,6 +144,25 @@ function isSensitiveFilePath(attachmentPath) {
   const normalized = attachmentPath.replace(/\\/g, "/").toLowerCase();
   return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
 }
+
+/**
+ * Collapse CR/LF/NUL runs in a single-line header value to a single space.
+ * Prevents header-injection and keeps a preview/sanitized subject on one line.
+ * Non-string input is returned unchanged. Pure (no I/O).
+ */
+function sanitizeHeaderLine(value) {
+  if (typeof value !== "string") return value;
+  return value.replace(/[\r\n\0]+/g, " ");
+}
+
+/**
+ * Count distinct recipients in a comma-separated address header string.
+ * Comma-splits, trims, drops empties. Pure (no I/O).
+ */
+function countRecipients(s) {
+  if (typeof s !== "string" || !s.trim()) return 0;
+  return s.split(",").map(p => p.trim()).filter(Boolean).length;
+}
 let _tempFileCounter = 0;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
@@ -966,6 +985,45 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         description: "Get the current account access control list. Shows which accounts the MCP server can access. Account access is configured by the user in the extension settings page (Tools > Add-ons > Thunderbird MCP > Options) and cannot be changed via MCP tools.",
         inputSchema: { type: "object", properties: {}, required: [] },
       },
+      {
+        name: "dryRunCompose",
+        group: "messages", crud: "read",
+        title: "Dry-Run Compose",
+        description: "Validate compose parameters WITHOUT sending or saving. Resolves the from identity, parses recipient counts, evaluates every attachment through the same path / size / deny-list pipeline that sendMail uses, and reports the rendered subject (after header sanitization). Useful for an agent that wants to self-check a compose call before triggering the review window or skipReview send.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            to: { type: "string", description: "Recipient email address" },
+            subject: { type: "string", description: "Email subject line" },
+            body: { type: "string", description: "Email body text (length is reported back; content is not echoed)" },
+            cc: { type: "string", description: "CC recipients (comma-separated)" },
+            bcc: { type: "string", description: "BCC recipients (comma-separated)" },
+            isHtml: { type: "boolean", description: "Treat body as HTML (default: false)" },
+            from: { type: "string", description: "Sender identity (email address or identity ID)" },
+            attachments: {
+              type: "array",
+              description: "Attachments to evaluate (same shape as sendMail). Each entry is checked but neither read nor copied; only path/size/deny-list status is returned.",
+              items: {
+                oneOf: [
+                  { type: "string", description: "Absolute file path to attach" },
+                  {
+                    type: "object",
+                    properties: {
+                      name: { type: "string" },
+                      contentType: { type: "string" },
+                      base64: { type: "string" },
+                      content: { type: "string", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
+                    },
+                    required: ["name"],
+                    additionalProperties: false,
+                  },
+                ],
+              },
+            },
+          },
+          required: ["to", "subject", "body"],
+        },
+      },
       ];
     }
 
@@ -1624,6 +1682,121 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /** Returns user-visible tag keywords from a message header, filtering out internal IMAP flags. */
             function getUserTags(msgHdr) {
               return (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
+            }
+
+            /**
+             * Read-only preview of a compose call. Resolves the from identity,
+             * counts recipients, sanitizes the subject, and evaluates each
+             * attachment through the SAME path / size / deny-list checks that
+             * sendMail uses -- but NEVER sends, saves a draft, opens a compose
+             * window, decodes/copies attachment bytes, or writes any temp file.
+             * Returns a plain object describing what would happen; it never
+             * throws to the caller and never returns an {error} shape.
+             */
+            function dryRunCompose(to, subject, body, cc, bcc, isHtml, from, attachments) {
+              const result = {
+                wouldSucceed: true,
+                blockers: [],
+                resolvedIdentity: null,
+                isHtml: !!isHtml,
+                subjectAfterSanitization: sanitizeHeaderLine(subject || ""),
+                bodyLength: typeof body === "string" ? body.length : 0,
+                recipients: {
+                  to: countRecipients(to),
+                  cc: countRecipients(cc),
+                  bcc: countRecipients(bcc),
+                },
+                attachments: [],
+                skipReviewBlocked: isSkipReviewBlocked(),
+              };
+
+              // Resolve identity through the same accessible-account path used
+              // by composeMail, but never fall back silently to the default --
+              // if `from` is set and doesn't match, surface the same error
+              // sendMail would return.
+              try {
+                if (from) {
+                  const identity = findIdentity(from);
+                  if (!identity) {
+                    result.blockers.push(`from identity not found or not accessible: ${from}`);
+                    result.wouldSucceed = false;
+                  } else {
+                    result.resolvedIdentity = {
+                      key: identity.key,
+                      email: identity.email,
+                      fullName: identity.fullName || null,
+                    };
+                  }
+                } else {
+                  // Default identity preview: first accessible identity.
+                  const accounts = getAccessibleAccounts();
+                  const firstIdentity = accounts[0] && accounts[0].defaultIdentity;
+                  if (firstIdentity) {
+                    result.resolvedIdentity = {
+                      key: firstIdentity.key,
+                      email: firstIdentity.email,
+                      fullName: firstIdentity.fullName || null,
+                      isDefault: true,
+                    };
+                  }
+                }
+              } catch (e) {
+                result.blockers.push(`identity resolution failed: ${e.message || e}`);
+                result.wouldSucceed = false;
+              }
+
+              // Per-attachment evaluation. Mirrors filePathsToAttachDescs but
+              // never copies / decodes / writes anything; only reports verdict.
+              if (Array.isArray(attachments)) {
+                for (const entry of attachments) {
+                  const att = { kind: null, name: null, status: "ok", reason: null, size: null };
+                  if (typeof entry === "string") {
+                    att.kind = "path";
+                    att.name = entry;
+                    if (isSensitiveFilePath(entry)) {
+                      att.status = "blocked";
+                      att.reason = "sensitive path";
+                    } else {
+                      try {
+                        const file = createLocalFile(entry);
+                        if (!file.exists()) {
+                          att.status = "missing";
+                          att.reason = "file does not exist";
+                        } else {
+                          try { att.size = file.fileSize; } catch { att.size = null; }
+                          if (att.size !== null && att.size > MAX_FILE_PATH_ATTACHMENT_BYTES) {
+                            att.status = "blocked";
+                            att.reason = `exceeds ${MAX_FILE_PATH_ATTACHMENT_BYTES / 1024 / 1024}MB cap`;
+                          }
+                        }
+                      } catch (e) {
+                        att.status = "error";
+                        att.reason = e.message || String(e);
+                      }
+                    }
+                  } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
+                    att.kind = "inline";
+                    att.name = entry.name;
+                    const b64 = entry.base64 || entry.content;
+                    att.size = typeof b64 === "string" ? Math.floor((b64.length * 3) / 4) : null;
+                    if (typeof b64 === "string" && b64.length > MAX_BASE64_SIZE) {
+                      att.status = "blocked";
+                      att.reason = `inline base64 exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB`;
+                    }
+                  } else {
+                    att.kind = "invalid";
+                    att.name = typeof entry === "object" ? JSON.stringify(entry).slice(0, 80) : String(entry);
+                    att.status = "blocked";
+                    att.reason = "neither a file path nor an inline {name, base64} object";
+                  }
+                  if (att.status !== "ok") {
+                    result.wouldSucceed = false;
+                  }
+                  result.attachments.push(att);
+                }
+              }
+
+              return result;
             }
 
             /**
@@ -6800,6 +6973,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return applyFilters(args.accountId, args.folderPath);
                 case "getAccountAccess":
                   return getAccountAccess();
+                case "dryRunCompose":
+                  return dryRunCompose(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
                 default:
                   throw new Error(`Unknown tool: ${name}`);
               }

@@ -299,6 +299,41 @@ const sampleTools = [
     name: "getAccountAccess",
     inputSchema: { type: "object", properties: {}, required: [] },
   },
+  {
+    name: "dryRunCompose",
+    inputSchema: {
+      type: "object",
+      properties: {
+        to: { type: "string" },
+        subject: { type: "string" },
+        body: { type: "string" },
+        cc: { type: "string" },
+        bcc: { type: "string" },
+        isHtml: { type: "boolean" },
+        from: { type: "string" },
+        attachments: {
+          type: "array",
+          items: {
+            oneOf: [
+              { type: "string" },
+              {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  contentType: { type: "string" },
+                  base64: { type: "string" },
+                  content: { type: "string" },
+                },
+                required: ["name"],
+                additionalProperties: false,
+              },
+            ],
+          },
+        },
+      },
+      required: ["to", "subject", "body"],
+    },
+  },
 ];
 
 const validate = createValidator(sampleTools);
@@ -1033,5 +1068,115 @@ describe('isSensitiveFilePath: case insensitivity and slash normalization', () =
   it('treats backslashes and forward slashes as equivalent boundaries', () => {
     assert.equal(isSensitiveFilePath('C:/Users/x/.ssh/id_rsa'), true);
     assert.equal(isSensitiveFilePath('C:\\Users\\x\\.ssh\\id_rsa'), true);
+  });
+});
+
+describe('Validation: dryRunCompose schema', () => {
+  it('accepts minimal required fields (to, subject, body)', () => {
+    const errors = validate('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello there',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts all optional scalar fields', () => {
+    const errors = validate('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      cc: 'bob@example.com',
+      bcc: 'carol@example.com',
+      isHtml: true,
+      from: 'me@example.com',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects when required field is missing', () => {
+    const errors = validate('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: body/);
+  });
+
+  it('rejects isHtml as string', () => {
+    const errors = validate('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      isHtml: 'true',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be boolean/);
+  });
+
+  it('rejects unknown top-level parameter (no skipReview on dry run)', () => {
+    const errors = validate('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      skipReview: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: skipReview/);
+  });
+
+  it('accepts attachments as array of file-path strings', () => {
+    const errors = validate('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: ['/home/user/report.pdf', '/tmp/data.csv'],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts inline attachment with required name + base64', () => {
+    const errors = validate('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: [{ name: 'a.txt', base64: 'aGVsbG8=' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  // Only `name` is required at the schema level (consistent with the other
+  // compose tools); an entry with neither base64 nor content passes validation
+  // and the handler reports it as an invalid attachment, rather than the
+  // validator rejecting the whole call.
+  it('accepts inline {name} at the schema level (handler reports it invalid)', () => {
+    const errors = validate('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: [{ name: 'a.txt' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts inline attachment using the content alias for base64', () => {
+    const errors = validate('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: [{ name: 'a.txt', content: 'aGVsbG8=' }],
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects attachments as a non-array', () => {
+    const errors = validate('dryRunCompose', {
+      to: 'alice@example.com',
+      subject: 'hi',
+      body: 'hello',
+      attachments: '/home/user/report.pdf',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
   });
 });
