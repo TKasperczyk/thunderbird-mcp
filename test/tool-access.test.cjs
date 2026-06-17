@@ -79,6 +79,7 @@ const ALL_TOOLS = [
   { name: "getMessages", group: "messages", crud: "read" },
   { name: "getMessageHeaders", group: "messages", crud: "read" },
   { name: "batchGetMessageHeaders", group: "messages", crud: "read" },
+  { name: "searchAttachments", group: "messages", crud: "read" },
   { name: "getRecentMessages", group: "messages", crud: "read" },
   { name: "displayMessage", group: "messages", crud: "read" },
   { name: "sendMail", group: "messages", crud: "create" },
