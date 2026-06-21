@@ -46,7 +46,11 @@ function isListenAllEnabled() {
 
 function stopConnectionInfoRefreshTimer() {
   if (globalThis.__tbMcpConnectionInfoRefreshTimer) {
-    clearInterval(globalThis.__tbMcpConnectionInfoRefreshTimer);
+    try {
+      globalThis.__tbMcpConnectionInfoRefreshTimer.cancel();
+    } catch (e) {
+      console.warn("thunderbird-mcp: failed to stop connection info refresh timer:", e);
+    }
     globalThis.__tbMcpConnectionInfoRefreshTimer = null;
   }
 }
@@ -1210,13 +1214,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function startConnectionInfoRefresh(port, token) {
               stopConnectionInfoRefreshTimer();
-              globalThis.__tbMcpConnectionInfoRefreshTimer = setInterval(() => {
+              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+              timer.initWithCallback(() => {
                 try {
                   ensureConnectionInfo(port, token);
                 } catch (e) {
                   console.warn("thunderbird-mcp: failed to refresh connection info:", e);
                 }
-              }, CONNECTION_FILE_REFRESH_MS);
+              }, CONNECTION_FILE_REFRESH_MS, Ci.nsITimer.TYPE_REPEATING_SLACK);
+              globalThis.__tbMcpConnectionInfoRefreshTimer = timer;
             }
 
             const authToken = getStableAuthTokenPref() || generateAuthToken();

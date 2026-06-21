@@ -12,14 +12,16 @@ describe("Connection info refresh", () => {
     assert.match(source, /function ensureConnectionInfo\(port, token\)/);
     assert.match(source, /return writeConnectionInfo\(port, token\);/);
     assert.match(source, /function startConnectionInfoRefresh\(port, token\)/);
-    assert.match(source, /setInterval\(\(\) => \{/);
+    assert.match(source, /Cc\["@mozilla\.org\/timer;1"\]\.createInstance\(Ci\.nsITimer\)/);
+    assert.match(source, /timer\.initWithCallback\(\(\) => \{/);
     assert.match(source, /ensureConnectionInfo\(port, token\);/);
+    assert.match(source, /Ci\.nsITimer\.TYPE_REPEATING_SLACK/);
   });
 
   it("starts and stops the refresh timer with the server lifecycle", () => {
     assert.match(source, /startConnectionInfoRefresh\(boundPort, authToken\);/);
     assert.match(source, /function stopConnectionInfoRefreshTimer\(\)/);
-    assert.match(source, /clearInterval\(globalThis\.__tbMcpConnectionInfoRefreshTimer\);/);
+    assert.match(source, /globalThis\.__tbMcpConnectionInfoRefreshTimer\.cancel\(\);/);
     assert.match(source, /stopConnectionInfoRefreshTimer\(\);\n\s*\/\/ Clear cached promise/);
     assert.match(source, /stopConnectionInfoRefreshTimer\(\);\n\s*\/\/ Clear the start promise/);
   });
