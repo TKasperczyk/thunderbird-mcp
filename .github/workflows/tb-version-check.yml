@@ -9,7 +9,7 @@ name: Thunderbird Version Check
 
 on:
   schedule:
-    - cron: "23 8 * * 1" # Every Monday at 08:23 UTC
+    - cron: "23 8 * * *" # Daily at 08:23 UTC
   workflow_dispatch:
 
 permissions:
