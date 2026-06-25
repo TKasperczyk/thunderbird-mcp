@@ -1628,13 +1628,26 @@ RequestReader.prototype = {
 
         var scheme = identity.getScheme(host, port);
         if (!scheme) {
-          dumpn(
-            "*** unrecognized hostname (" +
-              hostPort +
-              ") in Host " +
-              "header, 400 time"
-          );
-          throw HTTP_400;
+          // When the server is bound to all interfaces (startAll / listenAll
+          // mode), it may be reached through a port-mapping layer — Docker
+          // NAT, a reverse proxy, or WSL port forwarding — where the client
+          // sends a Host header reflecting the external port rather than the
+          // port this server is actually listening on.  Fall back to the
+          // primary identity instead of rejecting the request: the auth token
+          // is the real security boundary, not virtual-host routing.
+          if (identity._host === "0.0.0.0") {
+            scheme = identity.primaryScheme;
+            host = identity.primaryHost;
+            port = identity.primaryPort;
+          } else {
+            dumpn(
+              "*** unrecognized hostname (" +
+                hostPort +
+                ") in Host " +
+                "header, 400 time"
+            );
+            throw HTTP_400;
+          }
         }
 
         metadata._scheme = scheme;
