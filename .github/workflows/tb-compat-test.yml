@@ -1,0 +1,308 @@
+name: Thunderbird Compatibility Smoke Test
+
+on:
+  pull_request:
+    paths:
+      - "extension/**"
+      - "package.json"
+      - "scripts/build.sh"
+      - ".github/workflows/tb-compat-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  compat-test:
+    name: TB compat (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    # Beta runs against the next TB major (one ahead of the cap), so it is an
+    # early-warning signal, not a merge gate. Once Thunderbird disables
+    # experiment APIs on a future beta this leg will fail; that must not block
+    # unrelated PRs. The weekly scheduled workflow keeps beta/esr as hard signals.
+    continue-on-error: ${{ matrix.channel == 'beta' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, beta]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22.x"
+
+      - name: Load extension in Thunderbird
+        shell: bash
+        env:
+          EXIT_ON_FAILURE: "true"
+          TB_CHANNEL: ${{ matrix.channel }}
+        run: |
+          set -euo pipefail
+
+          status="success"
+          failure_kind=""
+          message=""
+          tb_version=""
+          ext_active=""
+          ext_app_disabled=""
+          profile_dir=""
+          result_file="${RUNNER_TEMP}/tb-compat-${TB_CHANNEL}.json"
+          tb_log="${RUNNER_TEMP}/thunderbird-${TB_CHANNEL}.log"
+
+          write_result() {
+            RESULT_STATUS="$status" \
+            RESULT_FAILURE_KIND="$failure_kind" \
+            RESULT_MESSAGE="$message" \
+            RESULT_TB_CHANNEL="$TB_CHANNEL" \
+            RESULT_TB_VERSION="$tb_version" \
+            RESULT_EXT_ACTIVE="$ext_active" \
+            RESULT_EXT_APP_DISABLED="$ext_app_disabled" \
+            RESULT_PROFILE_DIR="$profile_dir" \
+            RESULT_LOG_FILE="$tb_log" \
+            RESULT_FILE="$result_file" \
+            node <<'NODE'
+          const fs = require('fs');
+
+          function optionalBool(value) {
+            if (value === 'true') return true;
+            if (value === 'false') return false;
+            return null;
+          }
+
+          const result = {
+            channel: process.env.RESULT_TB_CHANNEL,
+            status: process.env.RESULT_STATUS,
+            failureKind: process.env.RESULT_FAILURE_KIND || null,
+            message: process.env.RESULT_MESSAGE || null,
+            thunderbirdVersion: process.env.RESULT_TB_VERSION || null,
+            active: optionalBool(process.env.RESULT_EXT_ACTIVE || ''),
+            appDisabled: optionalBool(process.env.RESULT_EXT_APP_DISABLED || ''),
+            profileDir: process.env.RESULT_PROFILE_DIR || null,
+            logFile: process.env.RESULT_LOG_FILE || null,
+          };
+
+          fs.writeFileSync(process.env.RESULT_FILE, JSON.stringify(result, null, 2) + '\n');
+          NODE
+          }
+
+          finish() {
+            write_result
+            {
+              echo "### Thunderbird compatibility (${TB_CHANNEL})"
+              echo ""
+              echo "- Status: ${status}"
+              if [ -n "$tb_version" ]; then echo "- Thunderbird: ${tb_version}"; fi
+              if [ -n "$ext_app_disabled" ]; then echo "- appDisabled: ${ext_app_disabled}"; fi
+              if [ -n "$ext_active" ]; then echo "- active: ${ext_active}"; fi
+              if [ -n "$message" ]; then echo "- Message: ${message}"; fi
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            if [ "$status" = "success" ]; then
+              exit 0
+            fi
+            if [ "${EXIT_ON_FAILURE:-true}" = "true" ]; then
+              exit 1
+            fi
+            exit 0
+          }
+
+          fail_infra() {
+            status="infra_failure"
+            failure_kind="infra"
+            message="$1"
+            echo "::error::${message}"
+            finish
+          }
+
+          fail_load() {
+            status="load_failure"
+            failure_kind="load"
+            message="$1"
+            echo "::error::${message}"
+            finish
+          }
+
+          sudo apt-get update -qq || fail_infra "apt-get update failed"
+          sudo apt-get install -y -qq bzip2 curl jq libdbus-glib-1-2 libgtk-3-0 libx11-xcb1 libxt6 xvfb xz-utils zip \
+            || fail_infra "failed to install Thunderbird runtime dependencies"
+          if ! ldconfig -p | grep -q 'libasound.so.2'; then
+            sudo apt-get install -y -qq libasound2t64 \
+              || sudo apt-get install -y -qq libasound2 \
+              || fail_infra "failed to install libasound"
+          fi
+
+          bash scripts/build.sh || fail_infra "scripts/build.sh failed"
+          [ -f dist/thunderbird-mcp.xpi ] || fail_infra "dist/thunderbird-mcp.xpi was not produced"
+
+          case "$TB_CHANNEL" in
+            stable) version_key="LATEST_THUNDERBIRD_VERSION" ;;
+            beta) version_key="LATEST_THUNDERBIRD_DEVEL_VERSION" ;;
+            *) fail_infra "unsupported Thunderbird channel: ${TB_CHANNEL}" ;;
+          esac
+
+          tb_json="$(curl -fsSL https://product-details.mozilla.org/1.0/thunderbird_versions.json)" \
+            || fail_infra "failed to fetch Thunderbird product details"
+          tb_version="$(printf '%s' "$tb_json" | jq -er --arg key "$version_key" '.[$key] // empty')" \
+            || fail_infra "Thunderbird version key ${version_key} was missing"
+          if [[ ! "$tb_version" =~ ^[0-9]+(\.[0-9]+)*([ab][0-9]+|esr)?$ ]]; then
+            fail_infra "unexpected Thunderbird version format: ${tb_version}"
+          fi
+
+          install_dir="${RUNNER_TEMP}/thunderbird-${TB_CHANNEL}"
+          archive="${RUNNER_TEMP}/thunderbird-${TB_CHANNEL}.tar.xz"
+          download_url="https://download.mozilla.org/?product=thunderbird-${tb_version}-SSL&os=linux64&lang=en-US"
+          archive_url="https://archive.mozilla.org/pub/thunderbird/releases/${tb_version}/linux-x86_64/en-US/thunderbird-${tb_version}.tar.xz"
+
+          echo "Downloading Thunderbird ${TB_CHANNEL} ${tb_version}"
+          if ! curl -fL "$download_url" -o "$archive"; then
+            echo "::warning::download.mozilla.org failed; trying archive.mozilla.org"
+            curl -fL "$archive_url" -o "$archive" \
+              || fail_infra "failed to download Thunderbird ${TB_CHANNEL} ${tb_version}"
+          fi
+
+          rm -rf "$install_dir"
+          mkdir -p "$install_dir" || fail_infra "failed to create Thunderbird install directory"
+          tar -xf "$archive" -C "$install_dir" --strip-components=1 \
+            || fail_infra "failed to unpack Thunderbird ${TB_CHANNEL} ${tb_version}"
+
+          tb_bin="${install_dir}/thunderbird"
+          [ -x "$tb_bin" ] || fail_infra "Thunderbird binary was not executable"
+          installed_version="$("$tb_bin" --version 2>/dev/null | grep -Eo '[0-9]+(\.[0-9]+)*([ab][0-9]+|esr)?' | head -n 1 || true)"
+          if [ -n "$installed_version" ]; then
+            tb_version="$installed_version"
+          fi
+          echo "Thunderbird ${TB_CHANNEL}: ${tb_version}"
+
+          profile_dir="$(mktemp -d)" || fail_infra "failed to create test profile"
+          mkdir -p "$profile_dir/extensions" || fail_infra "failed to create extension profile directory"
+          cp dist/thunderbird-mcp.xpi "$profile_dir/extensions/thunderbird-mcp@tkasperczyk.dev.xpi" \
+            || fail_infra "failed to install XPI into test profile"
+          cat > "$profile_dir/user.js" <<'PREFS'
+          user_pref("extensions.experiments.enabled", true);
+          user_pref("extensions.autoDisableScopes", 0);
+          user_pref("extensions.enabledScopes", 15);
+          user_pref("extensions.update.enabled", false);
+          user_pref("app.update.enabled", false);
+          user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);
+          user_pref("datareporting.policy.dataSubmissionEnabled", false);
+          PREFS
+
+          ext_json="${profile_dir}/extensions.json"
+
+          read_addon_state() {
+            EXT_JSON="$ext_json" node <<'NODE'
+          const fs = require('fs');
+          const addonId = 'thunderbird-mcp@tkasperczyk.dev';
+
+          function done(result) {
+            process.stdout.write(JSON.stringify(result));
+          }
+
+          if (!fs.existsSync(process.env.EXT_JSON)) {
+            done({ ok: false, kind: 'missing', message: 'extensions.json is not present yet' });
+            process.exit(0);
+          }
+
+          try {
+            const data = JSON.parse(fs.readFileSync(process.env.EXT_JSON, 'utf8'));
+            if (!Array.isArray(data.addons)) {
+              done({ ok: false, kind: 'unparseable', message: 'extensions.json has no addons array' });
+              process.exit(0);
+            }
+
+            const addon = data.addons.find((item) => item.id === addonId);
+            if (!addon) {
+              done({ ok: false, kind: 'absent', message: 'Extension not found in extensions.json' });
+              process.exit(0);
+            }
+
+            const summary = {
+              id: addon.id,
+              version: addon.version,
+              active: addon.active,
+              appDisabled: addon.appDisabled,
+              userDisabled: addon.userDisabled,
+              signedState: addon.signedState,
+            };
+            const ok = addon.active === true && addon.appDisabled === false;
+
+            done({
+              ok,
+              kind: ok ? null : 'load',
+              message: ok
+                ? 'Extension loaded'
+                : `Extension did not load (appDisabled=${addon.appDisabled}, active=${addon.active})`,
+              addon: summary,
+            });
+          } catch (error) {
+            done({ ok: false, kind: 'unparseable', message: `Failed to inspect extensions.json: ${error.message}` });
+          }
+          NODE
+          }
+
+          set_addon_fields() {
+            local state_json="$1"
+            ext_active="$(printf '%s' "$state_json" | jq -r 'if .addon.active == null then "" else (.addon.active | tostring) end')" \
+              || fail_infra "failed to read active state"
+            ext_app_disabled="$(printf '%s' "$state_json" | jq -r 'if .addon.appDisabled == null then "" else (.addon.appDisabled | tostring) end')" \
+              || fail_infra "failed to read appDisabled state"
+          }
+
+          stop_thunderbird() {
+            if kill -0 "$tb_pid" 2>/dev/null; then
+              kill "$tb_pid" 2>/dev/null || true
+            fi
+            wait "$tb_pid" 2>/dev/null || true
+          }
+
+          MOZ_HEADLESS=1 timeout --kill-after=5s 75s xvfb-run --auto-servernum "$tb_bin" \
+            --profile "$profile_dir" --headless --no-remote > "$tb_log" 2>&1 &
+          tb_pid=$!
+
+          poll_deadline=$((SECONDS + 60))
+          poll_interval=2
+          while [ "$SECONDS" -lt "$poll_deadline" ]; do
+            state_json="$(read_addon_state)" \
+              || state_json='{"ok":false,"kind":"unparseable","message":"state reader failed"}'
+            state_ok="$(printf '%s' "$state_json" | jq -r '.ok // false')" || state_ok="false"
+            if [ "$state_ok" = "true" ]; then
+              set_addon_fields "$state_json"
+              stop_thunderbird
+              echo "Extension loaded OK on Thunderbird ${TB_CHANNEL} ${tb_version}"
+              finish
+            fi
+            if ! kill -0 "$tb_pid" 2>/dev/null; then
+              break
+            fi
+            sleep "$poll_interval"
+          done
+
+          final_state_json="$(read_addon_state)" \
+            || final_state_json='{"ok":false,"kind":"unparseable","message":"state reader failed"}'
+          final_kind="$(printf '%s' "$final_state_json" | jq -r '.kind // ""')" \
+            || fail_infra "extension verification did not return valid JSON"
+          final_message="$(printf '%s' "$final_state_json" | jq -r '.message // "extension verification failed"')" \
+            || fail_infra "extension verification did not return valid JSON"
+          final_ok="$(printf '%s' "$final_state_json" | jq -r '.ok // false')" \
+            || fail_infra "extension verification did not return valid JSON"
+          set_addon_fields "$final_state_json"
+          stop_thunderbird
+
+          if [ "$final_ok" = "true" ]; then
+            echo "Extension loaded OK on Thunderbird ${TB_CHANNEL} ${tb_version}"
+            finish
+          fi
+
+          if [ "$final_kind" = "missing" ]; then
+            echo "::group::Thunderbird log"
+            tail -200 "$tb_log" || true
+            echo "::endgroup::"
+            fail_infra "extensions.json was never created; Thunderbird may not have started"
+          fi
+          if [ "$final_kind" = "unparseable" ]; then
+            fail_infra "$final_message"
+          fi
+
+          fail_load "$final_message"

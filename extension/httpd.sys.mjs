@@ -885,6 +885,7 @@ export var HttpServer = nsHttpServer;
 // addresses (e.g. [::1]), but may also match valid non-canonical IPv6 addresses
 // (e.g. [::127.0.0.1]) and even invalid bracketed addresses ([::], [99999::]).
 
+// BEGIN HOST HEADER IDENTITY HELPERS
 const HOST_REGEX = new RegExp(
   "^(?:" +
     // *( domainlabel "." )
@@ -900,6 +901,53 @@ const HOST_REGEX = new RegExp(
     ")$",
   "i"
 );
+
+function resolveIdentityFromHostHeader(identity, hostPort) {
+  var host, port;
+  var colon = hostPort.lastIndexOf(":");
+  if (hostPort.lastIndexOf("]") > colon) {
+    colon = -1;
+  }
+  if (colon < 0) {
+    host = hostPort;
+    port = "";
+  } else {
+    host = hostPort.substring(0, colon);
+    port = hostPort.substring(colon + 1);
+  }
+
+  // NB: We allow an empty port here because, oddly, a colon may be
+  //     present even without a port number, e.g. "example.com:"; in this
+  //     case the default port applies.
+  if (!HOST_REGEX.test(host) || !/^\d*$/.test(port)) {
+    return { error: HTTP_400, reason: "malformed" };
+  }
+
+  // If we're not given a port, we're stuck, because we don't know what
+  // scheme to use to look up the correct port here, in general.  Since
+  // the HTTPS case requires a tunnel/proxy and thus requires that the
+  // requested URI be absolute (and thus contain the necessary
+  // information), let's assume HTTP will prevail and use that.
+  port = +port || 80;
+
+  var scheme = identity.getScheme(host, port);
+  if (!scheme) {
+    if (identity._host === "0.0.0.0") {
+      // In listenAll/startAll mode the Host header may reflect Docker,
+      // reverse-proxy, or WSL port mapping, so it is NOT a security boundary.
+      // The required Authorization Bearer token is the security boundary.
+      return {
+        scheme: identity.primaryScheme,
+        host: identity.primaryHost,
+        port: identity.primaryPort,
+      };
+    }
+    return { error: HTTP_400, reason: "unrecognized" };
+  }
+
+  return { scheme, host, port };
+}
+// END HOST HEADER IDENTITY HELPERS
 
 /**
  * Represents the identity of a server.  An identity consists of a set of
@@ -1592,54 +1640,30 @@ RequestReader.prototype = {
       // server identity data at this point, because the request just doesn't
       // contain enough data on its own to do this, sadly.
       if (!metadata._host) {
-        var host, port;
         var hostPort = headers.getHeader("Host");
-        var colon = hostPort.lastIndexOf(":");
-        if (hostPort.lastIndexOf("]") > colon) {
-          colon = -1;
-        }
-        if (colon < 0) {
-          host = hostPort;
-          port = "";
-        } else {
-          host = hostPort.substring(0, colon);
-          port = hostPort.substring(colon + 1);
-        }
-
-        // NB: We allow an empty port here because, oddly, a colon may be
-        //     present even without a port number, e.g. "example.com:"; in this
-        //     case the default port applies.
-        if (!HOST_REGEX.test(host) || !/^\d*$/.test(port)) {
+        var resolvedIdentity = resolveIdentityFromHostHeader(identity, hostPort);
+        if (resolvedIdentity.error && resolvedIdentity.reason === "malformed") {
           dumpn(
             "*** malformed hostname (" +
               hostPort +
               ") in Host " +
               "header, 400 time"
           );
-          throw HTTP_400;
+          throw resolvedIdentity.error;
         }
-
-        // If we're not given a port, we're stuck, because we don't know what
-        // scheme to use to look up the correct port here, in general.  Since
-        // the HTTPS case requires a tunnel/proxy and thus requires that the
-        // requested URI be absolute (and thus contain the necessary
-        // information), let's assume HTTP will prevail and use that.
-        port = +port || 80;
-
-        var scheme = identity.getScheme(host, port);
-        if (!scheme) {
+        if (resolvedIdentity.error) {
           dumpn(
             "*** unrecognized hostname (" +
               hostPort +
               ") in Host " +
               "header, 400 time"
           );
-          throw HTTP_400;
+          throw resolvedIdentity.error;
         }
 
-        metadata._scheme = scheme;
-        metadata._host = host;
-        metadata._port = port;
+        metadata._scheme = resolvedIdentity.scheme;
+        metadata._host = resolvedIdentity.host;
+        metadata._port = resolvedIdentity.port;
       }
     } else {
       NS_ASSERT(

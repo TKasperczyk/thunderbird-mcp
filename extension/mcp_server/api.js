@@ -22,6 +22,7 @@ const resProto = Cc[
 
 const MCP_DEFAULT_PORT = 8765;
 const MCP_MAX_PORT_ATTEMPTS = 10;
+const CONNECTION_FILE_REFRESH_MS = 30 * 1000;
 
 // Versions of the MCP protocol this server understands. Behavior never depends
 // on the negotiated version inside Thunderbird (the bridge intercepts initialize
@@ -42,6 +43,46 @@ let _cachedExtVersion = null;
 function isListenAllEnabled() {
   try { return Services.prefs.getBoolPref(PREF_LISTEN_ALL, false); } catch { return false; }
 }
+
+function stopConnectionInfoRefreshTimer() {
+  if (globalThis.__tbMcpConnectionInfoRefreshTimer) {
+    try {
+      globalThis.__tbMcpConnectionInfoRefreshTimer.cancel();
+    } catch (e) {
+      console.warn("thunderbird-mcp: failed to stop connection info refresh timer:", e);
+    }
+    globalThis.__tbMcpConnectionInfoRefreshTimer = null;
+  }
+}
+
+// BEGIN CONNECTION INFO REFRESH HELPERS
+function ensureFreshConnectionInfo({
+  port,
+  token,
+  expectedPid,
+  readConnectionInfo,
+  writeConnectionInfo,
+  onCheckError,
+}) {
+  try {
+    const current = readConnectionInfo();
+    const data = current && current.data;
+    if (
+      data &&
+      data.port === port &&
+      data.token === token &&
+      data.pid === expectedPid
+    ) {
+      return current.path;
+    }
+  } catch (e) {
+    if (typeof onCheckError === "function") {
+      onCheckError(e);
+    }
+  }
+  return writeConnectionInfo(port, token);
+}
+// END CONNECTION INFO REFRESH HELPERS
 
 function getExtVersion() {
   if (_cachedExtVersion) return _cachedExtVersion;
@@ -988,6 +1029,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             if (globalThis.__tbMcpServer) {
               try { globalThis.__tbMcpServer.stop(() => {}); } catch { /* ignore */ }
               globalThis.__tbMcpServer = null;
+              stopConnectionInfoRefreshTimer();
             }
             const { HttpServer } = ChromeUtils.importESModule(
               "resource://thunderbird-mcp/httpd.sys.mjs?" + Date.now()
@@ -1178,6 +1220,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               } catch {
                 // Best-effort cleanup
               }
+            }
+
+            function ensureConnectionInfo(port, token) {
+              return ensureFreshConnectionInfo({
+                port,
+                token,
+                expectedPid: Services.appinfo.processID,
+                readConnectionInfo,
+                writeConnectionInfo,
+                onCheckError: (e) => {
+                  console.warn("thunderbird-mcp: connection info check failed; rewriting:", e);
+                },
+              });
+            }
+
+            function startConnectionInfoRefresh(port, token) {
+              stopConnectionInfoRefreshTimer();
+              const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+              timer.initWithCallback(() => {
+                try {
+                  ensureConnectionInfo(port, token);
+                } catch (e) {
+                  console.warn("thunderbird-mcp: failed to refresh connection info:", e);
+                }
+              }, CONNECTION_FILE_REFRESH_MS, Ci.nsITimer.TYPE_REPEATING_SLACK);
+              globalThis.__tbMcpConnectionInfoRefreshTimer = timer;
             }
 
             const authToken = getStableAuthTokenPref() || generateAuthToken();
@@ -6798,11 +6866,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             globalThis.__tbMcpServer = server;
             let connFilePath;
             try {
+              // Write the connection file fresh on initial start so the secure
+              // create path (0600 perms, directory checks) always runs. The
+              // refresh timer self-heals it afterward via ensureConnectionInfo
+              // if the OS deletes it while the server keeps running.
               connFilePath = writeConnectionInfo(boundPort, authToken);
+              startConnectionInfoRefresh(boundPort, authToken);
             } catch (writeErr) {
               // Connection file write failed -- stop the orphaned server
               try { server.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
               globalThis.__tbMcpServer = null;
+              stopConnectionInfoRefreshTimer();
               throw writeErr;
             }
             console.log(`Thunderbird MCP server listening on port ${boundPort}`);
@@ -6818,6 +6892,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               try { globalThis.__tbMcpServer.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
               globalThis.__tbMcpServer = null;
             }
+            stopConnectionInfoRefreshTimer();
             // Clear cached promise so a retry can attempt to bind again
             globalThis.__tbMcpStartPromise = null;
             removeConnectionInfo();
@@ -7124,6 +7199,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           if (globalThis.__tbMcpServer) {
             const stopServer = globalThis.__tbMcpServer;
             globalThis.__tbMcpServer = null;
+            stopConnectionInfoRefreshTimer();
             // Wait for the socket close callback before rebinding the port.
             try {
               await new Promise((resolve) => {
@@ -7157,6 +7233,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       try { globalThis.__tbMcpServer.stop(() => {}); } catch { /* ignore */ }
       globalThis.__tbMcpServer = null;
     }
+    stopConnectionInfoRefreshTimer();
     // Clear the start promise so a fresh start can occur on reload
     globalThis.__tbMcpStartPromise = null;
 
