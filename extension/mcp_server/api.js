@@ -707,6 +707,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "refreshFolder",
+        group: "messages", crud: "read",
+        title: "Refresh Folder",
+        description: "Fetch new mail for an IMAP folder from the server and wait for completion. Returns counts of messages before/after and how many new messages arrived. Non-IMAP folders (POP/Local) are skipped. The wait is bounded by timeoutMs (default 15000, hard-capped at 25000); on timeout the in-flight fetch keeps running in Thunderbird and a timeout result is returned.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            folderPath: { type: "string", description: "Folder URI (from listFolders) to refresh" },
+            timeoutMs: { type: "integer", description: "Max ms to wait for the fetch to complete (default 15000). Hard-capped at 25000 to stay below the stdio bridge's HTTP request timeout (30000ms); larger values are clamped." },
+          },
+          required: ["folderPath"],
+        },
+      },
+      {
         name: "createFolder",
         group: "folders", crud: "create",
         title: "Create Folder",
@@ -5995,6 +6009,88 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // Hard cap on the refresh wait, kept under the stdio bridge's
+            // 30000ms HTTP request timeout (5s safety margin) so a structured
+            // timeout result is returned rather than the bridge hard-failing.
+            const REFRESH_TIMEOUT_CAP_MS = 25000;
+
+            function refreshFolder(folderPath, timeoutMs) {
+              return new Promise((resolve) => {
+                try {
+                  const result = getAccessibleFolder(folderPath);
+                  if (result.error) {
+                    resolve({ error: result.error });
+                    return;
+                  }
+                  const folder = result.folder;
+
+                  // Non-IMAP folders (POP/Local) have no remote fetch to drive.
+                  if (!folder.server || folder.server.type !== "imap") {
+                    resolve({ success: true, folderPath: folder.URI, skipped: "not an IMAP folder" });
+                    return;
+                  }
+
+                  const limit = Number.isFinite(timeoutMs) && timeoutMs > 0
+                    ? Math.min(Math.floor(timeoutMs), REFRESH_TIMEOUT_CAP_MS)
+                    : 15000;
+
+                  let beforeCount = null;
+                  try { beforeCount = folder.getTotalMessages(false); } catch {}
+
+                  let settled = false;
+                  const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                  const settle = (value) => {
+                    if (settled) return;
+                    settled = true;
+                    try { timer.cancel(); } catch {}
+                    resolve(value);
+                  };
+
+                  // Arm the timeout BEFORE kicking off the fetch. On timeout the
+                  // in-flight getNewMessages is left running; only the wait is
+                  // abandoned.
+                  timer.initWithCallback({
+                    notify() {
+                      settle({ error: `refreshFolder timed out after ${limit}ms`, folderPath: folder.URI });
+                    }
+                  }, limit, Ci.nsITimer.TYPE_ONE_SHOT);
+
+                  const urlListener = {
+                    QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                    OnStartRunningUrl() {},
+                    OnStopRunningUrl(url, exitCode) {
+                      if (!Components.isSuccessCode(exitCode)) {
+                        // >>> 0 coerces the (negative, signed 32-bit) nsresult to
+                        // its unsigned form so the hex reads e.g. 0x80004005.
+                        settle({ error: `IMAP fetch failed (status 0x${(exitCode >>> 0).toString(16)})`, folderPath: folder.URI });
+                        return;
+                      }
+                      let afterCount = null;
+                      try { afterCount = folder.getTotalMessages(false); } catch {}
+                      const newMessages = (afterCount === null || typeof beforeCount !== "number")
+                        ? null
+                        : Math.max(0, afterCount - beforeCount);
+                      settle({
+                        success: true,
+                        folderPath: folder.URI,
+                        totalBefore: beforeCount,
+                        totalAfter: afterCount,
+                        newMessages,
+                      });
+                    },
+                  };
+
+                  try {
+                    folder.getNewMessages(null, urlListener);
+                  } catch (e) {
+                    settle({ error: e.toString(), folderPath: folder.URI });
+                  }
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
             // ── Filter constant maps ──
 
             const ATTRIB_MAP = {
@@ -6625,6 +6721,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":
                   return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash);
+                case "refreshFolder":
+                  return await refreshFolder(args.folderPath, args.timeoutMs);
                 case "createFolder":
                   return createFolder(args.parentFolderPath, args.name);
                 case "renameFolder":

@@ -63,6 +63,12 @@ function createValidator(tools) {
         if (typeof value !== "object" || Array.isArray(value)) {
           errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
         }
+      } else if (expectedType === "integer") {
+        // JSON Schema "integer" is a whole number. typeof reports
+        // "number" for both integers and floats, so check explicitly.
+        if (typeof value !== "number" || !Number.isInteger(value)) {
+          errors.push(`Parameter '${key}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
+        }
       } else if (expectedType && typeof value !== expectedType) {
         errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
       }
@@ -171,6 +177,17 @@ const sampleTools = [
         newParentPath: { type: "string" },
       },
       required: ["folderPath", "newParentPath"],
+    },
+  },
+  {
+    name: "refreshFolder",
+    inputSchema: {
+      type: "object",
+      properties: {
+        folderPath: { type: "string" },
+        timeoutMs: { type: "integer" },
+      },
+      required: ["folderPath"],
     },
   },
   {
@@ -377,6 +394,65 @@ describe('Validation: folder management', () => {
       folderPath: '/Source',
       newParentPath: '/Dest',
       recursive: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter/);
+  });
+});
+
+describe('Validation: refreshFolder', () => {
+  it('requires folderPath', () => {
+    const errors = validate('refreshFolder', {});
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter/);
+    assert.match(errors[0], /folderPath/);
+  });
+
+  it('accepts a valid folderPath alone', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('accepts a valid folderPath with integer timeoutMs', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 'imap://user@server/INBOX',
+      timeoutMs: 20000,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects number for folderPath', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 123,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects non-integer timeoutMs', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 'imap://user@server/INBOX',
+      timeoutMs: 1500.5,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects string timeoutMs', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 'imap://user@server/INBOX',
+      timeoutMs: '15000',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects unknown params', () => {
+    const errors = validate('refreshFolder', {
+      folderPath: 'imap://user@server/INBOX',
+      force: true,
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /Unknown parameter/);
