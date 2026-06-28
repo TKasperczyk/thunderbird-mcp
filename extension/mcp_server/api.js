@@ -273,6 +273,55 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getMessageHeaders",
+        group: "messages", crud: "read",
+        title: "Get Message Headers",
+        description: "Read just the header fields (subject, from, to, cc, date, tags, flags, threading) of a single message by its ID. Lighter than getMessage — no body/MIME parse.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The message ID (from searchMessages results)" },
+            folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
+          },
+          required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "batchGetMessageHeaders",
+        group: "messages", crud: "read",
+        title: "Batch Get Message Headers",
+        description: "Fetch headers for up to 200 messages that share one folder, in a single round-trip. Returns a map keyed by messageId; ids not found in the folder report a per-item error without failing the batch. Pair with searchMessages to enrich a result set without N round-trips.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageIds: {
+              type: "array",
+              description: "Message IDs to read headers for (hard cap 200, enforced by the handler). All must live in folderPath.",
+              items: { type: "string", description: "An RFC Message-ID (from searchMessages results)" },
+            },
+            folderPath: { type: "string", description: "The folder URI path shared by every id" },
+          },
+          required: ["messageIds", "folderPath"],
+        },
+      },
+      {
+        name: "searchAttachments",
+        group: "messages", crud: "read",
+        title: "Search Attachments",
+        description: "Find messages that carry an attachment matching a filename substring and/or a Content-Type prefix. Pre-filters on the per-message attachment flag, then parses only the flagged candidates' MIME (bounded concurrency). Provide at least one of nameContains or contentType.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            nameContains: { type: "string", description: "Case-insensitive substring matched against the attachment filename (e.g. 'invoice', '.pdf')" },
+            contentType: { type: "string", description: "Case-insensitive prefix matched against the attachment Content-Type (e.g. 'application/pdf', 'image/')" },
+            folderPath: { type: "string", description: "Optional folder URI to limit the search. Omitted = scan inbox of each accessible account." },
+            maxResults: { type: "integer", description: "Cap on matching messages (default 50, max 200)" },
+            scanCap: { type: "integer", description: "Hard cap on messages enumerated per folder before stopping (default 5000, max 50000). Prevents the LLM from accidentally walking a 200k-message archive." },
+          },
+          required: [],
+        },
+      },
+      {
         name: "sendMail",
         group: "messages", crud: "create",
         title: "Compose Mail",
@@ -1594,6 +1643,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             /** Returns user-visible tag keywords from a message header, filtering out internal IMAP flags. */
             function getUserTags(msgHdr) {
               return (msgHdr.getStringProperty("keywords") || "").split(/\s+/).filter(k => k && !INTERNAL_KEYWORDS.has(k.toLowerCase()));
+            }
+
+            /**
+             * Single shared header-shape extractor used by both getMessageHeaders
+             * and batchGetMessageHeaders so the two tools return field-identical
+             * objects. Reads only nsIMsgDBHdr fields plus the two threading headers
+             * (References / In-Reply-To) via getStringProperty — no MIME parse.
+             *
+             * Field notes:
+             *   - id is the RFC Message-ID (msgHdr.messageId), exposed under `id`.
+             *   - subject/author/recipients prefer the RFC2047-decoded mime2Decoded*
+             *     variants, then raw, then "".
+             *   - date is microseconds-since-epoch / 1000 -> ms -> ISO-8601, or null.
+             *   - threadId is the DB/Gloda numeric thread id stringified, NOT a header.
+             *   - tags excludes internal IMAP/system keywords; always an array.
+             *   - size is msgHdr.messageSize only when it is a number, else null.
+             */
+            function msgHdrToHeaderObject(msgHdr) {
+              return {
+                id: msgHdr.messageId,
+                subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "",
+                author: msgHdr.mime2DecodedAuthor || msgHdr.author || "",
+                recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients || "",
+                ccList: msgHdr.ccList || "",
+                date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
+                tags: getUserTags(msgHdr),
+                isRead: msgHdr.isRead,
+                isFlagged: msgHdr.isFlagged,
+                threadId: msgHdr.threadId ? String(msgHdr.threadId) : null,
+                references: msgHdr.getStringProperty("references") || "",
+                inReplyTo: msgHdr.getStringProperty("in-reply-to") || "",
+                size: typeof msgHdr.messageSize === "number" ? msgHdr.messageSize : null,
+              };
             }
 
             /**
@@ -4244,6 +4326,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END RAW MIME ATTACHMENT HELPERS
 
+            /**
+             * Reads only the header fields of a single message. Locates the
+             * nsIMsgDBHdr via findMessage (openFolder + direct/linear lookup)
+             * and returns the shared msgHdrToHeaderObject shape, or { error }.
+             * No body/MIME parse — synchronous, much lighter than getMessage.
+             */
+            function getMessageHeaders(messageId, folderPath) {
+              const found = findMessage(messageId, folderPath);
+              if (found.error) return { error: found.error };
+              return msgHdrToHeaderObject(found.msgHdr);
+            }
+
 	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource) {
 	              return new Promise((resolve) => {
 	                try {
@@ -4841,6 +4935,243 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	              });
 	            }
 
+            /**
+             * Search for messages carrying an attachment that matches a filename
+             * substring and/or a Content-Type prefix.
+             *
+             * Two-phase: (1) cheap synchronous header enumeration pre-filtered by
+             * the per-message Attachment flag (0x10000000) collects up to cap*4
+             * candidates; (2) a BOUNDED-CONCURRENCY MIME fan-out parses those
+             * candidates (at most MAX_MIME_CONCURRENCY in flight at once), each
+             * guarded by a per-parse one-shot nsITimer so a single stuck/uncached
+             * IMAP parse cannot hang the batch. The handler always resolves; it
+             * never rejects.
+             */
+            function searchAttachments(nameContains, contentType, folderPath, maxResults, scanCap) {
+              return new Promise((resolve) => {
+                try {
+                  if (!nameContains && !contentType) {
+                    resolve({ error: "Provide at least one of nameContains or contentType" });
+                    return;
+                  }
+
+                  const cap = Number.isFinite(maxResults) && maxResults > 0
+                    ? Math.min(Math.floor(maxResults), 200)
+                    : 50;
+                  const scanLimit = Number.isFinite(scanCap) && scanCap > 0
+                    ? Math.min(Math.floor(scanCap), 50000)
+                    : 5000;
+
+                  const wantName = nameContains ? String(nameContains).toLowerCase() : null;
+                  const wantType = contentType ? String(contentType).toLowerCase() : null;
+
+                  const FLAG_INBOX = 0x1000;     // nsMsgFolderFlags.Inbox
+                  const FLAG_ATTACH = 0x10000000; // nsMsgMessageFlags.Attachment
+
+                  // Resolve the set of folders to scan.
+                  const folders = [];
+                  if (folderPath) {
+                    const opened = openFolder(folderPath);
+                    if (opened.error) {
+                      resolve({ error: opened.error });
+                      return;
+                    }
+                    folders.push(opened.folder);
+                  } else {
+                    for (const account of getAccessibleAccounts()) {
+                      try {
+                        const root = account.incomingServer.rootFolder;
+                        if (!root) continue;
+                        let inbox = null;
+                        if (typeof root.getFolderWithFlags === "function") {
+                          try { inbox = root.getFolderWithFlags(FLAG_INBOX); } catch { /* fall back to root */ }
+                        }
+                        folders.push(inbox || root);
+                      } catch {
+                        // Skip inaccessible accounts.
+                      }
+                    }
+                  }
+
+                  // Phase 1: enumerate headers, pre-filter on the Attachment flag,
+                  // collect candidates up to the generous pre-MIME buffer (cap*4).
+                  const candidates = [];
+                  let totalScanned = 0;
+                  for (const folder of folders) {
+                    if (candidates.length >= cap * 4) break;
+                    let db;
+                    try {
+                      db = folder.msgDatabase;
+                    } catch {
+                      continue;
+                    }
+                    if (!db) continue;
+
+                    let scannedHere = 0;
+                    let broke = false;
+                    try {
+                      for (const hdr of db.enumerateMessages()) {
+                        scannedHere++;
+                        totalScanned++;
+                        if (scannedHere > scanLimit) break;
+                        if ((hdr.flags & FLAG_ATTACH) !== 0) {
+                          candidates.push({ hdr, folder });
+                          if (candidates.length >= cap * 4) { broke = true; break; }
+                        }
+                      }
+                    } catch {
+                      // msgDatabase access failure mid-enumeration: skip this folder.
+                      continue;
+                    }
+                    if (broke) break;
+                  }
+
+                  // Early empty-candidates success: this shape OMITS `truncated`.
+                  if (candidates.length === 0) {
+                    resolve({ matches: [], totalScanned, candidates: 0 });
+                    return;
+                  }
+
+                  const { MsgHdrToMimeMessage } = ChromeUtils.importESModule(
+                    "resource:///modules/gloda/MimeMessage.sys.mjs"
+                  );
+
+                  // Bounded MIME fan-out config.
+                  const MAX_MIME_CONCURRENCY = 8;
+                  const MIME_PARSE_TIMEOUT_MS = 8000;
+                  // Aggregate deadline: even with a per-parse timeout, cap*4 (up to
+                  // 800) stuck parses at concurrency 8 could run for minutes and blow
+                  // past the client/bridge request timeout. Once the deadline passes,
+                  // workers stop pulling new candidates and we finish with whatever
+                  // matched so far (signalled via `truncated`).
+                  const SEARCH_DEADLINE_MS = 20000;
+                  const deadline = Date.now() + SEARCH_DEADLINE_MS;
+                  let deadlineHit = false;
+
+                  const matches = [];
+
+                  // finish(): sort newest-first, slice to cap, strip _ts, resolve.
+                  function finish() {
+                    matches.sort((a, b) => b._ts - a._ts);
+                    const truncated = matches.length > cap || deadlineHit;
+                    const sliced = matches.slice(0, cap).map(({ _ts, ...rest }) => rest);
+                    resolve({
+                      matches: sliced,
+                      totalScanned,
+                      candidates: candidates.length,
+                      truncated,
+                    });
+                  }
+
+                  // Parse one candidate, resolving to a match object or null. Never
+                  // rejects. Guarded by a one-shot timer: if the MIME callback has
+                  // not fired by MIME_PARSE_TIMEOUT_MS, treat as a no-match and free
+                  // the slot. A `settled` flag guards against the callback and the
+                  // timer both firing.
+                  function parseCandidate({ hdr, folder }) {
+                    return new Promise((resolve) => {
+                      let settled = false;
+                      let timer = null;
+
+                      const settle = (value) => {
+                        if (settled) return;
+                        settled = true;
+                        if (timer) { try { timer.cancel(); } catch { /* ignore */ } }
+                        resolve(value);
+                      };
+
+                      // Everything that can throw (timer allocation, the MIME call)
+                      // lives inside this try, so the executor NEVER throws and the
+                      // promise NEVER rejects -- any failure path resolves to null
+                      // (no-match) and frees the worker slot.
+                      try {
+                        timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                        timer.initWithCallback({
+                          notify() { settle(null); }
+                        }, MIME_PARSE_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
+
+                        // 3-arg form, matching the fork: do NOT pass allowDownload /
+                        // examineEncryptedParts -- a 4th truthy arg makes MIME fetch
+                        // bodies over the network for IMAP, which is exactly the
+                        // resource blow-up this tool is meant to avoid.
+                        MsgHdrToMimeMessage(hdr, null, (aMsgHdr, aMimeMsg) => {
+                          try {
+                            const atts = (aMimeMsg && aMimeMsg.allUserAttachments) || [];
+                            const matched = [];
+                            for (const att of atts) {
+                              const name = att && att.name ? String(att.name).toLowerCase() : "";
+                              const ct = att && att.contentType ? String(att.contentType).toLowerCase() : "";
+                              const nameOk = !wantName || name.includes(wantName);
+                              const typeOk = !wantType || ct.startsWith(wantType);
+                              if (nameOk && typeOk) {
+                                matched.push({
+                                  name: att.name || "",
+                                  contentType: att.contentType || "",
+                                  size: typeof att.size === "number" ? att.size : null,
+                                });
+                              }
+                            }
+                            if (matched.length > 0) {
+                              const obj = msgHdrToHeaderObject(hdr);
+                              obj.matchingAttachments = matched;
+                              obj.folderPath = folder.URI;
+                              obj._ts = hdr.date ? hdr.date / 1000 : 0;
+                              settle(obj);
+                            } else {
+                              settle(null);
+                            }
+                          } catch {
+                            // skip parse errors
+                            settle(null);
+                          }
+                        });
+                      } catch {
+                        // Synchronous throw from timer allocation or MsgHdrToMimeMessage.
+                        settle(null);
+                      }
+                    });
+                  }
+
+                  // Worker-pool of MAX_MIME_CONCURRENCY pulling from a shared index.
+                  // At most MAX_MIME_CONCURRENCY parseCandidate calls are in flight;
+                  // when one resolves the same worker immediately pulls the next
+                  // index. Completion is detected when all workers run out of work.
+                  let nextIndex = 0;
+                  async function worker() {
+                    for (;;) {
+                      // Stop pulling new work once the aggregate deadline passes;
+                      // in-flight parses still settle (bounded by their own timer).
+                      // Only flag truncation if candidates actually remain, so a
+                      // deadline that elapses after the work is already drained does
+                      // not over-report truncated.
+                      if (Date.now() > deadline) {
+                        if (nextIndex < candidates.length) deadlineHit = true;
+                        return;
+                      }
+                      const i = nextIndex++;
+                      if (i >= candidates.length) return;
+                      const result = await parseCandidate(candidates[i]);
+                      if (result) matches.push(result);
+                    }
+                  }
+
+                  (async () => {
+                    try {
+                      const poolSize = Math.min(MAX_MIME_CONCURRENCY, candidates.length);
+                      const workers = [];
+                      for (let w = 0; w < poolSize; w++) workers.push(worker());
+                      await Promise.all(workers);
+                    } catch {
+                      // parseCandidate never rejects; guard is defensive.
+                    }
+                    finish();
+                  })();
+                } catch (e) {
+                  resolve({ error: e.toString() });
+                }
+              });
+            }
+
             async function getMessages(messages, saveAttachments, bodyFormat, rawSource) {
               if (typeof messages === "string") {
                 try { messages = JSON.parse(messages); } catch { /* leave as-is */ }
@@ -4900,6 +5231,98 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 failed,
                 max: getMessagesLimit,
               };
+            }
+
+            /**
+             * Reads header fields for many messages that share one folder, in a
+             * single pass. Returns { headers, total, failed } where `headers` is a
+             * null-prototype map keyed by the input messageId; each value is either
+             * the shared msgHdrToHeaderObject shape (resolved) or
+             * { error: "not found in this folder" } (unresolved). `total` is the
+             * requested id count (messageIds.length, includes duplicates), `failed`
+             * is the number of unresolved ids.
+             *
+             * Algorithm is deliberately O(M), not O(M*N): one openFolder, a direct
+             * db.getMsgHdrForMessageID per id when available, then a SINGLE linear
+             * enumeration pass (capped at SCAN_CAP) only for the residual misses,
+             * early-exiting once every missing id is found. Unlike getMessageHeaders
+             * it does not call findMessage per id.
+             */
+            function batchGetMessageHeaders(messageIds, folderPath) {
+              if (!Array.isArray(messageIds)) {
+                return { error: "messageIds must be an array" };
+              }
+              // Empty input short-circuits without opening the folder.
+              if (messageIds.length === 0) {
+                return { headers: {}, total: 0, failed: 0 };
+              }
+              // Hard cap of 200 -- search-result pages are typically smaller; a
+              // caller wanting more should page. Enforced here in the handler
+              // (not via the schema) so over-cap returns a clear {error} value
+              // rather than a dispatch-layer rejection.
+              if (messageIds.length > 200) {
+                return { error: `Too many ids: ${messageIds.length}. Hard cap is 200; call multiple times if needed.` };
+              }
+
+              const opened = openFolder(folderPath);
+              if (opened.error) return opened;
+              const { db } = opened;
+
+              // wanted is the de-duplicated set of ids we still need to resolve.
+              const wanted = new Set(messageIds);
+              const found = new Map();
+
+              const hasDirect = typeof db.getMsgHdrForMessageID === "function";
+              if (hasDirect) {
+                for (const id of wanted) {
+                  try {
+                    const hdr = db.getMsgHdrForMessageID(id);
+                    if (hdr) found.set(id, hdr);
+                  } catch {
+                    // Swallow per-id lookup throws; the id stays in missSet for
+                    // the linear fallback below.
+                  }
+                }
+              }
+
+              // Single linear pass for ids the direct lookup missed.
+              const missSet = new Set();
+              for (const id of wanted) {
+                if (!found.has(id)) missSet.add(id);
+              }
+              if (missSet.size > 0) {
+                const SCAN_CAP = 50000;
+                let scanned = 0;
+                for (const hdr of db.enumerateMessages()) {
+                  if (scanned++ >= SCAN_CAP) break;
+                  const id = hdr.messageId;
+                  if (missSet.has(id)) {
+                    found.set(id, hdr);
+                    missSet.delete(id);
+                    if (missSet.size === 0) break;
+                  }
+                }
+              }
+
+              const headers = Object.create(null);
+              for (const id of messageIds) {
+                const hdr = found.get(id);
+                if (hdr) {
+                  headers[id] = msgHdrToHeaderObject(hdr);
+                } else {
+                  headers[id] = { error: "not found in this folder" };
+                }
+              }
+
+              // failed = number of map entries whose value is the {error} form.
+              // Counted over the de-duplicated keys (duplicate ids collapse to one
+              // entry), while total reflects the raw requested count.
+              let failed = 0;
+              for (const key of Object.keys(headers)) {
+                if (headers[key] && headers[key].error) failed++;
+              }
+
+              return { headers, total: messageIds.length, failed };
             }
 
             /**
@@ -6583,6 +7006,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
                 case "getMessages":
                   return await getMessages(args.messages, args.saveAttachments, args.bodyFormat, args.rawSource);
+                case "getMessageHeaders":
+                  return getMessageHeaders(args.messageId, args.folderPath);
+                case "batchGetMessageHeaders":
+                  return batchGetMessageHeaders(args.messageIds, args.folderPath);
+                case "searchAttachments":
+                  return await searchAttachments(args.nameContains, args.contentType, args.folderPath, args.maxResults, args.scanCap);
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
                 case "createContact":

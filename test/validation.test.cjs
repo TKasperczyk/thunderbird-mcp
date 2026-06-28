@@ -63,6 +63,12 @@ function createValidator(tools) {
         if (typeof value !== "object" || Array.isArray(value)) {
           errors.push(`Parameter '${key}' must be an object, got ${Array.isArray(value) ? "array" : typeof value}`);
         }
+      } else if (expectedType === "integer") {
+        // JSON Schema "integer" is a whole number. typeof reports
+        // "number" for both integers and floats, so check explicitly.
+        if (typeof value !== "number" || !Number.isInteger(value)) {
+          errors.push(`Parameter '${key}' must be an integer, got ${typeof value === "number" ? "non-integer number" : typeof value}`);
+        }
       } else if (expectedType && typeof value !== expectedType) {
         errors.push(`Parameter '${key}' must be ${expectedType}, got ${typeof value}`);
       }
@@ -217,8 +223,47 @@ const sampleTools = [
     },
   },
   {
+    name: "getMessageHeaders",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageId: { type: "string" },
+        folderPath: { type: "string" },
+      },
+      required: ["messageId", "folderPath"],
+    },
+  },
+  {
+    name: "batchGetMessageHeaders",
+    inputSchema: {
+      type: "object",
+      properties: {
+        messageIds: {
+          type: "array",
+          items: { type: "string" },
+        },
+        folderPath: { type: "string" },
+      },
+      required: ["messageIds", "folderPath"],
+    },
+  },
+  {
     name: "getAccountAccess",
     inputSchema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "searchAttachments",
+    inputSchema: {
+      type: "object",
+      properties: {
+        nameContains: { type: "string" },
+        contentType: { type: "string" },
+        folderPath: { type: "string" },
+        maxResults: { type: "integer" },
+        scanCap: { type: "integer" },
+      },
+      required: [],
+    },
   },
 ];
 
@@ -528,5 +573,184 @@ describe('Validation: getMessages batch size', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /at most 10/);
+  });
+});
+
+describe('Validation: getMessageHeaders', () => {
+  it('accepts messageId + folderPath', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects missing messageId', () => {
+    const errors = validate('getMessageHeaders', {
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: messageId/);
+  });
+
+  it('rejects missing folderPath', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: folderPath/);
+  });
+
+  it('rejects messageId of the wrong type', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: 42,
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validate('getMessageHeaders', {
+      messageId: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+      headers: ['Subject'],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: headers/);
+  });
+});
+
+describe('Validation: batchGetMessageHeaders', () => {
+  it('accepts a valid batch', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: Array.from({ length: 10 }, (_, index) => `<message-${index}@example.com>`),
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  // No schema minItems: an empty array is valid at the dispatch layer; the
+  // handler short-circuits it to { headers: {}, total: 0, failed: 0 }.
+  it('accepts an empty messageIds array (handler returns the empty fast path)', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: [],
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  // No schema maxItems: the 200-id hard cap lives in the handler (returning a
+  // clear { error } value), not in validation, so large arrays pass validation.
+  it('does not bound messageIds at the schema level', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: Array.from({ length: 250 }, (_, index) => `<message-${index}@example.com>`),
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects messageIds passed as a non-array', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: '<abc@example.com>',
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an array/);
+  });
+
+  it('rejects missing folderPath', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: ['<abc@example.com>'],
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Missing required parameter: folderPath/);
+  });
+
+  // Validation is SHALLOW: it enforces the messageIds array type but does NOT
+  // recurse into items, so a null element passes top-level validation (per-id
+  // handling happens inside the handler, which records a per-item "not found in
+  // this folder" error rather than aborting the batch).
+  it('does not reject a null array item at the top level (shallow validation)', () => {
+    const errors = validate('batchGetMessageHeaders', {
+      messageIds: ['<abc@example.com>', null],
+      folderPath: 'imap://user@server/INBOX',
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+});
+
+describe('Validation: searchAttachments', () => {
+  it('accepts only nameContains (no required params)', () => {
+    const errors = validate('searchAttachments', { nameContains: 'invoice' });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts only contentType', () => {
+    const errors = validate('searchAttachments', { contentType: 'application/pdf' });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('accepts both filters plus folderPath, maxResults, scanCap', () => {
+    const errors = validate('searchAttachments', {
+      nameContains: 'invoice',
+      contentType: 'application/pdf',
+      folderPath: 'imap://user@server/INBOX',
+      maxResults: 100,
+      scanCap: 10000,
+    });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  // required: [] -- no params are mandatory at the validation layer. The
+  // "provide at least one filter" rule is enforced by the handler, not the
+  // schema, so an empty args object passes validation.
+  it('accepts an empty args object (the filter rule lives in the handler)', () => {
+    const errors = validate('searchAttachments', {});
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects nameContains of the wrong type', () => {
+    const errors = validate('searchAttachments', { nameContains: 42 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('rejects contentType of the wrong type', () => {
+    const errors = validate('searchAttachments', { contentType: true });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be string/);
+  });
+
+  it('accepts integer maxResults', () => {
+    const errors = validate('searchAttachments', { nameContains: 'x', maxResults: 50 });
+    assert.deepStrictEqual(errors, []);
+  });
+
+  it('rejects non-integer (float) maxResults', () => {
+    const errors = validate('searchAttachments', { nameContains: 'x', maxResults: 12.5 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects string maxResults', () => {
+    const errors = validate('searchAttachments', { nameContains: 'x', maxResults: '50' });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects non-integer (float) scanCap', () => {
+    const errors = validate('searchAttachments', { contentType: 'image/', scanCap: 99.9 });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /must be an integer/);
+  });
+
+  it('rejects unknown parameters', () => {
+    const errors = validate('searchAttachments', {
+      nameContains: 'invoice',
+      regex: true,
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /Unknown parameter: regex/);
   });
 });
