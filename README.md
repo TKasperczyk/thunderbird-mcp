@@ -144,6 +144,27 @@ Add to your MCP client config (e.g. `~/.claude.json` for Claude Code):
 }
 ```
 
+If the bridge runs outside Thunderbird's network namespace (for example, in a
+separate Docker container), set `THUNDERBIRD_MCP_HOST` so bridge HTTP requests
+target Thunderbird correctly instead of the bridge container's own loopback:
+
+```json
+{
+  "mcpServers": {
+    "thunderbird-mail": {
+      "command": "node",
+      "args": ["/absolute/path/to/thunderbird-mcp/mcp-bridge.cjs"],
+      "env": {
+        "THUNDERBIRD_MCP_HOST": "thunderbird"
+      }
+    }
+  }
+}
+```
+
+Use a hostname resolvable from the bridge process (Docker service name,
+container name, or reachable IP). If unset, the bridge defaults to `127.0.0.1`.
+
 ### Sandbox-aware connection discovery
 
 The bridge re-discovers `connection.json` on every cache miss. It tries these locations in order:
@@ -193,6 +214,7 @@ That's it. Your AI can now access Thunderbird.
 |---------|-----|
 | Extension not loading | Check Tools > Add-ons and Themes. Errors: Tools > Developer Tools > Error Console |
 | Connection refused | Make sure Thunderbird is running and the extension is enabled |
+| Bridge in Docker/container cannot connect | Set `THUNDERBIRD_MCP_HOST` to the Thunderbird host reachable from the bridge container (not `127.0.0.1` unless both run in the same namespace) |
 | Bridge can't find `connection.json` | Set `THUNDERBIRD_MCP_CONNECTION_FILE` explicitly if your environment uses a non-standard temp/runtime path |
 | Missing recent emails | IMAP folders can be stale. Click the folder in Thunderbird to sync, or right-click > Properties > Repair Folder |
 | Tool not found after update | Reconnect MCP (`/mcp` in Claude Code) to pick up new tools |
@@ -216,7 +238,8 @@ echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | node mcp-bridge.cjs
 CONN_FILE="${THUNDERBIRD_MCP_CONNECTION_FILE:-/tmp/thunderbird-mcp/connection.json}"
 TOKEN=$(jq -r .token "$CONN_FILE")
 PORT=$(jq -r .port "$CONN_FILE")
-curl -X POST http://127.0.0.1:$PORT \
+HOST="${THUNDERBIRD_MCP_HOST:-127.0.0.1}"
+curl -X POST http://$HOST:$PORT \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
