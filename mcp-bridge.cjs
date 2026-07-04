@@ -11,7 +11,9 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const THUNDERBIRD_HOSTS = ['127.0.0.1'];
+// Defaults to loopback for native installs, but allows container/network setups
+// to route bridge -> Thunderbird through an explicit host.
+const THUNDERBIRD_HOSTS = [process.env.THUNDERBIRD_MCP_HOST || '127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
 const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
