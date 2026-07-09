@@ -10,8 +10,9 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const net = require('net');
 
-const THUNDERBIRD_HOSTS = ['127.0.0.1'];
+const DEFAULT_THUNDERBIRD_HOSTS = ['127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
 const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
@@ -22,6 +23,7 @@ const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
 const CONNECTION_FILE_BASENAME = 'connection.json';
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
+const HOSTNAME_PATTERN = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/;
 
 // MCP protocol versions the bridge knows how to speak. Per lifecycle spec the
 // server MUST respond with the requested version if it supports it, otherwise
@@ -58,6 +60,38 @@ function debugLog(message) {
 
 function isValidAuthToken(token) {
   return typeof token === 'string' && AUTH_TOKEN_PATTERN.test(token);
+}
+
+function normalizeConnectionHost(host) {
+  if (typeof host !== 'string') {
+    throw new Error('Invalid connection file: host must be a string');
+  }
+
+  const trimmed = host.trim();
+  if (!trimmed) {
+    throw new Error('Invalid connection file: host must not be empty');
+  }
+
+  const normalized = trimmed.startsWith('[') && trimmed.endsWith(']')
+    ? trimmed.slice(1, -1)
+    : trimmed;
+
+  if (net.isIP(normalized)) {
+    return normalized;
+  }
+
+  if (HOSTNAME_PATTERN.test(normalized)) {
+    return normalized;
+  }
+
+  throw new Error('Invalid connection file: host must be a hostname or IP address');
+}
+
+function getConnectionHosts(connInfo) {
+  if (!connInfo || connInfo.host === undefined || connInfo.host === null) {
+    return DEFAULT_THUNDERBIRD_HOSTS;
+  }
+  return [normalizeConnectionHost(connInfo.host)];
 }
 
 let cachedConnectionInfo = null;
@@ -907,8 +941,10 @@ async function forwardToThunderbird(message) {
       throw new Error('Invalid connection file: token must be 64 lowercase hex characters');
     }
 
+    const requestHosts = getConnectionHosts(connInfo);
+
     try {
-      return await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token);
+      return await tryAllHosts(requestHosts, postData, connInfo.port, connInfo.token);
     } catch (err) {
       if (!isRetryableConnectionError(err)) {
         throw err;
@@ -1043,8 +1079,10 @@ module.exports = {
   findMacOsConnectionCandidates,
   findSnapConnectionCandidates,
   formatDiscoveryAttempts,
+  getConnectionHosts,
   compactToolResultJsonText,
   isValidAuthToken,
+  normalizeConnectionHost,
   readConnectionInfo,
   startBridge,
 };
