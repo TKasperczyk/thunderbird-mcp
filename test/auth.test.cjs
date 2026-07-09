@@ -89,9 +89,9 @@ function sendToBridge(message, { timeout = 10000 } = {}) {
 /**
  * Write a test connection.json file.
  */
-function writeTestConnectionInfo(port, token) {
+function writeTestConnectionInfo(port, token, extraFields = {}) {
   fs.mkdirSync(CONN_DIR, { recursive: true });
-  fs.writeFileSync(CONN_FILE, JSON.stringify({ port, token, pid: process.pid }), 'utf8');
+  fs.writeFileSync(CONN_FILE, JSON.stringify({ port, token, pid: process.pid, ...extraFields }), 'utf8');
 }
 
 /**
@@ -117,7 +117,7 @@ function restoreConnectionFile() {
   }
 }
 
-describe('Auth: connection info file', () => {
+describe('Auth: connection info file', { concurrency: false }, () => {
   before(async () => {
     backupConnectionFile();
   });
@@ -169,6 +169,60 @@ describe('Auth: connection info file', () => {
     }
   });
 
+  it('bridge uses the host from connection.json when present', async (t) => {
+    const TEST_PORT = 18768;
+    const TEST_TOKEN = 'e'.repeat(64);
+    const candidateHosts = ['127.0.0.2', '::1'];
+    let selectedHost = null;
+    let receivedHost = null;
+
+    const server = http.createServer((req, res) => {
+      receivedHost = req.socket.localAddress;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        jsonrpc: '2.0',
+        id: 101,
+        result: { tools: [{ name: 'remote-host' }] }
+      }));
+    });
+
+    for (const candidateHost of candidateHosts) {
+      try {
+        await new Promise((resolve, reject) => {
+          server.removeAllListeners('error');
+          server.once('error', reject);
+          server.listen(TEST_PORT, candidateHost, resolve);
+        });
+        selectedHost = candidateHost;
+        break;
+      } catch (err) {
+        if (!err || err.code !== 'EADDRNOTAVAIL') {
+          throw err;
+        }
+      }
+    }
+
+    if (!selectedHost) {
+      return t.skip(`no loopback alias available from: ${candidateHosts.join(', ')}`);
+    }
+
+    try {
+      writeTestConnectionInfo(TEST_PORT, TEST_TOKEN, { host: selectedHost });
+
+      const response = await sendToBridge({
+        jsonrpc: '2.0',
+        id: 101,
+        method: 'tools/list'
+      });
+
+      assert.equal(receivedHost, selectedHost);
+      assert.equal(response.id, 101);
+      assert.equal(response.result.tools[0].name, 'remote-host');
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
   it('bridge fails closed when connection file is missing', async (t) => {
     if (await isPortInUse(DEFAULT_PORT)) {
       return t.skip('Thunderbird running on default port, skipping connection file removal test');
@@ -190,7 +244,7 @@ describe('Auth: connection info file', () => {
   });
 });
 
-describe('Auth: token verification', () => {
+describe('Auth: token verification', { concurrency: false }, () => {
   let server;
   const TEST_PORT = 18766;
   const CORRECT_TOKEN = 'b'.repeat(64);
@@ -284,7 +338,7 @@ function timingSafeEqual(a, b) {
   return result === 0;
 }
 
-describe('Timing-safe comparison: correctness', () => {
+describe('Timing-safe comparison: correctness', { concurrency: false }, () => {
   it('equal strings return true', () => {
     assert.equal(timingSafeEqual('abc', 'abc'), true);
   });
@@ -355,7 +409,7 @@ describe('Timing-safe comparison: correctness', () => {
 // CONNECTION FILE EDGE CASES
 // ═══════════════════════════════════════════════════════════════════
 
-describe('Auth: connection file corruption', () => {
+describe('Auth: connection file corruption', { concurrency: false }, () => {
   let thunderbirdRunning = false;
   before(async () => {
     thunderbirdRunning = await isPortInUse(DEFAULT_PORT);
@@ -574,7 +628,7 @@ describe('Auth: connection file corruption', () => {
 // BRIDGE LIFECYCLE & RETRY BEHAVIOR
 // ═══════════════════════════════════════════════════════════════════
 
-describe('Auth: bridge handles MCP lifecycle locally', () => {
+describe('Auth: bridge handles MCP lifecycle locally', { concurrency: false }, () => {
   // These methods are handled by the bridge directly without
   // contacting Thunderbird, so they should work even without
   // a connection file.
@@ -693,7 +747,7 @@ describe('Auth: bridge handles MCP lifecycle locally', () => {
   });
 });
 
-describe('Auth: bridge retry then fail', () => {
+describe('Auth: bridge retry then fail', { concurrency: false }, () => {
   let thunderbirdRunning = false;
   before(async () => {
     thunderbirdRunning = await isPortInUse(DEFAULT_PORT);

@@ -10,7 +10,9 @@ const {
   compactToolResultJsonText,
   clearConnectionCache,
   discoverConnectionInfo,
+  getConnectionHosts,
   isValidAuthToken,
+  normalizeConnectionHost,
   readConnectionInfo,
 } = require('../mcp-bridge.cjs');
 
@@ -22,9 +24,9 @@ function cleanupTempRoot(root) {
   fs.rmSync(root, { recursive: true, force: true });
 }
 
-function writeConnectionFile(filePath, { port, token, pid = process.pid }) {
+function writeConnectionFile(filePath, { port, token, pid = process.pid, ...extraFields }) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, JSON.stringify({ port, token, pid }), 'utf8');
+  fs.writeFileSync(filePath, JSON.stringify({ port, token, pid, ...extraFields }), 'utf8');
 }
 
 function makeTestOptions(root, overrides = {}) {
@@ -103,6 +105,27 @@ describe('Auth token validation', () => {
   });
 });
 
+describe('Connection host selection', () => {
+  it('uses localhost fallback hosts when connection.json does not specify a host', () => {
+    assert.deepStrictEqual(getConnectionHosts({ port: 8765, token: 'token' }), ['127.0.0.1']);
+  });
+
+  it('uses the explicit host from connection.json', () => {
+    assert.deepStrictEqual(getConnectionHosts({ host: 'remote-host', port: 8765, token: 'token' }), ['remote-host']);
+  });
+
+  it('normalizes bracketed IPv6 host values', () => {
+    assert.equal(normalizeConnectionHost('[::1]'), '::1');
+  });
+
+  it('rejects malformed host values', () => {
+    assert.throws(
+      () => getConnectionHosts({ host: 'http://remote-host', port: 8765, token: 'token' }),
+      /host must be a hostname or IP address/
+    );
+  });
+});
+
 describe('Tool result serialization', () => {
   it('compacts JSON text content without mutating the original response', () => {
     const originalText = JSON.stringify([{ name: 'INBOX', unreadMessages: 3 }], null, 2);
@@ -158,6 +181,26 @@ describe('Bridge discovery', () => {
 
     const connInfo = readConnectionInfo(options);
     assert.deepStrictEqual(connInfo, {
+      port: 20002,
+      token: 'env-token',
+      pid: process.pid,
+    });
+  });
+
+  it('preserves the optional host field from connection.json', () => {
+    const options = makeTestOptions(root, {
+      env: { THUNDERBIRD_MCP_CONNECTION_FILE: path.join(root, 'env', 'connection.json') },
+    });
+
+    writeConnectionFile(options.env.THUNDERBIRD_MCP_CONNECTION_FILE, {
+      host: 'remote-host',
+      port: 20002,
+      token: 'env-token',
+    });
+
+    const connInfo = readConnectionInfo(options);
+    assert.deepStrictEqual(connInfo, {
+      host: 'remote-host',
       port: 20002,
       token: 'env-token',
       pid: process.pid,
