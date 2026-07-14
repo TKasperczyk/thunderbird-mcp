@@ -31,14 +31,15 @@ function getMarkedApiSnippet(startMarker, endMarker) {
   return apiSource.slice(start, end);
 }
 
-function loadProductionAttachmentValidation() {
+function loadProductionAttachmentValidation(overrides = {}) {
   const sandbox = {
     getConfiguredGetMessagesLimit: () => 20,
-    MAX_BASE64_SIZE: 25 * 1024 * 1024,
+    ...overrides,
   };
   vm.createContext(sandbox);
   vm.runInContext([
     getMarkedApiSnippet('// BEGIN INLINE ATTACHMENT BASE64 HELPERS', '// END INLINE ATTACHMENT BASE64 HELPERS'),
+    getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT LIMITS', '// END OUTBOUND ATTACHMENT LIMITS'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA BUILDER', '// END TOOL SCHEMA BUILDER'),
     getMarkedApiSnippet('// BEGIN TOOL SCHEMA VALIDATOR', '// END TOOL SCHEMA VALIDATOR'),
     getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT CONVERSION', '// END OUTBOUND ATTACHMENT CONVERSION'),
@@ -46,6 +47,7 @@ function loadProductionAttachmentValidation() {
     'this.buildTools = buildTools;',
     'this.validateAgainstSchema = validateAgainstSchema;',
     'this.filePathsToAttachDescs = filePathsToAttachDescs;',
+    'this.attachmentLimits = { MAX_TOTAL_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_MESSAGE };',
   ].join('\n'), sandbox);
   return sandbox;
 }
@@ -69,6 +71,14 @@ function validateProductionToolArgs(name, args) {
       continue;
     }
     productionAttachmentValidation.validateAgainstSchema(value, propSchema, key, errors);
+    if (propSchema.type === 'array' && Array.isArray(value)) {
+      if (propSchema.minItems !== undefined && value.length < propSchema.minItems) {
+        errors.push(`Parameter '${key}' must contain at least ${propSchema.minItems} item(s)`);
+      }
+      if (propSchema.maxItems !== undefined && value.length > propSchema.maxItems) {
+        errors.push(`Parameter '${key}' must contain at most ${propSchema.maxItems} item(s)`);
+      }
+    }
   }
   return errors;
 }
@@ -551,6 +561,57 @@ describe('Validation: folder management', () => {
   });
 });
 
+function makeMockLocalFile(attachmentPath, options = {}) {
+  const {
+    exists = true,
+    normalizedPath = attachmentPath,
+    normalizeError = null,
+    regularFile = true,
+    typeError = null,
+    size = 1,
+    sizeError = null,
+  } = options;
+  return {
+    path: attachmentPath,
+    leafName: attachmentPath.split('/').pop(),
+    exists() {
+      return exists;
+    },
+    normalize() {
+      if (normalizeError) throw normalizeError;
+      this.path = normalizedPath;
+    },
+    isFile() {
+      if (typeError) throw typeError;
+      return regularFile;
+    },
+    get fileSize() {
+      if (sizeError) throw sizeError;
+      return size;
+    },
+  };
+}
+
+function convertProductionFileAttachments(entries, files) {
+  const runtime = loadProductionAttachmentValidation({
+    createLocalFile(attachmentPath) {
+      const file = files.get(attachmentPath);
+      if (!file) throw new Error(`missing mock file: ${attachmentPath}`);
+      return file;
+    },
+    isSensitiveFilePath: () => false,
+    Services: {
+      io: {
+        newFileURI: file => ({ spec: `file://${file.path}` }),
+      },
+    },
+  });
+  return {
+    limits: runtime.attachmentLimits,
+    result: runtime.filePathsToAttachDescs(entries),
+  };
+}
+
 describe('Validation: attachment sending', () => {
   it('accepts attachments as array of strings (file paths)', () => {
     const errors = validate('sendMail', {
@@ -714,6 +775,68 @@ describe('Validation: attachment sending', () => {
     assert.equal(result.descs.length, 0);
     assert.equal(result.failed.length, 1);
     assert.match(result.failed[0], /garbage\.bin \(invalid base64 data\)/);
+  });
+
+  it('production schemas and runtime enforce the per-message attachment count cap', () => {
+    const maxCount = productionAttachmentValidation.attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE;
+    const entries = Array.from({ length: maxCount + 1 }, (_, index) => `/tmp/file-${index}.txt`);
+    for (const [toolName, requiredArgs] of Object.entries(productionToolArgs)) {
+      const errors = validateProductionToolArgs(toolName, {
+        ...requiredArgs,
+        attachments: entries,
+      });
+      assert.ok(
+        errors.some(error => error.includes(`at most ${maxCount}`)),
+        `${toolName}: ${errors.join('; ')}`
+      );
+    }
+
+    const files = new Map(entries.map(entry => [entry, makeMockLocalFile(entry)]));
+    const { result } = convertProductionFileAttachments(entries, files);
+    assert.equal(result.descs.length, maxCount);
+    assert.equal(result.failed.length, 1);
+    assert.match(result.failed[0], new RegExp(`Attachment count ${maxCount + 1} exceeds the ${maxCount} attachment limit`));
+  });
+
+  it('production runtime enforces a 50MB aggregate attachment cap', () => {
+    const mib = 1024 * 1024;
+    const entries = ['/tmp/first.bin', '/tmp/second.bin', '/tmp/over.bin'];
+    const files = new Map([
+      [entries[0], makeMockLocalFile(entries[0], { size: 30 * mib })],
+      [entries[1], makeMockLocalFile(entries[1], { size: 20 * mib })],
+      [entries[2], makeMockLocalFile(entries[2], { size: 1 })],
+    ]);
+    const { limits, result } = convertProductionFileAttachments(entries, files);
+    assert.equal(limits.MAX_TOTAL_ATTACHMENT_BYTES, 50 * mib);
+    assert.equal(result.descs.length, 2, 'attachments exactly at the aggregate cap should pass');
+    assert.equal(result.descs.reduce((total, desc) => total + desc.size, 0), 50 * mib);
+    assert.equal(result.failed.length, 1);
+    assert.match(result.failed[0], /over\.bin \(exceeds 50MB aggregate attachment limit\)/);
+  });
+
+  it('production runtime fails closed on normalization, type, and size checks', () => {
+    const entries = [
+      '/tmp/normalize.bin',
+      '/tmp/type.bin',
+      '/tmp/directory',
+      '/tmp/size.bin',
+      '/tmp/invalid-size.bin',
+    ];
+    const files = new Map([
+      [entries[0], makeMockLocalFile(entries[0], { normalizeError: new Error('normalize failed') })],
+      [entries[1], makeMockLocalFile(entries[1], { typeError: new Error('stat failed') })],
+      [entries[2], makeMockLocalFile(entries[2], { regularFile: false })],
+      [entries[3], makeMockLocalFile(entries[3], { sizeError: new Error('stat failed') })],
+      [entries[4], makeMockLocalFile(entries[4], { size: Number.NaN })],
+    ]);
+    const { result } = convertProductionFileAttachments(entries, files);
+    assert.equal(result.descs.length, 0);
+    assert.equal(result.failed.length, entries.length);
+    assert.ok(result.failed.some(error => /normalize\.bin \(path normalization failed\)/.test(error)));
+    assert.ok(result.failed.some(error => /type\.bin \(file type check failed\)/.test(error)));
+    assert.ok(result.failed.some(error => /directory \(not a regular file\)/.test(error)));
+    assert.ok(result.failed.some(error => /size\.bin \(file size check failed\)/.test(error)));
+    assert.ok(result.failed.some(error => /invalid-size\.bin \(invalid file size\)/.test(error)));
   });
 });
 

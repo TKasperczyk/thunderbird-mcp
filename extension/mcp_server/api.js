@@ -120,10 +120,14 @@ function isValidBase64(value) {
   return typeof value === "string" && value.length > 0 && STRICT_BASE64_PATTERN.test(value);
 }
 // END INLINE ATTACHMENT BASE64 HELPERS
+// BEGIN OUTBOUND ATTACHMENT LIMITS
 const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
 // Cap file-path attachments to the same magnitude as saved-message attachments.
 // Prevents an MCP caller from attaching multi-GB files to a single outgoing message.
 const MAX_FILE_PATH_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE = 20;
+// END OUTBOUND ATTACHMENT LIMITS
 // Must be large enough to carry MAX_BASE64_SIZE plus JSON-RPC framing overhead.
 // The httpd.sys.mjs pre-buffer cap uses the same value.
 const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP request bodies
@@ -371,6 +375,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             skipReview: { type: "boolean", description: "If true, send the message directly without opening a compose window (default: false)" },
             attachments: {
               type: "array",
+              maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
               items: {
                 oneOf: [
@@ -414,6 +419,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             attachments: {
               type: "array",
+              maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
               items: {
                 oneOf: [
@@ -667,6 +673,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             skipReview: { type: "boolean", description: "If true, send the reply directly without opening a compose window (default: false)" },
             attachments: {
               type: "array",
+              maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
               description: "Attachments: file paths (strings) or inline objects ({name, contentType, base64})",
               items: {
                 oneOf: [
@@ -712,6 +719,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             skipReview: { type: "boolean", description: "If true, send the forward directly without opening a compose window (default: false)" },
             attachments: {
               type: "array",
+              maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
               description: "Additional attachments: file paths (strings) or inline objects ({name, contentType, base64})",
               items: {
                 oneOf: [
@@ -1736,7 +1744,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const descs = [];
               const failed = [];
               if (!filePaths || !Array.isArray(filePaths)) return { descs, failed };
-              for (const entry of filePaths) {
+              let attachmentEntries = filePaths;
+              if (filePaths.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+                failed.push(`Attachment count ${filePaths.length} exceeds the ${MAX_ATTACHMENTS_PER_MESSAGE} attachment limit; skipped ${filePaths.length - MAX_ATTACHMENTS_PER_MESSAGE} attachment(s)`);
+                attachmentEntries = filePaths.slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
+              }
+              let totalAttachmentBytes = 0;
+              for (const entry of attachmentEntries) {
                 try {
                   if (typeof entry === "string") {
                     // File path attachment.
@@ -1761,20 +1775,55 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // symlink (e.g. /tmp/report.pdf -> ~/.ssh/id_rsa). Canonicalize
                     // (resolves symlinks + . / .. components) and re-run the
                     // deny-list before reading the file.
-                    try { file.normalize(); } catch (_) { /* keep raw path if normalize fails */ }
+                    try {
+                      file.normalize();
+                    } catch {
+                      failed.push(`${entry} (path normalization failed)`);
+                      continue;
+                    }
                     if (isSensitiveFilePath(file.path)) {
                       failed.push(`${entry} (sensitive path blocked)`);
                       continue;
                     }
+                    let isRegularFile;
+                    try {
+                      isRegularFile = file.isFile();
+                    } catch {
+                      failed.push(`${entry} (file type check failed)`);
+                      continue;
+                    }
+                    if (!isRegularFile) {
+                      failed.push(`${entry} (not a regular file)`);
+                      continue;
+                    }
                     // Size cap mirrors the saved-attachment ceiling and avoids
                     // ballooning outgoing messages when a caller points at a huge file.
-                    let fileSize = 0;
-                    try { fileSize = file.fileSize; } catch { fileSize = 0; }
+                    let fileSize;
+                    try {
+                      fileSize = file.fileSize;
+                    } catch {
+                      failed.push(`${entry} (file size check failed)`);
+                      continue;
+                    }
+                    if (!Number.isSafeInteger(fileSize) || fileSize < 0) {
+                      failed.push(`${entry} (invalid file size)`);
+                      continue;
+                    }
                     if (fileSize > MAX_FILE_PATH_ATTACHMENT_BYTES) {
                       failed.push(`${entry} (exceeds ${MAX_FILE_PATH_ATTACHMENT_BYTES / 1024 / 1024}MB size limit)`);
                       continue;
                     }
-                    descs.push({ url: Services.io.newFileURI(file).spec, name: file.leafName, size: fileSize });
+                    if (fileSize > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
+                      failed.push(`${entry} (exceeds ${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024}MB aggregate attachment limit)`);
+                      continue;
+                    }
+                    // SECURITY: A TOCTOU window remains between these checks and
+                    // Thunderbird's later MIME read. Fully closing it would require
+                    // copying each file to a private temp directory before sending;
+                    // that remains an accepted residual risk for this path.
+                    const desc = { url: Services.io.newFileURI(file).spec, name: file.leafName, size: fileSize };
+                    descs.push(desc);
+                    totalAttachmentBytes += fileSize;
                   } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
                     // Inline base64 attachment — decode and write to temp file
                     const b64Data = entry.base64 || entry.content;
@@ -1821,6 +1870,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         continue;
                       }
                     }
+                    if (bytes.length > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
+                      failed.push(`${entry.name} (exceeds ${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024}MB aggregate attachment limit)`);
+                      continue;
+                    }
                     const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
                     tmpDir.append("thunderbird-mcp");
                     tmpDir.append("attachments");
@@ -1845,6 +1898,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const desc = { url: Services.io.newFileURI(tmpFile).spec, name: entry.name || entry.filename, size: tmpFile.fileSize };
                     if (entry.contentType) desc.contentType = entry.contentType;
                     descs.push(desc);
+                    totalAttachmentBytes += bytes.length;
                   } else {
                     failed.push(typeof entry === "object" ? JSON.stringify(entry) : String(entry));
                   }
