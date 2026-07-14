@@ -5695,6 +5695,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     folder.deleteMessages(found, null, false, true, null, false);
                   }
                 } else {
+                  trashFolder = findTrashFolder(folder);
+                  if (!trashFolder) {
+                    return { error: "Trash folder not found" };
+                  }
                   folder.deleteMessages(found, null, false, true, null, false);
                 }
 
