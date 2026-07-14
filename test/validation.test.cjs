@@ -1006,50 +1006,21 @@ describe('Validator: integer type', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // isSensitiveFilePath: deny-list defending against the LLM-confused-deputy
 // chain (attacker email content → assistant calls sendMail with sensitive
-// attachment path). Implementation mirrors api.js; tests run cross-platform
-// against the normalized (lower-cased, forward-slash) match form.
+// attachment path). Tests execute the marked production helper from api.js and
+// run cross-platform against its normalized (lower-cased, forward-slash) form.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SENSITIVE_ATTACHMENT_PATTERNS = [
-  /\/\.ssh(\/|$)/,
-  /\/\.gnupg(\/|$)/,
-  /\/\.aws(\/|$)/,
-  /\/\.azure(\/|$)/,
-  /\/\.config\/gcloud(\/|$)/,
-  /\/\.kube(\/|$)/,
-  /\/\.docker(\/|$)/,
-  /\/\.netrc$/,
-  /\/\.npmrc$/,
-  /\/\.pypirc$/,
-  /\/id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/,
-  /\.pem$/,
-  /\.pfx$/,
-  /\.p12$/,
-  /\.kdbx$/,
-  /\.key$/,
-  /\.asc$/,
-  /\.gpg$/,
-  /^\/etc\//,
-  /^\/proc\//,
-  /^\/sys\//,
-  /^\/root\//,
-  /^\/var\/log\//,
-  /^\/var\/lib\/sudo\//,
-  /\/library\/keychains\//,
-  /^[a-z]:\/windows\//,
-  /^[a-z]:\/programdata\/microsoft\/(crypto|protect)\//,
-  /\/appdata\/(local|roaming)\/microsoft\/(credentials|crypto|protect|vault)(\/|$)/,
-  /\/(logins\.json|key3\.db|key4\.db|cookies(\.sqlite)?|login data)$/,
-  /\/\.?thunderbird\/profiles?(\/|$)/,
-  /\/library\/thunderbird(\/|$)/,
-  /\/appdata\/roaming\/thunderbird(\/|$)/,
-];
-
-function isSensitiveFilePath(attachmentPath) {
-  if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
-  const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
-  return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
+function loadProductionSensitivePathHelper() {
+  const sandbox = {};
+  vm.createContext(sandbox);
+  vm.runInContext([
+    getMarkedApiSnippet('// BEGIN SENSITIVE ATTACHMENT PATH HELPERS', '// END SENSITIVE ATTACHMENT PATH HELPERS'),
+    'this.isSensitiveFilePath = isSensitiveFilePath;',
+  ].join('\n'), sandbox);
+  return sandbox.isSensitiveFilePath;
 }
+
+const isSensitiveFilePath = loadProductionSensitivePathHelper();
 
 describe('isSensitiveFilePath: credential and key files', () => {
   it('blocks SSH private keys in ~/.ssh/', () => {
@@ -1132,8 +1103,17 @@ describe('isSensitiveFilePath: browser and mail data', () => {
     );
   });
 
-  it('blocks Thunderbird profile directories on all platforms', () => {
-    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/profiles/abc.default/Mail/Local Folders'), true);
+  it('blocks real Linux Thunderbird profile layouts and root files', () => {
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/abc.default-release/Mail/Local Folders'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/abc.default-release/prefs.js'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/abc.default-release/key4.db'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/abc.default-release/logins.json'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird/profiles.ini'), true);
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird'), true);
+  });
+
+  it('blocks Icedove and platform-specific Thunderbird profile roots', () => {
+    assert.equal(isSensitiveFilePath('/home/user/.icedove/abc.default/prefs.js'), true);
     assert.equal(isSensitiveFilePath('/Users/x/Library/Thunderbird/Profiles/abc/INBOX'), true);
     assert.equal(isSensitiveFilePath('C:\\Users\\jordan\\AppData\\Roaming\\Thunderbird\\Profiles\\abc'), true);
   });
@@ -1154,6 +1134,8 @@ describe('isSensitiveFilePath: benign paths pass through', () => {
     assert.equal(isSensitiveFilePath('/home/user/medical/pemphigus.txt'), false);
     // "etc" inside a path that doesn't start at /etc/
     assert.equal(isSensitiveFilePath('/home/user/etc-notes.md'), false);
+    // Profile-root names require a full path-component boundary.
+    assert.equal(isSensitiveFilePath('/home/user/.thunderbird-notes/report.txt'), false);
   });
 
   it('returns false on non-string / empty input rather than throwing', () => {

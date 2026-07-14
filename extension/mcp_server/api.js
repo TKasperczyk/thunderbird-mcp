@@ -138,6 +138,7 @@ const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP requ
 // This is a deny-list, not an allow-list -- it intentionally errs toward
 // blocking known-sensitive locations rather than restricting users to a
 // downloads-only sandbox. Extend it as new high-value targets surface.
+// BEGIN SENSITIVE ATTACHMENT PATH HELPERS
 const SENSITIVE_ATTACHMENT_PATTERNS = [
   // SSH / PGP / cloud / kube / docker credentials
   /\/\.ssh(\/|$)/,
@@ -175,9 +176,10 @@ const SENSITIVE_ATTACHMENT_PATTERNS = [
   // Browser credential stores (Firefox / Chrome / Edge)
   /\/(logins\.json|key3\.db|key4\.db|cookies(\.sqlite)?|login data)$/,
   // Thunderbird's own profile (contains the user's entire mail store + prefs).
-  // Linux uses ~/.thunderbird (dot-prefixed), macOS uses ~/Library/Thunderbird,
-  // Windows uses %APPDATA%/Roaming/Thunderbird; cover all three.
-  /\/\.?thunderbird\/profiles?(\/|$)/,
+  // Linux profile directories and profiles.ini live directly under
+  // ~/.thunderbird (or ~/.icedove), while macOS and Windows use the platform
+  // application-data directories below. Block each profile root in full.
+  /\/\.(?:thunderbird|icedove)(\/|$)/,
   /\/library\/thunderbird(\/|$)/,
   /\/appdata\/roaming\/thunderbird(\/|$)/,
 ];
@@ -193,6 +195,7 @@ function isSensitiveFilePath(attachmentPath) {
   const normalized = attachmentPath.replace(/\\/g, "/").toLowerCase();
   return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
 }
+// END SENSITIVE ATTACHMENT PATH HELPERS
 let _tempFileCounter = 0;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
