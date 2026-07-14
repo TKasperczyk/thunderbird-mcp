@@ -335,6 +335,118 @@ describe("contact field writes", () => {
     assert.ok(vCardProperties.entries.includes(custom));
   });
 
+  it("reuses vCard phone and address entries while preserving their metadata", () => {
+    const changedPhoneParams = { type: ["VOICE", "WORK"], pref: "1" };
+    const changedPhone = new FakeVCardPropertyEntry(
+      "tel",
+      changedPhoneParams,
+      "uri",
+      "tel:+48 100"
+    );
+    changedPhone.group = "item1";
+    const exactPhoneParams = { type: ["WORK", "VOICE"], pref: "2" };
+    const exactPhone = new FakeVCardPropertyEntry(
+      "tel",
+      exactPhoneParams,
+      "text",
+      "+48 200"
+    );
+    exactPhone.group = "item2";
+    const omittedPhone = new FakeVCardPropertyEntry(
+      "tel",
+      { type: "home", pref: "3" },
+      "text",
+      "+48 300"
+    );
+
+    const changedAddressParams = { type: ["WORK", "parcel"], pref: "1" };
+    const changedAddress = new FakeVCardPropertyEntry(
+      "adr",
+      changedAddressParams,
+      "text",
+      ["", "", "Old Street", "Old City", "", "", ""]
+    );
+    changedAddress.group = "item3";
+    const exactAddressParams = { type: ["WORK", "postal"], pref: "2" };
+    const exactAddressValue = ["", "", ["Exact Street", "Suite 5"], "Warsaw", "", "", "Poland"];
+    const exactAddress = new FakeVCardPropertyEntry(
+      "adr",
+      exactAddressParams,
+      "text",
+      exactAddressValue
+    );
+    exactAddress.group = "item4";
+    const omittedAddress = new FakeVCardPropertyEntry(
+      "adr",
+      { type: "home" },
+      "text",
+      ["", "", "Home Street", "", "", "", ""]
+    );
+
+    const vCardProperties = new FakeVCardProperties([
+      changedPhone,
+      exactPhone,
+      omittedPhone,
+      changedAddress,
+      exactAddress,
+      omittedAddress,
+    ]);
+    const result = helpers.applyContactFields({ supportsVCard: true, vCardProperties }, {
+      phones: [
+        { type: "work", number: "+48 200" },
+        { type: "work", number: "+48 400" },
+      ],
+      addresses: [
+        { type: "work", street: "Exact Street Suite 5", city: "Warsaw", country: "Poland" },
+        { type: "work", street: "New Street", city: "Krakow" },
+      ],
+    }, FakeVCardPropertyEntry);
+
+    assert.equal(result, null);
+    assert.deepEqual(vCardProperties.getAllEntries("tel"), [changedPhone, exactPhone]);
+    assert.equal(changedPhone.value, "tel:+48 400");
+    assert.equal(changedPhone.type, "uri");
+    assert.strictEqual(changedPhone.params, changedPhoneParams);
+    assert.equal(changedPhone.group, "item1");
+    assert.equal(exactPhone.value, "+48 200");
+    assert.strictEqual(exactPhone.params, exactPhoneParams);
+    assert.equal(exactPhone.group, "item2");
+    assert.ok(!vCardProperties.entries.includes(omittedPhone));
+
+    assert.deepEqual(vCardProperties.getAllEntries("adr"), [changedAddress, exactAddress]);
+    assert.deepEqual(plain(changedAddress.value), ["", "", "New Street", "Krakow", "", "", ""]);
+    assert.strictEqual(changedAddress.params, changedAddressParams);
+    assert.equal(changedAddress.group, "item3");
+    assert.strictEqual(exactAddress.value, exactAddressValue);
+    assert.strictEqual(exactAddress.params, exactAddressParams);
+    assert.equal(exactAddress.group, "item4");
+    assert.ok(!vCardProperties.entries.includes(omittedAddress));
+  });
+
+  it("keeps duplicate types on newly populated vCard cards", () => {
+    const vCardProperties = new FakeVCardProperties();
+    const result = helpers.applyContactFields({ supportsVCard: true, vCardProperties }, {
+      phones: [
+        { type: "work", number: "555-0100" },
+        { type: "work", number: "555-0101" },
+      ],
+      addresses: [
+        { type: "home", street: "First Home" },
+        { type: "home", street: "Second Home" },
+      ],
+    }, FakeVCardPropertyEntry);
+
+    assert.equal(result, null);
+    assert.deepEqual(vCardProperties.getAllEntries("tel").map(entry => entry.value), [
+      "555-0100",
+      "555-0101",
+    ]);
+    assert.deepEqual(vCardProperties.getAllEntries("adr").map(entry => entry.value[2]), [
+      "First Home",
+      "Second Home",
+    ]);
+  });
+
   it("keeps later ORG components when organization is cleared", () => {
     const org = new FakeVCardPropertyEntry("org", {}, "text", ["Old Corp", "Department"]);
     const card = {
@@ -398,6 +510,36 @@ describe("contact field writes", () => {
     assert.equal(card.stored.get("BirthYear"), "1980");
     assert.equal(card.stored.get("BirthMonth"), "04");
     assert.equal(card.stored.get("BirthDay"), "15");
+  });
+
+  it("rejects duplicate phone types on flat cards before mutating any fields", () => {
+    const card = makeFlatCard({ WorkPhone: "old-number" });
+    const result = helpers.applyContactFields(card, {
+      displayName: "Changed Name",
+      phones: [
+        { type: "work", number: "555-0100" },
+        { type: "work", number: "555-0101" },
+      ],
+    }, FakeVCardPropertyEntry);
+
+    assert.match(result.error, /Non-vCard.*only one phone.*duplicate phone type "work"/);
+    assert.equal(card.displayName, "Flat Contact");
+    assert.equal(card.stored.get("WorkPhone"), "old-number");
+  });
+
+  it("rejects duplicate address types on flat cards before mutating any fields", () => {
+    const card = makeFlatCard({ HomeAddress: "Old Home" });
+    const result = helpers.applyContactFields(card, {
+      firstName: "Changed",
+      addresses: [
+        { type: "home", street: "First Home" },
+        { type: "home", street: "Second Home" },
+      ],
+    }, FakeVCardPropertyEntry);
+
+    assert.match(result.error, /Non-vCard.*only one address.*duplicate address type "home"/);
+    assert.equal(card.firstName, "Flat");
+    assert.equal(card.stored.get("HomeAddress"), "Old Home");
   });
 });
 

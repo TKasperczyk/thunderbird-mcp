@@ -264,7 +264,7 @@ function readVCardContactFields(card) {
   const vCardProperties = card.vCardProperties;
   const phones = vCardProperties.getAllEntries("tel").map(entry => ({
     type: getContactPhoneType(entry),
-    number: contactValueToString(entry.value).replace(/^tel:/i, "").trim(),
+    number: normalizeContactPhoneValue(entry.value),
   })).filter(phone => phone.number);
 
   const addresses = [];
@@ -468,33 +468,141 @@ function updateVCardOrganization(vCardProperties, organization, VCardPropertyEnt
   }
 }
 
+function reconcileVCardContactEntries(vCardProperties, name, items, config) {
+  const existingEntries = vCardProperties.getAllEntries(name);
+  const matchedEntries = new Array(items.length).fill(null);
+  const retainedEntries = new Set();
+
+  // Prefer an exact normalized type/value match. Besides avoiding unnecessary
+  // writes, this keeps URI-backed TEL values and structured ADR values exactly
+  // as Thunderbird parsed them.
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const entry = existingEntries.find(candidate =>
+      !retainedEntries.has(candidate) &&
+      config.getEntryType(candidate) === config.getItemType(item) &&
+      config.getEntryValue(candidate) === config.getItemValue(item)
+    );
+    if (entry) {
+      matchedEntries[i] = entry;
+      retainedEntries.add(entry);
+    }
+  }
+
+  // A changed value still reuses the entry in the same type bucket. Mutating
+  // only its value preserves PREF, extra TYPE values, groups/labels, and the
+  // parsed vCard value type.
+  for (let i = 0; i < items.length; i++) {
+    if (matchedEntries[i]) continue;
+    const item = items[i];
+    const entry = existingEntries.find(candidate =>
+      !retainedEntries.has(candidate) &&
+      config.getEntryType(candidate) === config.getItemType(item)
+    );
+    if (entry) {
+      matchedEntries[i] = entry;
+      retainedEntries.add(entry);
+      config.updateEntry(entry, item);
+    }
+  }
+
+  for (const entry of existingEntries) {
+    if (!retainedEntries.has(entry)) vCardProperties.removeEntry(entry);
+  }
+  for (let i = 0; i < items.length; i++) {
+    if (!matchedEntries[i]) vCardProperties.addEntry(config.createEntry(items[i]));
+  }
+}
+
+function normalizeContactPhoneValue(value) {
+  return contactValueToString(value).trim().replace(/^tel:/i, "").trim();
+}
+
+function contactAddressValueParts(value) {
+  const rawParts = Array.isArray(value) ? value : [value];
+  return CONTACT_ADDRESS_FIELDS.map((_, index) =>
+    contactStructuredValuePart(rawParts[index])
+  );
+}
+
+function contactAddressItemParts(address) {
+  return CONTACT_ADDRESS_FIELDS.map(field => address[field] || "");
+}
+
+function normalizeContactAddressValue(value) {
+  return JSON.stringify(contactAddressValueParts(value).map(part => part.trim()));
+}
+
+function updateVCardPhoneEntry(entry, phone) {
+  const number = phone.number.trim();
+  const hasUriValueType = typeof entry.type === "string" &&
+    entry.type.toLowerCase() === "uri";
+  const hadTelUri = typeof entry.value === "string" && /^tel:/i.test(entry.value.trim());
+  const hasUriScheme = /^[a-z][a-z\d+.-]*:/i.test(number);
+  entry.value = (hasUriValueType || hadTelUri) && !hasUriScheme
+    ? `tel:${number}`
+    : number;
+}
+
+function getDuplicateContactType(items) {
+  if (!Array.isArray(items)) return null;
+  const seen = new Set();
+  for (const item of items) {
+    if (seen.has(item.type)) return item.type;
+    seen.add(item.type);
+  }
+  return null;
+}
+
+function getFlatContactCollectionError(card, fields) {
+  if (card.supportsVCard) return null;
+
+  const duplicatePhoneType = getDuplicateContactType(fields.phones);
+  if (duplicatePhoneType) {
+    return `Non-vCard contact cards support only one phone number per type; duplicate phone type "${duplicatePhoneType}" is not supported`;
+  }
+  const duplicateAddressType = getDuplicateContactType(fields.addresses);
+  if (duplicateAddressType) {
+    return `Non-vCard contact cards support only one address per type; duplicate address type "${duplicateAddressType}" is not supported`;
+  }
+  return null;
+}
+
 function applyVCardContactFields(card, fields, VCardPropertyEntry) {
   const vCardProperties = card.vCardProperties;
 
   if (fields.phones !== undefined) {
-    vCardProperties.clearValues("tel");
-    for (const phone of fields.phones) {
-      const type = phone.type === "mobile" ? "cell" : phone.type;
-      vCardProperties.addEntry(new VCardPropertyEntry(
+    reconcileVCardContactEntries(vCardProperties, "tel", fields.phones, {
+      getEntryType: getContactPhoneType,
+      getItemType: phone => phone.type,
+      getEntryValue: entry => normalizeContactPhoneValue(entry.value),
+      getItemValue: phone => normalizeContactPhoneValue(phone.number),
+      updateEntry: updateVCardPhoneEntry,
+      createEntry: phone => new VCardPropertyEntry(
         "tel",
-        { type },
+        { type: phone.type === "mobile" ? "cell" : phone.type },
         "text",
         phone.number.trim()
-      ));
-    }
+      ),
+    });
   }
 
   if (fields.addresses !== undefined) {
-    vCardProperties.clearValues("adr");
-    for (const address of fields.addresses) {
-      const value = CONTACT_ADDRESS_FIELDS.map(field => address[field] || "");
-      vCardProperties.addEntry(new VCardPropertyEntry(
+    reconcileVCardContactEntries(vCardProperties, "adr", fields.addresses, {
+      getEntryType: getContactAddressType,
+      getItemType: address => address.type,
+      getEntryValue: entry => normalizeContactAddressValue(entry.value),
+      getItemValue: address => normalizeContactAddressValue(contactAddressItemParts(address)),
+      updateEntry: (entry, address) => {
+        entry.value = contactAddressItemParts(address);
+      },
+      createEntry: address => new VCardPropertyEntry(
         "adr",
         { type: address.type },
         "text",
-        value
-      ));
-    }
+        contactAddressItemParts(address)
+      ),
+    });
   }
 
   if (fields.organization !== undefined) {
@@ -551,6 +659,9 @@ function applyFlatContactFields(card, fields) {
 
 function applyContactFields(card, fields, VCardPropertyEntry) {
   const supportsVCard = !!card.supportsVCard;
+  const flatCollectionError = getFlatContactCollectionError(card, fields);
+  if (flatCollectionError) return { error: flatCollectionError };
+
   if (fields.email !== undefined) {
     if (supportsVCard && fields.email === "") {
       card.vCardProperties.clearValues("email");
@@ -567,6 +678,7 @@ function applyContactFields(card, fields, VCardPropertyEntry) {
   } else {
     applyFlatContactFields(card, fields);
   }
+  return null;
 }
 
 function shouldSynthesizePhoneDisplayName(fields) {
@@ -3852,7 +3964,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const card = Cc["@mozilla.org/addressbook/cardproperty;1"]
                   .createInstance(Ci.nsIAbCard);
-                applyContactFields(card, fields, VCardPropertyEntry);
+                const applyError = applyContactFields(card, fields, VCardPropertyEntry);
+                if (applyError) return applyError;
                 if (shouldSynthesizePhoneDisplayName(fields) && !card.displayName) {
                   card.displayName = phones[0].number.trim();
                 }
@@ -3906,7 +4019,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (found.error) return found;
                 const { card, book } = found;
 
-                applyContactFields(card, fields, VCardPropertyEntry);
+                const applyError = applyContactFields(card, fields, VCardPropertyEntry);
+                if (applyError) return applyError;
 
                 book.modifyCard(card);
                 return {

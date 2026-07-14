@@ -2,8 +2,9 @@
  * Validation tests for new tool schemas added in this PR.
  *
  * Since the validation function runs inside the Thunderbird extension context,
- * we replicate the exact same logic here to verify it independently.
- * This ensures validation behavior is correct before deploying to the extension.
+ * we replicate the exact same logic here to verify it independently. Contact
+ * schemas are VM-extracted from production buildTools() so these tests cannot
+ * drift from the nested fields actually exposed by the extension.
  *
  * Covers:
  * - Tag operations (addTags/removeTags on updateMessage, tag filter on searchMessages)
@@ -82,6 +83,42 @@ function validateProductionToolArgs(name, args) {
   }
   return errors;
 }
+
+function loadProductionContactTools() {
+  const source = apiSource;
+  const constantsStart = source.indexOf('const CONTACT_PHONE_TYPES =');
+  const constantsEnd = source.indexOf('const CONTACT_ADDRESS_FIELDS =', constantsStart);
+  const buildToolsStart = source.indexOf('function buildTools()');
+  const fieldsStart = source.indexOf('const contactFieldProperties =', buildToolsStart);
+  const fieldsEnd = source.indexOf('\n      return [', fieldsStart);
+  const getContactName = source.indexOf('name: "getContact"', fieldsEnd);
+  const contactToolsStart = source.lastIndexOf('      {', getContactName);
+  const deleteContactName = source.indexOf('name: "deleteContact"', getContactName);
+  const contactToolsEnd = source.lastIndexOf('      {', deleteContactName);
+
+  assert.ok(constantsStart >= 0 && constantsEnd > constantsStart,
+    'production contact type constants missing');
+  assert.ok(fieldsStart >= 0 && fieldsEnd > fieldsStart,
+    'production contact field schemas missing from buildTools()');
+  assert.ok(contactToolsStart >= 0 && contactToolsEnd > contactToolsStart,
+    'production contact tool schemas missing from buildTools()');
+
+  const sandbox = {};
+  vm.createContext(sandbox);
+  vm.runInContext(`
+${source.slice(constantsStart, constantsEnd)}
+${source.slice(fieldsStart, fieldsEnd)}
+this.contactTools = [
+${source.slice(contactToolsStart, contactToolsEnd)}
+];`, sandbox);
+
+  return {
+    source,
+    tools: sandbox.contactTools,
+  };
+}
+
+const productionContacts = loadProductionContactTools();
 
 /**
  * Exact copy of validateToolArgs / validateAgainstSchema from api.js.
@@ -233,48 +270,6 @@ function createValidator(tools) {
   };
 }
 
-// Tool definitions matching the schemas in api.js for new tools
-const contactFieldProperties = {
-  email: { type: "string" },
-  displayName: { type: "string" },
-  firstName: { type: "string" },
-  lastName: { type: "string" },
-  phones: {
-    type: "array",
-    items: {
-      type: "object",
-      properties: {
-        type: { type: "string", enum: ["work", "home", "mobile", "fax", "pager"] },
-        number: { type: "string" },
-      },
-      required: ["type", "number"],
-      additionalProperties: false,
-    },
-  },
-  addresses: {
-    type: "array",
-    items: {
-      type: "object",
-      properties: {
-        type: { type: "string", enum: ["home", "work"] },
-        poBox: { type: "string" },
-        street: { type: "string" },
-        street2: { type: "string" },
-        city: { type: "string" },
-        region: { type: "string" },
-        postalCode: { type: "string" },
-        country: { type: "string" },
-      },
-      required: ["type"],
-      additionalProperties: false,
-    },
-  },
-  organization: { type: "string" },
-  title: { type: "string" },
-  note: { type: "string" },
-  birthday: { type: "string" },
-};
-
 const sampleTools = [
   {
     name: "searchMessages",
@@ -327,38 +322,7 @@ const sampleTools = [
       required: ["to", "subject", "body"],
     },
   },
-  {
-    name: "createContact",
-    inputSchema: {
-      type: "object",
-      properties: {
-        ...contactFieldProperties,
-        addressBookId: { type: "string" },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "getContact",
-    inputSchema: {
-      type: "object",
-      properties: {
-        contactId: { type: "string" },
-      },
-      required: ["contactId"],
-    },
-  },
-  {
-    name: "updateContact",
-    inputSchema: {
-      type: "object",
-      properties: {
-        contactId: { type: "string" },
-        ...contactFieldProperties,
-      },
-      required: ["contactId"],
-    },
-  },
+  ...productionContacts.tools,
   {
     name: "deleteContact",
     inputSchema: {
@@ -925,6 +889,72 @@ describe('Validation: attachment sending', () => {
       '/tmp/symlink.bin (symlinked path blocked)',
       '/tmp/symlink-check.bin (symlink check failed)',
     ]);
+  });
+});
+
+describe('Production contact schemas and dispatch', () => {
+  const toolsByName = new Map(productionContacts.tools.map(tool => [tool.name, tool]));
+  const contactFields = [
+    'email',
+    'displayName',
+    'firstName',
+    'lastName',
+    'phones',
+    'addresses',
+    'organization',
+    'title',
+    'note',
+    'birthday',
+  ];
+
+  it('extracts the complete nested schemas from buildTools()', () => {
+    const getSchema = toolsByName.get('getContact').inputSchema;
+    const createSchema = toolsByName.get('createContact').inputSchema;
+    const updateSchema = toolsByName.get('updateContact').inputSchema;
+
+    assert.deepEqual(Object.keys(getSchema.properties), ['contactId']);
+    assert.deepEqual(Array.from(getSchema.required), ['contactId']);
+    assert.deepEqual(Object.keys(createSchema.properties), [...contactFields, 'addressBookId']);
+    assert.deepEqual(Array.from(createSchema.required), []);
+    assert.deepEqual(Object.keys(updateSchema.properties), ['contactId', ...contactFields]);
+    assert.deepEqual(Array.from(updateSchema.required), ['contactId']);
+
+    for (const schema of [createSchema, updateSchema]) {
+      const phoneItems = schema.properties.phones.items;
+      assert.deepEqual(Object.keys(phoneItems.properties), ['type', 'number']);
+      assert.deepEqual(Array.from(phoneItems.properties.type.enum), [
+        'work', 'home', 'mobile', 'fax', 'pager',
+      ]);
+      assert.deepEqual(Array.from(phoneItems.required), ['type', 'number']);
+      assert.equal(phoneItems.additionalProperties, false);
+
+      const addressItems = schema.properties.addresses.items;
+      assert.deepEqual(Object.keys(addressItems.properties), [
+        'type',
+        'poBox',
+        'street',
+        'street2',
+        'city',
+        'region',
+        'postalCode',
+        'country',
+      ]);
+      assert.deepEqual(Array.from(addressItems.properties.type.enum), ['home', 'work']);
+      assert.deepEqual(Array.from(addressItems.required), ['type']);
+      assert.equal(addressItems.additionalProperties, false);
+    }
+  });
+
+  it('passes contact arguments to handlers in production schema order', () => {
+    for (const name of ['getContact', 'createContact', 'updateContact']) {
+      const match = new RegExp(`case "${name}":\\s*return ${name}\\(([^)]*)\\);`)
+        .exec(productionContacts.source);
+      assert.ok(match, `${name} dispatch missing`);
+      const actualArgs = match[1].split(',').map(value => value.trim());
+      const expectedArgs = Object.keys(toolsByName.get(name).inputSchema.properties)
+        .map(property => `args.${property}`);
+      assert.deepEqual(actualArgs, expectedArgs);
+    }
   });
 });
 
