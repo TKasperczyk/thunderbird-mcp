@@ -2739,7 +2739,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	             * Returns { msgHdr, folder, db } or { error }.
 	             */
             function findTrashFolder(folder) {
-              const TRASH_FLAG = 0x00000100;
               let account;
               try {
                 account = MailServices.accounts.findAccountForServer(folder.server);
@@ -2755,7 +2754,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               while (stack.length > 0) {
                 const current = stack.pop();
                 try {
-                  if (current && typeof current.getFlag === "function" && current.getFlag(TRASH_FLAG)) {
+                  if (current && typeof current.getFlag === "function" && current.getFlag(Ci.nsMsgFolderFlags.Trash)) {
                     return current;
                   }
                 } catch {}
@@ -5634,6 +5633,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return paginate(results, offset, effectiveLimit);
             }
 
+            function isTrashOrDescendant(folder) {
+              try {
+                return folder.isSpecialFolder(Ci.nsMsgFolderFlags.Trash, true);
+              } catch {
+                return false;
+              }
+            }
+
             function deleteMessages(messageIds, folderPath) {
               try {
                 // MCP clients may send arrays as JSON strings
@@ -5681,8 +5688,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 // Drafts get moved to Trash instead of hard-deleted
-                const DRAFTS_FLAG = 0x00000400;
-                const isDrafts = typeof folder.getFlag === "function" && folder.getFlag(DRAFTS_FLAG);
+                const isDrafts = typeof folder.getFlag === "function" && folder.getFlag(Ci.nsMsgFolderFlags.Drafts);
                 let trashFolder = null;
 
                 if (isDrafts) {
@@ -5695,9 +5701,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     folder.deleteMessages(found, null, false, true, null, false);
                   }
                 } else {
-                  trashFolder = findTrashFolder(folder);
-                  if (!trashFolder) {
-                    return { error: "Trash folder not found" };
+                  // Thunderbird permanently deletes from Trash (including its
+                  // descendants) and for non-move IMAP delete models.
+                  const server = folder.server;
+                  const deletionMovesToTrash = !isTrashOrDescendant(folder) &&
+                    (server?.type !== "imap" ||
+                      server.QueryInterface(Ci.nsIImapIncomingServer).deleteModel ===
+                        Ci.nsMsgImapDeleteModels.MoveToTrash);
+                  if (deletionMovesToTrash) {
+                    trashFolder = findTrashFolder(folder);
+                    if (!trashFolder) {
+                      return { error: "Trash folder not found" };
+                    }
                   }
                   folder.deleteMessages(found, null, false, true, null, false);
                 }
@@ -5937,20 +5952,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 // Check if folder is already in Trash — if so, permanently delete
-                const TRASH_FLAG = 0x00000100;
-                let inTrash = false;
-                let ancestor = folder;
-                while (ancestor) {
-                  try {
-                    if (ancestor.getFlag && ancestor.getFlag(TRASH_FLAG)) {
-                      inTrash = true;
-                      break;
-                    }
-                  } catch { /* ignore */ }
-                  ancestor = ancestor.parent;
-                }
-
-                if (inTrash) {
+                if (isTrashOrDescendant(folder)) {
                   // Permanently delete — deleteSelf requires a msgWindow
                   const win = Services.wm.getMostRecentWindow("mail:3pane");
                   folder.deleteSelf(win?.msgWindow ?? null);
@@ -6018,7 +6020,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function emptyTrash(accountId) {
               try {
-                const TRASH_FLAG = 0x00000100;
                 const accounts = accountId
                   ? [MailServices.accounts.getAccount(accountId)].filter(Boolean)
                   : Array.from(getAccessibleAccounts());
@@ -6033,7 +6034,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 for (const account of accounts) {
                   const root = account.incomingServer?.rootFolder;
                   if (!root) continue;
-                  const trash = findSpecialFolder(root, TRASH_FLAG);
+                  const trash = findSpecialFolder(root, Ci.nsMsgFolderFlags.Trash);
                   if (!trash) {
                     results.push({ account: account.key, status: "no Trash folder found" });
                     continue;
