@@ -566,6 +566,8 @@ function makeMockLocalFile(attachmentPath, options = {}) {
     exists = true,
     normalizedPath = attachmentPath,
     normalizeError = null,
+    symlink = false,
+    symlinkError = null,
     regularFile = true,
     typeError = null,
     size = 1,
@@ -576,6 +578,10 @@ function makeMockLocalFile(attachmentPath, options = {}) {
     leafName: attachmentPath.split('/').pop(),
     exists() {
       return exists;
+    },
+    isSymlink() {
+      if (symlinkError) throw symlinkError;
+      return symlink;
     },
     normalize() {
       if (normalizeError) throw normalizeError;
@@ -837,6 +843,22 @@ describe('Validation: attachment sending', () => {
     assert.ok(result.failed.some(error => /directory \(not a regular file\)/.test(error)));
     assert.ok(result.failed.some(error => /size\.bin \(file size check failed\)/.test(error)));
     assert.ok(result.failed.some(error => /invalid-size\.bin \(invalid file size\)/.test(error)));
+  });
+
+  it('production runtime rejects symlinks and fails closed when the check errors', () => {
+    const entries = ['/tmp/symlink.bin', '/tmp/symlink-check.bin'];
+    const files = new Map([
+      [entries[0], makeMockLocalFile(entries[0], { symlink: true })],
+      [entries[1], makeMockLocalFile(entries[1], { symlinkError: new Error('check failed') })],
+    ]);
+
+    const { result } = convertProductionFileAttachments(entries, files);
+
+    assert.equal(result.descs.length, 0);
+    assert.deepEqual(Array.from(result.failed), [
+      '/tmp/symlink.bin (symlinked path blocked)',
+      '/tmp/symlink-check.bin (symlink check failed)',
+    ]);
   });
 });
 

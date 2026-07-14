@@ -1771,11 +1771,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(entry);
                       continue;
                     }
-                    // SECURITY: re-check the *resolved* path. The raw string can
-                    // look benign while pointing at a credential store through a
-                    // symlink (e.g. /tmp/report.pdf -> ~/.ssh/id_rsa). Canonicalize
-                    // (resolves symlinks + . / .. components) and re-run the
-                    // deny-list before reading the file.
+                    let isSymlink;
+                    try {
+                      isSymlink = file.isSymlink();
+                    } catch {
+                      failed.push(`${entry} (symlink check failed)`);
+                      continue;
+                    }
+                    if (isSymlink) {
+                      failed.push(`${entry} (symlinked path blocked)`);
+                      continue;
+                    }
+                    // SECURITY: normalize for lexical cleanup and re-run the
+                    // deny-list against the cleaned path. Do not rely on
+                    // nsIFile.normalize() to resolve symlinks or junctions: that
+                    // is not its cross-platform contract (notably on Windows).
                     try {
                       file.normalize();
                     } catch {
@@ -1818,10 +1828,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(`${entry} (exceeds ${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024}MB aggregate attachment limit)`);
                       continue;
                     }
-                    // SECURITY: A TOCTOU window remains between these checks and
-                    // Thunderbird's later MIME read. Fully closing it would require
-                    // copying each file to a private temp directory before sending;
-                    // that remains an accepted residual risk for this path.
+                    // SECURITY: Parent-component symlinks/junctions and a TOCTOU
+                    // window remain between these checks and Thunderbird's later
+                    // MIME read. Fully closing those residual risks would require
+                    // copying each file to a private temp directory before sending.
                     const desc = { url: Services.io.newFileURI(file).spec, name: file.leafName, size: fileSize };
                     descs.push(desc);
                     totalAttachmentBytes += fileSize;
