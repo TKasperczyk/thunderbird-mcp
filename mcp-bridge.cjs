@@ -11,6 +11,8 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+const { getMapper } = require('./mcp-id-mapper.cjs');
+
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
 const REQUEST_TIMEOUT = 30000;
 const CONNECTION_RETRY_DELAY_MS = 1000;
@@ -748,6 +750,20 @@ async function handleMessage(line) {
       return { jsonrpc: '2.0', id: message.id, result: { prompts: [] } };
   }
 
+  // Inbound ID mapping: translate short surrogate IDs in tool arguments
+  // back to real Thunderbird IDs before forwarding. This sits before both
+  // the attachment inliner (so attachment path references aren't mis-mapped)
+  // and forwardToThunderbird. Skip for tools/list which has no args.
+  if (message.method === 'tools/call'
+      && message.params
+      && typeof message.params.name === 'string'
+      && message.params.arguments) {
+    const mapper = getMapper();
+    if (mapper) {
+      mapper.interceptInbound(message.params.name, message.params.arguments);
+    }
+  }
+
   // For mail-sending tools, inline any attachments passed as file paths.
   // The Thunderbird extension may run inside a sandboxed snap that cannot
   // see /data/..., the host /tmp, or any path outside its confined view —
@@ -840,11 +856,14 @@ function tryAllHosts(hosts, postData, port, token) {
   return tryNext(hosts);
 }
 
-function compactToolResultJsonText(response) {
+function compactToolResultJsonText(response, meta) {
   const content = response?.result?.content;
   if (!Array.isArray(content)) {
     return response;
   }
+
+  const mapper = getMapper();
+  const toolName = meta?.toolName;
 
   let changed = false;
   const compactedContent = content.map((item) => {
@@ -852,7 +871,12 @@ function compactToolResultJsonText(response) {
       return item;
     }
     try {
-      const compactedText = JSON.stringify(JSON.parse(item.text));
+      const parsed = JSON.parse(item.text);
+      // Apply ID mapping BEFORE compacting so aliases benefit from compaction too
+      if (mapper && toolName) {
+        mapper.interceptOutbound(toolName, parsed);
+      }
+      const compactedText = JSON.stringify(parsed);
       if (compactedText === item.text) {
         return item;
       }
@@ -965,10 +989,14 @@ function startBridge() {
 
     let messageId = null;
     let messageMethod = null;
+    let toolName = null;
     try {
       const parsed = JSON.parse(line);
       messageId = parsed.id ?? null;
       messageMethod = parsed.method ?? null;
+      if (messageMethod === 'tools/call' && parsed.params?.name) {
+        toolName = parsed.params.name;
+      }
     } catch {
       // Leave as null when request cannot be parsed
     }
@@ -979,7 +1007,8 @@ function startBridge() {
     handleMessage(line)
       .then(async (response) => {
         if (response !== null) {
-          await writeOutput(JSON.stringify(compactToolResultJsonText(response)) + '\n');
+          const meta = toolName ? { toolName } : undefined;
+          await writeOutput(JSON.stringify(compactToolResultJsonText(response, meta)) + '\n');
           debugLog(`send id=${messageId} method=${messageMethod}`);
         }
       })
