@@ -9,14 +9,18 @@ const vm = require("node:vm");
 function loadRawMimeHelpers() {
   const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
   const source = fs.readFileSync(apiPath, "utf8");
-  const startMarker = "// BEGIN RAW MIME ATTACHMENT HELPERS";
-  const endMarker = "// END RAW MIME ATTACHMENT HELPERS";
-  const start = source.indexOf(startMarker);
-  const end = source.indexOf(endMarker);
-  assert.ok(start >= 0, "raw MIME helper start marker missing");
-  assert.ok(end > start, "raw MIME helper end marker missing");
+  function markedSnippet(startMarker, endMarker) {
+    const start = source.indexOf(startMarker);
+    const end = source.indexOf(endMarker);
+    assert.ok(start >= 0, `${startMarker} missing`);
+    assert.ok(end > start, `${endMarker} missing`);
+    return source.slice(start, end);
+  }
 
-  const snippet = source.slice(start, end);
+  const snippet = [
+    markedSnippet("// BEGIN RAW MIME PARSING HELPERS", "// END RAW MIME PARSING HELPERS"),
+    markedSnippet("// BEGIN RAW MIME ATTACHMENT HELPERS", "// END RAW MIME ATTACHMENT HELPERS"),
+  ].join("\n");
   const sandbox = {
     Uint8Array,
     TextDecoder,

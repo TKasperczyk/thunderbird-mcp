@@ -5055,6 +5055,393 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // BEGIN RAW MIME PARSING HELPERS
+            function rawMimeToByteString(input) {
+              if (typeof input === "string") return input;
+              if (input instanceof Uint8Array) {
+                let out = "";
+                const chunkSize = 0x8000;
+                for (let i = 0; i < input.length; i += chunkSize) {
+                  out += String.fromCharCode(...input.subarray(i, i + chunkSize));
+                }
+                return out;
+              }
+              return "";
+            }
+
+            function rawMimeBytesFromByteString(s) {
+              const bytes = new Uint8Array(s.length);
+              for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xFF;
+              return bytes;
+            }
+
+            function findRawMimeHeaderBodySplit(s) {
+              const matches = [
+                { idx: s.indexOf("\r\n\r\n"), len: 4 },
+                { idx: s.indexOf("\n\n"), len: 2 },
+                { idx: s.indexOf("\r\r"), len: 2 },
+              ].filter(m => m.idx >= 0).sort((a, b) => a.idx - b.idx);
+              if (matches.length === 0) return null;
+              return {
+                header: s.slice(0, matches[0].idx),
+                body: s.slice(matches[0].idx + matches[0].len),
+              };
+            }
+
+            function parseRawMimeHeaders(headerBlock) {
+              const headers = Object.create(null);
+              const unfolded = String(headerBlock || "").replace(/(?:\r\n|\r|\n)[ \t]+/g, " ");
+              for (const line of unfolded.split(/\r\n|\r|\n/)) {
+                const colonIdx = line.indexOf(":");
+                if (colonIdx < 0) continue;
+                const name = line.slice(0, colonIdx).trim().toLowerCase();
+                const value = line.slice(colonIdx + 1).trim();
+                if (!name) continue;
+                if (!headers[name]) headers[name] = [];
+                headers[name].push(value);
+              }
+              return headers;
+            }
+
+            function splitRawMimeHeaderParameters(value) {
+              const parts = [];
+              let current = "";
+              let quote = "";
+              let escaped = false;
+              for (let i = 0; i < value.length; i++) {
+                const ch = value[i];
+                if (escaped) {
+                  current += ch;
+                  escaped = false;
+                  continue;
+                }
+                if (quote && ch === "\\") {
+                  current += ch;
+                  escaped = true;
+                  continue;
+                }
+                if (quote) {
+                  current += ch;
+                  if (ch === quote) quote = "";
+                  continue;
+                }
+                if (ch === "\"" || ch === "'") {
+                  current += ch;
+                  quote = ch;
+                  continue;
+                }
+                if (ch === ";") {
+                  parts.push(current.trim());
+                  current = "";
+                  continue;
+                }
+                current += ch;
+              }
+              parts.push(current.trim());
+              return parts;
+            }
+
+            function unquoteRawMimeParameter(value) {
+              let v = String(value || "").trim();
+              if ((v.startsWith("\"") && v.endsWith("\"")) || (v.startsWith("'") && v.endsWith("'"))) {
+                v = v.slice(1, -1).replace(/\\(["'\\])/g, "$1");
+              }
+              return v;
+            }
+
+            function decodeRawMimePercentBytes(s) {
+              const bytes = [];
+              for (let i = 0; i < s.length; i++) {
+                if (s[i] === "%" && i + 2 < s.length && /^[0-9A-Fa-f]{2}$/.test(s.slice(i + 1, i + 3))) {
+                  bytes.push(parseInt(s.slice(i + 1, i + 3), 16));
+                  i += 2;
+                } else {
+                  bytes.push(s.charCodeAt(i) & 0xFF);
+                }
+              }
+              return new Uint8Array(bytes);
+            }
+
+            function decodeRawMimeExtendedParameter(value) {
+              const raw = unquoteRawMimeParameter(value);
+              const match = raw.match(/^([^']*)'[^']*'(.*)$/);
+              if (!match) return raw;
+              const charset = (match[1] || "utf-8").trim() || "utf-8";
+              const encoded = match[2] || "";
+              try {
+                return new TextDecoder(charset, { fatal: false }).decode(decodeRawMimePercentBytes(encoded));
+              } catch {
+                try {
+                  return new TextDecoder("utf-8", { fatal: false }).decode(decodeRawMimePercentBytes(encoded));
+                } catch {
+                  return raw;
+                }
+              }
+            }
+
+            function parseRawMimeHeaderValue(value) {
+              const pieces = splitRawMimeHeaderParameters(String(value || ""));
+              const main = (pieces.shift() || "").trim().toLowerCase();
+              const params = Object.create(null);
+              for (const piece of pieces) {
+                const eqIdx = piece.indexOf("=");
+                if (eqIdx < 0) continue;
+                const key = piece.slice(0, eqIdx).trim().toLowerCase();
+                const val = piece.slice(eqIdx + 1).trim();
+                if (!key) continue;
+                params[key] = key.endsWith("*")
+                  ? decodeRawMimeExtendedParameter(val)
+                  : unquoteRawMimeParameter(val);
+              }
+              return { value: main, params };
+            }
+
+            function getRawMimeHeader(headers, name) {
+              return headers[name]?.[0] || "";
+            }
+
+            function getRawMimeFilename(contentDisposition, contentType) {
+              return contentDisposition.params["filename*"] ||
+                contentDisposition.params.filename ||
+                contentType.params["name*"] ||
+                contentType.params.name ||
+                "";
+            }
+
+            function normalizeRawMimeContentId(value) {
+              return String(value || "").trim().replace(/^<|>$/g, "");
+            }
+
+            function decodeRawMimeBase64ToBytes(body, strict = false) {
+              const raw = String(body || "");
+              const clean = strict
+                ? raw.replace(/\s/g, "")
+                : raw.replace(/[^A-Za-z0-9+/=]/g, "");
+              if (!clean) return new Uint8Array(0);
+              if (typeof atob === "function") {
+                const binary = atob(clean);
+                return rawMimeBytesFromByteString(binary);
+              }
+              if (strict && /[^A-Za-z0-9+/=]/.test(clean)) {
+                throw new Error("invalid base64 body");
+              }
+              const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+              const lookup = new Uint8Array(256);
+              for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
+              const out = [];
+              for (let i = 0; i < clean.length; i += 4) {
+                const a = clean[i];
+                const b = clean[i + 1];
+                const c = clean[i + 2];
+                const d = clean[i + 3];
+                if (!a || !b || a === "=" || b === "=") break;
+                const av = lookup[a.charCodeAt(0)];
+                const bv = lookup[b.charCodeAt(0)];
+                out.push((av << 2) | (bv >> 4));
+                if (c && c !== "=") {
+                  const cv = lookup[c.charCodeAt(0)];
+                  out.push(((bv & 15) << 4) | (cv >> 2));
+                  if (d && d !== "=") {
+                    const dv = lookup[d.charCodeAt(0)];
+                    out.push(((cv & 3) << 6) | dv);
+                  }
+                }
+              }
+              return new Uint8Array(out);
+            }
+
+            function decodeRawMimeQuotedPrintableToBytes(body) {
+              const qpBody = String(body || "").replace(/=(?:\r\n|\r|\n)/g, "");
+              const decodedBytes = [];
+              for (let i = 0; i < qpBody.length; i++) {
+                if (qpBody[i] === "=" && i + 2 < qpBody.length) {
+                  const hex = qpBody.slice(i + 1, i + 3);
+                  if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
+                    decodedBytes.push(parseInt(hex, 16));
+                    i += 2;
+                    continue;
+                  }
+                }
+                decodedBytes.push(qpBody.charCodeAt(i) & 0xFF);
+              }
+              return new Uint8Array(decodedBytes);
+            }
+
+            function decodeRawMimeTransferBody(body, transferEncoding, options = {}) {
+              const cte = (transferEncoding || "7bit").split(";")[0].trim().toLowerCase() || "7bit";
+              if (cte === "base64") {
+                return decodeRawMimeBase64ToBytes(body, options.strictBase64 === true);
+              }
+              if (cte === "quoted-printable") return decodeRawMimeQuotedPrintableToBytes(body);
+              if (cte === "7bit" || cte === "8bit" || cte === "binary") {
+                return rawMimeBytesFromByteString(body || "");
+              }
+              return null;
+            }
+
+            function escapeRawMimeRegExp(s) {
+              return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            }
+
+            function splitRawMimeMultipartBody(body, boundary) {
+              if (!boundary) return [];
+              const markerRe = new RegExp(
+                "(^|\\r\\n|\\n|\\r)--" + escapeRawMimeRegExp(boundary) +
+                  "(--)?[ \\t]*(?:\\r\\n|\\n|\\r|$)",
+                "g"
+              );
+              const parts = [];
+              let partStart = null;
+              let match;
+              while ((match = markerRe.exec(body)) !== null) {
+                if (partStart !== null) parts.push(body.slice(partStart, match.index));
+                if (match[2]) {
+                  partStart = null;
+                  break;
+                }
+                partStart = markerRe.lastIndex;
+                if (match[0].length === 0) markerRe.lastIndex++;
+              }
+              // A missing terminal boundary is common in damaged/imported mbox
+              // messages. Preserve the final open part instead of rejecting it.
+              if (partStart !== null && partStart < body.length) {
+                parts.push(body.slice(partStart));
+              }
+              return parts;
+            }
+
+            function parseRawMimeEntity(rawBytes, options = {}) {
+              const maxDepth = Number.isInteger(options.maxDepth) && options.maxDepth >= 0
+                ? options.maxDepth
+                : 32;
+              const raw = rawMimeToByteString(rawBytes);
+
+              function parseEntity(partRaw, depth, partName) {
+                const split = findRawMimeHeaderBodySplit(partRaw);
+                if (!split) return null;
+                const headers = parseRawMimeHeaders(split.header);
+                const contentType = parseRawMimeHeaderValue(
+                  getRawMimeHeader(headers, "content-type") || "text/plain"
+                );
+                const contentDisposition = parseRawMimeHeaderValue(
+                  getRawMimeHeader(headers, "content-disposition") || ""
+                );
+                const entity = {
+                  headers,
+                  contentType,
+                  contentDisposition,
+                  body: split.body,
+                  parts: [],
+                  partName,
+                  depthLimitReached: false,
+                };
+
+                if (contentType.value.startsWith("multipart/")) {
+                  entity.body = "";
+                  if (depth >= maxDepth) {
+                    entity.depthLimitReached = true;
+                    return entity;
+                  }
+                  const children = splitRawMimeMultipartBody(
+                    split.body,
+                    contentType.params.boundary || ""
+                  );
+                  for (let index = 0; index < children.length; index++) {
+                    const child = parseEntity(children[index], depth + 1, `${partName}.${index + 1}`);
+                    if (child) entity.parts.push(child);
+                  }
+                }
+                return entity;
+              }
+
+              return parseEntity(raw, 0, "1");
+            }
+
+            function decodeRawMimeTextPart(entity) {
+              const contentType = entity?.contentType?.value || "text/plain";
+              if (contentType !== "text/plain" && contentType !== "text/html") return null;
+              const transferEncoding = getRawMimeHeader(entity.headers, "content-transfer-encoding");
+              const bodyBytes = decodeRawMimeTransferBody(entity.body, transferEncoding, {
+                // Preserve the original singlepart fallback: whitespace is ignored,
+                // but other non-base64 input makes atob reject the part.
+                strictBase64: true,
+              });
+              if (!bodyBytes) return null;
+
+              const contentTypeValue = getRawMimeHeader(entity.headers, "content-type") || "text/plain";
+              const charsetMatch = contentTypeValue.match(
+                /(?:^|;)\s*charset\s*=\s*(?:"([^"]+)"|'([^']+)'|([^;\s]+))/i
+              );
+              const charset = (
+                charsetMatch?.[1] || charsetMatch?.[2] || charsetMatch?.[3] || "utf-8"
+              ).trim();
+              try {
+                return {
+                  text: new TextDecoder(charset, { fatal: false }).decode(bodyBytes),
+                  isHtml: contentType === "text/html",
+                  charset,
+                  charsetFallback: false,
+                };
+              } catch (e) {
+                if (!(e instanceof RangeError) && e?.name !== "RangeError") throw e;
+                return {
+                  text: new TextDecoder("utf-8", { fatal: false }).decode(bodyBytes),
+                  isHtml: contentType === "text/html",
+                  charset,
+                  charsetFallback: true,
+                };
+              }
+            }
+
+            function extractBodyPartFromRawMime(rawBytes, bodyFormat) {
+              // Body extraction runs synchronously on Thunderbird's main thread.
+              // Ten MIME levels covers normal nesting while bounding adversarial input.
+              const root = parseRawMimeEntity(rawBytes, { maxDepth: 10 });
+              if (!root) return null;
+              const preferHtml = bodyFormat === "html" || bodyFormat === "markdown";
+
+              function findBody(entity, isRoot = false) {
+                const contentType = entity.contentType.value || "text/plain";
+                // Attached messages are intentionally out of scope for this fallback.
+                if (contentType === "message/rfc822") return null;
+                if (!isRoot && entity.contentDisposition.value === "attachment") return null;
+
+                if (contentType.startsWith("multipart/")) {
+                  if (contentType === "multipart/alternative") {
+                    let fallback = null;
+                    for (const child of entity.parts) {
+                      const candidate = findBody(child);
+                      if (!candidate) continue;
+                      if (candidate.isHtml === preferHtml) return candidate;
+                      if (!fallback) fallback = candidate;
+                    }
+                    return fallback;
+                  }
+
+                  // mixed/related (and uncommon multipart subtypes) use the first
+                  // suitable text part in depth-first message order.
+                  for (const child of entity.parts) {
+                    const candidate = findBody(child);
+                    if (candidate) return candidate;
+                  }
+                  return null;
+                }
+
+                if (contentType !== "text/plain" && contentType !== "text/html") return null;
+                try {
+                  const decoded = decodeRawMimeTextPart(entity);
+                  // Preserve the singlepart fallback's empty-body result shape;
+                  // empty multipart candidates are not suitable alternatives.
+                  return decoded && (isRoot || decoded.text) ? decoded : null;
+                } catch {
+                  return null;
+                }
+              }
+
+              return findBody(root, true);
+            }
+            // END RAW MIME PARSING HELPERS
+
             // BEGIN RAW MIME ATTACHMENT HELPERS
             function attachmentSaveLooksWrong(declaredSize, actualSize) {
               if (typeof actualSize !== "number" || actualSize < 0) return true;
@@ -5085,270 +5472,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function parseAttachmentPartsFromRawMime(rawBytes, options = {}) {
               const includeInlineImages = options.includeInlineImages === true;
-              function toByteString(input) {
-                if (typeof input === "string") return input;
-                if (input instanceof Uint8Array) {
-                  let out = "";
-                  const chunkSize = 0x8000;
-                  for (let i = 0; i < input.length; i += chunkSize) {
-                    out += String.fromCharCode(...input.subarray(i, i + chunkSize));
-                  }
-                  return out;
-                }
-                return "";
-              }
-
-              function bytesFromByteString(s) {
-                const bytes = new Uint8Array(s.length);
-                for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i) & 0xFF;
-                return bytes;
-              }
-
-              function findHeaderBodySplit(s) {
-                const matches = [
-                  { idx: s.indexOf("\r\n\r\n"), len: 4 },
-                  { idx: s.indexOf("\n\n"), len: 2 },
-                  { idx: s.indexOf("\r\r"), len: 2 },
-                ].filter(m => m.idx >= 0).sort((a, b) => a.idx - b.idx);
-                if (matches.length === 0) return null;
-                return { header: s.slice(0, matches[0].idx), body: s.slice(matches[0].idx + matches[0].len) };
-              }
-
-              function parseHeaders(headerBlock) {
-                const headers = Object.create(null);
-                const unfolded = String(headerBlock || "").replace(/(?:\r\n|\r|\n)[ \t]+/g, " ");
-                for (const line of unfolded.split(/\r\n|\r|\n/)) {
-                  const colonIdx = line.indexOf(":");
-                  if (colonIdx < 0) continue;
-                  const name = line.slice(0, colonIdx).trim().toLowerCase();
-                  const value = line.slice(colonIdx + 1).trim();
-                  if (!name) continue;
-                  if (!headers[name]) headers[name] = [];
-                  headers[name].push(value);
-                }
-                return headers;
-              }
-
-              function splitHeaderParameters(value) {
-                const parts = [];
-                let current = "";
-                let quote = "";
-                let escaped = false;
-                for (let i = 0; i < value.length; i++) {
-                  const ch = value[i];
-                  if (escaped) {
-                    current += ch;
-                    escaped = false;
-                    continue;
-                  }
-                  if (quote && ch === "\\") {
-                    current += ch;
-                    escaped = true;
-                    continue;
-                  }
-                  if (quote) {
-                    current += ch;
-                    if (ch === quote) quote = "";
-                    continue;
-                  }
-                  if (ch === "\"" || ch === "'") {
-                    current += ch;
-                    quote = ch;
-                    continue;
-                  }
-                  if (ch === ";") {
-                    parts.push(current.trim());
-                    current = "";
-                    continue;
-                  }
-                  current += ch;
-                }
-                parts.push(current.trim());
-                return parts;
-              }
-
-              function unquoteParameter(value) {
-                let v = String(value || "").trim();
-                if ((v.startsWith("\"") && v.endsWith("\"")) || (v.startsWith("'") && v.endsWith("'"))) {
-                  v = v.slice(1, -1).replace(/\\(["'\\])/g, "$1");
-                }
-                return v;
-              }
-
-              function decodePercentBytes(s) {
-                const bytes = [];
-                for (let i = 0; i < s.length; i++) {
-                  if (s[i] === "%" && i + 2 < s.length && /^[0-9A-Fa-f]{2}$/.test(s.slice(i + 1, i + 3))) {
-                    bytes.push(parseInt(s.slice(i + 1, i + 3), 16));
-                    i += 2;
-                  } else {
-                    bytes.push(s.charCodeAt(i) & 0xFF);
-                  }
-                }
-                return new Uint8Array(bytes);
-              }
-
-              function decodeExtendedParameter(value) {
-                const raw = unquoteParameter(value);
-                const match = raw.match(/^([^']*)'[^']*'(.*)$/);
-                if (!match) return raw;
-                const charset = (match[1] || "utf-8").trim() || "utf-8";
-                const encoded = match[2] || "";
-                try {
-                  return new TextDecoder(charset, { fatal: false }).decode(decodePercentBytes(encoded));
-                } catch {
-                  try {
-                    return new TextDecoder("utf-8", { fatal: false }).decode(decodePercentBytes(encoded));
-                  } catch {
-                    return raw;
-                  }
-                }
-              }
-
-              function parseHeaderValue(value) {
-                const pieces = splitHeaderParameters(String(value || ""));
-                const main = (pieces.shift() || "").trim().toLowerCase();
-                const params = Object.create(null);
-                for (const piece of pieces) {
-                  const eqIdx = piece.indexOf("=");
-                  if (eqIdx < 0) continue;
-                  const key = piece.slice(0, eqIdx).trim().toLowerCase();
-                  const val = piece.slice(eqIdx + 1).trim();
-                  if (!key) continue;
-                  params[key] = key.endsWith("*") ? decodeExtendedParameter(val) : unquoteParameter(val);
-                }
-                return { value: main, params };
-              }
-
-              function getHeader(headers, name) {
-                return headers[name]?.[0] || "";
-              }
-
-              function getFilename(contentDisposition, contentType) {
-                return contentDisposition.params["filename*"] ||
-                  contentDisposition.params.filename ||
-                  contentType.params["name*"] ||
-                  contentType.params.name ||
-                  "";
-              }
-
-              function normalizeContentId(value) {
-                return String(value || "").trim().replace(/^<|>$/g, "");
-              }
-
-              function decodeBase64ToBytes(body) {
-                const clean = String(body || "").replace(/[^A-Za-z0-9+/=]/g, "");
-                if (!clean) return new Uint8Array(0);
-                if (typeof atob === "function") {
-                  const binary = atob(clean);
-                  return bytesFromByteString(binary);
-                }
-                const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                const lookup = new Uint8Array(256);
-                for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
-                const out = [];
-                for (let i = 0; i < clean.length; i += 4) {
-                  const a = clean[i];
-                  const b = clean[i + 1];
-                  const c = clean[i + 2];
-                  const d = clean[i + 3];
-                  if (!a || !b || a === "=" || b === "=") break;
-                  const av = lookup[a.charCodeAt(0)];
-                  const bv = lookup[b.charCodeAt(0)];
-                  out.push((av << 2) | (bv >> 4));
-                  if (c && c !== "=") {
-                    const cv = lookup[c.charCodeAt(0)];
-                    out.push(((bv & 15) << 4) | (cv >> 2));
-                    if (d && d !== "=") {
-                      const dv = lookup[d.charCodeAt(0)];
-                      out.push(((cv & 3) << 6) | dv);
-                    }
-                  }
-                }
-                return new Uint8Array(out);
-              }
-
-              function decodeQuotedPrintableToBytes(body) {
-                const qpBody = String(body || "").replace(/=(?:\r\n|\r|\n)/g, "");
-                const decodedBytes = [];
-                for (let i = 0; i < qpBody.length; i++) {
-                  if (qpBody[i] === "=" && i + 2 < qpBody.length) {
-                    const hex = qpBody.slice(i + 1, i + 3);
-                    if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
-                      decodedBytes.push(parseInt(hex, 16));
-                      i += 2;
-                      continue;
-                    }
-                  }
-                  decodedBytes.push(qpBody.charCodeAt(i) & 0xFF);
-                }
-                return new Uint8Array(decodedBytes);
-              }
-
-              function decodeTransferBody(body, transferEncoding) {
-                const cte = (transferEncoding || "7bit").split(";")[0].trim().toLowerCase() || "7bit";
-                if (cte === "base64") return decodeBase64ToBytes(body);
-                if (cte === "quoted-printable") return decodeQuotedPrintableToBytes(body);
-                if (cte === "7bit" || cte === "8bit" || cte === "binary") return bytesFromByteString(body || "");
-                return null;
-              }
-
-              function escapeRegExp(s) {
-                return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-              }
-
-              function splitMultipartBody(body, boundary) {
-                if (!boundary) return [];
-                const markerRe = new RegExp("(^|\\r\\n|\\n|\\r)--" + escapeRegExp(boundary) + "(--)?[ \\t]*(?:\\r\\n|\\n|\\r|$)", "g");
-                const parts = [];
-                let partStart = null;
-                let match;
-                while ((match = markerRe.exec(body)) !== null) {
-                  if (partStart !== null) {
-                    parts.push(body.slice(partStart, match.index));
-                  }
-                  if (match[2]) {
-                    partStart = null;
-                    break;
-                  }
-                  partStart = markerRe.lastIndex;
-                  if (match[0].length === 0) markerRe.lastIndex++;
-                }
-                if (partStart !== null && partStart < body.length) {
-                  parts.push(body.slice(partStart));
-                }
-                return parts;
-              }
-
-              const raw = toByteString(rawBytes);
-              const top = findHeaderBodySplit(raw);
-              if (!top) return [];
-              const topHeaders = parseHeaders(top.header);
-              const topContentType = parseHeaderValue(getHeader(topHeaders, "content-type") || "text/plain");
-              if (!topContentType.value.startsWith("multipart/")) return [];
+              // Keep the attachment walk's historical depth allowance. Body
+              // extraction uses the stricter main-thread cap in its own consumer.
+              const top = parseRawMimeEntity(rawBytes, { maxDepth: 33 });
+              if (!top || !top.contentType.value.startsWith("multipart/")) return [];
 
               const results = [];
-              function walkPart(partRaw, isRoot, depth, partName, insideRelated) {
-                if (depth > 32) return;
-                const split = findHeaderBodySplit(partRaw);
-                if (!split) return;
-                const headers = parseHeaders(split.header);
-                const contentType = parseHeaderValue(getHeader(headers, "content-type") || "text/plain");
-                const contentDisposition = parseHeaderValue(getHeader(headers, "content-disposition") || "");
+              function walkPart(entity, insideRelated) {
+                const contentType = entity.contentType;
+                const contentDisposition = entity.contentDisposition;
                 const ct = contentType.value || "text/plain";
                 const disposition = contentDisposition.value || "";
-                if (ct === "message/rfc822" && !isRoot) return;
+                if (ct === "message/rfc822") return;
                 if (ct.startsWith("multipart/")) {
-                  const children = splitMultipartBody(split.body, contentType.params.boundary || "");
                   const childInsideRelated = insideRelated || ct === "multipart/related";
-                  for (let index = 0; index < children.length; index++) {
-                    walkPart(children[index], false, depth + 1, `${partName}.${index + 1}`, childInsideRelated);
-                  }
+                  for (const child of entity.parts) walkPart(child, childInsideRelated);
                   return;
                 }
 
-                const filename = getFilename(contentDisposition, contentType);
-                const contentId = normalizeContentId(getHeader(headers, "content-id"));
+                const filename = getRawMimeFilename(contentDisposition, contentType);
+                const contentId = normalizeRawMimeContentId(
+                  getRawMimeHeader(entity.headers, "content-id")
+                );
                 const hasAttachmentDisposition = disposition === "attachment";
                 const hasInlineFilename = disposition === "inline" && !!filename;
                 const hasNonTextFilename = !!filename && !ct.startsWith("text/");
@@ -5359,7 +5504,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 let bytes;
                 try {
-                  bytes = decodeTransferBody(split.body, getHeader(headers, "content-transfer-encoding"));
+                  bytes = decodeRawMimeTransferBody(
+                    entity.body,
+                    getRawMimeHeader(entity.headers, "content-transfer-encoding")
+                  );
                 } catch {
                   bytes = null;
                 }
@@ -5369,17 +5517,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   contentType: ct,
                   contentId,
                   disposition,
-                  partName,
+                  partName: entity.partName,
                   isInline: isInlineImage,
                   bytes,
                 });
               }
 
-              const topChildren = splitMultipartBody(top.body, topContentType.params.boundary || "");
-              const insideRelated = topContentType.value === "multipart/related";
-              for (let index = 0; index < topChildren.length; index++) {
-                walkPart(topChildren[index], false, 0, `1.${index + 1}`, insideRelated);
-              }
+              const insideRelated = top.contentType.value === "multipart/related";
+              for (const child of top.parts) walkPart(child, insideRelated);
               return results;
             }
             // END RAW MIME ATTACHMENT HELPERS
@@ -5433,123 +5578,54 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const fmt = extractFormattedBody(aMimeMsg, requestedBodyFormat);
                     let body = fmt.body;
                     let bodyIsHtml = fmt.bodyIsHtml;
-                    // If structured MIME extraction failed, try raw stream
-                    // fallback for local mbox folders where MsgHdrToMimeMessage
-                    // returns empty body parts.
+
+                    // Bound all synchronous raw-MIME work with the existing
+                    // attachment-recovery ceiling.
+                    const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+                    let rawMimeContent = null;
+                    let rawMimeAttachmentParts = null;
+                    let rawMimePartsWithInlineImages = null;
+                    let rawMimeAttachmentError = null;
+
+                    // If structured MIME extraction failed, try the raw stream for
+                    // local mbox folders where MsgHdrToMimeMessage returns empty parts.
                     if (!body) {
-                      const fallbackContext = `thunderbird-mcp: raw singlepart body fallback (${msgHdr.messageId})`;
+                      const fallbackContext = `thunderbird-mcp: raw MIME body fallback (${msgHdr.messageId})`;
                       let rawStream = null;
                       try {
                         const rawFolder = msgHdr.folder;
                         rawStream = rawFolder.getMsgInputStream(msgHdr, {});
-                        // Latin-1 default preserves raw bytes for later transfer decoding.
-                        const rawContent = readMessageStreamFully(rawStream);
-                        if (!rawContent || rawContent.length === 0) {
+                        // Latin-1 default preserves raw bytes for transfer decoding.
+                        rawMimeContent = readMessageStreamFully(rawStream, MAX_ATTACHMENT_BYTES);
+                        if (!rawMimeContent || rawMimeContent.length === 0) {
                           console.error(`${fallbackContext}: message stream has zero size`);
                         } else {
-                          // Find header/body boundary. Prefer CRLFCRLF (RFC 5322),
-                          // then LFLF (LF-normalized mbox), then CRCR (legacy
-                          // classic Mac exports). Pick the earliest match so a
-                          // stray LFLF inside CRLF-separated headers doesn't win.
-                          const boundaryMatch = rawContent.match(/\r\n\r\n|\n\n|\r\r/);
-                          const headerEnd = boundaryMatch ? boundaryMatch.index : -1;
-                          const bodyStart = boundaryMatch
-                            ? boundaryMatch.index + boundaryMatch[0].length
-                            : -1;
-                          if (bodyStart < 0) {
-                            console.error(`${fallbackContext}: could not find header/body boundary`);
+                          const extracted = extractBodyPartFromRawMime(
+                            rawMimeContent,
+                            requestedBodyFormat
+                          );
+                          if (!extracted) {
+                            console.error(`${fallbackContext}: no suitable text MIME part found`);
                           } else {
-                            const headerBlock = rawContent.slice(0, headerEnd);
-                            const rawBody = rawContent.slice(bodyStart);
-                            // Unfold continuation lines for all three line-ending flavors.
-                            const unfoldedHeaders = headerBlock
-                              .replace(/(?:\r\n|\r|\n)[ \t]+/g, " ");
-                            let contentTypeHeader = "";
-                            let transferEncodingHeader = "";
-                            for (const line of unfoldedHeaders.split(/\r\n|\r|\n/)) {
-                              const colonIdx = line.indexOf(":");
-                              if (colonIdx < 0) continue;
-                              const headerName = line.slice(0, colonIdx).trim().toLowerCase();
-                              const headerValue = line.slice(colonIdx + 1).trim();
-                              if (headerName === "content-type" && !contentTypeHeader) {
-                                contentTypeHeader = headerValue;
-                              } else if (headerName === "content-transfer-encoding" && !transferEncodingHeader) {
-                                transferEncodingHeader = headerValue;
-                              }
+                            if (extracted.charsetFallback) {
+                              console.error(
+                                `${fallbackContext}: unknown charset "${extracted.charset}", retrying with utf-8`
+                              );
                             }
-                            const contentTypeValue = contentTypeHeader || "text/plain";
-                            const contentType = (contentTypeValue.split(";")[0] || "text/plain").trim().toLowerCase();
-                            if (contentType.startsWith("multipart/")) {
-                              console.error(`${fallbackContext}: multipart top-level content-type not supported (${contentType})`);
-                            } else if (contentType !== "text/plain" && contentType !== "text/html") {
-                              console.error(`${fallbackContext}: unsupported top-level content-type "${contentType || "(missing)"}"`);
-                            } else {
-                              const charsetMatch = contentTypeValue.match(/(?:^|;)\s*charset\s*=\s*(?:"([^"]+)"|'([^']+)'|([^;\s]+))/i);
-                              const charset = (charsetMatch?.[1] || charsetMatch?.[2] || charsetMatch?.[3] || "utf-8").trim();
-                              const transferEncoding = ((transferEncodingHeader.split(";")[0] || "7bit").trim().toLowerCase() || "7bit");
-                              let bodyBytes = null;
-
-                              if (transferEncoding === "quoted-printable") {
-                                // Remove quoted-printable soft breaks: =CRLF, =LF, =CR.
-                                const qpBody = rawBody.replace(/=(?:\r\n|\r|\n)/g, "");
-                                const decodedBytes = [];
-                                for (let i = 0; i < qpBody.length; i++) {
-                                  if (qpBody[i] === "=" && i + 2 < qpBody.length) {
-                                    const hex = qpBody.slice(i + 1, i + 3);
-                                    if (/^[0-9A-Fa-f]{2}$/.test(hex)) {
-                                      decodedBytes.push(parseInt(hex, 16));
-                                      i += 2;
-                                      continue;
-                                    }
-                                  }
-                                  decodedBytes.push(qpBody.charCodeAt(i) & 0xFF);
-                                }
-                                bodyBytes = new Uint8Array(decodedBytes);
-                              } else if (transferEncoding === "base64") {
-                                try {
-                                  const binary = atob(rawBody.replace(/\s/g, ""));
-                                  bodyBytes = new Uint8Array(binary.length);
-                                  for (let i = 0; i < binary.length; i++) {
-                                    bodyBytes[i] = binary.charCodeAt(i) & 0xFF;
-                                  }
-                                } catch (e) {
-                                  console.error(`${fallbackContext}: invalid base64 body`, e);
-                                }
-                              } else if (transferEncoding === "7bit" || transferEncoding === "8bit" || transferEncoding === "binary") {
-                                bodyBytes = new Uint8Array(rawBody.length);
-                                for (let i = 0; i < rawBody.length; i++) {
-                                  bodyBytes[i] = rawBody.charCodeAt(i) & 0xFF;
-                                }
+                            if (extracted.isHtml) {
+                              if (requestedBodyFormat === "html") {
+                                body = extracted.text;
+                                bodyIsHtml = true;
+                              } else if (requestedBodyFormat === "markdown") {
+                                body = htmlToMarkdown(extracted.text);
+                                bodyIsHtml = false;
                               } else {
-                                console.error(`${fallbackContext}: unsupported content-transfer-encoding "${transferEncoding}"`);
+                                body = stripHtml(extracted.text);
+                                bodyIsHtml = false;
                               }
-
-                              if (bodyBytes) {
-                                let decodedBody;
-                                try {
-                                  decodedBody = new TextDecoder(charset, { fatal: false }).decode(bodyBytes);
-                                } catch (e) {
-                                  if (!(e instanceof RangeError) && e?.name !== "RangeError") throw e;
-                                  console.error(`${fallbackContext}: unknown charset "${charset}", retrying with utf-8`);
-                                  decodedBody = new TextDecoder("utf-8", { fatal: false }).decode(bodyBytes);
-                                }
-
-                                if (contentType === "text/html") {
-                                  if (requestedBodyFormat === "html") {
-                                    body = decodedBody;
-                                    bodyIsHtml = true;
-                                  } else if (requestedBodyFormat === "markdown") {
-                                    body = htmlToMarkdown(decodedBody);
-                                    bodyIsHtml = false;
-                                  } else {
-                                    body = stripHtml(decodedBody);
-                                    bodyIsHtml = false;
-                                  }
-                                } else {
-                                  body = decodedBody;
-                                  bodyIsHtml = false;
-                                }
-                              }
+                            } else {
+                              body = extracted.text;
+                              bodyIsHtml = false;
                             }
                           }
                         }
@@ -5561,12 +5637,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         }
                       }
                     }
-
-                    const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
-                    let rawMimeContent = null;
-                    let rawMimeAttachmentParts = null;
-                    let rawMimePartsWithInlineImages = null;
-                    let rawMimeAttachmentError = null;
 
                     function getRawMimeAttachmentParts(includeInlineParts = false) {
                       const cached = includeInlineParts ? rawMimePartsWithInlineImages : rawMimeAttachmentParts;
