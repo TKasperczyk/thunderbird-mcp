@@ -362,7 +362,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "sendMail",
         group: "messages", crud: "create",
         title: "Compose Mail",
-        description: "Compose a new email. By default opens a compose window for review; set skipReview to send directly.",
+        description: "Compose a new email in a review window. The skipReview safety block is on by default; direct sending is honored only when the user explicitly disables that preference.",
         inputSchema: {
           type: "object",
           properties: {
@@ -373,7 +373,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            skipReview: { type: "boolean", description: "If true, send the message directly without opening a compose window (default: false)" },
+            skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
@@ -458,7 +458,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "createEvent",
         group: "calendar", crud: "create",
         title: "Create Event",
-        description: "Create a calendar event. By default opens a review dialog; set skipReview to add directly.",
+        description: "Create a calendar event through a review dialog. The skipReview safety block is on by default; direct creation is honored only when the user explicitly disables that preference.",
         inputSchema: {
           type: "object",
           properties: {
@@ -473,7 +473,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; use listCategories to get exact existing names before setting." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). After creation, OWL embeds the join URL in the event description and exposes it via listEvents (onlineMeetingURL). No-op on non-OWL backends." },
-            skipReview: { type: "boolean", description: "If true, add the event directly without opening a review dialog (default: false)" },
+            skipReview: { type: "boolean", description: "Request direct creation without a review dialog. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
           },
           required: ["title", "startDate"],
         },
@@ -535,7 +535,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "createTask",
         group: "calendar", crud: "create",
         title: "Create Task",
-        description: "Open a pre-filled task dialog in Thunderbird for user review before saving, or save directly when skipReview is true.",
+        description: "Open a pre-filled task dialog for review. The skipReview safety block is on by default; direct saving is honored only when the user explicitly disables that preference.",
         inputSchema: {
           type: "object",
           properties: {
@@ -545,7 +545,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             description: { type: "string", description: "Task description/body (optional)" },
             priority: { type: "integer", description: "Priority: 1=high, 5=normal, 9=low (optional)" },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Use listCategories to get exact existing names before setting." },
-            skipReview: { type: "boolean", description: "If true, save the task directly without opening a review dialog (default: false)" },
+            skipReview: { type: "boolean", description: "Request direct saving without a review dialog. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
           },
           required: ["title"],
         },
@@ -658,7 +658,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "replyToMessage",
         group: "messages", crud: "create",
         title: "Reply to Message",
-        description: "Reply to a message. By default opens a compose window with quoted original text for review; set skipReview to send directly.",
+        description: "Reply in a compose window with quoted original text for review. The skipReview safety block is on by default; direct sending is honored only when the user explicitly disables that preference.",
         inputSchema: {
           type: "object",
           properties: {
@@ -671,7 +671,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            skipReview: { type: "boolean", description: "If true, send the reply directly without opening a compose window (default: false)" },
+            skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
@@ -705,7 +705,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "forwardMessage",
         group: "messages", crud: "create",
         title: "Forward Message",
-        description: "Forward a message. By default opens a compose window with original content for review; set skipReview to send directly.",
+        description: "Forward in a compose window with original content for review. The skipReview safety block is on by default; direct sending is honored only when the user explicitly disables that preference.",
         inputSchema: {
           type: "object",
           properties: {
@@ -717,7 +717,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
-            skipReview: { type: "boolean", description: "If true, send the forward directly without opening a compose window (default: false)" },
+            skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
