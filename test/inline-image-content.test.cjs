@@ -25,6 +25,10 @@ this.helpers = {
   MAX_INLINE_IMAGE_BASE64_BYTES,
   MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES,
   normalizeInlineImageMimeType,
+  normalizeInlineImageContentId,
+  correlateInlineImageRecords,
+  getInlineImageContentIdReferences,
+  orderInlineImageRecordsForBody,
   getBase64EncodedSize,
   getInlineImageSkipReason,
   encodeByteStringToBase64,
@@ -40,6 +44,10 @@ const {
   MAX_INLINE_IMAGE_BASE64_BYTES,
   MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES,
   normalizeInlineImageMimeType,
+  normalizeInlineImageContentId,
+  correlateInlineImageRecords,
+  getInlineImageContentIdReferences,
+  orderInlineImageRecordsForBody,
   getBase64EncodedSize,
   getInlineImageSkipReason,
   encodeByteStringToBase64,
@@ -106,6 +114,73 @@ describe("inline image MCP content helpers", () => {
     assert.equal(getInlineImageSkipReason("image/webp", 4, 0), "");
     assert.match(getInlineImageSkipReason("image/svg+xml", 4, 0), /Unsupported MIME type/);
     assert.match(getInlineImageSkipReason("image/bmp", 4, 0), /Unsupported MIME type/);
+  });
+
+  it("keeps one metadata entry and one block candidate for a named attachment with Content-ID", () => {
+    const namedAttachment = {
+      info: { name: "signature-logo.png" },
+      contentId: " <SIGNATURE.Logo@Example.Test> ",
+      partName: "1.3",
+    };
+    const inlineImage = {
+      contentId: "signature.logo@example.test",
+      partName: "1.4",
+    };
+
+    const result = correlateInlineImageRecords([namedAttachment], [inlineImage]);
+
+    assert.equal(result.metadataEntries.length, 1);
+    assert.equal(result.inlineImageEntries.length, 1);
+    assert.strictEqual(result.inlineImageEntries[0].metadataRecord, namedAttachment);
+    assert.strictEqual(result.inlineImageEntries[0].inlineImage, inlineImage);
+    assert.equal(result.inlineImageEntries[0].matchedKnownAttachment, true);
+  });
+
+  it("keeps one metadata entry and one block candidate when Gloda stripped inline headers", () => {
+    const namedAttachment = {
+      info: { name: "signature-logo.png" },
+      contentId: "",
+      partName: "1.3",
+    };
+    const strippedInlineImage = {
+      contentId: "",
+      partName: "1.3",
+    };
+
+    const result = correlateInlineImageRecords(
+      [namedAttachment],
+      [strippedInlineImage]
+    );
+
+    assert.equal(result.metadataEntries.length, 1);
+    assert.equal(result.inlineImageEntries.length, 1);
+    assert.strictEqual(result.inlineImageEntries[0].metadataRecord, namedAttachment);
+    assert.strictEqual(result.inlineImageEntries[0].inlineImage, strippedInlineImage);
+    assert.equal(result.inlineImageEntries[0].matchedKnownAttachment, true);
+  });
+
+  it("orders rendered CID references before unreferenced inline images", () => {
+    const sources = [
+      { id: "unreferenced-1", info: { contentId: "unused-1@example.test" } },
+      { id: "second", info: { contentId: "second@example.test" } },
+      { id: "first", info: { contentId: "FIRST@EXAMPLE.TEST" } },
+      { id: "unreferenced-2", info: { contentId: "unused-2@example.test" } },
+    ];
+    const body = [
+      "![first](cid:%66irst%40example.test)",
+      '<img src="CID:<SECOND@EXAMPLE.TEST>">',
+      "![first again](cid:first@example.test)",
+    ].join("\n");
+
+    assert.deepEqual(
+      [...getInlineImageContentIdReferences(body)],
+      ["first@example.test", "second@example.test"]
+    );
+    assert.deepEqual(
+      [...orderInlineImageRecordsForBody(sources, body)].map(source => source.id),
+      ["first", "second", "unreferenced-1", "unreferenced-2"]
+    );
+    assert.equal(normalizeInlineImageContentId("CID:<FIRST@EXAMPLE.TEST>"), "first@example.test");
   });
 
   it("allows the exact per-image budget and skips one byte over it", () => {

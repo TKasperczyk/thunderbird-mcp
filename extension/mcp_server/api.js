@@ -759,6 +759,112 @@ function normalizeInlineImageMimeType(contentType) {
   return ((String(contentType || "").split(";")[0] || "").trim().toLowerCase());
 }
 
+function normalizeInlineImageContentId(contentId) {
+  let normalized = String(contentId || "").trim();
+  if (/^cid:/i.test(normalized)) normalized = normalized.slice(4).trim();
+  try {
+    normalized = decodeURIComponent(normalized);
+  } catch {
+    // Keep malformed-but-usable identifiers in their original form.
+  }
+  return normalized.replace(/^<+|>+$/g, "").trim().toLowerCase();
+}
+
+function findInlineImageRecordIndex(records, target) {
+  const targetContentId = normalizeInlineImageContentId(target?.contentId);
+  if (targetContentId) {
+    const contentIdIndex = records.findIndex(record =>
+      normalizeInlineImageContentId(record?.contentId) === targetContentId
+    );
+    if (contentIdIndex >= 0) return contentIdIndex;
+  }
+
+  const targetPartName = String(target?.partName || "").trim();
+  if (!targetPartName) return -1;
+  return records.findIndex(record =>
+    String(record?.partName || "").trim() === targetPartName
+  );
+}
+
+/**
+ * Correlates Gloda's allUserAttachments records with inline MIME-tree parts.
+ * Content-ID is authoritative when available; MIME part name is the fallback
+ * for Gloda representations where disposition and Content-ID were stripped.
+ * The returned arrays are new, and input records are not mutated.
+ */
+function correlateInlineImageRecords(knownAttachments, inlineImages) {
+  const metadataEntries = Array.isArray(knownAttachments)
+    ? knownAttachments.slice()
+    : [];
+  const inlineImageEntries = [];
+
+  for (const inlineImage of Array.isArray(inlineImages) ? inlineImages : []) {
+    if (findInlineImageRecordIndex(
+      inlineImageEntries.map(entry => entry.inlineImage),
+      inlineImage
+    ) >= 0) {
+      continue;
+    }
+
+    const knownAttachmentIndex = findInlineImageRecordIndex(metadataEntries, inlineImage);
+    const matchedKnownAttachment = knownAttachmentIndex >= 0;
+    let metadataRecord;
+    let metadataIndex = knownAttachmentIndex;
+    if (matchedKnownAttachment) {
+      metadataRecord = metadataEntries[knownAttachmentIndex];
+    } else {
+      metadataRecord = inlineImage;
+      metadataIndex = metadataEntries.length;
+      metadataEntries.push(metadataRecord);
+    }
+
+    inlineImageEntries.push({
+      metadataRecord,
+      metadataIndex,
+      inlineImage,
+      matchedKnownAttachment,
+    });
+  }
+
+  return { metadataEntries, inlineImageEntries };
+}
+
+function getInlineImageContentIdReferences(body) {
+  const references = [];
+  const seen = new Set();
+  const cidPattern = /\bcid\s*:\s*(?:<([^>]+)>|([^"'<>\s)\]]+))/gi;
+  let match;
+  while ((match = cidPattern.exec(String(body || ""))) !== null) {
+    const contentId = normalizeInlineImageContentId(match[1] || match[2]);
+    if (!contentId || seen.has(contentId)) continue;
+    seen.add(contentId);
+    references.push(contentId);
+  }
+  return references;
+}
+
+function orderInlineImageRecordsForBody(inlineImages, body) {
+  const remaining = Array.isArray(inlineImages) ? inlineImages.slice() : [];
+  const ordered = [];
+
+  // Attempt rendered CID images first, in first-reference document order.
+  // Any inline MIME parts not referenced by the rendered body retain MIME order.
+  for (const referencedContentId of getInlineImageContentIdReferences(body)) {
+    for (let i = 0; i < remaining.length;) {
+      const recordContentId = normalizeInlineImageContentId(
+        remaining[i]?.contentId ?? remaining[i]?.info?.contentId
+      );
+      if (recordContentId === referencedContentId) {
+        ordered.push(remaining.splice(i, 1)[0]);
+      } else {
+        i++;
+      }
+    }
+  }
+
+  return ordered.concat(remaining);
+}
+
 function getBase64EncodedSize(byteLength) {
   if (!Number.isFinite(byteLength) || byteLength <= 0) return 0;
   return 4 * Math.ceil(byteLength / 3);
@@ -1040,7 +1146,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             messageId: { type: "string", description: "The message ID (from searchMessages results)" },
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             saveAttachments: { type: "boolean", description: "If true, save attachments to <OS temp dir>/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" },
-            includeInlineImages: { type: "boolean", description: "If true, append supported inline email images as MCP image content blocks after the text result (default: false; max 1 MiB base64 per image and 4 MiB total). Ignored when rawSource is true." },
+            includeInlineImages: { type: "boolean", description: "If true, append supported inline email images as MCP image content blocks after the text result (default: false; max 1 MiB base64 per image and 4 MiB total). Images referenced by the rendered body are attempted first in document order, followed by remaining inline images in MIME order. Ignored when rawSource is true." },
             bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format: 'markdown' (default, preserves structure), 'text' (plain text), 'html' (raw HTML)" },
             rawSource: { type: "boolean", description: "If true, return the full raw RFC 2822 message source (all headers + MIME parts). Useful for extracting calendar invites, S/MIME data, or debugging. Other fields (body, attachments) are omitted when this is set. Note: requires local/offline message copy; IMAP messages not cached offline may fail." },
           },
@@ -5496,6 +5602,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const attachments = [];
                     const attachmentSources = [];
                     const inlineImageSources = [];
+                    const knownAttachmentRecords = [];
+
+                    function getGlodaInlineContentId(part) {
+                      const rawContentId = part?.contentId || part?.contentID || part?.cid ||
+                        part?.headers?.["content-id"]?.[0] || "";
+                      return String(rawContentId).trim().replace(/^<+|>+$/g, "").trim();
+                    }
+
                     if (aMimeMsg && aMimeMsg.allUserAttachments) {
                       for (const att of aMimeMsg.allUserAttachments) {
                         const info = {
@@ -5504,12 +5618,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           size: typeof att?.size === "number" ? att.size : null,
                           isInline: false,
                         };
-                        attachments.push(info);
-                        attachmentSources.push({
+                        const source = {
                           info,
                           url: att?.url || "",
                           size: typeof att?.size === "number" ? att.size : null
-                        });
+                        };
+                        attachments.push(info);
+                        attachmentSources.push(source);
+                        if (includeInlineImages) {
+                          knownAttachmentRecords.push({
+                            info,
+                            source,
+                            contentId: getGlodaInlineContentId(att),
+                            partName: att?.partName || "",
+                          });
+                        }
                       }
                     }
 
@@ -5521,8 +5644,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // through the message service because imap-message:// is not
                     // directly fetchable by NetUtil.
                     if (aMimeMsg) {
+                      // For the opt-in path this set only deduplicates the MIME-tree
+                      // walk. allUserAttachments is reconciled after collection so a
+                      // named inline image remains eligible for an image block.
                       const existingPartNames = includeInlineImages
-                        ? new Set((aMimeMsg.allUserAttachments || []).map(att => att?.partName).filter(Boolean))
+                        ? new Set()
                         : new Set(attachments.map(a => a.partName).filter(Boolean));
                       function collectInlineImages(part, insideRelated, results) {
                         const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
@@ -5538,11 +5664,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         const disposition = includeInlineImages
                           ? (dispositionHeader.split(";")[0] || "").trim().toLowerCase()
                           : "";
-                        const rawContentId = includeInlineImages
-                          ? part.headers?.["content-id"]?.[0] || ""
-                          : "";
+                        const rawContentId = includeInlineImages ? getGlodaInlineContentId(part) : "";
                         const contentId = includeInlineImages
-                          ? String(rawContentId).trim().replace(/^<|>$/g, "")
+                          ? String(rawContentId).trim().replace(/^<+|>+$/g, "").trim()
                           : "";
                         const isInline = includeInlineImages
                           ? disposition !== "attachment" &&
@@ -5550,8 +5674,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           : insideRelated;
                         if (isInline && ct.startsWith("image/") && part.partName) {
                           // Deduplicate by partName (stable ID), not filename (can collide)
-                          if (existingPartNames.has(part.partName) &&
-                              (!includeInlineImages || (disposition !== "inline" && !contentId))) return;
+                          if (existingPartNames.has(part.partName)) return;
                           existingPartNames.add(part.partName);
                           // Extract filename from headers (contentType field lacks params)
                           const ctHeader = part.headers?.["content-type"]?.[0] || "";
@@ -5559,7 +5682,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             ? `${dispositionHeader};${ctHeader}`.match(/(?:filename|name)\s*=\s*"?([^";]+)"?/i)
                             : ctHeader.match(/name\s*=\s*"?([^";]+)"?/i);
                           const name = nameMatch ? nameMatch[1] : `inline_${part.partName}`;
-                          results.push({ part, name, ct, contentId });
+                          results.push({
+                            part,
+                            name,
+                            ct,
+                            contentId,
+                            partName: part.partName,
+                          });
                         }
                         if (part.parts) {
                           for (const sub of part.parts) collectInlineImages(sub, insideRelated, results);
@@ -5569,7 +5698,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       collectInlineImages(aMimeMsg, false, inlineImages);
                       if (inlineImages.length > 0) {
                         const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
-                        for (const { part, name, ct, contentId } of inlineImages) {
+                        const correlations = includeInlineImages
+                          ? correlateInlineImageRecords(knownAttachmentRecords, inlineImages)
+                          : {
+                              inlineImageEntries: inlineImages.map(inlineImage => ({
+                                inlineImage,
+                                matchedKnownAttachment: false,
+                              })),
+                            };
+                        for (const correlation of correlations.inlineImageEntries) {
+                          const { part, name, ct, contentId } = correlation.inlineImage;
                           // Resolve to a fetchable URL via the message service
                           let partUrl;
                           try {
@@ -5581,21 +5719,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           } catch {
                             partUrl = "";
                           }
-                          const info = {
-                            name,
-                            contentType: ct,
-                            size: typeof part.size === "number" && part.size > 0 ? part.size : null,
-                            partName: part.partName,
-                            isInline: true,
-                          };
-                          if (includeInlineImages) info.contentId = contentId || null;
-                          attachments.push(info);
-                          if (partUrl) {
-                            attachmentSources.push({ info, url: partUrl, size: info.size });
+                          const partSize = typeof part.size === "number" && part.size > 0
+                            ? part.size
+                            : null;
+                          let info;
+                          let fallbackUrl = "";
+                          if (includeInlineImages && correlation.matchedKnownAttachment) {
+                            const knownRecord = correlation.metadataRecord;
+                            info = knownRecord.info;
+                            info.name = info.name || name;
+                            info.contentType = ct || info.contentType;
+                            if (!(typeof info.size === "number" && info.size > 0)) {
+                              info.size = partSize;
+                            }
+                            info.partName = part.partName;
+                            info.isInline = true;
+                            info.contentId = contentId || knownRecord.contentId || null;
+                            fallbackUrl = knownRecord.source?.url || "";
+                          } else {
+                            info = {
+                              name,
+                              contentType: ct,
+                              size: partSize,
+                              partName: part.partName,
+                              isInline: true,
+                            };
+                            if (includeInlineImages) info.contentId = contentId || null;
+                            attachments.push(info);
+                            if (partUrl) {
+                              attachmentSources.push({ info, url: partUrl, size: info.size });
+                            }
                           }
                           inlineImageSources.push({
                             info,
-                            url: partUrl,
+                            url: partUrl || fallbackUrl,
                             size: info.size,
                             partName: part.partName,
                           });
@@ -5610,21 +5767,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       const parsed = getRawMimeAttachmentParts(true);
                       if (!parsed.error) {
                         const rawInlineParts = (parsed.parts || []).filter(part => part.isInline);
-                        const usedRawParts = new Set();
-                        for (const source of inlineImageSources) {
-                          let rawPart = rawInlineParts.find(part =>
-                            !usedRawParts.has(part) && part.partName === source.partName
-                          );
-                          if (!rawPart) {
-                            rawPart = rawInlineParts.find(part =>
-                              !usedRawParts.has(part) &&
-                              normalizeInlineImageMimeType(part.contentType) ===
-                                normalizeInlineImageMimeType(source.info.contentType) &&
-                              (!part.filename || part.filename === source.info.name)
-                            );
-                          }
-                          if (!rawPart) continue;
-                          usedRawParts.add(rawPart);
+                        const sourceRecords = inlineImageSources.map(source => ({
+                          contentId: source.info.contentId,
+                          partName: source.partName,
+                          source,
+                        }));
+                        const rawPartRecords = rawInlineParts.map(rawPart => ({
+                          contentId: rawPart.contentId,
+                          partName: rawPart.partName,
+                          rawPart,
+                        }));
+                        const rawCorrelations = correlateInlineImageRecords(
+                          sourceRecords,
+                          rawPartRecords
+                        );
+                        for (const correlation of rawCorrelations.inlineImageEntries) {
+                          if (!correlation.matchedKnownAttachment) continue;
+                          const source = correlation.metadataRecord.source;
+                          const rawPart = correlation.inlineImage.rawPart;
                           if (rawPart.contentId) source.info.contentId = rawPart.contentId;
                           if (rawPart.filename && source.info.name.startsWith("inline_")) {
                             source.info.name = rawPart.filename;
@@ -5706,8 +5866,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     async function appendInlineImageContent() {
                       const blocks = [];
                       let totalBase64Bytes = 0;
+                      const orderedInlineImageSources = orderInlineImageRecordsForBody(
+                        inlineImageSources,
+                        body
+                      );
 
-                      for (const source of inlineImageSources) {
+                      for (const source of orderedInlineImageSources) {
                         const mimeType = normalizeInlineImageMimeType(source.info.contentType);
                         let skipReason = "";
 
