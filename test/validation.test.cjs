@@ -14,6 +14,64 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+
+const apiSource = fs.readFileSync(
+  path.resolve(__dirname, '../extension/mcp_server/api.js'),
+  'utf8'
+);
+
+function getMarkedApiSnippet(startMarker, endMarker) {
+  const start = apiSource.indexOf(startMarker);
+  const end = apiSource.indexOf(endMarker, start + startMarker.length);
+  assert.ok(start >= 0, `api.js marker missing: ${startMarker}`);
+  assert.ok(end > start, `api.js marker missing: ${endMarker}`);
+  return apiSource.slice(start, end);
+}
+
+function loadProductionAttachmentValidation() {
+  const sandbox = {
+    getConfiguredGetMessagesLimit: () => 20,
+    MAX_BASE64_SIZE: 25 * 1024 * 1024,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext([
+    getMarkedApiSnippet('// BEGIN INLINE ATTACHMENT BASE64 HELPERS', '// END INLINE ATTACHMENT BASE64 HELPERS'),
+    getMarkedApiSnippet('// BEGIN TOOL SCHEMA BUILDER', '// END TOOL SCHEMA BUILDER'),
+    getMarkedApiSnippet('// BEGIN TOOL SCHEMA VALIDATOR', '// END TOOL SCHEMA VALIDATOR'),
+    getMarkedApiSnippet('// BEGIN OUTBOUND ATTACHMENT CONVERSION', '// END OUTBOUND ATTACHMENT CONVERSION'),
+    'this.isValidBase64 = isValidBase64;',
+    'this.buildTools = buildTools;',
+    'this.validateAgainstSchema = validateAgainstSchema;',
+    'this.filePathsToAttachDescs = filePathsToAttachDescs;',
+  ].join('\n'), sandbox);
+  return sandbox;
+}
+
+const productionAttachmentValidation = loadProductionAttachmentValidation();
+
+function validateProductionToolArgs(name, args) {
+  const tool = productionAttachmentValidation.buildTools().find(t => t.name === name);
+  assert.ok(tool, `production tool schema missing: ${name}`);
+  const schema = tool.inputSchema;
+  const errors = [];
+  for (const key of schema.required || []) {
+    if (args[key] === undefined || args[key] === null) {
+      errors.push(`Missing required parameter: ${key}`);
+    }
+  }
+  for (const [key, value] of Object.entries(args)) {
+    const propSchema = schema.properties?.[key];
+    if (!propSchema) {
+      errors.push(`Unknown parameter: ${key}`);
+      continue;
+    }
+    productionAttachmentValidation.validateAgainstSchema(value, propSchema, key, errors);
+  }
+  return errors;
+}
 
 /**
  * Exact copy of validateToolArgs / validateAgainstSchema from api.js.
@@ -69,15 +127,42 @@ function validateAgainstSchema(value, schema, path, errors) {
     return;
   }
 
+  if (expectedType === "string") {
+    if (schema.minLength !== undefined && value.length < schema.minLength) {
+      errors.push(`Parameter '${path}' must contain at least ${schema.minLength} character(s)`);
+    }
+    if (schema.contentEncoding === "base64" && !productionAttachmentValidation.isValidBase64(value)) {
+      errors.push(`Parameter '${path}' must contain valid base64 data`);
+    }
+  }
+
+  if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
+    let matched = 0;
+    const branchFailures = [];
+    for (const branch of schema.anyOf) {
+      const branchErrors = [];
+      validateAgainstSchema(value, branch, path, branchErrors);
+      if (branchErrors.length === 0) matched++;
+      else branchFailures.push(branchErrors);
+    }
+    if (matched === 0) {
+      const details = [...new Set(branchFailures.flat())].join("; ");
+      errors.push(`Parameter '${path}' did not match any required schema alternative${details ? `: ${details}` : ""}`);
+    }
+  }
+
   if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
     let matched = 0;
+    const branchFailures = [];
     for (const branch of schema.oneOf) {
       const branchErrors = [];
       validateAgainstSchema(value, branch, path, branchErrors);
       if (branchErrors.length === 0) matched++;
+      else branchFailures.push(branchErrors);
     }
     if (matched === 0) {
-      errors.push(`Parameter '${path}' did not match any allowed schema variant`);
+      const details = [...new Set(branchFailures.flat())].join("; ");
+      errors.push(`Parameter '${path}' did not match any allowed schema variant${details ? `: ${details}` : ""}`);
     } else if (matched > 1) {
       errors.push(`Parameter '${path}' matched more than one schema variant`);
     }
@@ -169,10 +254,14 @@ const sampleTools = [
                 properties: {
                   name: { type: "string" },
                   contentType: { type: "string" },
-                  base64: { type: "string" },
-                  content: { type: "string" },
+                  base64: { type: "string", minLength: 1, contentEncoding: "base64" },
+                  content: { type: "string", minLength: 1, contentEncoding: "base64" },
                 },
                 required: ["name"],
+                anyOf: [
+                  { type: "object", required: ["base64"] },
+                  { type: "object", required: ["content"] },
+                ],
                 additionalProperties: false,
               },
             ],
@@ -572,6 +661,59 @@ describe('Validation: attachment sending', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must not be null/);
+  });
+
+  const productionToolArgs = {
+    sendMail: { to: 'user@example.com', subject: 'test', body: 'hello' },
+    saveDraft: {},
+    replyToMessage: { messageId: 'message-1', folderPath: 'imap://example/INBOX', body: 'hello' },
+    forwardMessage: { messageId: 'message-1', folderPath: 'imap://example/INBOX', to: 'user@example.com' },
+  };
+
+  for (const [toolName, requiredArgs] of Object.entries(productionToolArgs)) {
+    it(`production ${toolName} schema rejects payload-less and empty inline attachments`, () => {
+      for (const attachment of [
+        { name: 'empty.bin' },
+        { name: 'empty.bin', base64: '' },
+        { name: 'empty.bin', content: '' },
+      ]) {
+        const errors = validateProductionToolArgs(toolName, {
+          ...requiredArgs,
+          attachments: [attachment],
+        });
+        assert.ok(errors.length > 0, `${toolName} accepted ${JSON.stringify(attachment)}`);
+      }
+    });
+
+    it(`production ${toolName} schema accepts non-empty base64 and content payloads`, () => {
+      for (const attachment of [
+        { name: 'file.bin', contentType: 'application/octet-stream', base64: 'AAAA' },
+        { name: 'file.bin', contentType: 'application/octet-stream', content: 'AAAA' },
+      ]) {
+        const errors = validateProductionToolArgs(toolName, {
+          ...requiredArgs,
+          attachments: [attachment],
+        });
+        assert.deepEqual(errors, [], `${toolName} rejected ${JSON.stringify(attachment)}: ${errors.join('; ')}`);
+      }
+    });
+  }
+
+  it('production validation rejects malformed base64 with a clear error', () => {
+    const errors = validateProductionToolArgs('sendMail', {
+      ...productionToolArgs.sendMail,
+      attachments: [{ name: 'garbage.bin', base64: '%%%%' }],
+    });
+    assert.ok(errors.some(error => /valid base64 data/.test(error)), errors.join('; '));
+  });
+
+  it('production runtime rejects malformed base64 before decoding it', () => {
+    const result = productionAttachmentValidation.filePathsToAttachDescs([
+      { name: 'garbage.bin', base64: '%%%%' },
+    ]);
+    assert.equal(result.descs.length, 0);
+    assert.equal(result.failed.length, 1);
+    assert.match(result.failed[0], /garbage\.bin \(invalid base64 data\)/);
   });
 });
 

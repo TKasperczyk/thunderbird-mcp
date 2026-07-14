@@ -112,6 +112,14 @@ const _tempAttachFiles = new Set();
 // (which would double-inject the body/attachments).
 // WeakSet so entries are collected automatically when the window is destroyed.
 const _claimedComposeWindows = new WeakSet();
+// BEGIN INLINE ATTACHMENT BASE64 HELPERS
+// Require canonical RFC 4648 base64: complete quartets with padding only in
+// the final quartet. In particular, do not silently discard invalid bytes.
+const STRICT_BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+function isValidBase64(value) {
+  return typeof value === "string" && value.length > 0 && STRICT_BASE64_PATTERN.test(value);
+}
+// END INLINE ATTACHMENT BASE64 HELPERS
 const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data (encoded)
 // Cap file-path attachments to the same magnitude as saved-message attachments.
 // Prevents an MCP caller from attaching multi-GB files to a single outgoing message.
@@ -243,6 +251,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       }
     }
 
+    // BEGIN TOOL SCHEMA BUILDER
     function buildTools() {
       const getMessagesLimit = getConfiguredGetMessagesLimit();
       return [
@@ -368,10 +377,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     properties: {
                       name: { type: "string", description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
-                      base64: { type: "string", description: "Base64-encoded file content" },
-                      content: { type: "string", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
+                      base64: { type: "string", minLength: 1, contentEncoding: "base64", description: "Base64-encoded file content" },
+                      content: { type: "string", minLength: 1, contentEncoding: "base64", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
                     },
                     required: ["name"],
+                    anyOf: [
+                      { type: "object", required: ["base64"] },
+                      { type: "object", required: ["content"] },
+                    ],
                     additionalProperties: false,
                   },
                 ],
@@ -407,10 +420,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     properties: {
                       name: { type: "string", description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
-                      base64: { type: "string", description: "Base64-encoded file content" },
-                      content: { type: "string", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
+                      base64: { type: "string", minLength: 1, contentEncoding: "base64", description: "Base64-encoded file content" },
+                      content: { type: "string", minLength: 1, contentEncoding: "base64", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
                     },
                     required: ["name"],
+                    anyOf: [
+                      { type: "object", required: ["base64"] },
+                      { type: "object", required: ["content"] },
+                    ],
                     additionalProperties: false,
                   },
                 ],
@@ -656,10 +673,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     properties: {
                       name: { type: "string", description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
-                      base64: { type: "string", description: "Base64-encoded file content" },
-                      content: { type: "string", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
+                      base64: { type: "string", minLength: 1, contentEncoding: "base64", description: "Base64-encoded file content" },
+                      content: { type: "string", minLength: 1, contentEncoding: "base64", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
                     },
                     required: ["name"],
+                    anyOf: [
+                      { type: "object", required: ["base64"] },
+                      { type: "object", required: ["content"] },
+                    ],
                     additionalProperties: false,
                   },
                 ],
@@ -697,10 +718,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     properties: {
                       name: { type: "string", description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
-                      base64: { type: "string", description: "Base64-encoded file content" },
-                      content: { type: "string", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
+                      base64: { type: "string", minLength: 1, contentEncoding: "base64", description: "Base64-encoded file content" },
+                      content: { type: "string", minLength: 1, contentEncoding: "base64", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
                     },
                     required: ["name"],
+                    anyOf: [
+                      { type: "object", required: ["base64"] },
+                      { type: "object", required: ["content"] },
+                    ],
                     additionalProperties: false,
                   },
                 ],
@@ -1009,6 +1034,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       },
       ];
     }
+    // END TOOL SCHEMA BUILDER
 
     const tools = buildTools();
 
@@ -1702,6 +1728,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *     to a temp file under <TmpD>/thunderbird-mcp/attachments/
              * Returns { descs: [{url, name, size, contentType?}], failed: string[] }
              */
+            // BEGIN OUTBOUND ATTACHMENT CONVERSION
             function filePathsToAttachDescs(filePaths) {
               const descs = [];
               const failed = [];
@@ -1748,6 +1775,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   } else if (entry && typeof entry === "object" && (entry.base64 || entry.content) && entry.name) {
                     // Inline base64 attachment — decode and write to temp file
                     const b64Data = entry.base64 || entry.content;
+                    if (!isValidBase64(b64Data)) {
+                      failed.push(`${entry.name} (invalid base64 data)`);
+                      continue;
+                    }
                     if (b64Data.length > MAX_BASE64_SIZE) {
                       failed.push(`${entry.name} (exceeds ${MAX_BASE64_SIZE / 1024 / 1024}MB size limit)`);
                       continue;
@@ -1765,7 +1796,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         const lookup = new Uint8Array(256);
                         const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
                         for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i;
-                        const clean = b64Data.replace(/[^A-Za-z0-9+/]/g, "");
+                        // Shape was validated above; remove only legal trailing
+                        // padding rather than stripping arbitrary invalid bytes.
+                        const clean = b64Data.replace(/=+$/, "");
                         const len = clean.length;
                         const outLen = (len * 3) >> 2;
                         bytes = new Uint8Array(outLen);
@@ -1818,6 +1851,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
               return { descs, failed };
             }
+            // END OUTBOUND ATTACHMENT CONVERSION
 
             /**
              * Converts attachment descriptors to nsIMsgAttachment objects.
@@ -6626,12 +6660,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Not a full JSON Schema implementation -- intentionally minimal --
              * but covers the keywords actually used by toolSchemas:
              *   - type (string/number/integer/boolean/array/object)
-             *   - enum
+             *   - enum, minLength, and base64 contentEncoding
              *   - properties + required + additionalProperties (on objects)
-             *   - items (on arrays), including a single-branch oneOf with type
-             *     discrimination, which is how the attachments array is described.
+             *   - items (on arrays), oneOf, and anyOf
              * `path` is the dotted property path used in error messages.
              */
+            // BEGIN TOOL SCHEMA VALIDATOR
             function validateAgainstSchema(value, schema, path, errors) {
               if (!schema || value === undefined || value === null) return;
 
@@ -6685,17 +6719,45 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return;
               }
 
+              if (expectedType === "string") {
+                if (schema.minLength !== undefined && value.length < schema.minLength) {
+                  errors.push(`Parameter '${path}' must contain at least ${schema.minLength} character(s)`);
+                }
+                if (schema.contentEncoding === "base64" && !isValidBase64(value)) {
+                  errors.push(`Parameter '${path}' must contain valid base64 data`);
+                }
+              }
+
+              // anyOf: accept the value when one or more branches validate.
+              if (Array.isArray(schema.anyOf) && schema.anyOf.length > 0) {
+                let matched = 0;
+                const branchFailures = [];
+                for (const branch of schema.anyOf) {
+                  const branchErrors = [];
+                  validateAgainstSchema(value, branch, path, branchErrors);
+                  if (branchErrors.length === 0) matched++;
+                  else branchFailures.push(branchErrors);
+                }
+                if (matched === 0) {
+                  const details = [...new Set(branchFailures.flat())].join("; ");
+                  errors.push(`Parameter '${path}' did not match any required schema alternative${details ? `: ${details}` : ""}`);
+                }
+              }
+
               // oneOf: accept the value if exactly one branch validates clean.
               // Used by the attachments array items (string | object).
               if (Array.isArray(schema.oneOf) && schema.oneOf.length > 0) {
                 let matched = 0;
+                const branchFailures = [];
                 for (const branch of schema.oneOf) {
                   const branchErrors = [];
                   validateAgainstSchema(value, branch, path, branchErrors);
                   if (branchErrors.length === 0) matched++;
+                  else branchFailures.push(branchErrors);
                 }
                 if (matched === 0) {
-                  errors.push(`Parameter '${path}' did not match any allowed schema variant`);
+                  const details = [...new Set(branchFailures.flat())].join("; ");
+                  errors.push(`Parameter '${path}' did not match any allowed schema variant${details ? `: ${details}` : ""}`);
                 } else if (matched > 1) {
                   errors.push(`Parameter '${path}' matched more than one schema variant`);
                 }
@@ -6706,6 +6768,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 errors.push(`Parameter '${path}' must be one of ${JSON.stringify(schema.enum)}, got ${JSON.stringify(value)}`);
               }
             }
+            // END TOOL SCHEMA VALIDATOR
 
             function validateToolArgs(name, args) {
               const tool = buildTools().find(t => t.name === name);
