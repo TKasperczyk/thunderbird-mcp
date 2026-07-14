@@ -115,6 +115,29 @@ Account and tool access are configured via the extension settings page (Tools > 
 
 The same settings page has a "Send Safety" section: toggle **Block `skipReview`** to reject `sendMail` / `replyToMessage` / `forwardMessage` calls that pass `skipReview: true`. The review-window path still works, so clients stay usable -- they just can't send silently.
 
+### Lifecycle management
+
+The bridge exposes three tools for managing the Thunderbird process itself. These are handled locally by the bridge and never forwarded to the extension, so they work even when Thunderbird is not running.
+
+| Tool | Description |
+|------|-------------|
+| `launchThunderbird` | Start Thunderbird if not already running. Waits up to ~30 s for the MCP extension to become reachable. No-op if already running. |
+| `thunderbirdStatus` | Check whether Thunderbird is running and the extension is reachable. Returns `{ running, extensionReachable, port? }`. |
+| `stopThunderbird` | Gracefully stop Thunderbird. **Always requires explicit user confirmation** -- the user may have unsaved work. |
+
+Typical AI workflow:
+
+```
+thunderbirdStatus → not running →
+launchThunderbird → Thunderbird starts, extension connects →
+... use email/calendar/contacts tools ... →
+stopThunderbird (with user confirmation)
+```
+
+Thunderbird is launched as a detached process -- it stays running even if the MCP client (Claude, Hermes, etc.) disconnects. This is intentional: the user may have Thunderbird open for their own work.
+
+When Thunderbird is not running, `tools/list` returns only the three lifecycle tools. Once Thunderbird starts, `tools/list` returns all extension tools plus the lifecycle tools.
+
 ---
 
 ## Setup

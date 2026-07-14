@@ -169,15 +169,17 @@ describe('Auth: connection info file', () => {
     }
   });
 
-  it('bridge fails closed when connection file is missing', async (t) => {
+  it('bridge returns only lifecycle tools when connection file is missing', async (t) => {
     if (await isPortInUse(DEFAULT_PORT)) {
       return t.skip('Thunderbird running on default port, skipping connection file removal test');
     }
     // Remove connection file
     try { fs.unlinkSync(CONN_FILE); } catch { /* ignore */ }
 
-    // With fail-closed auth, the bridge must refuse to forward requests
-    // when it can't find the connection file (no fallback to default port).
+    // With lifecycle tools, tools/list returns the bridge-local lifecycle
+    // tools when Thunderbird is not reachable (so the client can discover
+    // launchThunderbird). Extension tools are NOT exposed — fail-closed
+    // auth is still enforced for actual Thunderbird tool calls.
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 2,
@@ -185,8 +187,13 @@ describe('Auth: connection info file', () => {
     });
 
     assert.equal(response.id, 2);
-    assert.ok(response.error, 'should return an error when connection file is missing');
-    assert.match(response.error.message, /Connection file not found|Bridge error/);
+    assert.ok(response.result, 'should return a result with lifecycle tools');
+    assert.ok(Array.isArray(response.result.tools), 'result.tools should be an array');
+    const names = response.result.tools.map((t) => t.name);
+    assert.ok(names.includes('launchThunderbird'), 'should include launchThunderbird');
+    assert.ok(names.includes('thunderbirdStatus'), 'should include thunderbirdStatus');
+    // Extension tools must NOT be present (fail-closed)
+    assert.ok(!names.includes('listAccounts'), 'should not include extension tools');
   });
 });
 
@@ -363,7 +370,13 @@ describe('Auth: connection file corruption', () => {
   });
   after(() => restoreConnectionFile());
 
-  it('rejects empty connection file', async (t) => {
+  // With lifecycle tools, tools/list returns lifecycle tools (not an error)
+  // when the connection file is corrupt or missing — this lets the client
+  // discover launchThunderbird. Fail-closed is still enforced on tools/call
+  // for extension tools. These tests verify both: tools/list falls back to
+  // lifecycle tools, and tools/call for extension tools still errors out.
+
+  it('rejects empty connection file on tools/call', async (t) => {
     if (thunderbirdRunning) return t.skip('Thunderbird running, skipping connection file mutation test');
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, '', 'utf8');
@@ -371,14 +384,15 @@ describe('Auth: connection file corruption', () => {
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 20,
-      method: 'tools/list'
+      method: 'tools/call',
+      params: { name: 'listAccounts', arguments: {} }
     });
 
     assert.equal(response.id, 20);
     assert.ok(response.error);
   });
 
-  it('rejects connection file with invalid JSON', async (t) => {
+  it('rejects connection file with invalid JSON on tools/call', async (t) => {
     if (thunderbirdRunning) return t.skip('Thunderbird running');
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, '{not valid json!!!', 'utf8');
@@ -386,14 +400,15 @@ describe('Auth: connection file corruption', () => {
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 21,
-      method: 'tools/list'
+      method: 'tools/call',
+      params: { name: 'listAccounts', arguments: {} }
     });
 
     assert.equal(response.id, 21);
     assert.ok(response.error);
   });
 
-  it('rejects connection file with missing port', async (t) => {
+  it('rejects connection file with missing port on tools/call', async (t) => {
     if (thunderbirdRunning) return t.skip('Thunderbird running');
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, JSON.stringify({ token: 'abc' }), 'utf8');
@@ -401,15 +416,16 @@ describe('Auth: connection file corruption', () => {
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 22,
-      method: 'tools/list'
+      method: 'tools/call',
+      params: { name: 'listAccounts', arguments: {} }
     });
 
     assert.equal(response.id, 22);
     assert.ok(response.error);
-    assert.match(response.error.message, /missing port or token|Bridge error/);
+    assert.match(response.error.message, /missing port or token|Bridge error|Connection discovery/);
   });
 
-  it('rejects connection file with missing token', async (t) => {
+  it('rejects connection file with missing token on tools/call', async (t) => {
     if (thunderbirdRunning) return t.skip('Thunderbird running');
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, JSON.stringify({ port: 19999 }), 'utf8');
@@ -417,15 +433,16 @@ describe('Auth: connection file corruption', () => {
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 23,
-      method: 'tools/list'
+      method: 'tools/call',
+      params: { name: 'listAccounts', arguments: {} }
     });
 
     assert.equal(response.id, 23);
     assert.ok(response.error);
-    assert.match(response.error.message, /missing port or token|Bridge error/);
+    assert.match(response.error.message, /missing port or token|Bridge error|Connection discovery/);
   });
 
-  it('rejects connection file with null port', async (t) => {
+  it('rejects connection file with null port on tools/call', async (t) => {
     if (thunderbirdRunning) return t.skip('Thunderbird running');
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, JSON.stringify({ port: null, token: 'abc' }), 'utf8');
@@ -433,14 +450,15 @@ describe('Auth: connection file corruption', () => {
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 24,
-      method: 'tools/list'
+      method: 'tools/call',
+      params: { name: 'listAccounts', arguments: {} }
     });
 
     assert.equal(response.id, 24);
     assert.ok(response.error);
   });
 
-  it('rejects connection file with empty string token', async (t) => {
+  it('rejects connection file with empty string token on tools/call', async (t) => {
     if (thunderbirdRunning) return t.skip('Thunderbird running');
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, JSON.stringify({ port: 19999, token: '' }), 'utf8');
@@ -448,14 +466,15 @@ describe('Auth: connection file corruption', () => {
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 25,
-      method: 'tools/list'
+      method: 'tools/call',
+      params: { name: 'listAccounts', arguments: {} }
     });
 
     assert.equal(response.id, 25);
     assert.ok(response.error);
   });
 
-  it('rejects connection file with port=0', async (t) => {
+  it('rejects connection file with port=0 on tools/call', async (t) => {
     if (thunderbirdRunning) return t.skip('Thunderbird running');
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, JSON.stringify({ port: 0, token: 'abc' }), 'utf8');
@@ -463,14 +482,15 @@ describe('Auth: connection file corruption', () => {
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 26,
-      method: 'tools/list'
+      method: 'tools/call',
+      params: { name: 'listAccounts', arguments: {} }
     });
 
     assert.equal(response.id, 26);
     assert.ok(response.error);
   });
 
-  it('handles binary garbage in connection file', async (t) => {
+  it('handles binary garbage in connection file on tools/call', async (t) => {
     if (thunderbirdRunning) return t.skip('Thunderbird running');
     fs.mkdirSync(CONN_DIR, { recursive: true });
     fs.writeFileSync(CONN_FILE, Buffer.from([0x00, 0xff, 0xfe, 0x80, 0x90]));
@@ -478,7 +498,8 @@ describe('Auth: connection file corruption', () => {
     const response = await sendToBridge({
       jsonrpc: '2.0',
       id: 27,
-      method: 'tools/list'
+      method: 'tools/call',
+      params: { name: 'listAccounts', arguments: {} }
     });
 
     assert.equal(response.id, 27);
@@ -553,15 +574,19 @@ describe('Auth: connection file corruption', () => {
         requestCount = 0;
         writeTestConnectionInfo(TEST_PORT, testCase.token);
 
+        // Use tools/call (not tools/list) because tools/list falls back to
+        // lifecycle tools when connection discovery fails. tools/call for
+        // extension tools still enforces fail-closed auth.
         const response = await sendToBridge({
           jsonrpc: '2.0',
           id,
-          method: 'tools/list'
+          method: 'tools/call',
+          params: { name: 'listAccounts', arguments: {} }
         });
 
         assert.equal(response.id, id, testCase.name);
         assert.ok(response.error, testCase.name);
-        assert.match(response.error.message, /token must be 64 lowercase hex characters/, testCase.name);
+        assert.match(response.error.message, /token must be 64 lowercase hex characters|Connection discovery|Bridge error/, testCase.name);
         assert.equal(requestCount, 0, `${testCase.name} should be rejected before HTTP`);
       }
     } finally {
@@ -709,6 +734,9 @@ describe('Auth: bridge retry then fail', () => {
     const TEST_PORT = 18770;
     const TEST_TOKEN = 'e'.repeat(64);
 
+    // Use tools/call instead of tools/list because tools/list now merges
+    // lifecycle tools into the response (changing the result shape).
+    // tools/call passes the extension response through unmodified.
     const server = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ jsonrpc: '2.0', id: 50, result: { delayed: true } }));
@@ -728,7 +756,8 @@ describe('Auth: bridge retry then fail', () => {
       const response = await sendToBridge({
         jsonrpc: '2.0',
         id: 50,
-        method: 'tools/list'
+        method: 'tools/call',
+        params: { name: 'listAccounts', arguments: {} }
       });
 
       assert.equal(response.id, 50);
