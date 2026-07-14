@@ -20,7 +20,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 36 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
-Compose tools open a review window before sending by default. Set `skipReview` to send directly when you've already approved the content upstream. **Nothing gets sent without your approval.**
+Mail sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. **By default, nothing is sent or created without your review.**
 
 ---
 
@@ -62,11 +62,11 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 
 | Tool | Description |
 |------|-------------|
-| `sendMail` | Compose a new email -- opens a review window, or set `skipReview` to send directly |
-| `replyToMessage` | Reply with quoted original and proper threading -- supports `skipReview` |
-| `forwardMessage` | Forward with all original attachments preserved -- supports `skipReview` |
+| `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
+| `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block |
+| `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
 
-All compose tools open a window for you to review and edit before sending by default. Set `skipReview: true` to send directly when you've already approved the content. Attachments can be file paths or inline base64 objects.
+All compose tools open a window for you to review and edit before sending by default. The **Block `skipReview`** preference is on by default, so `skipReview: true` is rejected until you explicitly disable the preference; only then can it send directly. Attachments can be file paths or inline base64 objects.
 
 Compose tools validate the `from` identity strictly -- if the specified sender doesn't match any configured Thunderbird identity, the tool returns an error instead of silently substituting another account.
 
@@ -97,11 +97,11 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 | Tool | Description |
 |------|-------------|
 | `listCalendars` | List all calendars with read-only, event, and task support flags |
-| `createEvent` | Create a calendar event -- opens a review dialog, or set `skipReview` to add directly. Accepts `status: tentative \| confirmed \| cancelled` (VEVENT STATUS per iCal RFC 5545). |
+| `createEvent` | Create a calendar event -- opens a review dialog; direct creation via `skipReview` requires explicitly disabling the default safety block. Accepts `status: tentative \| confirmed \| cancelled` (VEVENT STATUS per iCal RFC 5545). |
 | `listEvents` | Query events by date range with recurring event expansion. Returns `status` on each event. |
 | `updateEvent` | Modify an event's title, dates, location, description, or `status` |
 | `deleteEvent` | Delete a calendar event by ID |
-| `createTask` | Open a pre-filled task dialog for review |
+| `createTask` | Open a pre-filled task dialog for review; direct creation via `skipReview` requires explicitly disabling the default safety block |
 | `listTasks` | List tasks/to-dos from calendars -- filter by completion status, due date, or calendar |
 | `updateTask` | Update a task's title, due date, description, priority, completion status, or percent complete |
 
@@ -113,7 +113,7 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 
 Account and tool access are configured via the extension settings page (Tools > Add-ons > Thunderbird MCP > Options). Access control is not MCP-exposed -- only the user can change it.
 
-The same settings page has a "Send Safety" section: toggle **Block `skipReview`** to reject `sendMail` / `replyToMessage` / `forwardMessage` calls that pass `skipReview: true`. The review-window path still works, so clients stay usable -- they just can't send silently.
+The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`; their review window or dialog still opens normally. `skipReview` is honored only after you explicitly disable this preference.
 
 ---
 

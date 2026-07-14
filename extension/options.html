@@ -288,15 +288,17 @@
 <div class="section">
   <h2>Send Safety</h2>
   <p class="mode-note">
-    When enabled, MCP clients requesting <code>skipReview: true</code> on sendMail,
-    replyToMessage, or forwardMessage are rejected. The client can still compose
-    messages -- they just always open a review window before sending.
+    This setting is enabled by default. While enabled, MCP clients requesting
+    <code>skipReview: true</code> on sendMail, replyToMessage, forwardMessage,
+    createEvent, or createTask are rejected; the review window or dialog remains
+    available. <code>skipReview</code> is honored only after you explicitly disable
+    this setting.
   </p>
   <ul class="account-list">
     <li>
       <label>
         <input type="checkbox" id="blockSkipReview">
-        <span>Block <code>skipReview</code> -- require a review window before sending</span>
+        <span>Block <code>skipReview</code> (default) -- require review for mail, events, and tasks</span>
       </label>
     </li>
   </ul>

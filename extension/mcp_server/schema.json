@@ -75,19 +75,19 @@
         "name": "getBlockSkipReview",
         "type": "function",
         "async": true,
-        "description": "Get whether skipReview is blocked by user preference",
+        "description": "Get the Block skipReview preference. It defaults to true and gates direct mail sends plus event/task creation.",
         "parameters": []
       },
       {
         "name": "setBlockSkipReview",
         "type": "function",
         "async": true,
-        "description": "Set whether skipReview is blocked by user preference",
+        "description": "Set whether skipReview is blocked. The preference defaults to true; skipReview is honored only after it is explicitly set to false.",
         "parameters": [
           {
             "name": "blockSkipReview",
             "type": "boolean",
-            "description": "When true, send/reply/forward tools reject skipReview=true and require the review window."
+            "description": "When true (the default), sendMail, replyToMessage, forwardMessage, createEvent, and createTask reject skipReview=true and require their review window or dialog. Set false explicitly to allow those tools to honor skipReview."
           }
         ]
       },
