@@ -1126,6 +1126,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       return { path: connFile.path, data: JSON.parse(text) };
     }
 
+    /**
+     * Remove the connection info file during startup or shutdown cleanup.
+     */
+    function removeConnectionInfo() {
+      try {
+        const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
+        tmpDir.append("thunderbird-mcp");
+        const connFile = tmpDir.clone();
+        connFile.append("connection.json");
+        if (connFile.exists()) {
+          connFile.remove(false);
+        }
+      } catch {
+        // Best-effort cleanup
+      }
+    }
+
     return {
       mcpServer: {
         start: async function() {
@@ -1333,23 +1350,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               converter.writeString(data);
               converter.close();
               return connFile.path;
-            }
-
-            /**
-             * Remove the connection info file on shutdown.
-             */
-            function removeConnectionInfo() {
-              try {
-                const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-                tmpDir.append("thunderbird-mcp");
-                const connFile = tmpDir.clone();
-                connFile.append("connection.json");
-                if (connFile.exists()) {
-                  connFile.remove(false);
-                }
-              } catch {
-                // Best-effort cleanup
-              }
             }
 
             function ensureConnectionInfo(port, token) {
@@ -7578,7 +7578,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     globalThis.__tbMcpStartPromise = null;
 
     // Always clean up the connection info file so stale tokens don't linger
-    // (Inlined here because removeConnectionInfo() is scoped inside start())
+    // (Inlined because getAPI() helpers are not in scope in onShutdown().)
     try {
       const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
       tmpDir.append("thunderbird-mcp");
