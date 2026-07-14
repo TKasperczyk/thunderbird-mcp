@@ -112,12 +112,17 @@ function validateAgainstSchema(value, schema, path, errors) {
     }
     const nestedProps = schema.properties || {};
     const nestedRequired = schema.required || [];
+    const hasPreferredBase64 = value.base64 !== undefined
+      && value.base64 !== null
+      && nestedProps.base64?.contentEncoding === "base64"
+      && nestedProps.content?.contentEncoding === "base64";
     for (const r of nestedRequired) {
       if (value[r] === undefined || value[r] === null) {
         errors.push(`Missing required parameter: ${path}.${r}`);
       }
     }
     for (const [k, v] of Object.entries(value)) {
+      if (k === "content" && hasPreferredBase64) continue;
       const has = Object.prototype.hasOwnProperty.call(nestedProps, k);
       if (!has) {
         if (schema.additionalProperties === false) {
@@ -262,7 +267,7 @@ const sampleTools = [
               {
                 type: "object",
                 properties: {
-                  name: { type: "string" },
+                  name: { type: "string", minLength: 1 },
                   contentType: { type: "string" },
                   base64: { type: "string", minLength: 1, contentEncoding: "base64" },
                   content: { type: "string", minLength: 1, contentEncoding: "base64" },
@@ -684,13 +689,13 @@ describe('Validation: attachment sending', () => {
   });
 
   // base64 + content together is accepted (runtime lets base64 win); validation
-  // must mirror that and not reject the redundant shape.
-  it('accepts inline attachment with both base64 and content set', () => {
+  // must not inspect malformed content when the preferred base64 is valid.
+  it('accepts inline attachment with valid base64 and malformed content', () => {
     const errors = validate('sendMail', {
       to: 'user@example.com',
       subject: 'test',
       body: 'hello',
-      attachments: [{ name: 'file.pdf', base64: 'AAAA', content: 'BBBB' }],
+      attachments: [{ name: 'file.pdf', base64: 'AAAA', content: '%%%%' }],
     });
     assert.equal(errors.length, 0);
   });
@@ -763,6 +768,22 @@ describe('Validation: attachment sending', () => {
         });
         assert.deepEqual(errors, [], `${toolName} rejected ${JSON.stringify(attachment)}: ${errors.join('; ')}`);
       }
+    });
+
+    it(`production ${toolName} schema honors base64 precedence`, () => {
+      const errors = validateProductionToolArgs(toolName, {
+        ...requiredArgs,
+        attachments: [{ name: 'file.bin', base64: 'AAAA', content: '%%%%' }],
+      });
+      assert.deepEqual(errors, []);
+    });
+
+    it(`production ${toolName} schema rejects an empty attachment name`, () => {
+      const errors = validateProductionToolArgs(toolName, {
+        ...requiredArgs,
+        attachments: [{ name: '', base64: 'AAAA' }],
+      });
+      assert.ok(errors.some(error => /at least 1 character/.test(error)), errors.join('; '));
     });
   }
 

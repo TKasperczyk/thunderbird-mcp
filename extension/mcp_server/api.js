@@ -384,7 +384,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   {
                     type: "object",
                     properties: {
-                      name: { type: "string", description: "Attachment filename" },
+                      name: { type: "string", minLength: 1, description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
                       base64: { type: "string", minLength: 1, contentEncoding: "base64", description: "Base64-encoded file content" },
                       content: { type: "string", minLength: 1, contentEncoding: "base64", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
@@ -428,7 +428,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   {
                     type: "object",
                     properties: {
-                      name: { type: "string", description: "Attachment filename" },
+                      name: { type: "string", minLength: 1, description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
                       base64: { type: "string", minLength: 1, contentEncoding: "base64", description: "Base64-encoded file content" },
                       content: { type: "string", minLength: 1, contentEncoding: "base64", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
@@ -682,7 +682,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   {
                     type: "object",
                     properties: {
-                      name: { type: "string", description: "Attachment filename" },
+                      name: { type: "string", minLength: 1, description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
                       base64: { type: "string", minLength: 1, contentEncoding: "base64", description: "Base64-encoded file content" },
                       content: { type: "string", minLength: 1, contentEncoding: "base64", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
@@ -728,7 +728,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   {
                     type: "object",
                     properties: {
-                      name: { type: "string", description: "Attachment filename" },
+                      name: { type: "string", minLength: 1, description: "Attachment filename" },
                       contentType: { type: "string", description: "MIME type, e.g. application/pdf" },
                       base64: { type: "string", minLength: 1, contentEncoding: "base64", description: "Base64-encoded file content" },
                       content: { type: "string", minLength: 1, contentEncoding: "base64", description: "Alias for base64 (accepted for backwards compatibility); base64 takes precedence when both are set" },
@@ -6762,12 +6762,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 const nestedProps = schema.properties || {};
                 const nestedRequired = schema.required || [];
+                // Inline attachment objects accept `content` as a legacy alias,
+                // but runtime uses `base64` whenever it is present. Do not reject
+                // an ignored `content` value after the preferred payload validates.
+                const hasPreferredBase64 = value.base64 !== undefined
+                  && value.base64 !== null
+                  && nestedProps.base64?.contentEncoding === "base64"
+                  && nestedProps.content?.contentEncoding === "base64";
                 for (const r of nestedRequired) {
                   if (value[r] === undefined || value[r] === null) {
                     errors.push(`Missing required parameter: ${path}.${r}`);
                   }
                 }
                 for (const [k, v] of Object.entries(value)) {
+                  if (k === "content" && hasPreferredBase64) continue;
                   const has = Object.prototype.hasOwnProperty.call(nestedProps, k);
                   if (!has) {
                     if (schema.additionalProperties === false) {
