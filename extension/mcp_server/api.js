@@ -1001,6 +1001,14 @@ const CRUD_ORDER = { read: 0, create: 1, update: 2, delete: 3 };
 const UNDISABLEABLE_TOOLS = new Set(["listAccounts", "listFolders", "getAccountAccess"]);
 const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 10000;
+// searchMessages enumerates message headers on Thunderbird's main thread, so a
+// large folder (or an unscoped, whole-account search) can freeze the UI and blow
+// past the bridge's 30s request timeout. To stay cooperative we yield to the
+// event loop every SEARCH_YIELD_EVERY headers, and abort after SEARCH_TIME_BUDGET_MS
+// (kept safely under the 30s bridge timeout) — returning partial results with a
+// `truncated` flag instead of hanging or timing out.
+const SEARCH_YIELD_EVERY = 2000;
+const SEARCH_TIME_BUDGET_MS = 20000;
 const DEFAULT_GET_MESSAGES_LIMIT = 10;
 // 20 is a reasonable upper bound for now; adjust later if usage supports it.
 const MAX_GET_MESSAGES_LIMIT = 20;
@@ -3859,7 +3867,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId) {
+	            async function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId) {
 	              // Gloda full-body search path (async)
 	              if (searchBody) {
 	                if (!GlodaMsgSearcher) return { error: "Gloda full-text index is not available" };
@@ -3906,17 +3914,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               );
               const normalizedSortOrder = sortOrder === "asc" ? "asc" : "desc";
 
-              function searchFolder(folder) {
-                if (results.length >= SEARCH_COLLECTION_CAP) return;
+              // Cooperative-scan state (see SEARCH_TIME_BUDGET_MS above).
+              const scanDeadline = Date.now() + SEARCH_TIME_BUDGET_MS;
+              let scannedCount = 0;
+              let timedOut = false;
+
+              async function searchFolder(folder, refresh) {
+                if (results.length >= SEARCH_COLLECTION_CAP || timedOut) return;
 
                 try {
-                  refreshImapFolderSync(folder);
+                  // Only force an IMAP sync for the explicitly-requested folder.
+                  // Refreshing every folder during a recursive or whole-account
+                  // scan triggers an updateFolder storm across the whole tree.
+                  if (refresh) refreshImapFolderSync(folder);
 
                   const db = folder.msgDatabase;
                   if (!db) return;
 
                   for (const msgHdr of db.enumerateMessages()) {
                     if (results.length >= SEARCH_COLLECTION_CAP) break;
+
+                    // Yield to the event loop every SEARCH_YIELD_EVERY headers so
+                    // Thunderbird's UI stays responsive, and abort the scan once
+                    // the time budget is exhausted (marking the result partial).
+                    if ((++scannedCount % SEARCH_YIELD_EVERY) === 0) {
+                      if (Date.now() > scanDeadline) { timedOut = true; break; }
+                      await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+                    }
 
                     // Check cheap numeric/boolean filters before string work
                     const msgDateTs = msgHdr.date || 0;
@@ -3978,11 +4002,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // Skip inaccessible folders
                 }
 
+                if (timedOut) return;
+
                 const recurse = includeSubfolders !== false; // default true
                 if (recurse && folder.hasSubFolders) {
                   for (const subfolder of folder.subFolders) {
-                    if (results.length >= SEARCH_COLLECTION_CAP) break;
-                    searchFolder(subfolder);
+                    if (results.length >= SEARCH_COLLECTION_CAP || timedOut) break;
+                    await searchFolder(subfolder, false);
                   }
                 }
               }
@@ -3990,23 +4016,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (folderPath) {
                 const result = getAccessibleFolder(folderPath);
                 if (result.error) return result;
-                searchFolder(result.folder);
+                await searchFolder(result.folder, true);
               } else {
                 for (const account of getAccessibleAccounts()) {
-                  if (results.length >= SEARCH_COLLECTION_CAP) break;
-                  searchFolder(account.incomingServer.rootFolder);
+                  if (results.length >= SEARCH_COLLECTION_CAP || timedOut) break;
+                  await searchFolder(account.incomingServer.rootFolder, false);
                 }
               }
+
+              const collectionCapped = results.length >= SEARCH_COLLECTION_CAP;
+              const incomplete = timedOut || collectionCapped;
+              const truncationNote = timedOut
+                ? `Search stopped after ${SEARCH_TIME_BUDGET_MS / 1000}s (${scannedCount} messages scanned); results are partial. Narrow with folderPath, includeSubfolders:false, or a date range.`
+                : `Search hit the ${SEARCH_COLLECTION_CAP}-match collection cap; results are partial. Narrow the search to see the rest.`;
 
               const finalResults = dedupByMessageId !== false ? dedupeSearchMessageResults(results) : results;
 
               if (countOnly) {
-                return { count: finalResults.length };
+                return incomplete
+                  ? { count: finalResults.length, truncated: true, message: truncationNote }
+                  : { count: finalResults.length };
               }
 
               finalResults.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
 
-              return paginate(finalResults, offset, effectiveLimit);
+              const page = paginate(finalResults, offset, effectiveLimit);
+              if (incomplete) {
+                // paginate returns a bare array when no offset was supplied; wrap it
+                // so the truncation signal always rides alongside the results.
+                const wrapped = Array.isArray(page) ? { messages: page } : page;
+                return { ...wrapped, truncated: true, message: truncationNote };
+              }
+              return page;
             }
 
             function searchContacts(query, maxResults) {
