@@ -185,6 +185,48 @@ function isSensitiveFilePath(attachmentPath) {
   const normalized = attachmentPath.replace(/\\/g, "/").toLowerCase();
   return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
 }
+
+/**
+ * Strip CR/LF (and other RFC 5322 forbidden chars) from a single-line header
+ * value before it reaches nsIMsgCompFields. Mozilla's C++ setters are expected
+ * to sanitize, but relying on undocumented downstream behavior is risky:
+ * a permissive build or future regression would let an MCP caller smuggle
+ * a hidden Bcc / extra To header through subject = "a\r\nBcc: x@y.z".
+ * This is defense in depth, not the only line of defense.
+ */
+function sanitizeHeaderLine(value) {
+  if (typeof value !== "string") return value;
+  // Replace runs of CR / LF / NUL with a single space rather than dropping
+  // them, so the result is still readable when a long subject got wrapped.
+  return value.replace(/[\r\n\0]+/g, " ");
+}
+
+// URLs that are safe to fetch with the system principal: only Thunderbird's
+// own mail-store protocols. Anything outside this list (file:, chrome:, http:,
+// resource:, jar:) would let a Thunderbird regression or extension interaction
+// turn the attachment-save path into a confused-deputy fetch primitive. We
+// pin the channel construction to exactly these schemes.
+const SYSTEM_PRINCIPAL_FETCH_SCHEMES = new Set([
+  "mailbox",
+  "mailbox-message",
+  "imap",
+  "imap-message",
+  "news",
+  "news-message",
+]);
+
+/**
+ * Return true if `url` is one of the mail-store protocols safe to fetch with
+ * the system principal. Case-insensitive scheme match; everything else (file:,
+ * chrome:, http(s):, resource:, jar:, ftp:) is rejected.
+ */
+function isSystemPrincipalFetchAllowed(url) {
+  if (typeof url !== "string" || !url) return false;
+  const colon = url.indexOf(":");
+  if (colon <= 0) return false;
+  const scheme = url.slice(0, colon).toLowerCase();
+  return SYSTEM_PRINCIPAL_FETCH_SCHEMES.has(scheme);
+}
 let _tempFileCounter = 0;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
@@ -193,6 +235,19 @@ const PREF_BLOCK_SKIPREVIEW = "extensions.thunderbird-mcp.blockSkipReview";
 const PREF_STABLE_AUTH_TOKEN = "extensions.thunderbird-mcp.stableAuthToken";
 const PREF_GET_MESSAGES_LIMIT = "extensions.thunderbird-mcp.getMessagesLimit";
 const PREF_LISTEN_ALL = "extensions.thunderbird-mcp.listenAll";
+// Gate `forward` and `reply` actions on filter creation/update. Filters run on
+// every incoming message and never open a review UI, so a single createFilter
+// call can install a permanent silent-exfiltration rule. Default is to refuse
+// these action types via the MCP API; users who legitimately need them can
+// flip this pref or create the filter manually in Thunderbird.
+const PREF_BLOCK_FILTER_FORWARD_REPLY = "extensions.thunderbird-mcp.blockFilterForwardReply";
+// Gate write operations on address books. createContact / updateContact /
+// deleteContact have no UI confirmation, span every address book the user has
+// configured, and could be used to spoof an existing contact (change Boss's
+// email to attacker@evil.com) so the user's future replies are silently
+// misrouted. Default is to refuse contact writes; users who want LLM-driven
+// contact management opt in via the options page.
+const PREF_BLOCK_CONTACT_WRITES = "extensions.thunderbird-mcp.blockContactWrites";
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
@@ -1357,6 +1412,96 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return result === 0;
             }
 
+            // Audit-log cap before rotation. 5 MB of JSON lines is roughly
+            // 10k-30k compose events depending on subject length; rotating to
+            // a single `.log.1` keeps disk use bounded without losing history.
+            const AUDIT_LOG_ROTATE_BYTES = 5 * 1024 * 1024;
+            const AUDIT_LOG_SUBDIR = "thunderbird-mcp";
+            const AUDIT_LOG_FILENAME = "audit.log";
+            const AUDIT_LOG_ROTATED_FILENAME = "audit.log.1";
+
+            /**
+             * Append a single JSON line describing an outbound-compose action
+             * (sendMail / replyToMessage / forwardMessage / saveDraft) to
+             * <ProfD>/thunderbird-mcp/audit.log. Best-effort: any failure is
+             * swallowed so disk errors never block a legitimate send.
+             *
+             * Logged fields are metadata only -- no body, no attachment
+             * content, no recipient lists beyond counts. The whole point is
+             * incident response, not message archival.
+             */
+            function appendComposeAudit(entry) {
+              try {
+                const profDir = Services.dirsvc.get("ProfD", Ci.nsIFile);
+                const auditDir = profDir.clone();
+                auditDir.append(AUDIT_LOG_SUBDIR);
+                if (!auditDir.exists()) {
+                  auditDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
+                }
+
+                const logFile = auditDir.clone();
+                logFile.append(AUDIT_LOG_FILENAME);
+
+                // Rotate when the active log exceeds the cap.
+                if (logFile.exists()) {
+                  let size = 0;
+                  try { size = logFile.fileSize; } catch { size = 0; }
+                  if (size > AUDIT_LOG_ROTATE_BYTES) {
+                    const rotated = auditDir.clone();
+                    rotated.append(AUDIT_LOG_ROTATED_FILENAME);
+                    if (rotated.exists()) {
+                      try { rotated.remove(false); } catch { /* best-effort */ }
+                    }
+                    try { logFile.moveTo(auditDir, AUDIT_LOG_ROTATED_FILENAME); } catch { /* best-effort */ }
+                  }
+                }
+
+                const line = JSON.stringify({
+                  ts: new Date().toISOString(),
+                  ...entry,
+                }) + "\n";
+
+                const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
+                  .createInstance(Ci.nsIFileOutputStream);
+                // 0x02 = O_WRONLY, 0x08 = O_CREAT, 0x10 = O_APPEND
+                ostream.init(logFile, 0x02 | 0x08 | 0x10, 0o600, 0);
+                const converter = Cc["@mozilla.org/intl/converter-output-stream;1"]
+                  .createInstance(Ci.nsIConverterOutputStream);
+                converter.init(ostream, "UTF-8");
+                converter.writeString(line);
+                converter.close();
+              } catch (e) {
+                // Audit failure must never block a send. Surface it once on the
+                // console and move on; do NOT propagate.
+                try { console.warn("thunderbird-mcp: audit log write failed:", e); } catch { /* ignore */ }
+              }
+            }
+
+            /**
+             * Summarize attachment descriptors for the audit log without
+             * leaking content. Returns {count, names, totalBytes}.
+             */
+            function summarizeAttachmentsForAudit(descs) {
+              if (!Array.isArray(descs)) return { count: 0, names: [], totalBytes: 0 };
+              let total = 0;
+              const names = [];
+              for (const d of descs) {
+                if (d && typeof d.size === "number") total += d.size;
+                if (d && d.name) names.push(String(d.name).slice(0, 200));
+              }
+              return { count: descs.length, names, totalBytes: total };
+            }
+
+            /**
+             * Count comma-separated recipients in a free-form address string
+             * without keeping the addresses themselves. Used to log "this send
+             * went to N recipients" without retaining who.
+             */
+            function countRecipients(s) {
+              if (typeof s !== "string" || !s.trim()) return 0;
+              return s.split(",").map(p => p.trim()).filter(Boolean).length;
+            }
+
             /**
              * Get the list of allowed account IDs from preferences.
              * Returns an empty array if no restriction is set (all accounts allowed).
@@ -1404,6 +1549,37 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               } catch {
                 // Fail closed: if we can't read the pref, assume blocked so the
                 // user retains ability to review before send.
+                return true;
+              }
+            }
+
+            /**
+             * Check if the user has blocked `forward` and `reply` filter actions
+             * from the MCP API. Filters execute on every incoming message with
+             * no UI, so allowing an MCP caller to create one is equivalent to
+             * giving the LLM write access to a persistent silent-exfil channel.
+             * Default true.
+             */
+            function isFilterForwardReplyBlocked() {
+              try {
+                return Services.prefs.getBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, true);
+              } catch {
+                return true;
+              }
+            }
+
+            /**
+             * Check if the user has blocked address-book write operations from
+             * the MCP API (createContact / updateContact / deleteContact).
+             * Contact writes are persistent, cross every configured address
+             * book, and have no UI confirmation -- enabling a "spoof a known
+             * sender" attack where the LLM edits Boss's email to attacker's.
+             * Default true.
+             */
+            function isContactWritesBlocked() {
+              try {
+                return Services.prefs.getBoolPref(PREF_BLOCK_CONTACT_WRITES, true);
+              } catch {
                 return true;
               }
             }
@@ -2445,12 +2621,96 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return text;
             }
 
+            // URL schemes that are safe to surface verbatim inside markdown
+            // [text](url) and ![alt](src) constructs. Email bodies routinely
+            // contain links to web pages, mailto: addresses, and inline CID
+            // image references; everything else (javascript:, data: non-image,
+            // vbscript:, file:, chrome:, jar:, blob:, ...) gets dropped to
+            // plain text so a downstream markdown renderer cannot produce a
+            // clickable javascript: link.
+            const SAFE_HREF_SCHEMES = new Set(["http", "https", "mailto", "tel", "cid", "ftp", "ftps"]);
+
+            /**
+             * Return true if `url` is acceptable as the target of a markdown
+             * link or image. Plain relative URLs (no scheme) are accepted --
+             * a downstream renderer will resolve them relative to nothing,
+             * which is harmless. Anything with an unknown or dangerous scheme
+             * is rejected.
+             */
+            function isSafeMarkdownHref(url) {
+              if (typeof url !== "string") return false;
+              const trimmed = url.trim();
+              if (!trimmed) return false;
+              // Strip leading whitespace + control chars before the scheme so
+              // " javascript:..." with NBSP/tab/CR/LF can't slip through.
+              const cleaned = trimmed.replace(/^[\s -]+/, "");
+              const colon = cleaned.indexOf(":");
+              const slash = cleaned.indexOf("/");
+              const question = cleaned.indexOf("?");
+              const hash = cleaned.indexOf("#");
+              // No colon, or the first colon comes after a path separator
+              // (e.g. "foo/bar:baz") -- treat as a relative URL.
+              if (colon === -1) return true;
+              if (slash !== -1 && slash < colon) return true;
+              if (question !== -1 && question < colon) return true;
+              if (hash !== -1 && hash < colon) return true;
+              const scheme = cleaned.slice(0, colon).toLowerCase();
+              return SAFE_HREF_SCHEMES.has(scheme);
+            }
+
+            /**
+             * Same as isSafeMarkdownHref, but `data:image/...` is also allowed
+             * because inline images are a legitimate email pattern. Other
+             * data: payloads remain blocked.
+             */
+            function isSafeImageSrc(url) {
+              if (isSafeMarkdownHref(url)) return true;
+              if (typeof url !== "string") return false;
+              const cleaned = url.trim().replace(/^[\s -]+/, "").toLowerCase();
+              return cleaned.startsWith("data:image/");
+            }
+
+            /**
+             * Escape characters that would let attacker-controlled `<a>` text
+             * close the visible-text bracket and rebind to a different URL.
+             * <a href="https://good">click](javascript:bad)</a> would otherwise
+             * produce [click](javascript:bad)](https://good) -- the first
+             * `](` pair wins in most markdown renderers.
+             */
+            function escapeMarkdownLinkText(s) {
+              return String(s).replace(/[[\]]/g, m => m === "[" ? "\\[" : "\\]");
+            }
+
+            /**
+             * Pick the URL form for a markdown link. If the URL contains
+             * parentheses or whitespace the parenthesized form `[text](url)`
+             * is ambiguous, so wrap the URL in angle brackets `<url>` per
+             * CommonMark. If it contains `>` the wrap would also break, in
+             * which case drop the link target and keep just the visible text.
+             */
+            function renderMarkdownLink(text, url) {
+              const safeText = escapeMarkdownLinkText(text);
+              if (url.includes(">")) {
+                // Cannot safely wrap; fall back to text-only.
+                return safeText;
+              }
+              if (/[()\s]/.test(url)) {
+                return `[${safeText}](<${url}>)`;
+              }
+              return `[${safeText}](${url})`;
+            }
+
             /**
              * Converts HTML to markdown using DOMParser for structure-preserving
              * body extraction. Handles headings, links, bold/italic, lists,
              * blockquotes, code blocks, images, and horizontal rules. Email
              * tables (usually layout, not data) are flattened to text.
              * Falls back to stripHtml if DOMParser is unavailable.
+             *
+             * SECURITY: `<a href>` and `<img src>` values come from sender-
+             * controlled HTML, so we strip dangerous schemes (javascript:,
+             * data: non-image, etc.) and defang markdown-syntax injection in
+             * the link text before emitting the final markdown.
              */
             function htmlToMarkdown(html) {
               if (!html) return "";
@@ -2490,23 +2750,40 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return t ? "*" + t + "*" : "";
                     }
                     case "a": {
-                      const href = node.getAttribute("href") || "";
+                      const rawHref = node.getAttribute("href") || "";
                       const text = inner().trim();
-                      // Skip empty/anchor-only links and mailto: without text
-                      if (!text && !href) return "";
-                      if (href && text && text !== href) return `[${text}](${href})`;
-                      return text || href;
+                      // Skip empty/anchor-only links
+                      if (!text && !rawHref) return "";
+                      // Drop unsafe href schemes (javascript:, data: non-image,
+                      // vbscript:, file:, chrome:, jar:, blob:, ...). Fall back
+                      // to the visible text so the message stays readable.
+                      if (rawHref && !isSafeMarkdownHref(rawHref)) {
+                        return escapeMarkdownLinkText(text || rawHref);
+                      }
+                      if (rawHref && text && text !== rawHref) {
+                        return renderMarkdownLink(text, rawHref);
+                      }
+                      return escapeMarkdownLinkText(text || rawHref);
                     }
                     case "img": {
                       const alt = node.getAttribute("alt") || "";
-                      const src = node.getAttribute("src") || "";
+                      const rawSrc = node.getAttribute("src") || "";
                       // Skip tracking pixels (1x1, tiny, or data: without alt)
                       const w = parseInt(node.getAttribute("width")) || 0;
                       const h = parseInt(node.getAttribute("height")) || 0;
                       if ((w > 0 && w <= 3) || (h > 0 && h <= 3)) return "";
-                      if (src.startsWith("data:") && !alt) return "";
-                      if (src) return `![${alt}](${src})`;
-                      return alt;
+                      if (rawSrc.startsWith("data:") && !alt) return "";
+                      // Allow http(s):, cid:, mailto: (rare), and data:image/*.
+                      // Anything else (javascript:, data: non-image, file:, ...)
+                      // is dropped to alt text.
+                      if (rawSrc && !isSafeImageSrc(rawSrc)) {
+                        return escapeMarkdownLinkText(alt);
+                      }
+                      if (!rawSrc) return escapeMarkdownLinkText(alt);
+                      const safeAlt = escapeMarkdownLinkText(alt);
+                      if (rawSrc.includes(">")) return safeAlt;
+                      const srcForMd = /[()\s]/.test(rawSrc) ? `<${rawSrc}>` : rawSrc;
+                      return `![${safeAlt}](${srcForMd})`;
                     }
                     case "code": return "`" + node.textContent + "`";
                     case "pre": return "\n\n```\n" + node.textContent.trim() + "\n```\n\n";
@@ -2589,25 +2866,53 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
+             * Wrap an attacker-controlled body snippet in explicit delimiters
+             * so an LLM consuming the MCP response has a structural cue that
+             * the wrapped region is data, not instructions. This is defense in
+             * depth against prompt injection -- a well-behaved LLM will be
+             * told by its system prompt to treat anything inside the markers
+             * as untrusted content. It does NOT prevent injection by itself.
+             *
+             * Applied only to text/markdown bodies returned to the model.
+             * Callers asking for raw HTML or rawSource get the unwrapped form
+             * because they are likely parsing it programmatically.
+             */
+            const UNTRUSTED_OPEN = "<untrusted_email_body>";
+            const UNTRUSTED_CLOSE = "</untrusted_email_body>";
+            function wrapUntrustedBody(text) {
+              if (typeof text !== "string" || !text) return text;
+              // Defang any existing close-marker the sender embedded so they
+              // cannot terminate the wrap and escape into instruction-land.
+              const safe = text.split(UNTRUSTED_CLOSE).join("</untrusted_email_body​>");
+              return `${UNTRUSTED_OPEN}\n${safe}\n${UNTRUSTED_CLOSE}`;
+            }
+
+            function wrapUntrustedPreview(text) {
+              if (typeof text !== "string" || !text) return text;
+              const safe = text.split(UNTRUSTED_CLOSE).join("</untrusted_email_body​>");
+              return `${UNTRUSTED_OPEN} ${safe} ${UNTRUSTED_CLOSE}`;
+            }
+
+            /**
              * Extracts body from a MIME message in the requested format.
              * For "text": uses coerceBodyToPlaintext fast path (original behavior).
              * For "markdown"/"html": walks MIME tree to find raw HTML content.
              */
             function extractFormattedBody(aMimeMsg, bodyFormat) {
               if (bodyFormat === "text") {
-                return { body: extractPlainTextBody(aMimeMsg), bodyIsHtml: false };
+                return { body: wrapUntrustedBody(extractPlainTextBody(aMimeMsg)), bodyIsHtml: false };
               }
               // For markdown/html: need raw MIME content, not coerced text
               const { text, isHtml } = extractBodyContent(aMimeMsg);
               if (!text) {
                 // MIME tree empty -- try coerce as last resort
                 const fallback = extractPlainTextBody(aMimeMsg);
-                return { body: fallback, bodyIsHtml: false };
+                return { body: wrapUntrustedBody(fallback), bodyIsHtml: false };
               }
-              if (!isHtml) return { body: text, bodyIsHtml: false };
+              if (!isHtml) return { body: wrapUntrustedBody(text), bodyIsHtml: false };
               if (bodyFormat === "html") return { body: text, bodyIsHtml: true };
               // Default: markdown
-              return { body: htmlToMarkdown(text), bodyIsHtml: false };
+              return { body: wrapUntrustedBody(htmlToMarkdown(text)), bodyIsHtml: false };
             }
 
             /**
@@ -2891,7 +3196,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             tags: msgTags,
                             _dateTs: msgDateTs
                           };
-                          if (preview) result.preview = preview;
+                          if (preview) result.preview = wrapUntrustedPreview(preview);
                           results.push(result);
                         }
 
@@ -3028,7 +3333,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tags: msgTags,
                       _dateTs: msgDateTs
                     };
-                    if (preview) result.preview = preview;
+                    if (preview) result.preview = wrapUntrustedPreview(preview);
                     results.push(result);
                   }
                 } catch {
@@ -3136,9 +3441,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function createContact(email, displayName, firstName, lastName, addressBookId) {
               try {
+                if (isContactWritesBlocked()) {
+                  return { error: "User preference blocks contact writes via MCP. Enable 'Allow contact writes' in the extension options page if you trust this MCP client to manage your address book." };
+                }
                 if (typeof email !== "string" || !email) {
                   return { error: "email must be a non-empty string" };
                 }
+                appendComposeAudit({
+                  tool: "createContact",
+                  email: typeof email === "string" ? email.slice(0, 200) : null,
+                  addressBookId: typeof addressBookId === "string" ? addressBookId : null,
+                });
 
                 // Find the target address book
                 let targetBook = null;
@@ -3187,6 +3500,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function updateContact(contactId, email, displayName, firstName, lastName) {
               try {
+                if (isContactWritesBlocked()) {
+                  return { error: "User preference blocks contact writes via MCP. Enable 'Allow contact writes' in the extension options page if you trust this MCP client to manage your address book." };
+                }
                 if (typeof contactId !== "string" || !contactId) {
                   return { error: "contactId must be a non-empty string" };
                 }
@@ -3194,6 +3510,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const found = findContactByUID(contactId);
                 if (found.error) return found;
                 const { card, book } = found;
+
+                // Log the change BEFORE mutating so the audit captures the old
+                // email -- crucial when an attacker repoints "Boss" at their
+                // own address. Persist as much identifying detail as we can
+                // without storing the full contact card.
+                appendComposeAudit({
+                  tool: "updateContact",
+                  contactId,
+                  bookName: book.dirName,
+                  bookURI: book.URI,
+                  oldEmail: card.primaryEmail || null,
+                  newEmail: typeof email === "string" ? email.slice(0, 200) : null,
+                });
 
                 if (email !== undefined) card.primaryEmail = email;
                 if (displayName !== undefined) card.displayName = displayName;
@@ -3216,6 +3545,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function deleteContact(contactId) {
               try {
+                if (isContactWritesBlocked()) {
+                  return { error: "User preference blocks contact writes via MCP. Enable 'Allow contact writes' in the extension options page if you trust this MCP client to manage your address book." };
+                }
                 if (typeof contactId !== "string" || !contactId) {
                   return { error: "contactId must be a non-empty string" };
                 }
@@ -3223,6 +3555,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const found = findContactByUID(contactId);
                 if (found.error) return found;
                 const { card, book } = found;
+
+                appendComposeAudit({
+                  tool: "deleteContact",
+                  contactId,
+                  bookName: book.dirName,
+                  bookURI: book.URI,
+                  email: card.primaryEmail || null,
+                  displayName: card.displayName || null,
+                });
 
                 book.deleteCards([card]);
                 return {
@@ -4612,9 +4953,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           try {
                             const svc = MailServices.messageServiceFromURI(msgUri);
                             const baseUri = svc.getUrlForUri(msgUri);
-                            // Append part parameter to the resolved fetchable URL
+                            // Append part parameter to the resolved fetchable URL.
+                            // URL-encode partName: it is structural (e.g. "1.2.1")
+                            // in current Thunderbird but encoding it costs nothing
+                            // and closes any future regression where a non-digit
+                            // character could land inside a URL query value.
                             const sep = baseUri.spec.includes("?") ? "&" : "?";
-                            partUrl = `${baseUri.spec}${sep}part=${part.partName}`;
+                            partUrl = `${baseUri.spec}${sep}part=${encodeURIComponent(part.partName)}`;
                           } catch {
                             partUrl = "";
                           }
@@ -4863,6 +5208,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             return;
                           }
 
+                          // SECURITY: the channel uses the system principal so
+                          // mail-store protocols (mailbox:, imap-message:, ...)
+                          // can be fetched without sandboxing. That privilege
+                          // would let a file:// or chrome:// URL slipping into
+                          // `url` exfiltrate arbitrary local files or read
+                          // internal browser resources, so we hard-require an
+                          // allow-listed mail-store scheme here. This is
+                          // defense in depth: Thunderbird itself supplies the
+                          // URLs we feed into this code path, but if a future
+                          // regression or extension interaction ever returned
+                          // a non-mail scheme, this check refuses to fetch it.
+                          if (!isSystemPrincipalFetchAllowed(url)) {
+                            info.error = `Refusing to fetch attachment from non-mail-store URL: ${String(url).slice(0, 80)}`;
+                            try { file.remove(false); } catch {}
+                            done();
+                            return;
+                          }
                           const channel = NetUtil.newChannel({
                             uri: url,
                             loadUsingSystemPrincipal: true
@@ -5049,6 +5411,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (skipReview && isSkipReviewBlocked()) {
                   return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
                 }
+                appendComposeAudit({
+                  tool: "sendMail",
+                  skipReview: !!skipReview,
+                  isHtml: !!isHtml,
+                  from: typeof from === "string" ? from : null,
+                  to: countRecipients(to),
+                  cc: countRecipients(cc),
+                  bcc: countRecipients(bcc),
+                  subject: typeof subject === "string" ? subject.slice(0, 200) : null,
+                  attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                });
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
 
@@ -5058,7 +5431,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeFields.to = to || "";
                 composeFields.cc = cc || "";
                 composeFields.bcc = bcc || "";
-                composeFields.subject = subject || "";
+                composeFields.subject = sanitizeHeaderLine(subject || "");
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
@@ -5125,6 +5498,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              */
             function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments) {
               try {
+                appendComposeAudit({
+                  tool: "saveDraft",
+                  isHtml: !!isHtml,
+                  from: typeof from === "string" ? from : null,
+                  to: countRecipients(to),
+                  cc: countRecipients(cc),
+                  bcc: countRecipients(bcc),
+                  subject: typeof subject === "string" ? subject.slice(0, 200) : null,
+                  attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                });
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
 
@@ -5134,7 +5517,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeFields.to = to || "";
                 composeFields.cc = cc || "";
                 composeFields.bcc = bcc || "";
-                composeFields.subject = subject || "";
+                composeFields.subject = sanitizeHeaderLine(subject || "");
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
@@ -5193,6 +5576,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
 	                    return;
 	                  }
+	                  appendComposeAudit({
+	                    tool: "replyToMessage",
+	                    skipReview: !!skipReview,
+	                    replyAll: !!replyAll,
+	                    isHtml: !!isHtml,
+	                    from: typeof from === "string" ? from : null,
+	                    originalMessageId: typeof messageId === "string" ? messageId.slice(0, 256) : null,
+	                    to: countRecipients(to),
+	                    cc: countRecipients(cc),
+	                    bcc: countRecipients(bcc),
+	                    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+	                  });
 	                  const found = findMessage(messageId, folderPath);
 	                  if (found.error) {
 	                    resolve({ error: found.error });
@@ -5262,7 +5657,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
 	                        composeFields.bcc = bcc || "";
 
-	                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+	                        const origSubject = sanitizeHeaderLine(msgHdr.mime2DecodedSubject || msgHdr.subject || "");
 	                        composeFields.subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`;
 	                        composeFields.references = `<${messageId}>`;
 	                        composeFields.setHeader("In-Reply-To", `<${messageId}>`);
@@ -5359,6 +5754,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
                     return;
                   }
+                  appendComposeAudit({
+                    tool: "forwardMessage",
+                    skipReview: !!skipReview,
+                    isHtml: !!isHtml,
+                    from: typeof from === "string" ? from : null,
+                    originalMessageId: typeof messageId === "string" ? messageId.slice(0, 256) : null,
+                    to: countRecipients(to),
+                    cc: countRecipients(cc),
+                    bcc: countRecipients(bcc),
+                    attachmentCount: Array.isArray(attachments) ? attachments.length : 0,
+                  });
                   const found = findMessage(messageId, folderPath);
                   if (found.error) {
                     resolve({ error: found.error });
@@ -5412,7 +5818,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         composeFields.cc = cc || "";
                         composeFields.bcc = bcc || "";
 
-                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                        const origSubject = sanitizeHeaderLine(msgHdr.mime2DecodedSubject || msgHdr.subject || "");
                         composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
 
                         const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
@@ -5595,7 +6001,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tags: msgTags,
                       _dateTs: msgDateTs
                     };
-                    if (preview) result.preview = preview;
+                    if (preview) result.preview = wrapUntrustedPreview(preview);
                     results.push(result);
                   }
                 } catch {
@@ -6271,6 +6677,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   throw new Error(`Unknown action type: ${act.type}`);
                 }
                 const typeNum = ACTION_MAP[act.type];
+
+                // SECURITY: forward (0x0B) and reply (0x0A) filter actions run on
+                // every incoming message with no UI, so an MCP caller that can
+                // create one effectively installs a permanent silent-exfiltration
+                // rule. Block these action types unless the user has explicitly
+                // opted in via the options page. Move/copy/tag/markRead etc.
+                // remain available -- this only restricts the network-egress
+                // action types.
+                if ((typeNum === 0x0A || typeNum === 0x0B) && isFilterForwardReplyBlocked()) {
+                  throw new Error(
+                    `Filter action '${act.type}' is blocked by user preference. ` +
+                    `Forward/reply filter actions run silently on every message ` +
+                    `and are not permitted via the MCP API by default. ` +
+                    `Enable them in the extension options page if needed, ` +
+                    `or have the user create the filter directly in Thunderbird.`
+                  );
+                }
+
                 action.type = typeNum;
 
                 if (act.value) {
@@ -7365,6 +7789,38 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           // choice survives independent of the default we ship.
           Services.prefs.setBoolPref(PREF_BLOCK_SKIPREVIEW, blockSkipReview);
           return { success: true, blockSkipReview };
+        },
+
+        getBlockFilterForwardReply: async function() {
+          let blocked = true;
+          try {
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, true);
+          } catch { /* ignore */ }
+          return { blockFilterForwardReply: blocked };
+        },
+
+        setBlockFilterForwardReply: async function(blockFilterForwardReply) {
+          if (typeof blockFilterForwardReply !== "boolean") {
+            return { error: "blockFilterForwardReply must be a boolean" };
+          }
+          Services.prefs.setBoolPref(PREF_BLOCK_FILTER_FORWARD_REPLY, blockFilterForwardReply);
+          return { success: true, blockFilterForwardReply };
+        },
+
+        getBlockContactWrites: async function() {
+          let blocked = true;
+          try {
+            blocked = Services.prefs.getBoolPref(PREF_BLOCK_CONTACT_WRITES, true);
+          } catch { /* ignore */ }
+          return { blockContactWrites: blocked };
+        },
+
+        setBlockContactWrites: async function(blockContactWrites) {
+          if (typeof blockContactWrites !== "boolean") {
+            return { error: "blockContactWrites must be a boolean" };
+          }
+          Services.prefs.setBoolPref(PREF_BLOCK_CONTACT_WRITES, blockContactWrites);
+          return { success: true, blockContactWrites };
         },
 
         getStableAuthToken: async function() {
