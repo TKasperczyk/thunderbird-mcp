@@ -343,9 +343,15 @@ describe('Contact write: validation edge cases', () => {
           displayName: { type: "string" },
           firstName: { type: "string" },
           lastName: { type: "string" },
+          phones: { type: "array" },
+          addresses: { type: "array" },
+          organization: { type: "string" },
+          title: { type: "string" },
+          note: { type: "string" },
+          birthday: { type: "string" },
           addressBookId: { type: "string" },
         },
-        required: ["email"],
+        required: [],
       },
     },
     {
@@ -358,6 +364,12 @@ describe('Contact write: validation edge cases', () => {
           displayName: { type: "string" },
           firstName: { type: "string" },
           lastName: { type: "string" },
+          phones: { type: "array" },
+          addresses: { type: "array" },
+          organization: { type: "string" },
+          title: { type: "string" },
+          note: { type: "string" },
+          birthday: { type: "string" },
         },
         required: ["contactId"],
       },
@@ -375,9 +387,9 @@ describe('Contact write: validation edge cases', () => {
   ];
   const contactValidate = createValidator(contactTools);
 
-  it('rejects createContact with null email', () => {
+  it('allows omitted contact fields at the schema layer', () => {
     const errors = contactValidate('createContact', { email: null });
-    assert.ok(errors.some(e => e.includes('email')));
+    assert.equal(errors.length, 0);
   });
 
   it('rejects createContact with array email', () => {
@@ -420,6 +432,12 @@ describe('Contact write: validation edge cases', () => {
       displayName: 'Test',
       firstName: 'First',
       lastName: 'Last',
+      phones: [{ type: 'mobile', number: '555-0100' }],
+      addresses: [{ type: 'home', city: 'Warsaw' }],
+      organization: 'Example Corp',
+      title: 'Engineer',
+      note: 'note',
+      birthday: '--04-15',
       addressBookId: 'book-1',
     });
     assert.equal(errors.length, 0);

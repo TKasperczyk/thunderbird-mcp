@@ -92,6 +92,7 @@ const ALL_TOOLS = [
   { name: "emptyTrash", group: "folders", crud: "delete" },
   { name: "emptyJunk", group: "folders", crud: "delete" },
   { name: "searchContacts", group: "contacts", crud: "read" },
+  { name: "getContact", group: "contacts", crud: "read" },
   { name: "createContact", group: "contacts", crud: "create" },
   { name: "updateContact", group: "contacts", crud: "update" },
   { name: "deleteContact", group: "contacts", crud: "delete" },

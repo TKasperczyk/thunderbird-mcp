@@ -234,6 +234,47 @@ function createValidator(tools) {
 }
 
 // Tool definitions matching the schemas in api.js for new tools
+const contactFieldProperties = {
+  email: { type: "string" },
+  displayName: { type: "string" },
+  firstName: { type: "string" },
+  lastName: { type: "string" },
+  phones: {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        type: { type: "string", enum: ["work", "home", "mobile", "fax", "pager"] },
+        number: { type: "string" },
+      },
+      required: ["type", "number"],
+      additionalProperties: false,
+    },
+  },
+  addresses: {
+    type: "array",
+    items: {
+      type: "object",
+      properties: {
+        type: { type: "string", enum: ["home", "work"] },
+        poBox: { type: "string" },
+        street: { type: "string" },
+        street2: { type: "string" },
+        city: { type: "string" },
+        region: { type: "string" },
+        postalCode: { type: "string" },
+        country: { type: "string" },
+      },
+      required: ["type"],
+      additionalProperties: false,
+    },
+  },
+  organization: { type: "string" },
+  title: { type: "string" },
+  note: { type: "string" },
+  birthday: { type: "string" },
+};
+
 const sampleTools = [
   {
     name: "searchMessages",
@@ -291,13 +332,20 @@ const sampleTools = [
     inputSchema: {
       type: "object",
       properties: {
-        email: { type: "string" },
-        displayName: { type: "string" },
-        firstName: { type: "string" },
-        lastName: { type: "string" },
+        ...contactFieldProperties,
         addressBookId: { type: "string" },
       },
-      required: ["email"],
+      required: [],
+    },
+  },
+  {
+    name: "getContact",
+    inputSchema: {
+      type: "object",
+      properties: {
+        contactId: { type: "string" },
+      },
+      required: ["contactId"],
     },
   },
   {
@@ -306,10 +354,7 @@ const sampleTools = [
       type: "object",
       properties: {
         contactId: { type: "string" },
-        email: { type: "string" },
-        displayName: { type: "string" },
-        firstName: { type: "string" },
-        lastName: { type: "string" },
+        ...contactFieldProperties,
       },
       required: ["contactId"],
     },
@@ -884,16 +929,20 @@ describe('Validation: attachment sending', () => {
 });
 
 describe('Validation: contact write operations', () => {
-  it('createContact requires email', () => {
+  it('createContact no longer requires email at the schema layer', () => {
     const errors = validate('createContact', {});
-    assert.equal(errors.length, 1);
-    assert.match(errors[0], /email/);
+    assert.equal(errors.length, 0);
   });
 
-  it('createContact accepts valid params', () => {
+  it('createContact accepts all structured contact fields', () => {
     const errors = validate('createContact', {
-      email: 'user@example.com',
       displayName: 'Test User',
+      phones: [{ type: 'mobile', number: '+48 123 456 789' }],
+      addresses: [{ type: 'work', street: '1 Main St', city: 'Warsaw' }],
+      organization: 'Example Corp',
+      title: 'Engineer',
+      note: 'first line\nsecond line',
+      birthday: '--04-15',
     });
     assert.equal(errors.length, 0);
   });
@@ -904,6 +953,25 @@ describe('Validation: contact write operations', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must be string/);
+  });
+
+  it('createContact deep-validates phone and address item schemas', () => {
+    const phoneErrors = validate('createContact', {
+      phones: [{ type: 'cell', number: '123' }],
+    });
+    assert.ok(phoneErrors.some(error => /must be one of/.test(error)));
+
+    const addressErrors = validate('createContact', {
+      addresses: [{ type: 'home', city: 'Warsaw', label: 'private' }],
+    });
+    assert.ok(addressErrors.some(error => /Unknown parameter: addresses\[0\]\.label/.test(error)));
+  });
+
+  it('getContact requires a contactId', () => {
+    const missing = validate('getContact', {});
+    assert.equal(missing.length, 1);
+    assert.match(missing[0], /contactId/);
+    assert.deepEqual(validate('getContact', { contactId: 'uid-123' }), []);
   });
 
   it('updateContact requires contactId', () => {

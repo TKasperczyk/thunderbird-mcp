@@ -84,6 +84,502 @@ function ensureFreshConnectionInfo({
 }
 // END CONNECTION INFO REFRESH HELPERS
 
+// BEGIN CONTACT FIELD HELPERS
+const CONTACT_PHONE_TYPES = ["work", "home", "mobile", "fax", "pager"];
+const CONTACT_ADDRESS_TYPES = ["home", "work"];
+const CONTACT_ADDRESS_FIELDS = [
+  "poBox",
+  "street2",
+  "street",
+  "city",
+  "region",
+  "postalCode",
+  "country",
+];
+const CONTACT_SCALAR_FIELDS = [
+  "email",
+  "displayName",
+  "firstName",
+  "lastName",
+  "organization",
+  "title",
+  "note",
+  "birthday",
+];
+const CONTACT_PHONE_FLAT_PROPERTIES = {
+  work: "WorkPhone",
+  home: "HomePhone",
+  mobile: "CellularNumber",
+  fax: "FaxNumber",
+  pager: "PagerNumber",
+};
+const CONTACT_ADDRESS_FLAT_PROPERTIES = {
+  home: [
+    "HomePOBox",
+    "HomeAddress2",
+    "HomeAddress",
+    "HomeCity",
+    "HomeState",
+    "HomeZipCode",
+    "HomeCountry",
+  ],
+  work: [
+    "WorkPOBox",
+    "WorkAddress2",
+    "WorkAddress",
+    "WorkCity",
+    "WorkState",
+    "WorkZipCode",
+    "WorkCountry",
+  ],
+};
+
+function contactValueToString(value, separator = ",") {
+  if (Array.isArray(value)) {
+    return value.map(part => {
+      if (Array.isArray(part)) return part.join(" ");
+      return part === null || part === undefined ? "" : String(part);
+    }).join(separator);
+  }
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function contactStructuredValuePart(value) {
+  if (Array.isArray(value)) return value.join(" ");
+  return value === null || value === undefined ? "" : String(value);
+}
+
+function getContactVCardTypes(entry) {
+  const type = entry?.params?.type;
+  if (!type) return [];
+  const types = Array.isArray(type) ? type : [type];
+  return types
+    .filter(value => typeof value === "string")
+    .map(value => value.toLowerCase());
+}
+
+function getContactPhoneType(entry) {
+  const vCardType = getContactVCardTypes(entry)
+    .find(type => ["home", "work", "cell", "fax", "pager"].includes(type));
+  if (vCardType === "cell") return "mobile";
+  return vCardType || "work";
+}
+
+function getContactAddressType(entry) {
+  return getContactVCardTypes(entry).includes("home") ? "home" : "work";
+}
+
+function isContactLeapYear(year) {
+  return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+}
+
+function isValidContactBirthdayParts(year, month, day) {
+  const numericMonth = Number(month);
+  const numericDay = Number(day);
+  if (!Number.isInteger(numericMonth) || numericMonth < 1 || numericMonth > 12) {
+    return false;
+  }
+  const numericYear = year ? Number(year) : 2000;
+  if (year && (!/^\d{4}$/.test(year) || numericYear < 1)) return false;
+  const daysInMonth = [
+    31,
+    isContactLeapYear(numericYear) ? 29 : 28,
+    31,
+    30,
+    31,
+    30,
+    31,
+    31,
+    30,
+    31,
+    30,
+    31,
+  ];
+  return Number.isInteger(numericDay) && numericDay >= 1 && numericDay <= daysInMonth[numericMonth - 1];
+}
+
+/**
+ * Normalize API and serialized vCard birthday forms to YYYY-MM-DD/--MM-DD.
+ * Returns null for invalid input and an empty string for an explicit clear.
+ */
+function normalizeContactBirthday(value) {
+  if (typeof value !== "string") return null;
+  if (value === "") return "";
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  let match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (!match) match = /^(\d{4})(\d{2})(\d{2})$/.exec(trimmed);
+  if (match) {
+    const [, year, month, day] = match;
+    return isValidContactBirthdayParts(year, month, day)
+      ? `${year}-${month}-${day}`
+      : null;
+  }
+
+  match = /^--(\d{2})-(\d{2})$/.exec(trimmed);
+  if (!match) match = /^--(\d{2})(\d{2})$/.exec(trimmed);
+  if (match) {
+    const [, month, day] = match;
+    return isValidContactBirthdayParts("", month, day)
+      ? `--${month}-${day}`
+      : null;
+  }
+  return null;
+}
+
+function contactBirthdayToVCard(value) {
+  // VCardPropertyEntry stores ICAL's normalized jCard value. ICAL removes the
+  // separators as needed when the card is serialized.
+  return normalizeContactBirthday(value) || "";
+}
+
+function contactBirthdayToFlatParts(value) {
+  const normalized = normalizeContactBirthday(value);
+  if (!normalized) return { year: "", month: "", day: "" };
+  if (normalized.startsWith("--")) {
+    return {
+      year: "",
+      month: normalized.slice(2, 4),
+      day: normalized.slice(5, 7),
+    };
+  }
+  return {
+    year: normalized.slice(0, 4),
+    month: normalized.slice(5, 7),
+    day: normalized.slice(8, 10),
+  };
+}
+
+function getContactCardProperty(card, name) {
+  try {
+    const value = card.getProperty(name, "");
+    return value === null || value === undefined ? "" : String(value);
+  } catch {
+    return "";
+  }
+}
+
+function readVCardContactFields(card) {
+  const vCardProperties = card.vCardProperties;
+  const phones = vCardProperties.getAllEntries("tel").map(entry => ({
+    type: getContactPhoneType(entry),
+    number: contactValueToString(entry.value).replace(/^tel:/i, "").trim(),
+  })).filter(phone => phone.number);
+
+  const addresses = [];
+  for (const entry of vCardProperties.getAllEntries("adr")) {
+    const rawParts = Array.isArray(entry.value) ? entry.value : [entry.value];
+    const parts = CONTACT_ADDRESS_FIELDS.map((field, index) =>
+      contactStructuredValuePart(rawParts[index])
+    );
+    if (!parts.some(Boolean)) continue;
+    const address = { type: getContactAddressType(entry) };
+    for (let i = 0; i < CONTACT_ADDRESS_FIELDS.length; i++) {
+      if (parts[i]) address[CONTACT_ADDRESS_FIELDS[i]] = parts[i];
+    }
+    addresses.push(address);
+  }
+
+  const organizationValue = vCardProperties.getFirstValue("org");
+  const organization = Array.isArray(organizationValue)
+    ? contactStructuredValuePart(organizationValue[0])
+    : contactValueToString(organizationValue);
+  const birthdayValue = contactValueToString(vCardProperties.getFirstValue("bday"));
+
+  return {
+    phones,
+    addresses,
+    organization,
+    title: contactValueToString(vCardProperties.getFirstValue("title")),
+    note: contactValueToString(vCardProperties.getFirstValue("note")),
+    birthday: normalizeContactBirthday(birthdayValue) || "",
+  };
+}
+
+function readFlatContactFields(card) {
+  const phones = [];
+  for (const type of CONTACT_PHONE_TYPES) {
+    const number = getContactCardProperty(card, CONTACT_PHONE_FLAT_PROPERTIES[type]);
+    if (number) phones.push({ type, number });
+  }
+
+  const addresses = [];
+  for (const type of CONTACT_ADDRESS_TYPES) {
+    const properties = CONTACT_ADDRESS_FLAT_PROPERTIES[type];
+    const values = properties.map(name => getContactCardProperty(card, name));
+    if (!values.some(Boolean)) continue;
+    const address = { type };
+    for (let i = 0; i < CONTACT_ADDRESS_FIELDS.length; i++) {
+      if (values[i]) address[CONTACT_ADDRESS_FIELDS[i]] = values[i];
+    }
+    addresses.push(address);
+  }
+
+  const year = getContactCardProperty(card, "BirthYear").trim();
+  const rawMonth = getContactCardProperty(card, "BirthMonth").trim();
+  const rawDay = getContactCardProperty(card, "BirthDay").trim();
+  let birthday = "";
+  if (rawMonth && rawDay) {
+    const month = rawMonth.padStart(2, "0");
+    const day = rawDay.padStart(2, "0");
+    birthday = normalizeContactBirthday(year ? `${year}-${month}-${day}` : `--${month}-${day}`) || "";
+  }
+
+  return {
+    phones,
+    addresses,
+    organization: getContactCardProperty(card, "Company"),
+    title: getContactCardProperty(card, "JobTitle"),
+    note: getContactCardProperty(card, "Notes"),
+    birthday,
+  };
+}
+
+function readContactFields(card) {
+  if (card.supportsVCard) {
+    try {
+      return readVCardContactFields(card);
+    } catch {
+      // A malformed vCard should not prevent the rest of an address book from
+      // being searched. Legacy properties are the best available fallback.
+    }
+  }
+  return readFlatContactFields(card);
+}
+
+function formatContact(card, book) {
+  const details = readContactFields(card);
+  return {
+    id: card.UID,
+    displayName: card.displayName || "",
+    email: card.primaryEmail || "",
+    firstName: card.firstName || "",
+    lastName: card.lastName || "",
+    phones: details.phones,
+    addresses: details.addresses,
+    organization: details.organization,
+    title: details.title,
+    note: details.note,
+    birthday: details.birthday,
+    addressBook: book.dirName,
+    addressBookId: book.URI,
+  };
+}
+
+function contactFieldsHaveContent(fields) {
+  if (CONTACT_SCALAR_FIELDS.some(name =>
+    typeof fields[name] === "string" && fields[name].trim().length > 0
+  )) {
+    return true;
+  }
+  return (Array.isArray(fields.phones) && fields.phones.length > 0) ||
+    (Array.isArray(fields.addresses) && fields.addresses.length > 0);
+}
+
+/**
+ * Deep validation used inside contact handlers before any card is mutated.
+ * Returns an error string, or null for a valid payload.
+ */
+function validateContactFields(fields, requireContent = false) {
+  for (const name of CONTACT_SCALAR_FIELDS) {
+    if (fields[name] !== undefined && typeof fields[name] !== "string") {
+      return `${name} must be a string`;
+    }
+  }
+
+  if (fields.phones !== undefined) {
+    if (!Array.isArray(fields.phones)) return "phones must be an array";
+    for (let i = 0; i < fields.phones.length; i++) {
+      const phone = fields.phones[i];
+      if (!phone || typeof phone !== "object" || Array.isArray(phone)) {
+        return `phones[${i}] must be an object`;
+      }
+      const unknown = Object.keys(phone).find(key => !["type", "number"].includes(key));
+      if (unknown) return `Unknown phones[${i}] property: ${unknown}`;
+      if (!CONTACT_PHONE_TYPES.includes(phone.type)) {
+        return `phones[${i}].type must be one of: ${CONTACT_PHONE_TYPES.join(", ")}`;
+      }
+      if (typeof phone.number !== "string" || !phone.number.trim()) {
+        return `phones[${i}].number must be a non-empty string`;
+      }
+    }
+  }
+
+  if (fields.addresses !== undefined) {
+    if (!Array.isArray(fields.addresses)) return "addresses must be an array";
+    for (let i = 0; i < fields.addresses.length; i++) {
+      const address = fields.addresses[i];
+      if (!address || typeof address !== "object" || Array.isArray(address)) {
+        return `addresses[${i}] must be an object`;
+      }
+      const unknown = Object.keys(address)
+        .find(key => key !== "type" && !CONTACT_ADDRESS_FIELDS.includes(key));
+      if (unknown) return `Unknown addresses[${i}] property: ${unknown}`;
+      if (!CONTACT_ADDRESS_TYPES.includes(address.type)) {
+        return `addresses[${i}].type must be one of: ${CONTACT_ADDRESS_TYPES.join(", ")}`;
+      }
+      for (const field of CONTACT_ADDRESS_FIELDS) {
+        if (address[field] !== undefined && typeof address[field] !== "string") {
+          return `addresses[${i}].${field} must be a string`;
+        }
+      }
+      if (!CONTACT_ADDRESS_FIELDS.some(field =>
+        typeof address[field] === "string" && address[field].trim().length > 0
+      )) {
+        return `addresses[${i}] must contain at least one non-empty address field`;
+      }
+    }
+  }
+
+  if (fields.birthday !== undefined && normalizeContactBirthday(fields.birthday) === null) {
+    return "birthday must be YYYY-MM-DD or --MM-DD with a valid calendar date";
+  }
+  if (requireContent && !contactFieldsHaveContent(fields)) {
+    return "At least one non-empty contact field is required";
+  }
+  return null;
+}
+
+function updateVCardOrganization(vCardProperties, organization, VCardPropertyEntry) {
+  const entries = vCardProperties.getAllEntries("org");
+  const entry = entries[0];
+  if (!entry) {
+    if (organization) {
+      vCardProperties.addEntry(new VCardPropertyEntry("org", {}, "text", [organization]));
+    }
+    return;
+  }
+
+  if (!Array.isArray(entry.value)) {
+    if (organization) entry.value = organization;
+    else if (entries.length > 1) entry.value = [""];
+    else vCardProperties.removeEntry(entry);
+    return;
+  }
+
+  const remainingComponents = entry.value.slice(1);
+  if (organization || remainingComponents.some(value => contactStructuredValuePart(value))) {
+    entry.value = [organization, ...remainingComponents];
+  } else if (entries.length > 1) {
+    entry.value = [""];
+  } else {
+    vCardProperties.removeEntry(entry);
+  }
+}
+
+function applyVCardContactFields(card, fields, VCardPropertyEntry) {
+  const vCardProperties = card.vCardProperties;
+
+  if (fields.phones !== undefined) {
+    vCardProperties.clearValues("tel");
+    for (const phone of fields.phones) {
+      const type = phone.type === "mobile" ? "cell" : phone.type;
+      vCardProperties.addEntry(new VCardPropertyEntry(
+        "tel",
+        { type },
+        "text",
+        phone.number.trim()
+      ));
+    }
+  }
+
+  if (fields.addresses !== undefined) {
+    vCardProperties.clearValues("adr");
+    for (const address of fields.addresses) {
+      const value = CONTACT_ADDRESS_FIELDS.map(field => address[field] || "");
+      vCardProperties.addEntry(new VCardPropertyEntry(
+        "adr",
+        { type: address.type },
+        "text",
+        value
+      ));
+    }
+  }
+
+  if (fields.organization !== undefined) {
+    updateVCardOrganization(vCardProperties, fields.organization, VCardPropertyEntry);
+  }
+  for (const [field, vCardName] of [["title", "title"], ["note", "note"]]) {
+    if (fields[field] === undefined) continue;
+    vCardProperties.clearValues(vCardName);
+    if (fields[field]) {
+      vCardProperties.addEntry(new VCardPropertyEntry(vCardName, {}, "text", fields[field]));
+    }
+  }
+  if (fields.birthday !== undefined) {
+    vCardProperties.clearValues("bday");
+    const birthday = contactBirthdayToVCard(fields.birthday);
+    if (birthday) {
+      vCardProperties.addEntry(new VCardPropertyEntry("bday", {}, "date", birthday));
+    }
+  }
+}
+
+function applyFlatContactFields(card, fields) {
+  if (fields.phones !== undefined) {
+    for (const property of Object.values(CONTACT_PHONE_FLAT_PROPERTIES)) {
+      card.setProperty(property, "");
+    }
+    for (const phone of fields.phones) {
+      card.setProperty(CONTACT_PHONE_FLAT_PROPERTIES[phone.type], phone.number.trim());
+    }
+  }
+
+  if (fields.addresses !== undefined) {
+    for (const properties of Object.values(CONTACT_ADDRESS_FLAT_PROPERTIES)) {
+      for (const property of properties) card.setProperty(property, "");
+    }
+    for (const address of fields.addresses) {
+      const properties = CONTACT_ADDRESS_FLAT_PROPERTIES[address.type];
+      for (let i = 0; i < CONTACT_ADDRESS_FIELDS.length; i++) {
+        card.setProperty(properties[i], address[CONTACT_ADDRESS_FIELDS[i]] || "");
+      }
+    }
+  }
+
+  if (fields.organization !== undefined) card.setProperty("Company", fields.organization);
+  if (fields.title !== undefined) card.setProperty("JobTitle", fields.title);
+  if (fields.note !== undefined) card.setProperty("Notes", fields.note);
+  if (fields.birthday !== undefined) {
+    const birthday = contactBirthdayToFlatParts(fields.birthday);
+    card.setProperty("BirthYear", birthday.year);
+    card.setProperty("BirthMonth", birthday.month);
+    card.setProperty("BirthDay", birthday.day);
+  }
+}
+
+function applyContactFields(card, fields, VCardPropertyEntry) {
+  const supportsVCard = !!card.supportsVCard;
+  if (fields.email !== undefined) {
+    if (supportsVCard && fields.email === "") {
+      card.vCardProperties.clearValues("email");
+    } else {
+      card.primaryEmail = fields.email;
+    }
+  }
+  if (fields.displayName !== undefined) card.displayName = fields.displayName;
+  if (fields.firstName !== undefined) card.firstName = fields.firstName;
+  if (fields.lastName !== undefined) card.lastName = fields.lastName;
+
+  if (supportsVCard) {
+    applyVCardContactFields(card, fields, VCardPropertyEntry);
+  } else {
+    applyFlatContactFields(card, fields);
+  }
+}
+
+function shouldSynthesizePhoneDisplayName(fields) {
+  if (!Array.isArray(fields.phones) || fields.phones.length === 0) return false;
+  if (CONTACT_SCALAR_FIELDS.some(name =>
+    typeof fields[name] === "string" && fields[name].trim()
+  )) {
+    return false;
+  }
+  return !Array.isArray(fields.addresses) || fields.addresses.length === 0;
+}
+// END CONTACT FIELD HELPERS
+
 function getExtVersion() {
   if (_cachedExtVersion) return _cachedExtVersion;
   try {
@@ -262,6 +758,48 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     // BEGIN TOOL SCHEMA BUILDER
     function buildTools() {
       const getMessagesLimit = getConfiguredGetMessagesLimit();
+      const contactFieldProperties = {
+        email: { type: "string", description: "Primary email address. May be omitted for phone-only contacts." },
+        displayName: { type: "string", description: "Display name" },
+        firstName: { type: "string", description: "First name" },
+        lastName: { type: "string", description: "Last name" },
+        phones: {
+          type: "array",
+          description: "Phone numbers. On update, replaces the phone collection; use [] to clear it.",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: CONTACT_PHONE_TYPES, description: "Phone type" },
+              number: { type: "string", description: "Phone number" },
+            },
+            required: ["type", "number"],
+            additionalProperties: false,
+          },
+        },
+        addresses: {
+          type: "array",
+          description: "Postal addresses. On update, replaces the address collection; use [] to clear it.",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: CONTACT_ADDRESS_TYPES, description: "Address type" },
+              poBox: { type: "string", description: "Post office box" },
+              street: { type: "string", description: "Street address" },
+              street2: { type: "string", description: "Additional street/address line" },
+              city: { type: "string", description: "City or locality" },
+              region: { type: "string", description: "State, province, or region" },
+              postalCode: { type: "string", description: "Postal or ZIP code" },
+              country: { type: "string", description: "Country" },
+            },
+            required: ["type"],
+            additionalProperties: false,
+          },
+        },
+        organization: { type: "string", description: "Organization or company name" },
+        title: { type: "string", description: "Job title" },
+        note: { type: "string", description: "Contact note; may contain multiple lines" },
+        birthday: { type: "string", description: "Birthday as YYYY-MM-DD or --MM-DD when the year is unknown" },
+      };
       return [
       {
         name: "listAccounts",
@@ -608,6 +1146,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
       },
       {
+        name: "getContact",
+        group: "contacts", crud: "read",
+        title: "Get Contact",
+        description: "Read a contact by UID",
+        inputSchema: {
+          type: "object",
+          properties: {
+            contactId: { type: "string", description: "Contact UID (from searchContacts results)" },
+          },
+          required: ["contactId"],
+        },
+      },
+      {
         name: "createContact",
         group: "contacts", crud: "create",
         title: "Create Contact",
@@ -615,13 +1166,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            email: { type: "string", description: "Primary email address" },
-            displayName: { type: "string", description: "Display name" },
-            firstName: { type: "string", description: "First name" },
-            lastName: { type: "string", description: "Last name" },
+            ...contactFieldProperties,
             addressBookId: { type: "string", description: "Address book directory ID (from searchContacts results). Defaults to the first writable address book." },
           },
-          required: ["email"],
+          required: [],
         },
       },
       {
@@ -633,10 +1181,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             contactId: { type: "string", description: "Contact UID (from searchContacts results)" },
-            email: { type: "string", description: "New primary email address" },
-            displayName: { type: "string", description: "New display name" },
-            firstName: { type: "string", description: "New first name" },
-            lastName: { type: "string", description: "New last name" },
+            ...contactFieldProperties,
           },
           required: ["contactId"],
         },
@@ -1168,6 +1713,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const { MailServices } = ChromeUtils.importESModule(
               "resource:///modules/MailServices.sys.mjs"
             );
+            let VCardPropertyEntry;
+            try {
+              ({ VCardPropertyEntry } = ChromeUtils.importESModule(
+                "resource:///modules/VCardUtils.sys.mjs"
+              ));
+            } catch {
+              ({ VCardPropertyEntry } = ChromeUtils.import(
+                "resource:///modules/VCardUtils.jsm"
+              ));
+            }
 
             let cal = null;
             let CalEvent = null;
@@ -3198,15 +3753,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     fields.some(field => field.includes(token))
                   );
                   if (matches) {
-                    results.push({
-                      id: card.UID,
-                      displayName: card.displayName,
-                      email: card.primaryEmail,
-                      firstName: card.firstName,
-                      lastName: card.lastName,
-                      addressBook: book.dirName,
-                      addressBookId: book.URI,
-                    });
+                    results.push(formatContact(card, book));
                   }
 
                   if (results.length >= limit) { truncated = true; break; }
@@ -3227,6 +3774,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function findContactByUID(contactId) {
               for (const book of MailServices.ab.directories) {
                 for (const card of book.childCards) {
+                  if (card.isMailList) continue;
                   if (card.UID === contactId) {
                     return { card, book };
                   }
@@ -3235,11 +3783,47 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { error: `Contact not found: ${contactId}` };
             }
 
-            function createContact(email, displayName, firstName, lastName, addressBookId) {
+            function getContact(contactId) {
               try {
-                if (typeof email !== "string" || !email) {
-                  return { error: "email must be a non-empty string" };
+                if (typeof contactId !== "string" || !contactId) {
+                  return { error: "contactId must be a non-empty string" };
                 }
+                const found = findContactByUID(contactId);
+                if (found.error) return found;
+                return formatContact(found.card, found.book);
+              } catch (e) {
+                return { error: e.toString() };
+              }
+            }
+
+            function createContact(
+              email,
+              displayName,
+              firstName,
+              lastName,
+              phones,
+              addresses,
+              organization,
+              title,
+              note,
+              birthday,
+              addressBookId
+            ) {
+              try {
+                const fields = {
+                  email,
+                  displayName,
+                  firstName,
+                  lastName,
+                  phones,
+                  addresses,
+                  organization,
+                  title,
+                  note,
+                  birthday,
+                };
+                const validationError = validateContactFields(fields, true);
+                if (validationError) return { error: validationError };
 
                 // Find the target address book
                 let targetBook = null;
@@ -3268,10 +3852,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const card = Cc["@mozilla.org/addressbook/cardproperty;1"]
                   .createInstance(Ci.nsIAbCard);
-                card.primaryEmail = email;
-                if (displayName) card.displayName = displayName;
-                if (firstName) card.firstName = firstName;
-                if (lastName) card.lastName = lastName;
+                applyContactFields(card, fields, VCardPropertyEntry);
+                if (shouldSynthesizePhoneDisplayName(fields) && !card.displayName) {
+                  card.displayName = phones[0].number.trim();
+                }
 
                 const newCard = targetBook.addCard(card);
                 return {
@@ -3286,20 +3870,43 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function updateContact(contactId, email, displayName, firstName, lastName) {
+            function updateContact(
+              contactId,
+              email,
+              displayName,
+              firstName,
+              lastName,
+              phones,
+              addresses,
+              organization,
+              title,
+              note,
+              birthday
+            ) {
               try {
                 if (typeof contactId !== "string" || !contactId) {
                   return { error: "contactId must be a non-empty string" };
                 }
+                const fields = {
+                  email,
+                  displayName,
+                  firstName,
+                  lastName,
+                  phones,
+                  addresses,
+                  organization,
+                  title,
+                  note,
+                  birthday,
+                };
+                const validationError = validateContactFields(fields);
+                if (validationError) return { error: validationError };
 
                 const found = findContactByUID(contactId);
                 if (found.error) return found;
                 const { card, book } = found;
 
-                if (email !== undefined) card.primaryEmail = email;
-                if (displayName !== undefined) card.displayName = displayName;
-                if (firstName !== undefined) card.firstName = firstName;
-                if (lastName !== undefined) card.lastName = lastName;
+                applyContactFields(card, fields, VCardPropertyEntry);
 
                 book.modifyCard(card);
                 return {
@@ -6946,10 +7553,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return await getMessages(args.messages, args.saveAttachments, args.bodyFormat, args.rawSource);
                 case "searchContacts":
                   return searchContacts(args.query || "", args.maxResults);
+                case "getContact":
+                  return getContact(args.contactId);
                 case "createContact":
-                  return createContact(args.email, args.displayName, args.firstName, args.lastName, args.addressBookId);
+                  return createContact(args.email, args.displayName, args.firstName, args.lastName, args.phones, args.addresses, args.organization, args.title, args.note, args.birthday, args.addressBookId);
                 case "updateContact":
-                  return updateContact(args.contactId, args.email, args.displayName, args.firstName, args.lastName);
+                  return updateContact(args.contactId, args.email, args.displayName, args.firstName, args.lastName, args.phones, args.addresses, args.organization, args.title, args.note, args.birthday);
                 case "deleteContact":
                   return deleteContact(args.contactId);
                 case "listCalendars":

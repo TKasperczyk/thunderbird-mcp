@@ -1,7 +1,7 @@
 # Thunderbird MCP
 
 [![CI](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml)
-[![Tools](https://img.shields.io/badge/35_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/40_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -18,7 +18,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 36 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 40 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Mail sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. **By default, nothing is sent or created without your review.**
 
@@ -87,9 +87,10 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 
 | Tool | Description |
 |------|-------------|
-| `searchContacts` | Search contacts across all address books by email or name. Supports `maxResults`. |
-| `createContact` | Create a new contact in any writable address book |
-| `updateContact` | Update an existing contact's email, name, or display name |
+| `searchContacts` | Search contacts across all address books by email or name and return full contact details. Supports `maxResults`. |
+| `getContact` | Read full contact details by UID |
+| `createContact` | Create a contact with optional email/name, phones, postal addresses, organization, title, note, and birthday. Phone-only contacts are supported. |
+| `updateContact` | Update contact fields; omitted fields stay unchanged, while empty phone/address arrays clear those collections |
 | `deleteContact` | Delete a contact by UID |
 
 ### Calendar
@@ -239,7 +240,7 @@ thunderbird-mcp/
 │   ├── options.js              # Settings page logic
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 36 MCP tools + auth + access control
+│       ├── api.js              # All 40 MCP tools + auth + access control
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/
