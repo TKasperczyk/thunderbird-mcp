@@ -85,6 +85,7 @@ function ensureFreshConnectionInfo({
 // END CONNECTION INFO REFRESH HELPERS
 
 // BEGIN CONTACT FIELD HELPERS
+// BEGIN CONTACT FIELD CONSTANTS
 const CONTACT_PHONE_TYPES = ["work", "home", "mobile", "fax", "pager"];
 const CONTACT_ADDRESS_TYPES = ["home", "work"];
 const CONTACT_ADDRESS_FIELDS = [
@@ -133,6 +134,7 @@ const CONTACT_ADDRESS_FLAT_PROPERTIES = {
     "WorkCountry",
   ],
 };
+// END CONTACT FIELD CONSTANTS
 
 function contactValueToString(value, separator = ",") {
   if (Array.isArray(value)) {
