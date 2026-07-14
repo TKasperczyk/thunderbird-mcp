@@ -116,6 +116,13 @@ const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data 
 // Must be large enough to carry MAX_BASE64_SIZE plus JSON-RPC framing overhead.
 // The httpd.sys.mjs pre-buffer cap uses the same value.
 const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP request bodies
+
+// Daisy-chain search result registry (session lifetime).
+// Entries persist until extension restart.
+let _searchCounter = 0;
+/** @type {Map<string, { messages: object[], query: string, folderPath: string|null, createdAt: number }>} */
+const _searchRegistries = new Map();
+
 let _tempFileCounter = 0;
 const DEFAULT_MAX_RESULTS = 50;
 const PREF_ALLOWED_ACCOUNTS = "extensions.thunderbird-mcp.allowedAccounts";
@@ -679,8 +686,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs to delete" },
+            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs to delete. Use ['*'] with searchId for daisy-chain linking." },
             folderPath: { type: "string", description: "The folder URI containing the messages (from listFolders or searchMessages results)" },
+            excludeIds: { type: "array", items: { type: "string" }, description: "Message IDs to exclude when messageIds is ['*']. Optional." },
+            searchId: { type: "string", description: "Prior searchId for daisy-chain linking with ['*']." },
           },
           required: ["messageIds", "folderPath"],
         },
@@ -694,7 +703,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           type: "object",
           properties: {
             messageId: { type: "string", description: "A single message ID (from searchMessages results). Required unless messageIds is provided." },
-            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs for bulk operations. Required unless messageId is provided." },
+            messageIds: { type: "array", items: { type: "string" }, description: "Array of message IDs for bulk operations. Use ['*'] with searchId for daisy-chain linking." },
             folderPath: { type: "string", description: "The folder URI containing the message(s) (from searchMessages results)" },
             read: { type: "boolean", description: "Set to true/false to mark read/unread (optional)" },
             flagged: { type: "boolean", description: "Set to true/false to flag/unflag (optional)" },
@@ -702,6 +711,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             removeTags: { type: "array", items: { type: "string" }, description: "Tag keywords to remove from the message(s)" },
             moveTo: { type: "string", description: "Destination folder URI (optional). Cannot be used with trash." },
             trash: { type: "boolean", description: "Set to true to move message to Trash (optional). Cannot be used with moveTo." },
+            excludeIds: { type: "array", items: { type: "string" }, description: "Message IDs to exclude when messageIds is ['*']. Optional." },
+            searchId: { type: "string", description: "Prior searchId for daisy-chain linking with ['*']." },
           },
           required: ["folderPath"],
         },
@@ -2775,7 +2786,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           return;
                         }
                         finalResults.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
-                        resolve(paginate(finalResults, offset, effectiveLimit));
+                        const searchId = registerSearchSession(finalResults, query, folderFilterURI);
+                        const paginated = paginate(finalResults, offset, effectiveLimit);
+                        if (Array.isArray(paginated)) {
+                          resolve({ messages: paginated, searchId });
+                        } else {
+                          paginated.searchId = searchId;
+                          resolve(paginated);
+                        }
                       } catch (e) {
                         resolve({ error: e.toString() });
                       }
@@ -2789,7 +2807,24 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-	            function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId) {
+            /**
+             * Register a search result set for daisy-chain linking.
+             * Returns a searchId that can be referenced by updateMessage
+             * or deleteMessages with messageIds ["*"].
+             */
+            function registerSearchSession(finalResults, query, folderPath) {
+              _searchCounter++;
+              const searchId = 'search_' + _searchCounter;
+              _searchRegistries.set(searchId, {
+                messages: finalResults,
+                query: query || '',
+                folderPath: folderPath || (finalResults[0]?.folderPath || null),
+                createdAt: Date.now(),
+              });
+              return searchId;
+            }
+
+	          function searchMessages(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, includeSubfolders, countOnly, searchBody, dedupByMessageId) {
 	              // Gloda full-body search path (async)
 	              if (searchBody) {
 	                if (!GlodaMsgSearcher) return { error: "Gloda full-text index is not available" };
@@ -2936,7 +2971,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               finalResults.sort((a, b) => normalizedSortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
 
-              return paginate(finalResults, offset, effectiveLimit);
+              const searchId = registerSearchSession(finalResults, query, folderPath);
+              const paginated = paginate(finalResults, offset, effectiveLimit);
+              if (Array.isArray(paginated)) {
+                return { messages: paginated, searchId };
+              }
+              paginated.searchId = searchId;
+              return paginated;
             }
 
             function searchContacts(query, maxResults) {
@@ -5501,7 +5542,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return paginate(results, offset, effectiveLimit);
             }
 
-            function deleteMessages(messageIds, folderPath) {
+            function deleteMessages(messageIds, folderPath, excludeIds, searchId) {
               try {
                 // MCP clients may send arrays as JSON strings
                 if (typeof messageIds === "string") {
@@ -5513,6 +5554,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (typeof folderPath !== "string" || !folderPath) {
                   return { error: "folderPath must be a non-empty string" };
                 }
+
+                // Daisy-chain wildcard resolution
+                const wildcardResolved = resolveWildcardIds(messageIds, excludeIds, searchId, folderPath);
+                if (wildcardResolved.error) return wildcardResolved;
+                messageIds = wildcardResolved.messageIds;
+                folderPath = wildcardResolved.folderPath || folderPath;
 
                 const opened = openFolder(folderPath);
                 if (opened.error) return { error: opened.error };
@@ -5574,7 +5621,61 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function updateMessage(messageId, messageIds, folderPath, read, flagged, addTags, removeTags, moveTo, trash) {
+            /**
+             * Resolve wildcard ["*"] messageIds against a prior search session.
+             * When messageIds is exactly ["*"], looks up the searchId registry
+             * and returns the resolved list of real message IDs minus any
+             * excludeIds. For non-wildcard arrays, passes through unchanged.
+             */
+            function resolveWildcardIds(messageIds, excludeIds, searchId, folderPath) {
+              // Only trigger for exact ["*"] — normal arrays pass through
+              if (!Array.isArray(messageIds) || messageIds.length !== 1
+                  || messageIds[0] !== '*') {
+                return { messageIds, folderPath };
+              }
+
+              if (!searchId) {
+                return { error: 'searchId is required when messageIds is ["*"]' };
+              }
+
+              const registry = _searchRegistries.get(searchId);
+              if (!registry) {
+                const searches = Array.from(_searchRegistries.entries())
+                  .map(([id, entry]) => `${id} (${entry.messages.length} msgs, query: "${entry.query}")`)
+                  .join(', ');
+                return {
+                  error: `searchId "${searchId}" not found or expired. `
+                    + `Available searches: ${searches || '(none)'}. `
+                    + `Run searchMessages to create a new search session.`
+                };
+              }
+
+              // Filter exclusions
+              const excludeSet = new Set(Array.isArray(excludeIds) ? excludeIds : []);
+              const resolvedIds = [];
+              for (const msg of registry.messages) {
+                if (!excludeSet.has(msg.id)) {
+                  resolvedIds.push(msg.id);
+                }
+              }
+
+              if (resolvedIds.length === 0) {
+                return { error: 'All messages excluded — no messages to act on' };
+              }
+
+              // folderPath: prefer explicit, fall back to registry's folder
+              if (!folderPath) {
+                const folders = new Set(registry.messages.map(m => m.folderPath));
+                if (folders.size > 1) {
+                  return { error: 'folderPath required — results span multiple folders' };
+                }
+                folderPath = registry.folderPath;
+              }
+
+              return { messageIds: resolvedIds, folderPath };
+            }
+
+            function updateMessage(messageId, messageIds, folderPath, read, flagged, addTags, removeTags, moveTo, trash, excludeIds, searchId) {
               try {
                 // Normalize to an array of IDs
                 if (typeof messageIds === "string") {
@@ -5592,6 +5693,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (typeof folderPath !== "string" || !folderPath) {
                   return { error: "folderPath must be a non-empty string" };
                 }
+
+                // Daisy-chain wildcard resolution
+                const wildcardResolved = resolveWildcardIds(messageIds, excludeIds, searchId, folderPath);
+                if (wildcardResolved.error) return wildcardResolved;
+                messageIds = wildcardResolved.messageIds;
+                folderPath = wildcardResolved.folderPath || folderPath;
 
                 // Coerce boolean params (MCP clients may send strings)
                 if (read !== undefined) read = read === true || read === "true";
@@ -6622,9 +6729,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "displayMessage":
                   return displayMessage(args.messageId, args.folderPath, args.displayMode);
                 case "deleteMessages":
-                  return deleteMessages(args.messageIds, args.folderPath);
+                  return deleteMessages(args.messageIds, args.folderPath, args.excludeIds, args.searchId);
                 case "updateMessage":
-                  return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash);
+                  return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash, args.excludeIds, args.searchId);
                 case "createFolder":
                   return createFolder(args.parentFolderPath, args.name);
                 case "renameFolder":
