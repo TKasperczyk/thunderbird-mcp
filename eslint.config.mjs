@@ -109,7 +109,7 @@ export default [
 
   // ── Node-side scripts and tests ──────────────────────────────────
   {
-    files: ["scripts/**/*.{cjs,mjs,js}", "test/**/*.{cjs,mjs,js}", "mcp-bridge.cjs"],
+    files: ["scripts/**/*.{cjs,mjs,js}", "test/**/*.{cjs,mjs,js}", "mcp-bridge.cjs", "mcp-id-mapper.cjs"],
     languageOptions: {
       ecmaVersion: "latest",
       sourceType: "commonjs",

@@ -118,6 +118,18 @@ The same settings page has a "Send Safety" section. **Block `skipReview`** is en
 
 ---
 
+## Token-Efficient ID Aliasing
+
+To reduce token usage and improve readability, the bridge transparently translates long Thunderbird entity IDs into short word aliases (e.g. `msg_blue-fox-rain`, `ctc_happy-sun-tree`, `evt_calm-river-path`).
+
+- **Outbound** (Thunderbird → LLM): Real IDs in tool results are replaced with 3-word aliases prefixed by entity type: `msg_`, `ctc_`, `evt_`, `tsk_`, `cal_`, `fld_`, `acc_`.
+- **Inbound** (LLM → Thunderbird): Aliases are automatically resolved back to real IDs before forwarding to Thunderbird. Use aliases as-is in any tool parameter — the bridge handles the translation.
+- **Idempotent**: The same real ID always maps to the same alias within a session.
+
+No client-side changes needed. Set `THUNDERBIRD_MCP_DISABLE_ID_MAPPING=1` to bypass aliasing and pass raw IDs through.
+
+---
+
 ## Setup
 
 ### 1. Install the extension

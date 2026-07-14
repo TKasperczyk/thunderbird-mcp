@@ -1113,7 +1113,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "searchMessages",
         group: "messages", crud: "read",
         title: "Search Mail",
-        description: "Search message headers and return IDs/folder paths you can use with getMessage to read full email content",
+        description: "Search message headers and return short-word-alias IDs (e.g. msg_blue-fox-rain) you can use with getMessage, replyToMessage, forwardMessage, displayMessage, deleteMessages, and updateMessage",
         inputSchema: {
           type: "object",
           properties: {
@@ -1139,11 +1139,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "getMessage",
         group: "messages", crud: "read",
         title: "Get Message",
-        description: "Read the full content of an email message by its ID",
+        description: "Read full email content using messageId and folderPath from searchMessages results (IDs are short-word aliases like msg_blue-fox-rain)",
         inputSchema: {
           type: "object",
           properties: {
-            messageId: { type: "string", description: "The message ID (from searchMessages results)" },
+            messageId: { type: "string", description: "The message ID (short-word alias from searchMessages, e.g. msg_blue-fox-rain)" },
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             saveAttachments: { type: "boolean", description: "If true, save attachments to <OS temp dir>/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" },
             includeInlineImages: { type: "boolean", description: "If true, append supported inline email images as MCP image content blocks after the text result (default: false; max 1 MiB base64 per image and 4 MiB total). Images referenced by the rendered body are attempted first in document order, followed by remaining inline images in MIME order. Ignored when rawSource is true." },
