@@ -222,6 +222,18 @@ Zm9sZGVk
     assert.equal(utf8(parts[0].bytes), "folded");
   });
 
+  it("allows apostrophes in unquoted boundary tokens", () => {
+    const boundary = "abc'def";
+    const raw = multipart(boundary, [
+      attachmentPart({ filename: "apostrophe.txt", body: "YXBvc3Ryb3BoZQ==" }),
+    ], `Content-Type: multipart/mixed; boundary=${boundary}; type="text/html"`);
+
+    const parts = parseAttachmentPartsFromRawMime(raw);
+    assert.equal(parts.length, 1);
+    assert.equal(parts[0].filename, "apostrophe.txt");
+    assert.equal(utf8(parts[0].bytes), "apostrophe");
+  });
+
   it("handles CRLF, LF, and bare-CR line endings", () => {
     const lf = `Content-Type: multipart/mixed; boundary="lines"
 

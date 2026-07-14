@@ -58,11 +58,18 @@ function multipart({
   epilogue = "",
   lineEnding = "\n",
   foldedBoundary = false,
+  quoteBoundary = true,
+  contentTypeParameters = [],
 }) {
+  const boundaryValue = quoteBoundary ? `"${boundary}"` : boundary;
   const contentType = foldedBoundary
-    ? `Content-Type: multipart/${subtype};\n boundary="${boundary}"`
-    : `Content-Type: multipart/${subtype}; boundary="${boundary}"`;
-  let raw = `${contentType}\nMIME-Version: 1.0\n\n`;
+    ? `Content-Type: multipart/${subtype};\n boundary=${boundaryValue}`
+    : `Content-Type: multipart/${subtype}; boundary=${boundaryValue}`;
+  const contentTypeHeader = contentTypeParameters.reduce(
+    (header, parameter) => `${header}; ${parameter}`,
+    contentType
+  );
+  let raw = `${contentTypeHeader}\nMIME-Version: 1.0\n\n`;
   if (preamble) raw += `${preamble}\n`;
   for (const part of parts) raw += `--${boundary}\n${part}\n`;
   if (terminal) raw += `--${boundary}--\n${epilogue}`;
@@ -169,6 +176,35 @@ describe("raw MIME body extraction", () => {
     assertExtracted(htmlWithInlineImage, "markdown", "<p>HTML with CID image</p>", true);
   });
 
+  it("uses multipart/related start as the root for every body format", () => {
+    const parts = [
+      mimePart({
+        body: "First plain root",
+        extraHeaders: ["Content-ID: <first@example.test>"],
+      }),
+      mimePart({
+        body: "<p>Selected HTML root</p>",
+        contentType: "text/html",
+        extraHeaders: ["Content-ID: <ROOT@EXAMPLE.TEST>"],
+      }),
+    ];
+    const matched = multipart({
+      subtype: "related",
+      parts,
+      contentTypeParameters: ['start="<root@example.test>"'],
+    });
+    const unmatched = multipart({
+      subtype: "related",
+      parts,
+      contentTypeParameters: ['start="<missing@example.test>"'],
+    });
+
+    for (const bodyFormat of ["text", "html", "markdown"]) {
+      assertExtracted(matched, bodyFormat, "<p>Selected HTML root</p>", true);
+      assertExtracted(unmatched, bodyFormat, "First plain root");
+    }
+  });
+
   it("decodes each text part with its own charset and transfer encoding", () => {
     const fixtures = [
       {
@@ -214,6 +250,17 @@ describe("raw MIME body extraction", () => {
     }
   });
 
+  it("allows apostrophes in unquoted boundary tokens", () => {
+    const raw = multipart({
+      boundary: "abc'def",
+      quoteBoundary: false,
+      contentTypeParameters: ['type="text/html"'],
+      parts: [mimePart({ body: "Apostrophe boundary body" })],
+    });
+
+    assertExtracted(raw, "text", "Apostrophe boundary body");
+  });
+
   it("keeps the final part when the terminal boundary is missing", () => {
     const raw = multipart({
       boundary: "unterminated",
@@ -251,7 +298,9 @@ describe("raw MIME body extraction", () => {
     }
 
     assertExtracted(nested(10), "text", "Deep body");
-    assert.equal(extractBodyPartFromRawMime(nested(11), "text"), null);
+    const diagnostic = {};
+    assert.equal(extractBodyPartFromRawMime(nested(11), "text", diagnostic), null);
+    assert.equal(diagnostic.bodyNote, "multipart body extraction hit depth cap");
   });
 
   it("preserves the singlepart decoder behavior", () => {
@@ -290,6 +339,11 @@ describe("raw MIME body extraction", () => {
 
   it("returns null for unsupported top-level content", () => {
     const raw = mimePart({ body: "JVBERi0=", contentType: "application/pdf", cte: "base64" });
-    assert.equal(extractBodyPartFromRawMime(raw, "text"), null);
+    const diagnostic = {};
+    assert.equal(extractBodyPartFromRawMime(raw, "text", diagnostic), null);
+    assert.equal(
+      diagnostic.bodyNote,
+      "raw MIME body extraction found no suitable text part"
+    );
   });
 });

@@ -5106,7 +5106,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function splitRawMimeHeaderParameters(value) {
               const parts = [];
               let current = "";
-              let quote = "";
+              let quoted = false;
               let escaped = false;
               for (let i = 0; i < value.length; i++) {
                 const ch = value[i];
@@ -5115,19 +5115,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   escaped = false;
                   continue;
                 }
-                if (quote && ch === "\\") {
+                if (quoted && ch === "\\") {
                   current += ch;
                   escaped = true;
                   continue;
                 }
-                if (quote) {
+                if (quoted) {
                   current += ch;
-                  if (ch === quote) quote = "";
+                  if (ch === "\"") quoted = false;
                   continue;
                 }
-                if (ch === "\"" || ch === "'") {
+                if (ch === "\"") {
                   current += ch;
-                  quote = ch;
+                  quoted = true;
                   continue;
                 }
                 if (ch === ";") {
@@ -5143,7 +5143,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function unquoteRawMimeParameter(value) {
               let v = String(value || "").trim();
-              if ((v.startsWith("\"") && v.endsWith("\"")) || (v.startsWith("'") && v.endsWith("'"))) {
+              if (v.startsWith("\"") && v.endsWith("\"")) {
                 v = v.slice(1, -1).replace(/\\(["'\\])/g, "$1");
               }
               return v;
@@ -5210,6 +5210,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function normalizeRawMimeContentId(value) {
               return String(value || "").trim().replace(/^<|>$/g, "");
+            }
+
+            function normalizeRawMimeContentIdForMatch(value) {
+              return String(value || "")
+                .trim()
+                .replace(/^<+|>+$/g, "")
+                .trim()
+                .toLowerCase();
             }
 
             function decodeRawMimeBase64ToBytes(body, strict = false) {
@@ -5393,12 +5401,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            function extractBodyPartFromRawMime(rawBytes, bodyFormat) {
+            function extractBodyPartFromRawMime(rawBytes, bodyFormat, diagnostic = null) {
               // Body extraction runs synchronously on Thunderbird's main thread.
               // Ten MIME levels covers normal nesting while bounding adversarial input.
               const root = parseRawMimeEntity(rawBytes, { maxDepth: 10 });
-              if (!root) return null;
+              if (!root) {
+                if (diagnostic) {
+                  diagnostic.bodyNote = "raw MIME body extraction could not parse message";
+                }
+                return null;
+              }
               const preferHtml = bodyFormat === "html" || bodyFormat === "markdown";
+              let depthLimitReached = false;
 
               function findBody(entity, isRoot = false) {
                 const contentType = entity.contentType.value || "text/plain";
@@ -5407,6 +5421,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!isRoot && entity.contentDisposition.value === "attachment") return null;
 
                 if (contentType.startsWith("multipart/")) {
+                  if (entity.depthLimitReached) {
+                    depthLimitReached = true;
+                    return null;
+                  }
                   if (contentType === "multipart/alternative") {
                     let fallback = null;
                     for (const child of entity.parts) {
@@ -5418,8 +5436,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return fallback;
                   }
 
-                  // mixed/related (and uncommon multipart subtypes) use the first
-                  // suitable text part in depth-first message order.
+                  if (contentType === "multipart/related") {
+                    const start = normalizeRawMimeContentIdForMatch(
+                      entity.contentType.params.start
+                    );
+                    const matchingRoot = start
+                      ? entity.parts.find(child => normalizeRawMimeContentIdForMatch(
+                        getRawMimeHeader(child.headers, "content-id")
+                      ) === start)
+                      : null;
+                    // RFC 2387 defines one related root. An absent or unmatched
+                    // start parameter falls back to the first child.
+                    const relatedRoot = matchingRoot || entity.parts[0];
+                    return relatedRoot ? findBody(relatedRoot) : null;
+                  }
+
+                  // mixed (and uncommon multipart subtypes) use the first suitable
+                  // text part in depth-first message order.
                   for (const child of entity.parts) {
                     const candidate = findBody(child);
                     if (candidate) return candidate;
@@ -5438,7 +5471,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
 
-              return findBody(root, true);
+              const bodyPart = findBody(root, true);
+              if (!bodyPart && diagnostic) {
+                diagnostic.bodyNote = depthLimitReached
+                  ? "multipart body extraction hit depth cap"
+                  : root.contentType.value.startsWith("multipart/")
+                    ? "multipart body extraction found no suitable text part"
+                    : "raw MIME body extraction found no suitable text part";
+              }
+              return bodyPart;
             }
             // END RAW MIME PARSING HELPERS
 
@@ -5578,6 +5619,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const fmt = extractFormattedBody(aMimeMsg, requestedBodyFormat);
                     let body = fmt.body;
                     let bodyIsHtml = fmt.bodyIsHtml;
+                    let bodyNote = "";
 
                     // Bound all synchronous raw-MIME work with the existing
                     // attachment-recovery ceiling.
@@ -5598,14 +5640,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         // Latin-1 default preserves raw bytes for transfer decoding.
                         rawMimeContent = readMessageStreamFully(rawStream, MAX_ATTACHMENT_BYTES);
                         if (!rawMimeContent || rawMimeContent.length === 0) {
+                          bodyNote = "raw MIME body extraction could not read message stream";
                           console.error(`${fallbackContext}: message stream has zero size`);
                         } else {
+                          const bodyDiagnostic = {};
                           const extracted = extractBodyPartFromRawMime(
                             rawMimeContent,
-                            requestedBodyFormat
+                            requestedBodyFormat,
+                            bodyDiagnostic
                           );
                           if (!extracted) {
-                            console.error(`${fallbackContext}: no suitable text MIME part found`);
+                            bodyNote = bodyDiagnostic.bodyNote ||
+                              "raw MIME body extraction found no suitable text part";
+                            console.error(`${fallbackContext}: ${bodyNote}`);
                           } else {
                             if (extracted.charsetFallback) {
                               console.error(
@@ -5630,6 +5677,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           }
                         }
                       } catch (e) {
+                        bodyNote = String(e?.message || e).startsWith("message too large")
+                          ? "raw MIME body extraction hit 50 MiB size cap"
+                          : "raw MIME body extraction failed";
                         console.error(`${fallbackContext}: failed`, e);
                       } finally {
                         if (rawStream) try { rawStream.close(); } catch (e) {
@@ -5876,6 +5926,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       bodyIsHtml,
                       attachments
                     };
+                    if (bodyNote) baseResponse.bodyNote = bodyNote;
 
                     function fetchInlineImageBase64(source) {
                       return new Promise((resolve) => {
