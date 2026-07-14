@@ -130,6 +130,30 @@ describe('Tool result serialization', () => {
     assert.equal(response.result.content[0].text, originalText);
     assert.equal(compacted.result.content[0].text.includes('\n'), false);
   });
+
+  it('preserves image content blocks while compacting the leading JSON text', () => {
+    const imageBlock = {
+      type: 'image',
+      data: 'iVBORw0KGgo=',
+      mimeType: 'image/png',
+    };
+    const response = {
+      jsonrpc: '2.0',
+      id: 137,
+      result: {
+        content: [
+          { type: 'text', text: JSON.stringify({ inlineImages: 1 }, null, 2) },
+          imageBlock,
+        ],
+      },
+    };
+
+    const compacted = compactToolResultJsonText(response);
+
+    assert.equal(compacted.result.content[0].text, '{"inlineImages":1}');
+    assert.strictEqual(compacted.result.content[1], imageBlock);
+    assert.strictEqual(response.result.content[1], imageBlock);
+  });
 });
 
 describe('Bridge attachment path policy', () => {

@@ -1103,6 +1103,7 @@ const richValidator = createValidator([
         folderPath: { type: 'string' },
         bodyFormat: { type: 'string', enum: ['markdown', 'text', 'html'] },
         rawSource: { type: 'boolean' },
+        includeInlineImages: { type: 'boolean' },
       },
       required: ['messageId', 'folderPath'],
     },
@@ -1179,6 +1180,28 @@ describe('Validator: enum enforcement', () => {
     });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must be one of/);
+  });
+});
+
+describe('Validator: getMessage inline images', () => {
+  it('accepts includeInlineImages as a boolean', () => {
+    const errors = richValidator('getMessage', {
+      messageId: 'm-1',
+      folderPath: 'imap://x/INBOX',
+      includeInlineImages: true,
+    });
+    assert.equal(errors.length, 0);
+  });
+
+  it('rejects non-boolean includeInlineImages values', () => {
+    const errors = richValidator('getMessage', {
+      messageId: 'm-1',
+      folderPath: 'imap://x/INBOX',
+      includeInlineImages: 'yes',
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /includeInlineImages/);
+    assert.match(errors[0], /must be boolean/);
   });
 });
 

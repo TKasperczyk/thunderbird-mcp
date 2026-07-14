@@ -1101,6 +1101,7 @@ describe('Validation: adversarial and edge-case inputs', () => {
       properties: {
         messageId: { type: "string" }, folderPath: { type: "string" },
         saveAttachments: { type: "boolean" },
+        includeInlineImages: { type: "boolean" },
       },
       required: ["messageId", "folderPath"],
     }},

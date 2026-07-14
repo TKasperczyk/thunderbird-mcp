@@ -742,6 +742,72 @@ const MAX_ATTACHMENTS_PER_MESSAGE = 20;
 // The httpd.sys.mjs pre-buffer cap uses the same value.
 const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP request bodies
 
+// BEGIN INLINE IMAGE CONTENT HELPERS
+// MCP image payloads are base64 text, so budget the encoded representation that
+// actually enters the client's context rather than only the decoded MIME bytes.
+const MAX_INLINE_IMAGE_BASE64_BYTES = 1 * 1024 * 1024;
+const MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES = 4 * 1024 * 1024;
+const SUPPORTED_INLINE_IMAGE_MIME_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+]);
+const MCP_EXTRA_CONTENT_BLOCKS = Symbol("thunderbird-mcp.extra-content-blocks");
+
+function normalizeInlineImageMimeType(contentType) {
+  return ((String(contentType || "").split(";")[0] || "").trim().toLowerCase());
+}
+
+function getBase64EncodedSize(byteLength) {
+  if (!Number.isFinite(byteLength) || byteLength <= 0) return 0;
+  return 4 * Math.ceil(byteLength / 3);
+}
+
+function getInlineImageSkipReason(mimeType, encodedSize, totalEncodedSize) {
+  const normalizedMimeType = normalizeInlineImageMimeType(mimeType);
+  if (!SUPPORTED_INLINE_IMAGE_MIME_TYPES.has(normalizedMimeType)) {
+    return `Unsupported MIME type "${normalizedMimeType || "(missing)"}"`;
+  }
+  if (!Number.isFinite(encodedSize) || encodedSize <= 0) {
+    return "Image data is empty";
+  }
+  if (encodedSize > MAX_INLINE_IMAGE_BASE64_BYTES) {
+    return `Image exceeds per-image base64 limit (${encodedSize} bytes > ${MAX_INLINE_IMAGE_BASE64_BYTES} bytes)`;
+  }
+  if (totalEncodedSize + encodedSize > MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES) {
+    return `Image would exceed total base64 limit (${totalEncodedSize + encodedSize} bytes > ${MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES} bytes)`;
+  }
+  return "";
+}
+
+function encodeByteStringToBase64(byteString) {
+  return btoa(String(byteString || ""));
+}
+
+function setExtraMcpContentBlocks(toolResult, blocks) {
+  if (!toolResult || typeof toolResult !== "object" || !Array.isArray(blocks) || blocks.length === 0) {
+    return toolResult;
+  }
+  Object.defineProperty(toolResult, MCP_EXTRA_CONTENT_BLOCKS, {
+    value: blocks,
+    enumerable: false,
+    configurable: true,
+  });
+  return toolResult;
+}
+
+function buildToolResultContent(toolResult) {
+  const content = [{
+    type: "text",
+    text: JSON.stringify(toolResult, null, 2),
+  }];
+  const extraBlocks = toolResult && toolResult[MCP_EXTRA_CONTENT_BLOCKS];
+  if (Array.isArray(extraBlocks)) content.push(...extraBlocks);
+  return content;
+}
+// END INLINE IMAGE CONTENT HELPERS
+
 // File paths that an MCP caller must never be allowed to attach to outbound
 // mail. Protects against the LLM-confused-deputy chain where attacker-controlled
 // email content prompt-injects an assistant into running
@@ -974,6 +1040,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             messageId: { type: "string", description: "The message ID (from searchMessages results)" },
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             saveAttachments: { type: "boolean", description: "If true, save attachments to <OS temp dir>/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" },
+            includeInlineImages: { type: "boolean", description: "If true, append supported inline email images as MCP image content blocks after the text result (default: false; max 1 MiB base64 per image and 4 MiB total). Ignored when rawSource is true." },
             bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format: 'markdown' (default, preserves structure), 'text' (plain text), 'html' (raw HTML)" },
             rawSource: { type: "boolean", description: "If true, return the full raw RFC 2822 message source (all headers + MIME parts). Useful for extracting calendar invites, S/MIME data, or debugging. Other fields (body, attachments) are omitted when this is set. Note: requires local/offline message copy; IMAP messages not cached offline may fail." },
           },
@@ -4910,7 +4977,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return raw;
             }
 
-            function parseAttachmentPartsFromRawMime(rawBytes) {
+            function parseAttachmentPartsFromRawMime(rawBytes, options = {}) {
+              const includeInlineImages = options.includeInlineImages === true;
               function toByteString(input) {
                 if (typeof input === "string") return input;
                 if (input instanceof Uint8Array) {
@@ -5154,7 +5222,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (!topContentType.value.startsWith("multipart/")) return [];
 
               const results = [];
-              function walkPart(partRaw, isRoot, depth = 0) {
+              function walkPart(partRaw, isRoot, depth, partName, insideRelated) {
                 if (depth > 32) return;
                 const split = findHeaderBodySplit(partRaw);
                 if (!split) return;
@@ -5165,8 +5233,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const disposition = contentDisposition.value || "";
                 if (ct === "message/rfc822" && !isRoot) return;
                 if (ct.startsWith("multipart/")) {
-                  for (const child of splitMultipartBody(split.body, contentType.params.boundary || "")) {
-                    walkPart(child, false, depth + 1);
+                  const children = splitMultipartBody(split.body, contentType.params.boundary || "");
+                  const childInsideRelated = insideRelated || ct === "multipart/related";
+                  for (let index = 0; index < children.length; index++) {
+                    walkPart(children[index], false, depth + 1, `${partName}.${index + 1}`, childInsideRelated);
                   }
                   return;
                 }
@@ -5176,7 +5246,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const hasAttachmentDisposition = disposition === "attachment";
                 const hasInlineFilename = disposition === "inline" && !!filename;
                 const hasNonTextFilename = !!filename && !ct.startsWith("text/");
-                if (!hasAttachmentDisposition && !hasInlineFilename && !hasNonTextFilename) return;
+                const isInlineImage = ct.startsWith("image/") && disposition !== "attachment" &&
+                  (insideRelated || disposition === "inline" || !!contentId);
+                if (!hasAttachmentDisposition && !hasInlineFilename && !hasNonTextFilename &&
+                    !(includeInlineImages && isInlineImage)) return;
 
                 let bytes;
                 try {
@@ -5190,18 +5263,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   contentType: ct,
                   contentId,
                   disposition,
+                  partName,
+                  isInline: isInlineImage,
                   bytes,
                 });
               }
 
-              for (const child of splitMultipartBody(top.body, topContentType.params.boundary || "")) {
-                walkPart(child, false, 0);
+              const topChildren = splitMultipartBody(top.body, topContentType.params.boundary || "");
+              const insideRelated = topContentType.value === "multipart/related";
+              for (let index = 0; index < topChildren.length; index++) {
+                walkPart(topChildren[index], false, 0, `1.${index + 1}`, insideRelated);
               }
               return results;
             }
             // END RAW MIME ATTACHMENT HELPERS
 
-	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource) {
+	            function getMessage(messageId, folderPath, saveAttachments, bodyFormat, rawSource, includeInlineImages) {
 	              return new Promise((resolve) => {
 	                try {
 	                  const found = findMessage(messageId, folderPath);
@@ -5379,9 +5456,46 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     }
 
+                    const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+                    let rawMimeContent = null;
+                    let rawMimeAttachmentParts = null;
+                    let rawMimePartsWithInlineImages = null;
+                    let rawMimeAttachmentError = null;
+
+                    function getRawMimeAttachmentParts(includeInlineParts = false) {
+                      const cached = includeInlineParts ? rawMimePartsWithInlineImages : rawMimeAttachmentParts;
+                      if (cached) return { parts: cached };
+                      if (rawMimeAttachmentError) return { error: rawMimeAttachmentError };
+                      let rawStream = null;
+                      try {
+                        if (rawMimeContent === null) {
+                          const rawFolder = msgHdr.folder;
+                          rawStream = rawFolder.getMsgInputStream(msgHdr, {});
+                          rawMimeContent = readMessageStreamFully(rawStream, MAX_ATTACHMENT_BYTES);
+                          if (!rawMimeContent || rawMimeContent.length === 0) {
+                            throw new Error("message stream has zero size");
+                          }
+                        }
+                        const parts = parseAttachmentPartsFromRawMime(rawMimeContent, {
+                          includeInlineImages: includeInlineParts,
+                        });
+                        if (includeInlineParts) rawMimePartsWithInlineImages = parts;
+                        else rawMimeAttachmentParts = parts;
+                        return { parts };
+                      } catch (e) {
+                        rawMimeAttachmentError = e;
+                        return { error: e };
+                      } finally {
+                        if (rawStream) try { rawStream.close(); } catch {
+                          // ignore close failure during best-effort fallback
+                        }
+                      }
+                    }
+
                     // Always collect attachment metadata
                     const attachments = [];
                     const attachmentSources = [];
+                    const inlineImageSources = [];
                     if (aMimeMsg && aMimeMsg.allUserAttachments) {
                       for (const att of aMimeMsg.allUserAttachments) {
                         const info = {
@@ -5400,27 +5514,52 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
 
                     // Find inline CID images not included in allUserAttachments.
-                    // Gloda's MimeMessage strips content-id headers, so we identify
-                    // inline images by: image/* parts inside multipart/related that
-                    // aren't already in allUserAttachments. URLs are resolved via
-                    // MailServices.messageServiceFromURI (imap-message:// isn't
-                    // directly fetchable by NetUtil).
+                    // Gloda's MimeMessage commonly strips content-id headers, so the
+                    // primary signal is an image/* part inside multipart/related. An
+                    // explicit inline disposition or surviving Content-ID also counts;
+                    // an explicit attachment disposition never does. URLs are resolved
+                    // through the message service because imap-message:// is not
+                    // directly fetchable by NetUtil.
                     if (aMimeMsg) {
-                      const existingPartNames = new Set(attachments.map(a => a.partName).filter(Boolean));
+                      const existingPartNames = includeInlineImages
+                        ? new Set((aMimeMsg.allUserAttachments || []).map(att => att?.partName).filter(Boolean))
+                        : new Set(attachments.map(a => a.partName).filter(Boolean));
                       function collectInlineImages(part, insideRelated, results) {
                         const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
-                        // Skip nested messages -- their inline images are not ours
-                        if (ct === "message/rfc822") return;
+                        // Skip nested messages -- their inline images are not ours. The
+                        // Gloda root is also message/rfc822 with an empty partName; walk
+                        // that wrapper for the opt-in path while preserving legacy output
+                        // when includeInlineImages is omitted.
+                        if (ct === "message/rfc822" && (part.partName || !includeInlineImages)) return;
                         if (ct === "multipart/related") insideRelated = true;
-                        if (insideRelated && ct.startsWith("image/") && part.partName) {
+                        const dispositionHeader = includeInlineImages
+                          ? part.headers?.["content-disposition"]?.[0] || ""
+                          : "";
+                        const disposition = includeInlineImages
+                          ? (dispositionHeader.split(";")[0] || "").trim().toLowerCase()
+                          : "";
+                        const rawContentId = includeInlineImages
+                          ? part.headers?.["content-id"]?.[0] || ""
+                          : "";
+                        const contentId = includeInlineImages
+                          ? String(rawContentId).trim().replace(/^<|>$/g, "")
+                          : "";
+                        const isInline = includeInlineImages
+                          ? disposition !== "attachment" &&
+                            (insideRelated || disposition === "inline" || !!contentId)
+                          : insideRelated;
+                        if (isInline && ct.startsWith("image/") && part.partName) {
                           // Deduplicate by partName (stable ID), not filename (can collide)
-                          if (existingPartNames.has(part.partName)) return;
+                          if (existingPartNames.has(part.partName) &&
+                              (!includeInlineImages || (disposition !== "inline" && !contentId))) return;
                           existingPartNames.add(part.partName);
                           // Extract filename from headers (contentType field lacks params)
                           const ctHeader = part.headers?.["content-type"]?.[0] || "";
-                          const nameMatch = ctHeader.match(/name\s*=\s*"?([^";]+)"?/i);
+                          const nameMatch = includeInlineImages
+                            ? `${dispositionHeader};${ctHeader}`.match(/(?:filename|name)\s*=\s*"?([^";]+)"?/i)
+                            : ctHeader.match(/name\s*=\s*"?([^";]+)"?/i);
                           const name = nameMatch ? nameMatch[1] : `inline_${part.partName}`;
-                          results.push({ part, name, ct });
+                          results.push({ part, name, ct, contentId });
                         }
                         if (part.parts) {
                           for (const sub of part.parts) collectInlineImages(sub, insideRelated, results);
@@ -5430,7 +5569,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       collectInlineImages(aMimeMsg, false, inlineImages);
                       if (inlineImages.length > 0) {
                         const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
-                        for (const { part, name, ct } of inlineImages) {
+                        for (const { part, name, ct, contentId } of inlineImages) {
                           // Resolve to a fetchable URL via the message service
                           let partUrl;
                           try {
@@ -5449,9 +5588,46 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             partName: part.partName,
                             isInline: true,
                           };
+                          if (includeInlineImages) info.contentId = contentId || null;
                           attachments.push(info);
                           if (partUrl) {
                             attachmentSources.push({ info, url: partUrl, size: info.size });
+                          }
+                          inlineImageSources.push({
+                            info,
+                            url: partUrl,
+                            size: info.size,
+                            partName: part.partName,
+                          });
+                        }
+                      }
+                    }
+
+                    // Recover Content-ID from the raw MIME tree for attribution. This
+                    // only runs for the opt-in path; default getMessage output and I/O
+                    // remain unchanged.
+                    if (includeInlineImages && inlineImageSources.length > 0) {
+                      const parsed = getRawMimeAttachmentParts(true);
+                      if (!parsed.error) {
+                        const rawInlineParts = (parsed.parts || []).filter(part => part.isInline);
+                        const usedRawParts = new Set();
+                        for (const source of inlineImageSources) {
+                          let rawPart = rawInlineParts.find(part =>
+                            !usedRawParts.has(part) && part.partName === source.partName
+                          );
+                          if (!rawPart) {
+                            rawPart = rawInlineParts.find(part =>
+                              !usedRawParts.has(part) &&
+                              normalizeInlineImageMimeType(part.contentType) ===
+                                normalizeInlineImageMimeType(source.info.contentType) &&
+                              (!part.filename || part.filename === source.info.name)
+                            );
+                          }
+                          if (!rawPart) continue;
+                          usedRawParts.add(rawPart);
+                          if (rawPart.contentId) source.info.contentId = rawPart.contentId;
+                          if (rawPart.filename && source.info.name.startsWith("inline_")) {
+                            source.info.name = rawPart.filename;
                           }
                         }
                       }
@@ -5471,8 +5647,148 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       attachments
                     };
 
+                    function fetchInlineImageBase64(source) {
+                      return new Promise((resolve) => {
+                        if (!source.url) {
+                          resolve({ error: "Inline image has no fetchable message-part URL" });
+                          return;
+                        }
+                        try {
+                          const channel = NetUtil.newChannel({
+                            uri: source.url,
+                            loadUsingSystemPrincipal: true,
+                          });
+                          NetUtil.asyncFetch(channel, (inputStream, status, request) => {
+                            try {
+                              if (status && status !== 0) {
+                                resolve({ error: `Inline image fetch failed: ${status}` });
+                                return;
+                              }
+                              if (!inputStream) {
+                                resolve({ error: "Inline image fetch returned no data" });
+                                return;
+                              }
+                              const requestLength = request && typeof request.contentLength === "number"
+                                ? request.contentLength
+                                : -1;
+                              if (requestLength > 0 &&
+                                  getBase64EncodedSize(requestLength) > MAX_INLINE_IMAGE_BASE64_BYTES) {
+                                resolve({
+                                  error: `Image exceeds per-image base64 limit (${getBase64EncodedSize(requestLength)} bytes > ${MAX_INLINE_IMAGE_BASE64_BYTES} bytes)`,
+                                });
+                                return;
+                              }
+                              // Largest decoded payload whose base64 representation fits
+                              // exactly inside the per-image encoded budget.
+                              const maxRawBytes = Math.floor(MAX_INLINE_IMAGE_BASE64_BYTES / 4) * 3;
+                              let byteString;
+                              try {
+                                byteString = readMessageStreamFully(inputStream, maxRawBytes);
+                              } catch {
+                                resolve({
+                                  error: `Image exceeds per-image base64 limit (${MAX_INLINE_IMAGE_BASE64_BYTES} bytes)`,
+                                });
+                                return;
+                              }
+                              resolve({ data: encodeByteStringToBase64(byteString) });
+                            } catch (e) {
+                              resolve({ error: `Inline image fetch failed: ${e}` });
+                            } finally {
+                              try { inputStream?.close(); } catch {}
+                            }
+                          });
+                        } catch (e) {
+                          resolve({ error: `Inline image fetch failed: ${e}` });
+                        }
+                      });
+                    }
+
+                    async function appendInlineImageContent() {
+                      const blocks = [];
+                      let totalBase64Bytes = 0;
+
+                      for (const source of inlineImageSources) {
+                        const mimeType = normalizeInlineImageMimeType(source.info.contentType);
+                        let skipReason = "";
+
+                        if (!SUPPORTED_INLINE_IMAGE_MIME_TYPES.has(mimeType)) {
+                          skipReason = getInlineImageSkipReason(mimeType, 1, totalBase64Bytes);
+                        } else if (totalBase64Bytes >= MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES) {
+                          skipReason = `Total base64 limit reached (${MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES} bytes)`;
+                        } else if (typeof source.size === "number" && source.size >= 0) {
+                          skipReason = getInlineImageSkipReason(
+                            mimeType,
+                            getBase64EncodedSize(source.size),
+                            totalBase64Bytes
+                          );
+                        }
+
+                        if (skipReason) {
+                          source.info.mcpImage = { status: "skipped", reason: skipReason };
+                          continue;
+                        }
+
+                        const fetched = await fetchInlineImageBase64(source);
+                        if (fetched.error) {
+                          source.info.mcpImage = { status: "skipped", reason: fetched.error };
+                          continue;
+                        }
+
+                        skipReason = getInlineImageSkipReason(
+                          mimeType,
+                          fetched.data.length,
+                          totalBase64Bytes
+                        );
+                        if (skipReason) {
+                          source.info.mcpImage = { status: "skipped", reason: skipReason };
+                          continue;
+                        }
+
+                        const contentBlockIndex = blocks.length + 1; // text block is index 0
+                        blocks.push({ type: "image", data: fetched.data, mimeType });
+                        totalBase64Bytes += fetched.data.length;
+                        source.info.mcpImage = {
+                          status: "included",
+                          contentBlockIndex,
+                          base64Bytes: fetched.data.length,
+                        };
+                      }
+
+                      baseResponse.inlineImageContent = {
+                        included: blocks.length,
+                        skipped: inlineImageSources.length - blocks.length,
+                        totalBase64Bytes,
+                        limits: {
+                          perImageBase64Bytes: MAX_INLINE_IMAGE_BASE64_BYTES,
+                          totalBase64Bytes: MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES,
+                        },
+                      };
+                      setExtraMcpContentBlocks(baseResponse, blocks);
+                    }
+
+                    function resolveBaseResponse() {
+                      if (!includeInlineImages) {
+                        resolve(baseResponse);
+                        return;
+                      }
+                      appendInlineImageContent()
+                        .then(() => resolve(baseResponse))
+                        .catch((e) => {
+                          baseResponse.inlineImageContent = {
+                            included: 0,
+                            skipped: inlineImageSources.length,
+                            error: `Failed to include inline images: ${e}`,
+                            limits: {
+                              perImageBase64Bytes: MAX_INLINE_IMAGE_BASE64_BYTES,
+                              totalBase64Bytes: MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES,
+                            },
+                          };
+                          resolve(baseResponse);
+                        });
+                    }
+
                     if (!saveAttachments || attachmentSources.length === 0) {
-                      resolve(baseResponse);
+                      resolveBaseResponse();
                       return;
                     }
 
@@ -5517,37 +5833,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       for (const { info } of attachmentSources) {
                         info.error = `Failed to create attachment directory: ${e}`;
                       }
-                      resolve(baseResponse);
+                      resolveBaseResponse();
                       return;
                     }
 
-                    const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
-                    let rawMimeAttachmentParts = null;
-                    let rawMimeAttachmentError = null;
                     const _consumedRawMimeParts = new Set();
-
-                                        function getRawMimeAttachmentParts() {
-                                          if (rawMimeAttachmentParts) return { parts: rawMimeAttachmentParts };
-                                          if (rawMimeAttachmentError) return { error: rawMimeAttachmentError };
-                                          let rawStream = null;
-                                          try {
-                                            const rawFolder = msgHdr.folder;
-                                            rawStream = rawFolder.getMsgInputStream(msgHdr, {});
-                                            const rawContent = readMessageStreamFully(rawStream, MAX_ATTACHMENT_BYTES);
-                                            if (!rawContent || rawContent.length === 0) {
-                                              throw new Error("message stream has zero size");
-                                            }
-                                            rawMimeAttachmentParts = parseAttachmentPartsFromRawMime(rawContent);
-                                            return { parts: rawMimeAttachmentParts };
-                                          } catch (e) {
-                                            rawMimeAttachmentError = e;
-                                            return { error: e };
-                                          } finally {
-                                            if (rawStream) try { rawStream.close(); } catch {
-                                              // ignore close failure during best-effort fallback
-                                            }
-                                          }
-                                        }
 
                                         function normalizeAttachmentFilename(name) {
                                           return String(name || "").trim().toLowerCase();
@@ -5788,7 +6078,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           if (!info.error) info.error = `Unexpected save error: ${e}`;
                         }
                       }
-                      resolve(baseResponse);
+                      resolveBaseResponse();
                     })();
                   }, true, { examineEncryptedParts: true });
 
@@ -7664,7 +7954,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "searchMessages":
                   return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody, args.dedupByMessageId);
                 case "getMessage":
-                  return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource);
+                  return await getMessage(args.messageId, args.folderPath, args.saveAttachments, args.bodyFormat, args.rawSource, args.includeInlineImages);
                 case "getMessages":
                   return await getMessages(args.messages, args.saveAttachments, args.bodyFormat, args.rawSource);
                 case "searchContacts":
@@ -7892,10 +8182,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           throw new Error(`Invalid parameters for '${params.name}': ${validationErrors.join("; ")}`);
                         }
                         result = {
-                          content: [{
-                            type: "text",
-                            text: JSON.stringify(await callTool(params.name, toolArgs), null, 2)
-                          }]
+                          content: buildToolResultContent(await callTool(params.name, toolArgs))
                         };
                       }
                       break;

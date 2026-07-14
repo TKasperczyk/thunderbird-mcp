@@ -140,6 +140,47 @@ Content-Type: text/html
     assert.equal(utf8(parts[0].bytes), "nested-pdf");
   });
 
+  it("opt-in parsing identifies CID images without treating regular image attachments as inline", () => {
+    const regularAttachment = attachmentPart({
+      filename: "photo.png",
+      contentType: "image/png",
+      body: "cmVndWxhci1hdHRhY2htZW50",
+    });
+    const related = `Content-Type: multipart/related; boundary="related"
+
+--related
+Content-Type: text/html; charset=utf-8
+
+<p>See <img src="cid:diagram@example.test"></p>
+--related
+Content-Type: image/png
+Content-ID: <diagram@example.test>
+Content-Transfer-Encoding: base64
+
+aW5saW5lLXBpeGVscw==
+--related
+${regularAttachment}
+--related--`;
+    const raw = multipart("outer", [related]);
+
+    const defaultParts = parseAttachmentPartsFromRawMime(raw);
+    assert.equal(defaultParts.length, 1);
+    assert.equal(defaultParts[0].filename, "photo.png");
+    assert.equal(defaultParts[0].isInline, false);
+
+    const optInParts = parseAttachmentPartsFromRawMime(raw, { includeInlineImages: true });
+    const inlinePart = optInParts.find(part => part.isInline);
+    const regularPart = optInParts.find(part => part.filename === "photo.png");
+
+    assert.ok(inlinePart);
+    assert.equal(inlinePart.partName, "1.1.2");
+    assert.equal(inlinePart.contentId, "diagram@example.test");
+    assert.equal(inlinePart.contentType, "image/png");
+    assert.equal(utf8(inlinePart.bytes), "inline-pixels");
+    assert.ok(regularPart);
+    assert.equal(regularPart.isInline, false);
+  });
+
   it("decodes supported content-transfer-encoding variants", () => {
     const binary = String.fromCharCode(0, 1, 2, 255);
     const raw8bit = String.fromCharCode(0x63, 0x61, 0x66, 0xE9);
