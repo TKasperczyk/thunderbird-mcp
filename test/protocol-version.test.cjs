@@ -11,9 +11,37 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('child_process');
+const fs = require('fs');
 const path = require('path');
+const vm = require('vm');
 
 const BRIDGE_PATH = path.resolve(__dirname, '..', 'mcp-bridge.cjs');
+const API_PATH = path.resolve(__dirname, '..', 'extension', 'mcp_server', 'api.js');
+
+function runProductionNotificationBranch(method) {
+  const source = fs.readFileSync(API_PATH, 'utf8');
+  const startMarker = '// BEGIN MCP NOTIFICATION HTTP RESPONSE';
+  const endMarker = '// END MCP NOTIFICATION HTTP RESPONSE';
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  assert.ok(start >= 0, 'notification response start marker missing');
+  assert.ok(end > start, 'notification response end marker missing');
+
+  const calls = [];
+  const sandbox = {
+    method,
+    res: {
+      setStatusLine(...args) {
+        calls.push({ name: 'setStatusLine', args });
+      },
+      finish() {
+        calls.push({ name: 'finish', args: [] });
+      },
+    },
+  };
+  vm.runInNewContext(`(function () {\n${source.slice(start, end)}\n})()`, sandbox);
+  return calls;
+}
 
 function sendInitialize(protocolVersion) {
   return new Promise((resolve, reject) => {
@@ -174,5 +202,19 @@ describe('protocolVersion negotiation', () => {
   it('includes tools capability', async () => {
     const response = await sendInitialize('2024-11-05');
     assert.ok(response.result.capabilities.tools, 'should include tools capability');
+  });
+});
+
+describe('Streamable HTTP notifications', () => {
+  it('returns 202 Accepted without a response body', () => {
+    const calls = runProductionNotificationBranch('notifications/initialized');
+    assert.deepEqual(calls, [
+      { name: 'setStatusLine', args: ['1.1', 202, 'Accepted'] },
+      { name: 'finish', args: [] },
+    ]);
+  });
+
+  it('does not handle ordinary JSON-RPC methods as notifications', () => {
+    assert.deepEqual(runProductionNotificationBranch('tools/list'), []);
   });
 });

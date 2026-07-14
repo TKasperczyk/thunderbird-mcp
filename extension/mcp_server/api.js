@@ -7084,12 +7084,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               const { id, method, params } = message;
 
-              // Notifications don't expect a response
+              // Streamable HTTP notifications are accepted without a JSON-RPC body.
+              // BEGIN MCP NOTIFICATION HTTP RESPONSE
               if (typeof method === "string" && method.startsWith("notifications/")) {
-                res.setStatusLine("1.1", 204, "No Content");
+                res.setStatusLine("1.1", 202, "Accepted");
                 res.finish();
                 return;
               }
+              // END MCP NOTIFICATION HTTP RESPONSE
 
               (async () => {
                 try {
