@@ -502,6 +502,64 @@ function discoverConnectionInfo(options = {}) {
 // Encoded size grows ~33%, so 18 MB raw → ~24 MB base64, staying under the
 // extension's 25 MB MAX_BASE64_SIZE limit.
 const MAX_ATTACHMENT_BYTES = 18 * 1024 * 1024;
+// Keep these message-wide limits in sync with extension/mcp_server/api.js.
+const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE = 20;
+
+// File paths that an MCP caller must never be allowed to attach to outbound
+// mail. Keep the pattern list and helper behavior identical to the extension so
+// neither transport can bypass the LLM-confused-deputy defense.
+// Keep in sync with extension/mcp_server/api.js isSensitiveFilePath.
+const SENSITIVE_ATTACHMENT_PATTERNS = [
+  // SSH / PGP / cloud / kube / docker credentials
+  /\/\.ssh(\/|$)/,
+  /\/\.gnupg(\/|$)/,
+  /\/\.aws(\/|$)/,
+  /\/\.azure(\/|$)/,
+  /\/\.config\/gcloud(\/|$)/,
+  /\/\.kube(\/|$)/,
+  /\/\.docker(\/|$)/,
+  /\/\.netrc$/,
+  /\/\.npmrc$/,
+  /\/\.pypirc$/,
+  // Common key / secret file extensions anywhere on disk
+  /\/id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/,
+  /\.pem$/,
+  /\.pfx$/,
+  /\.p12$/,
+  /\.kdbx$/,
+  /\.key$/,
+  /\.asc$/,
+  /\.gpg$/,
+  // Linux / macOS system directories
+  /^\/etc\//,
+  /^\/proc\//,
+  /^\/sys\//,
+  /^\/root\//,
+  /^\/var\/log\//,
+  /^\/var\/lib\/sudo\//,
+  // macOS keychain locations
+  /\/library\/keychains\//,
+  // Windows system directories
+  /^[a-z]:\/windows\//,
+  /^[a-z]:\/programdata\/microsoft\/(crypto|protect)\//,
+  /\/appdata\/(local|roaming)\/microsoft\/(credentials|crypto|protect|vault)(\/|$)/,
+  // Browser credential stores (Firefox / Chrome / Edge)
+  /\/(logins\.json|key3\.db|key4\.db|cookies(\.sqlite)?|login data)$/,
+  // Thunderbird's own profile (contains the user's entire mail store + prefs).
+  // Linux profile directories and profiles.ini live directly under
+  // ~/.thunderbird (or ~/.icedove), while macOS and Windows use the platform
+  // application-data directories below. Block each profile root in full.
+  /\/\.(?:thunderbird|icedove)(\/|$)/,
+  /\/library\/thunderbird(\/|$)/,
+  /\/appdata\/roaming\/thunderbird(\/|$)/,
+];
+
+function isSensitiveFilePath(attachmentPath) {
+  if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
+  const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
+  return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
+}
 
 // Tools whose `attachments` array may contain string file paths that this
 // bridge resolves on the host filesystem before forwarding. Needed because the
@@ -565,22 +623,25 @@ function guessContentType(filePath) {
   return MIME_BY_EXT[ext] || 'application/octet-stream';
 }
 
-// Read a file path off the host filesystem and convert it to the inline
-// { name, contentType, base64 } shape the extension already supports. Throws
-// a clear error on missing/unreadable/oversized files so the caller can
-// surface them as MCP errors instead of the extension's silent
-// "failed to attach" warning.
-async function readAttachmentFromPath(filePath) {
-  let stat;
-  try {
-    stat = await fs.promises.stat(filePath);
-  } catch (e) {
-    if (e.code === 'ENOENT') throw new Error(`Attachment not found: ${filePath}`, { cause: e });
-    if (e.code === 'EACCES') throw new Error(`Attachment unreadable (permission denied): ${filePath}`, { cause: e });
-    throw new Error(`Attachment stat failed (${e.code || 'unknown'}): ${filePath}`, { cause: e });
+function attachmentError(action, filePath, error) {
+  if (error?.code === 'ENOENT') {
+    return new Error(`Attachment not found: ${filePath}`, { cause: error });
+  }
+  if (error?.code === 'EACCES' || error?.code === 'EPERM') {
+    return new Error(`Attachment unreadable (permission denied): ${filePath}`, { cause: error });
+  }
+  return new Error(`Attachment ${action} failed (${error?.code || 'unknown'}): ${filePath}`, { cause: error });
+}
+
+function validateAttachmentStat(filePath, stat) {
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Attachment path is a symlink and is not allowed: ${filePath}`);
   }
   if (!stat.isFile()) {
     throw new Error(`Attachment is not a regular file: ${filePath}`);
+  }
+  if (!Number.isSafeInteger(stat.size) || stat.size < 0) {
+    throw new Error(`Attachment has an invalid file size: ${filePath}`);
   }
   if (stat.size > MAX_ATTACHMENT_BYTES) {
     throw new Error(
@@ -588,31 +649,138 @@ async function readAttachmentFromPath(filePath) {
       `(limit ${MAX_ATTACHMENT_BYTES} bytes / ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB raw before base64)`
     );
   }
-  let buf;
-  try {
-    buf = await fs.promises.readFile(filePath);
-  } catch (e) {
-    throw new Error(`Attachment read failed (${e.code || 'unknown'}): ${filePath}`, { cause: e });
+}
+
+async function inspectAttachmentPath(filePath) {
+  // Check both the supplied path and its lexical normalization before any
+  // filesystem access. The latter catches paths such as /tmp/../etc/passwd.
+  if (isSensitiveFilePath(filePath) || isSensitiveFilePath(path.resolve(filePath))) {
+    throw new Error(`Sensitive attachment path blocked: ${filePath}`);
   }
-  return {
-    name: path.basename(filePath),
-    contentType: guessContentType(filePath),
-    base64: buf.toString('base64')
-  };
+
+  let stat;
+  try {
+    // lstat is deliberate: stat would follow the final symlink before policy
+    // could reject it.
+    stat = await fs.promises.lstat(filePath);
+  } catch (e) {
+    throw attachmentError('lstat', filePath, e);
+  }
+  validateAttachmentStat(filePath, stat);
+  return { filePath, stat };
+}
+
+function sameFile(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function readFileHandleExactly(handle, filePath, size) {
+  const buffer = Buffer.allocUnsafe(size);
+  let offset = 0;
+  while (offset < size) {
+    const { bytesRead } = await handle.read(buffer, offset, size - offset, offset);
+    if (bytesRead === 0) {
+      throw new Error(`Attachment changed while being read: ${filePath}`);
+    }
+    offset += bytesRead;
+  }
+
+  // Do not let a file that grew after fstat trigger an unbounded read.
+  const extra = Buffer.allocUnsafe(1);
+  const { bytesRead } = await handle.read(extra, 0, 1, size);
+  if (bytesRead !== 0) {
+    throw new Error(`Attachment changed while being read: ${filePath}`);
+  }
+
+  return buffer;
+}
+
+// Read a preflighted file path off the host filesystem and convert it to the
+// inline { name, contentType, base64 } shape the extension supports. Opening
+// with O_NOFOLLOW where available and comparing the opened file to the lstat
+// snapshot prevents a path swap from redirecting the read to a symlink/other
+// inode between policy validation and I/O.
+async function readAttachmentFromPath(fileInfo) {
+  const { filePath, stat: preflightStat } = fileInfo;
+  const freshInfo = await inspectAttachmentPath(filePath);
+  if (!sameFile(preflightStat, freshInfo.stat) || preflightStat.size !== freshInfo.stat.size) {
+    throw new Error(`Attachment changed after validation: ${filePath}`);
+  }
+
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  let handle;
+  try {
+    handle = await fs.promises.open(filePath, fs.constants.O_RDONLY | noFollow);
+  } catch (e) {
+    if (e?.code === 'ELOOP') {
+      throw new Error(`Attachment path is a symlink and is not allowed: ${filePath}`, { cause: e });
+    }
+    throw attachmentError('open', filePath, e);
+  }
+
+  try {
+    let openedStat;
+    try {
+      openedStat = await handle.stat();
+    } catch (e) {
+      throw attachmentError('fstat', filePath, e);
+    }
+    validateAttachmentStat(filePath, openedStat);
+    if (!sameFile(freshInfo.stat, openedStat) || freshInfo.stat.size !== openedStat.size) {
+      throw new Error(`Attachment changed after validation: ${filePath}`);
+    }
+    const buffer = await readFileHandleExactly(handle, filePath, openedStat.size);
+    return {
+      name: path.basename(filePath),
+      contentType: guessContentType(filePath),
+      base64: buffer.toString('base64')
+    };
+  } finally {
+    await handle.close();
+  }
 }
 
 // Replace every string entry in `args.attachments` (= file path) with an
 // inline { name, contentType, base64 } object read off the host filesystem.
-// Inline objects pass through unchanged. Reads run in parallel; the first
-// failing path rejects the whole call so the bridge fails loud instead of
-// silently dropping an attachment.
+// Inline objects pass through unchanged. All paths and message-wide limits are
+// preflighted before the first read, then files are read sequentially so a
+// caller cannot force many large buffers to be resident at once.
 async function inlineAttachmentPaths(args) {
   if (!args || !Array.isArray(args.attachments)) return;
-  const resolved = await Promise.all(
-    args.attachments.map(entry =>
-      typeof entry === 'string' ? readAttachmentFromPath(entry) : entry
-    )
-  );
+
+  if (args.attachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+    throw new Error(
+      `Attachment count ${args.attachments.length} exceeds the ` +
+      `${MAX_ATTACHMENTS_PER_MESSAGE} attachment limit`
+    );
+  }
+
+  const fileInfoByIndex = new Map();
+  let totalAttachmentBytes = 0;
+  for (let index = 0; index < args.attachments.length; index++) {
+    const entry = args.attachments[index];
+    if (typeof entry !== 'string') continue;
+
+    const fileInfo = await inspectAttachmentPath(entry);
+    if (fileInfo.stat.size > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
+      throw new Error(
+        `Attachment aggregate too large at ${entry}: exceeds the ` +
+        `${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024} MB aggregate attachment limit`
+      );
+    }
+    totalAttachmentBytes += fileInfo.stat.size;
+    fileInfoByIndex.set(index, fileInfo);
+  }
+
+  const resolved = [];
+  for (let index = 0; index < args.attachments.length; index++) {
+    const entry = args.attachments[index];
+    resolved.push(
+      typeof entry === 'string'
+        ? await readAttachmentFromPath(fileInfoByIndex.get(index))
+        : entry
+    );
+  }
   args.attachments = resolved;
 }
 
@@ -1044,7 +1212,14 @@ module.exports = {
   findSnapConnectionCandidates,
   formatDiscoveryAttempts,
   compactToolResultJsonText,
+  inlineAttachmentPaths,
+  isSensitiveFilePath,
   isValidAuthToken,
   readConnectionInfo,
   startBridge,
+  attachmentLimits: {
+    MAX_ATTACHMENT_BYTES,
+    MAX_TOTAL_ATTACHMENT_BYTES,
+    MAX_ATTACHMENTS_PER_MESSAGE,
+  },
 };

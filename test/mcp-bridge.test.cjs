@@ -6,10 +6,13 @@ const path = require('path');
 
 const {
   advanceToNextCandidate,
+  attachmentLimits,
   buildConnectionDiscoveryErrorMessage,
   compactToolResultJsonText,
   clearConnectionCache,
   discoverConnectionInfo,
+  inlineAttachmentPaths,
+  isSensitiveFilePath,
   isValidAuthToken,
   readConnectionInfo,
 } = require('../mcp-bridge.cjs');
@@ -126,6 +129,131 @@ describe('Tool result serialization', () => {
     );
     assert.equal(response.result.content[0].text, originalText);
     assert.equal(compacted.result.content[0].text.includes('\n'), false);
+  });
+});
+
+describe('Bridge attachment path policy', () => {
+  let root;
+
+  beforeEach(() => {
+    root = makeTempRoot();
+  });
+
+  afterEach(() => {
+    cleanupTempRoot(root);
+  });
+
+  it('rejects sensitive paths before trying to inline them', async () => {
+    const sensitivePath = path.join(root, '.ssh', 'id_rsa');
+    const args = { attachments: [sensitivePath] };
+
+    await assert.rejects(
+      inlineAttachmentPaths(args),
+      error => {
+        assert.match(error.message, /Sensitive attachment path blocked/);
+        assert.ok(error.message.includes(sensitivePath), error.message);
+        return true;
+      }
+    );
+    assert.deepEqual(args.attachments, [sensitivePath]);
+  });
+
+  it('uses the same normalized deny-list rules for Windows paths', () => {
+    assert.equal(isSensitiveFilePath('C:\\Users\\alice\\.ssh\\id_ed25519'), true);
+    assert.equal(isSensitiveFilePath('C:\\Users\\alice\\Downloads\\report.pdf'), false);
+  });
+
+  it('rejects attachment counts above the extension limit before filesystem access', async () => {
+    const attachments = Array.from(
+      { length: attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE + 1 },
+      (_, index) => ({ name: `inline-${index}.txt`, base64: 'QQ==' })
+    );
+
+    await assert.rejects(
+      inlineAttachmentPaths({ attachments }),
+      new RegExp(
+        `Attachment count ${attachments.length} exceeds the ` +
+        `${attachmentLimits.MAX_ATTACHMENTS_PER_MESSAGE} attachment limit`
+      )
+    );
+  });
+
+  it('rejects an aggregate of path attachments above 50 MB before reading', async () => {
+    const sizes = [18, 18, 15].map(mib => mib * 1024 * 1024);
+    const attachments = sizes.map((size, index) => {
+      const filePath = path.join(root, `aggregate-${index}.bin`);
+      fs.writeFileSync(filePath, '');
+      fs.truncateSync(filePath, size);
+      return filePath;
+    });
+    const args = { attachments };
+
+    await assert.rejects(
+      inlineAttachmentPaths(args),
+      error => {
+        assert.match(error.message, /50 MB aggregate attachment limit/);
+        assert.ok(error.message.includes(attachments[2]), error.message);
+        return true;
+      }
+    );
+    assert.deepEqual(args.attachments, attachments);
+  });
+
+  it('rejects oversized and non-regular files during preflight', async () => {
+    const oversizedPath = path.join(root, 'oversized.bin');
+    fs.writeFileSync(oversizedPath, '');
+    fs.truncateSync(oversizedPath, attachmentLimits.MAX_ATTACHMENT_BYTES + 1);
+
+    await assert.rejects(
+      inlineAttachmentPaths({ attachments: [oversizedPath] }),
+      error => error.message.includes(`Attachment too large: ${oversizedPath}`)
+    );
+    await assert.rejects(
+      inlineAttachmentPaths({ attachments: [root] }),
+      error => error.message.includes(`Attachment is not a regular file: ${root}`)
+    );
+  });
+
+  it('rejects symlinked attachment paths', async (t) => {
+    const targetPath = path.join(root, 'target.txt');
+    const symlinkPath = path.join(root, 'attachment.txt');
+    fs.writeFileSync(targetPath, 'safe attachment', 'utf8');
+    try {
+      fs.symlinkSync(targetPath, symlinkPath, 'file');
+    } catch (error) {
+      if (error.code === 'EPERM' || error.code === 'EACCES') {
+        t.skip(`symlinks unavailable: ${error.code}`);
+        return;
+      }
+      throw error;
+    }
+
+    await assert.rejects(
+      inlineAttachmentPaths({ attachments: [symlinkPath] }),
+      error => {
+        assert.match(error.message, /symlink/);
+        assert.ok(error.message.includes(symlinkPath), error.message);
+        return true;
+      }
+    );
+  });
+
+  it('inlines allowed files and leaves inline objects untouched', async () => {
+    const filePath = path.join(root, 'report.txt');
+    const inline = { name: 'already-inline.txt', base64: 'QQ==' };
+    fs.writeFileSync(filePath, 'hello', 'utf8');
+    const args = { attachments: [filePath, inline] };
+
+    await inlineAttachmentPaths(args);
+
+    assert.deepEqual(args.attachments, [
+      {
+        name: 'report.txt',
+        contentType: 'text/plain',
+        base64: Buffer.from('hello').toString('base64'),
+      },
+      inline,
+    ]);
   });
 });
 

@@ -143,6 +143,7 @@ const MAX_REQUEST_BODY = 32 * 1024 * 1024; // 32 MB limit for incoming HTTP requ
 // blocking known-sensitive locations rather than restricting users to a
 // downloads-only sandbox. Extend it as new high-value targets surface.
 // BEGIN SENSITIVE ATTACHMENT PATH HELPERS
+// Keep in sync with mcp-bridge.cjs isSensitiveFilePath.
 const SENSITIVE_ATTACHMENT_PATTERNS = [
   // SSH / PGP / cloud / kube / docker credentials
   /\/\.ssh(\/|$)/,
