@@ -5539,7 +5539,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => b._dateTs - a._dateTs);
 
-              return paginate(results, offset, effectiveLimit);
+              const searchId = registerSearchSession(results, '', folderPath);
+              const paginated = paginate(results, offset, effectiveLimit);
+              if (Array.isArray(paginated)) {
+                return { messages: paginated, searchId };
+              }
+              paginated.searchId = searchId;
+              return paginated;
             }
 
             function deleteMessages(messageIds, folderPath, excludeIds, searchId) {
@@ -5691,7 +5697,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "messageId or messageIds is required" };
                 }
                 if (typeof folderPath !== "string" || !folderPath) {
-                  return { error: "folderPath must be a non-empty string" };
+                  if (messageIds.length !== 1 || messageIds[0] !== '*') {
+                    return { error: "folderPath must be a non-empty string" };
+                  }
                 }
 
                 // Daisy-chain wildcard resolution
