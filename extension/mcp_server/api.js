@@ -5558,7 +5558,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "messageIds must be a non-empty array of strings" };
                 }
                 if (typeof folderPath !== "string" || !folderPath) {
-                  return { error: "folderPath must be a non-empty string" };
+                  if (messageIds.length !== 1 || messageIds[0] !== '*') {
+                    return { error: "folderPath must be a non-empty string" };
+                  }
                 }
 
                 // Daisy-chain wildcard resolution
