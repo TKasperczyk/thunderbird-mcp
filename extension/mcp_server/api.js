@@ -3568,6 +3568,157 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
+             * Reads the identity's signature: either the sig_file on disk
+             * (attach_signature=true) or the inline htmlSigText.
+             *
+             * Returns { content, isHtmlSig } or null when the identity has none.
+             */
+            function readSignatureFileText(file) {
+              const fstream = Cc["@mozilla.org/network/file-input-stream;1"]
+                .createInstance(Ci.nsIFileInputStream);
+              const cstream = Cc["@mozilla.org/intl/converter-input-stream;1"]
+                .createInstance(Ci.nsIConverterInputStream);
+              try {
+                fstream.init(file, -1, 0, 0);
+                cstream.init(fstream, "UTF-8", 0, 0);
+                let data = "";
+                const chunk = {};
+                let read = 0;
+                do {
+                  read = cstream.readString(0xffffffff, chunk);
+                  data += chunk.value;
+                } while (read !== 0);
+                return data;
+              } finally {
+                try { cstream.close(); } catch (e) { /* already closed */ }
+              }
+            }
+
+            function getIdentitySignature(identity) {
+              if (!identity) return null;
+              try {
+                if (identity.attachSignature) {
+                  const file = identity.signature;
+                  if (file && file.exists() && file.isFile()) {
+                    const content = readSignatureFileText(file);
+                    if (content && content.trim()) {
+                      return { content, isHtmlSig: /\.html?$/i.test(file.leafName) };
+                    }
+                  }
+                }
+                const inline = identity.htmlSigText;
+                if (inline && inline.trim()) {
+                  return { content: inline, isHtmlSig: identity.htmlSigFormat === true };
+                }
+              } catch (error) {
+                console.warn("thunderbird-mcp: could not read identity signature", error);
+              }
+              return null;
+            }
+
+            /**
+             * Signatures are often stored as a whole document (htmlSigText from
+             * a signature generator keeps <!DOCTYPE><html><head>...). Embedding
+             * that inside our <body> would nest documents, so keep the body's
+             * inner HTML only -- which is what Thunderbird's compose editor
+             * effectively does when it inserts the signature.
+             */
+            function unwrapHtmlDocument(html) {
+              if (!/<(?:html|body|head)\b/i.test(html)) return html;
+
+              // NOTE: DOMParser is NOT reliably available in this ExtensionAPI
+              // scope (see the globals comment at the top of this file, and the
+              // stripHtml fallback in htmlToMarkdown). Guard on typeof -- a bare
+              // `new DOMParser()` throws ReferenceError, and swallowing it in a
+              // catch would silently return the document unwrapped.
+              try {
+                if (typeof DOMParser !== "undefined") {
+                  const doc = new DOMParser().parseFromString(html, "text/html");
+                  if (doc && doc.body) return doc.body.innerHTML;
+                }
+              } catch (error) {
+                console.warn("thunderbird-mcp: DOMParser unwrap failed, stripping envelope textually", error);
+              }
+
+              const body = /<body\b[^>]*>([\s\S]*)<\/body>/i.exec(html);
+              if (body) return body[1];
+              return html
+                .replace(/<!DOCTYPE[^>]*>/gi, "")
+                .replace(/<head\b[^>]*>[\s\S]*?<\/head>/gi, "")
+                .replace(/<\/?(?:html|body)\b[^>]*>/gi, "");
+            }
+
+            function htmlSignatureToPlainText(html) {
+              try {
+                const parserUtils = Cc["@mozilla.org/parserutils;1"].getService(Ci.nsIParserUtils);
+                return parserUtils.convertToPlainText(
+                  html,
+                  Ci.nsIDocumentEncoder.OutputFormatted | Ci.nsIDocumentEncoder.OutputLFLineBreak,
+                  0
+                ).replace(/\s+$/, "");
+              } catch (error) {
+                console.warn("thunderbird-mcp: parserUtils unavailable, stripping tags", error);
+                return html.replace(/<br\s*\/?>/gi, "\n").replace(/<[^>]*>/g, "").trim();
+              }
+            }
+
+            /**
+             * Builds the trailing signature fragment for a body we compose
+             * ourselves.
+             *
+             * Thunderbird inserts signatures from its compose window only
+             * (gMsgCompose reads htmlSigText/sig_file and honours sig_bottom).
+             * The createAndSendMessage path behind saveDraft and skipReview
+             * sends never opens that window, so without this the message ships
+             * with no signature at all. New messages carry no quote, so
+             * sig_bottom does not apply: the signature always goes last.
+             *
+             * Returns "" when the identity has no signature.
+             */
+            function buildSignatureFragment(identity, useHtml) {
+              const sig = getIdentitySignature(identity);
+              if (!sig) return "";
+
+              const asText = sig.isHtmlSig ? htmlSignatureToPlainText(sig.content) : sig.content;
+              // Thunderbird prepends the "-- " separator unless the signature
+              // already opens with one (mail.compose.dont_add_signature_separator).
+              const hasSeparator = /^\s*--\s*$/m.test(asText.split("\n")[0] || "");
+
+              if (useHtml) {
+                const sigHtml = sig.isHtmlSig
+                  ? formatBodyHtml(unwrapHtmlDocument(sig.content), true)
+                  : formatBodyHtml(sig.content, false);
+                const separator = hasSeparator ? "" : "-- <br>";
+                return `<br><div class="moz-signature">${separator}${sigHtml}</div>`;
+              }
+
+              const separator = hasSeparator ? "" : "-- \n";
+              return `\n\n${separator}${asText}`;
+            }
+
+            /**
+             * Shapes composeFields.body for the direct-send paths, appending the
+             * identity signature. Mirrors the plain/HTML envelope rules used by
+             * the compose-window paths.
+             */
+            function buildBodyWithSignature(body, identity, useHtml, isHtml) {
+              const sigFragment = buildSignatureFragment(identity, useHtml);
+
+              if (!useHtml) {
+                return (body || "") + sigFragment;
+              }
+
+              const formatted = formatBodyHtml(body, isHtml);
+              if (isHtml && formatted.includes('<html')) {
+                if (!sigFragment) return formatted;
+                return /<\/body>/i.test(formatted)
+                  ? formatted.replace(/<\/body>/i, `${sigFragment}</body>`)
+                  : formatted + sigFragment;
+              }
+              return `<html><head><meta charset="UTF-8"></head><body>${formatted}${sigFragment}</body></html>`;
+            }
+
+            /**
              * Decides whether a compose operation will (or should) run in HTML
              * mode, and returns the matching msgComposeParams.format value.
              *
@@ -6483,6 +6634,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
                 if (skipReview) {
+                  // Direct send bypasses the compose window, so the identity
+                  // signature has to be appended here. The review path below
+                  // must NOT get it -- Thunderbird adds it when the window
+                  // opens, and doing both would duplicate it.
+                  composeFields.body = buildBodyWithSignature(body, msgComposeParams.identity, useHtml, isHtml);
                   return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New, Ci.nsIMsgCompDeliverMode.Now, useHtml ? "text/html" : "text/plain").then(result => {
                     if (result.success) {
                       let msg = "Message sent";
@@ -6543,14 +6699,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const { useHtml, format } = resolveComposeFormat(msgComposeParams.identity, isHtml, Ci.nsIMsgCompType.New);
                 msgComposeParams.format = format;
-                if (useHtml) {
-                  const formatted = formatBodyHtml(body, isHtml);
-                  composeFields.body = isHtml && formatted.includes('<html')
-                    ? formatted
-                    : `<html><head><meta charset="UTF-8"></head><body>${formatted}</body></html>`;
-                } else {
-                  composeFields.body = body || "";
-                }
+                // saveDraft always builds the message directly, so Thunderbird's
+                // compose window never runs and never inserts the signature --
+                // we have to append it ourselves.
+                composeFields.body = buildBodyWithSignature(body, msgComposeParams.identity, useHtml, isHtml);
 
                 const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
