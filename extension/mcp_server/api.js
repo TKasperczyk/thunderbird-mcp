@@ -2153,14 +2153,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
               } else if (tmpDir.isSymlink()) {
                 throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
-              } else {
+              } else if (Services.appinfo.OS !== "WINNT") {
                 // POSIX hardening: on a shared /tmp another local user could
                 // pre-create the directory with group/world bits set, then race
                 // the connection file. The O_EXCL on the file itself blocks a
                 // straight overwrite, but a permissive directory still lets the
                 // attacker read or rename our file. Force perms back to 0o700.
-                // permissions is 0 on platforms that don't expose POSIX modes
-                // (Windows ACLs), so the chmod is a no-op there.
+                // Skipped on Windows: nsIFile.permissions returns a synthetic
+                // value there (not real POSIX bits), so this check is not
+                // meaningful on WINNT. NTFS ACLs are the Windows equivalent
+                // protection and are left as configured by the user/OS.
                 try {
                   const mode = tmpDir.permissions;
                   if (mode && (mode & 0o077) !== 0) {
