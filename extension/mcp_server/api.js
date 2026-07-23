@@ -7535,11 +7535,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // ── Filter constant maps ──
 
+            // Values are the real nsMsgSearchAttrib enum (nsMsgSearchCore.idl).
+            // They are NOT sequential past allAddresses -- do not renumber.
             const ATTRIB_MAP = {
               subject: 0, from: 1, body: 2, date: 3, priority: 4,
               status: 5, to: 6, cc: 7, toOrCc: 8, allAddresses: 9,
-              ageInDays: 10, size: 11, tag: 12, hasAttachment: 13,
-              junkStatus: 14, junkPercent: 15, otherHeader: 16,
+              ageInDays: 12, size: 14, tag: 16, hasAttachment: 44,
+              junkStatus: 45, junkPercent: 46, otherHeader: 52,
             };
             const ATTRIB_NAMES = Object.fromEntries(Object.entries(ATTRIB_MAP).map(([k, v]) => [v, k]));
 
@@ -7554,16 +7556,94 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             };
             const OP_NAMES = Object.fromEntries(Object.entries(OP_MAP).map(([k, v]) => [v, k]));
 
+            // Values are the real nsMsgRuleActionType enum (nsMsgFilterCore.idl).
+            // They are NOT sequential -- copyToFolder jumps to 16, value 8 (Label)
+            // no longer exists, and 18 is killSubthread. Do not renumber.
             const ACTION_MAP = {
-              moveToFolder: 0x01, copyToFolder: 0x02, changePriority: 0x03,
-              delete: 0x04, markRead: 0x05, killThread: 0x06,
-              watchThread: 0x07, markFlagged: 0x08, label: 0x09,
-              reply: 0x0A, forward: 0x0B, stopExecution: 0x0C,
-              deleteFromServer: 0x0D, leaveOnServer: 0x0E, junkScore: 0x0F,
-              fetchBody: 0x10, addTag: 0x11, deleteBody: 0x12,
-              markUnread: 0x14, custom: 0x15,
+              moveToFolder: 1, changePriority: 2, delete: 3,
+              markRead: 4, killThread: 5, watchThread: 6,
+              markFlagged: 7, reply: 9, forward: 10,
+              stopExecution: 11, deleteFromServer: 12, leaveOnServer: 13,
+              junkScore: 14, fetchBody: 15, copyToFolder: 16,
+              addTag: 17, killSubthread: 18, markUnread: 19,
+              custom: -1,
             };
             const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
+
+            // nsIMsgSearchValue is a tagged union: the value lives in a different
+            // member depending on the attribute. Attributes not listed here are
+            // string-valued and use `.str`. Setting the wrong member (e.g. `.str`
+            // on a Date attrib) makes XPCOM throw NS_ERROR_ILLEGAL_VALUE, which
+            // otherwise fails the whole filter operation. Every mapping below
+            // matches upstream nsMsgSearchCore.idl (IS_STRING_ATTRIBUTE),
+            // nsMsgSearchValue.cpp and nsMsgSearchTerm.cpp @ 72b8ba0.
+            const VALUE_KIND = {
+              3: "date",           // Date -> PRTime (microseconds since epoch)
+              4: "priority",       // Priority
+              5: "status",         // MsgStatus bitmask -> .status (u.msgStatus)
+              12: "age",           // AgeInDays (whole days, int32)
+              14: "size",          // Size (bytes)
+              44: "hasAttachment", // HasAttachmentStatus -> .status = Attachment flag
+              45: "junkStatus",    // JunkStatus
+              46: "junkPercent",   // JunkPercent
+            };
+
+            // nsMsgMessageFlags.Attachment: the fixed flag a HasAttachmentStatus
+            // term stores in .status. Has-vs-hasn't is decided by the operator
+            // (is/isnt), not the value; Thunderbird ignores the file token too.
+            const MSG_FLAG_ATTACHMENT = 0x10000000;
+
+            function parseIntStrict(raw, label) {
+              const n = parseInt(raw, 10);
+              if (Number.isNaN(n)) throw new Error(`Invalid numeric value for ${label}: ${raw}`);
+              return n;
+            }
+
+            // Write a condition's value into an nsIMsgSearchValue using the union
+            // member that matches its attribute. Throws on malformed input so the
+            // caller surfaces a clear error rather than persisting a broken filter.
+            function setSearchValue(value, attribNum, raw) {
+              value.attrib = attribNum;
+              switch (VALUE_KIND[attribNum]) {
+                case "date": {
+                  const ms = Date.parse(raw);
+                  if (Number.isNaN(ms)) throw new Error(`Invalid date value: ${raw}`);
+                  value.date = ms * 1000; // PRTime is microseconds since epoch
+                  break;
+                }
+                case "age": value.age = parseIntStrict(raw, "ageInDays"); break;
+                case "size": value.size = parseIntStrict(raw, "size"); break;
+                case "priority": value.priority = parseIntStrict(raw, "priority"); break;
+                case "status": value.status = parseIntStrict(raw, "status"); break;
+                case "hasAttachment": value.status = MSG_FLAG_ATTACHMENT; break; // raw ignored, like TB
+                case "junkStatus": value.junkStatus = parseIntStrict(raw, "junkStatus"); break;
+                case "junkPercent": value.junkPercent = parseIntStrict(raw, "junkPercent"); break;
+                default: value.str = raw || "";
+              }
+            }
+
+            // Read an nsIMsgSearchValue back into a display string, reading the
+            // union member that matches its attribute. Falls back to `.str`.
+            function readSearchValue(term) {
+              try {
+                switch (VALUE_KIND[term.attrib]) {
+                  case "date": {
+                    const d = term.value.date;
+                    return d ? new Date(d / 1000).toISOString() : "";
+                  }
+                  case "age": return String(term.value.age);
+                  case "size": return String(term.value.size);
+                  case "priority": return String(term.value.priority);
+                  case "status": return String(term.value.status);
+                  case "hasAttachment": return (term.value.status & MSG_FLAG_ATTACHMENT) ? "true" : "false";
+                  case "junkStatus": return String(term.value.junkStatus);
+                  case "junkPercent": return String(term.value.junkPercent);
+                  default: return term.value.str || "";
+                }
+              } catch {
+                try { return term.value.str || ""; } catch { return ""; }
+              }
+            }
 
             function getFilterListForAccount(accountId) {
               if (!isAccountAllowed(accountId)) {
@@ -7588,17 +7668,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     op: OP_NAMES[term.op] || String(term.op),
                     booleanAnd: term.booleanAnd,
                   };
-                  try {
-                    if (term.attrib === 3 || term.attrib === 10) {
-                      // Date or AgeInDays: try date first, then str
-                      try {
-                        const d = term.value.date;
-                        t.value = d ? new Date(d / 1000).toISOString() : (term.value.str || "");
-                      } catch { t.value = term.value.str || ""; }
-                    } else {
-                      t.value = term.value.str || "";
-                    }
-                  } catch { t.value = ""; }
+                  t.value = readSearchValue(term);
                   if (term.arbitraryHeader) t.header = term.arbitraryHeader;
                   terms.push(t);
                 }
@@ -7612,11 +7682,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   const action = filter.getActionAt(a);
                   const act = { type: ACTION_NAMES[action.type] || String(action.type) };
-                  if (action.type === 0x01 || action.type === 0x02) {
+                  if (action.type === 1 || action.type === 16) {
+                    // moveToFolder or copyToFolder
                     act.value = action.targetFolderUri || "";
-                  } else if (action.type === 0x03) {
+                  } else if (action.type === 2) {
                     act.value = String(action.priority);
-                  } else if (action.type === 0x0F) {
+                  } else if (action.type === 14) {
                     act.value = String(action.junkScore);
                   } else {
                     try { if (action.strValue) act.value = action.strValue; } catch {}
@@ -7655,8 +7726,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 term.op = OP_MAP[cond.op];
 
                 const value = term.value;
-                value.attrib = term.attrib;
-                value.str = cond.value || "";
+                setSearchValue(value, term.attrib, cond.value);
                 term.value = value;
 
                 term.booleanAnd = cond.booleanAnd !== false;
@@ -7679,14 +7749,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 action.type = typeNum;
 
                 if (act.value) {
-                  if (typeNum === 0x01 || typeNum === 0x02) {
+                  if (typeNum === 1 || typeNum === 16) {
                     // Move/Copy to folder -- verify target is accessible
                     const targetCheck = getAccessibleFolder(act.value);
                     if (targetCheck.error) throw new Error(`Filter target folder not accessible: ${act.value}`);
                     action.targetFolderUri = act.value;
-                  } else if (typeNum === 0x03) {
+                  } else if (typeNum === 2) {
                     action.priority = parseInt(act.value);
-                  } else if (typeNum === 0x0F) {
+                  } else if (typeNum === 14) {
                     action.junkScore = parseInt(act.value);
                   } else {
                     action.strValue = act.value;
@@ -7861,9 +7931,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         newTerm.attrib = term.attrib;
                         newTerm.op = term.op;
                         const val = newTerm.value;
-                        val.attrib = term.attrib;
-                        try { val.str = term.value.str || ""; } catch {}
-                        try { if (term.attrib === 3) val.date = term.value.date; } catch {}
+                        try { setSearchValue(val, term.attrib, readSearchValue(term)); } catch {}
                         newTerm.value = val;
                         newTerm.booleanAnd = term.booleanAnd;
                         try { newTerm.beginsGrouping = term.beginsGrouping; } catch {}

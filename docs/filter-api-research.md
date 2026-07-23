@@ -234,6 +234,8 @@ Key properties:
 
 ### Filter Types (bitmask, combinable)
 
+Source: [`nsMsgFilterCore.idl` L13-L24](https://github.com/mozilla/releases-comm-central/blob/72b8ba0761b3881d926be53f77fbf75d5a9316d5/mailnews/search/public/nsMsgFilterCore.idl#L13-L24) (`nsMsgFilterType`) — verified against upstream 2026-07-23.
+
 ```
 nsMsgFilterType.InboxRule          = 0x1     // Applied on new mail
 nsMsgFilterType.InboxJavaScript    = 0x2     // JS filter on new mail
@@ -253,6 +255,8 @@ Common combination: type `17` = InboxRule (0x1) + Manual (0x10)
 
 ### Search Attributes (nsMsgSearchAttrib)
 
+Source: [`nsMsgSearchCore.idl` L49-L104](https://github.com/mozilla/releases-comm-central/blob/72b8ba0761b3881d926be53f77fbf75d5a9316d5/mailnews/search/public/nsMsgSearchCore.idl#L49-L104) (`nsMsgSearchAttrib`) — verified against upstream 2026-07-23.
+
 ```
 Subject        = 0     // Message subject
 Sender         = 1     // From header
@@ -264,16 +268,18 @@ To             = 6     // To header
 CC             = 7     // CC header
 ToOrCC         = 8     // To or CC
 AllAddresses   = 9     // From, To, CC, BCC
-AgeInDays      = 10    // Message age
-Size           = 11    // Message size
-Keywords       = 12    // Tags/keywords
-HasAttachment  = 13    // Has attachments
-JunkStatus     = 14    // Junk classification
-JunkPercent    = 15    // Junk probability
-OtherHeader    = 16    // Arbitrary header (uses arbitraryHeader property)
+AgeInDays      = 12    // Message age
+Size           = 14    // Message size
+Keywords       = 16    // Tags/keywords
+HasAttachment  = 44    // Has attachments (HasAttachmentStatus)
+JunkStatus     = 45    // Junk classification
+JunkPercent    = 46    // Junk probability
+OtherHeader    = 52    // Arbitrary header (uses arbitraryHeader property)
 ```
 
 ### Search Operators (nsMsgSearchOp)
+
+Source: [`nsMsgSearchCore.idl` L113-L139](https://github.com/mozilla/releases-comm-central/blob/72b8ba0761b3881d926be53f77fbf75d5a9316d5/mailnews/search/public/nsMsgSearchCore.idl#L113-L139) (`nsMsgSearchOp`) — verified against upstream 2026-07-23.
 
 ```
 Contains       = 0
@@ -301,27 +307,29 @@ DoesntMatch    = 20    // Regex no match
 
 ### Filter Actions (nsMsgFilterAction)
 
+Source: [`nsMsgFilterCore.idl` L38-L60](https://github.com/mozilla/releases-comm-central/blob/72b8ba0761b3881d926be53f77fbf75d5a9316d5/mailnews/search/public/nsMsgFilterCore.idl#L38-L60) (`nsMsgRuleActionType`) — verified against upstream 2026-07-23.
+
 ```
-MoveToFolder       = 0x01
-CopyToFolder       = 0x02
-ChangePriority     = 0x03
-Delete             = 0x04
-MarkRead           = 0x05
-KillThread         = 0x06
-WatchThread        = 0x07
-MarkFlagged        = 0x08
-Label              = 0x09    // Deprecated, use AddTag
-Reply              = 0x0A
-Forward            = 0x0B
-StopExecution      = 0x0C    // Stop processing more filters
-DeleteFromServer   = 0x0D    // POP3: don't download
-LeaveOnServer      = 0x0E    // POP3: leave on server
-JunkScore          = 0x0F
-FetchBodyFromServer = 0x10   // IMAP: fetch full body
-AddTag             = 0x11    // Add a tag/keyword
-DeleteBody         = 0x12
-MarkUnread         = 0x14
-Custom             = 0x15    // Custom action via nsIMsgFilterCustomAction
+Custom             = -1      // Custom action via nsIMsgFilterCustomAction
+MoveToFolder       = 1
+ChangePriority     = 2
+Delete             = 3
+MarkRead           = 4
+KillThread         = 5
+WatchThread        = 6
+MarkFlagged        = 7
+// 8 (Label) removed -- use AddTag
+Reply              = 9
+Forward            = 10
+StopExecution      = 11      // Stop processing more filters
+DeleteFromServer   = 12      // POP3: don't download (DeleteFromPop3Server)
+LeaveOnServer      = 13      // POP3: leave on server (LeaveOnPop3Server)
+JunkScore          = 14
+FetchBodyFromServer = 15     // IMAP/POP3: fetch full body (FetchBodyFromPop3Server)
+CopyToFolder       = 16
+AddTag             = 17      // Add a tag/keyword
+KillSubthread      = 18
+MarkUnread         = 19
 ```
 
 ---
@@ -350,7 +358,15 @@ condition="AND (from,is,boss@company.com)"
 
 ---
 
-## 5. Proposed MCP Tools
+## 5. MCP Tools
+
+> **Status: implemented.** The tools below (`listFilters`, `createFilter`,
+> `updateFilter`, `deleteFilter`, `reorderFilters`, `applyFilters`) live in
+> `extension/mcp_server/api.js` — that file is canonical, and
+> `extension/mcp_server/schema.json` is the authoritative tool schema. The
+> `inputSchema` blocks here are design intent only. Enum values live in Section 3
+> and union-member handling in Section 6; do not inline pseudocode in this file —
+> point at the handler.
 
 ### 5.1 listFilters
 
@@ -374,78 +390,7 @@ condition="AND (from,is,boss@company.com)"
 }
 ```
 
-**Implementation sketch**:
-```js
-function listFilters(accountId) {
-  const results = [];
-  const accounts = accountId
-    ? [MailServices.accounts.getAccount(accountId)]
-    : Array.from(MailServices.accounts.accounts);
-
-  for (const account of accounts) {
-    const server = account.incomingServer;
-    if (!server.canHaveFilters) continue;
-
-    const filterList = server.getFilterList(null);
-    const filters = [];
-
-    for (let i = 0; i < filterList.filterCount; i++) {
-      const filter = filterList.getFilterAt(i);
-      const terms = [];
-      const actions = [];
-
-      // Extract search terms
-      for (const term of filter.searchTerms) {
-        terms.push({
-          attrib: term.attrib,        // numeric — map to name for readability
-          op: term.op,                // numeric — map to name
-          value: term.value.str || term.value.date || String(term.value),
-          booleanAnd: term.booleanAnd,
-          arbitraryHeader: term.arbitraryHeader || undefined,
-        });
-      }
-
-      // Extract actions
-      for (let a = 0; a < filter.actionCount; a++) {
-        const action = filter.getActionAt(a);
-        actions.push({
-          type: action.type,          // numeric — map to name
-          targetFolderUri: action.targetFolderUri || undefined,
-          priority: action.priority || undefined,
-          customId: action.customId || undefined,
-        });
-      }
-
-      filters.push({
-        index: i,
-        name: filter.filterName,
-        enabled: filter.enabled,
-        type: filter.filterType,
-        temporary: filter.temporary,
-        terms,
-        actions,
-      });
-    }
-
-    results.push({
-      accountId: account.key,
-      accountName: server.prettyName,
-      filterCount: filterList.filterCount,
-      loggingEnabled: filterList.loggingEnabled,
-      filters,
-    });
-  }
-
-  return results;
-}
-```
-
-**Important**: Map numeric attrib/op/action constants to human-readable names in output. Create lookup objects like:
-```js
-const ATTRIB_NAMES = { 0: "subject", 1: "from", 2: "body", 3: "date", ... };
-const OP_NAMES = { 0: "contains", 1: "doesntContain", 2: "is", 3: "isnt", ... };
-const ACTION_NAMES = { 1: "moveToFolder", 2: "copyToFolder", 5: "markRead", 8: "markFlagged", 0x11: "addTag", ... };
-```
+**Implemented in** `extension/mcp_server/api.js` — `listFilters()` / `serializeFilter()`. Numeric attrib/op/action constants are mapped to names via the `ATTRIB_NAMES` / `OP_NAMES` / `ACTION_NAMES` reverse maps; typed term values are read through `readSearchValue()` (correct union member per attribute — see Section 6).
 
 ### 5.2 createFilter
 
@@ -497,92 +442,7 @@ const ACTION_NAMES = { 1: "moveToFolder", 2: "copyToFolder", 5: "markRead", 8: "
 }
 ```
 
-**Implementation sketch**:
-```js
-function createFilter(accountId, name, enabled, type, conditions, actions, insertAtIndex) {
-  const account = MailServices.accounts.getAccount(accountId);
-  if (!account) return { error: "Account not found" };
-  const server = account.incomingServer;
-  if (!server.canHaveFilters) return { error: "Account does not support filters" };
-
-  const filterList = server.getFilterList(null);
-  const filter = filterList.createFilter(name);
-
-  filter.enabled = enabled !== false;
-  filter.filterType = type || 17; // inbox + manual
-
-  // Map string attribute names → numeric constants
-  const ATTRIB_MAP = {
-    subject: 0, from: 1, body: 2, date: 3, priority: 4,
-    status: 5, to: 6, cc: 7, toOrCc: 8, allAddresses: 9,
-    ageInDays: 10, size: 11, tag: 12, hasAttachment: 13,
-    junkStatus: 14, junkPercent: 15, otherHeader: 16,
-  };
-  const OP_MAP = {
-    contains: 0, doesntContain: 1, is: 2, isnt: 3, isEmpty: 4,
-    isBefore: 5, isAfter: 6, isHigherThan: 7, isLowerThan: 8,
-    beginsWith: 9, endsWith: 10,
-    soundsLike: 11, ldapDwim: 12,
-    isGreaterThan: 13, isLessThan: 14,
-    nameCompletion: 15, isInAB: 16, isntInAB: 17, isntEmpty: 18,
-    matches: 19, doesntMatch: 20,
-  };
-
-  for (const cond of conditions) {
-    const term = filter.createTerm();
-    term.attrib = ATTRIB_MAP[cond.attrib] ?? parseInt(cond.attrib);
-    term.op = OP_MAP[cond.op] ?? parseInt(cond.op);
-    // Setting value depends on type — for string attributes:
-    const value = term.value;
-    value.attrib = term.attrib;
-    value.str = cond.value;
-    term.value = value;
-    term.booleanAnd = cond.booleanAnd !== false;
-    if (cond.header) term.arbitraryHeader = cond.header;
-    filter.appendTerm(term);
-  }
-
-  const ACTION_MAP = {
-    moveToFolder: 0x01, copyToFolder: 0x02, changePriority: 0x03,
-    delete: 0x04, markRead: 0x05, killThread: 0x06,
-    watchThread: 0x07, markFlagged: 0x08, reply: 0x0A,
-    forward: 0x0B, stopExecution: 0x0C, deleteFromServer: 0x0D,
-    leaveOnServer: 0x0E, junkScore: 0x0F, addTag: 0x11,
-    markUnread: 0x14, custom: 0x15,
-  };
-
-  for (const act of actions) {
-    const action = filter.createAction();
-    action.type = ACTION_MAP[act.type] ?? parseInt(act.type);
-    if (act.value) {
-      if (action.type === 0x01 || action.type === 0x02) {
-        action.targetFolderUri = act.value;
-      } else if (action.type === 0x03) {
-        action.priority = parseInt(act.value);
-      } else {
-        // For addTag, forward, etc. — check what property to set
-        // addTag uses strValue, forward/reply use strValue as email address
-        action.strValue = act.value;
-      }
-    }
-    filter.appendAction(action);
-  }
-
-  // Insert at position or append
-  const idx = (insertAtIndex != null && insertAtIndex >= 0)
-    ? Math.min(insertAtIndex, filterList.filterCount)
-    : filterList.filterCount;
-  filterList.insertFilterAt(idx, filter);
-  filterList.saveToDefaultFile();
-
-  return {
-    created: true,
-    name: filter.filterName,
-    index: idx,
-    filterCount: filterList.filterCount,
-  };
-}
-```
+**Implemented in** `extension/mcp_server/api.js` — `createFilter()`, which builds terms via `buildTerms()` and actions via `buildActions()`. Attribute/operator/action names are resolved through the strict allow-lists `ATTRIB_MAP` / `OP_MAP` / `ACTION_MAP` (the real `nsMsgSearchAttrib` / `nsMsgRuleActionType` values from Sections 3 — no `parseInt` fallback). Condition values are written by `setSearchValue()`, which dispatches on the attribute to the correct `nsIMsgSearchValue` union member (`.date`, `.age`, `.size`, `.priority`, `.status`, `.junkStatus`, `.junkPercent`, else `.str`) per Section 6.
 
 ### 5.3 updateFilter
 
@@ -608,6 +468,8 @@ function createFilter(accountId, name, enabled, type, conditions, actions, inser
 }
 ```
 
+**Implemented in** `extension/mcp_server/api.js` — `updateFilter()`. When only some fields change, it rebuilds the filter via remove+insert and **copies** the untouched terms/actions. The copy path goes through `setSearchValue()`/`readSearchValue()`, so typed condition values (date/age/size/etc.) are preserved across an update.
+
 ### 5.4 deleteFilter
 
 **Purpose**: Remove a filter.
@@ -628,21 +490,7 @@ function createFilter(accountId, name, enabled, type, conditions, actions, inser
 }
 ```
 
-**Implementation sketch**:
-```js
-function deleteFilter(accountId, filterIndex) {
-  const account = MailServices.accounts.getAccount(accountId);
-  const filterList = account.incomingServer.getFilterList(null);
-  if (filterIndex < 0 || filterIndex >= filterList.filterCount) {
-    return { error: `Invalid filter index ${filterIndex}` };
-  }
-  const filter = filterList.getFilterAt(filterIndex);
-  const name = filter.filterName;
-  filterList.removeFilterAt(filterIndex);
-  filterList.saveToDefaultFile();
-  return { deleted: true, name, remainingCount: filterList.filterCount };
-}
-```
+**Implemented in** `extension/mcp_server/api.js` — `deleteFilter()`.
 
 ### 5.5 reorderFilters
 
@@ -665,16 +513,7 @@ function deleteFilter(accountId, filterIndex) {
 }
 ```
 
-**Implementation**:
-```js
-function reorderFilters(accountId, fromIndex, toIndex) {
-  const account = MailServices.accounts.getAccount(accountId);
-  const filterList = account.incomingServer.getFilterList(null);
-  filterList.moveFilterAt(fromIndex, toIndex);
-  filterList.saveToDefaultFile();
-  return { moved: true, fromIndex, toIndex };
-}
-```
+**Implemented in** `extension/mcp_server/api.js` — `reorderFilters()`.
 
 ### 5.6 applyFilters
 
@@ -696,25 +535,9 @@ function reorderFilters(accountId, fromIndex, toIndex) {
 }
 ```
 
-**Implementation sketch**:
-```js
-function applyFilters(accountId, folderPath) {
-  const account = MailServices.accounts.getAccount(accountId);
-  const server = account.incomingServer;
-  const filterList = server.getFilterList(null);
-  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-  if (!folder) return { error: "Folder not found" };
+**Implemented in** `extension/mcp_server/api.js` — `applyFilters()`, via `nsIMsgFilterService.applyFiltersToFolders(filterList, [folder], null)`.
 
-  // Method signature: applyFiltersToFolders(filterList, folders, msgWindow)
-  const filterService = Cc["@mozilla.org/messenger/filter-service;1"]
-    .getService(Ci.nsIMsgFilterService);
-  filterService.applyFiltersToFolders(filterList, [folder], null);
-
-  return { applied: true, folder: folderPath, filterCount: filterList.filterCount };
-}
-```
-
-**Note**: `applyFiltersToFolders` may be asynchronous in practice — the function returns immediately but processing continues. We may need to investigate whether there's a completion callback or listener to await.
+**Note**: `applyFiltersToFolders` is asynchronous — it returns immediately while processing continues; move/copy actions may not complete instantly.
 
 ---
 
@@ -730,13 +553,30 @@ function applyFilters(accountId, folderPath) {
 - `server.canHaveFilters` — check this before attempting filter operations (news servers may not support filters)
 
 ### Search Term Value Setting
-- The `value` property on `nsIMsgSearchTerm` is an `nsIMsgSearchValue` object
-- You must set `value.attrib` to match the term's attrib before setting the value content
-- For string attributes: `value.str = "something"`
-- For date attributes: `value.date` (PRTime, microseconds since epoch)
-- For priority: `value.priority` (numeric constant)
-- For status: `value.status` (bitmask)
-- For junk: `value.junkStatus` / `value.junkPercent`
+
+Sources — verified against upstream @ `72b8ba0` 2026-07-23: member names from [`nsIMsgSearchValue.idl`](https://github.com/mozilla/releases-comm-central/blob/72b8ba0761b3881d926be53f77fbf75d5a9316d5/mailnews/search/public/nsIMsgSearchValue.idl); which member each attribute uses from the [`IS_STRING_ATTRIBUTE`](https://github.com/mozilla/releases-comm-central/blob/72b8ba0761b3881d926be53f77fbf75d5a9316d5/mailnews/search/public/nsMsgSearchCore.idl#L195-L202) macro and the match code in `nsMsgSearchValue.cpp` / `nsMsgSearchTerm.cpp`.
+
+`nsIMsgSearchValue` is a **tagged union**: the value lives in a different member
+depending on `attrib`. You must set `value.attrib` first, then write the member
+that matches — writing the wrong one (e.g. `.str` on a Date attrib) makes XPCOM
+throw `NS_ERROR_ILLEGAL_VALUE` and fails the whole operation. This is the spec
+`setSearchValue()` / `readSearchValue()` implement; keep them in sync with this
+table.
+
+| Attribute (`nsMsgSearchAttrib`) | Member | Notes |
+|---|---|---|
+| Date (3) | `value.date` | PRTime, **microseconds** since epoch (`Date.parse(x) * 1000`) |
+| Priority (4) | `value.priority` | numeric constant |
+| MsgStatus (5) | `value.status` | bitmask |
+| AgeInDays (12) | `value.age` | whole days (int32) |
+| Size (14) | `value.size` | bytes (uint32) |
+| HasAttachmentStatus (44) | `value.status` | fixed flag `nsMsgMessageFlags.Attachment` = `0x10000000`; has/hasn't chosen by operator, value ignored |
+| JunkStatus (45) | `value.junkStatus` | |
+| JunkPercent (46) | `value.junkPercent` | |
+| Subject (0), From (1), Body (2), To (6), CC (7), ToOrCC (8), AllAddresses (9), Keywords/tag (16), OtherHeader (52) | `value.str` | the string attributes |
+
+Verified live end-to-end (create + read-back round-trip, incl. `updateFilter`
+copy path) 2026-07-23.
 
 ### Action Value Setting
 - `MoveToFolder` / `CopyToFolder`: set `action.targetFolderUri`
@@ -820,16 +660,16 @@ If `MailServices.filters` exists, prefer that over manual `Cc` lookup for consis
 
 ## 10. Implementation Checklist
 
-- [ ] Add constant lookup maps (ATTRIB_NAMES, OP_NAMES, ACTION_NAMES and reverse maps)
-- [ ] Implement `listFilters(accountId)` handler
-- [ ] Implement `createFilter(...)` handler
-- [ ] Implement `updateFilter(...)` handler
-- [ ] Implement `deleteFilter(accountId, filterIndex)` handler
-- [ ] Implement `reorderFilters(accountId, fromIndex, toIndex)` handler
-- [ ] Implement `applyFilters(accountId, folderPath)` handler
-- [ ] Add all 6 tool definitions to the `tools` array
-- [ ] Add all 6 dispatch cases to `callTool()` switch
-- [ ] Test each tool with real Thunderbird instance
-- [ ] Handle edge cases (canHaveFilters, null accounts, empty filter lists)
-- [ ] Ensure `saveToDefaultFile()` called after all mutations
-- [ ] Verify `searchTerms` iteration works on target Thunderbird version
+- [x] Add constant lookup maps (ATTRIB_NAMES, OP_NAMES, ACTION_NAMES and reverse maps)
+- [x] Implement `listFilters(accountId)` handler
+- [x] Implement `createFilter(...)` handler
+- [x] Implement `updateFilter(...)` handler
+- [x] Implement `deleteFilter(accountId, filterIndex)` handler
+- [x] Implement `reorderFilters(accountId, fromIndex, toIndex)` handler
+- [x] Implement `applyFilters(accountId, folderPath)` handler
+- [x] Add all 7 tool definitions to the `tools` array
+- [x] Add all 7 dispatch cases to `callTool()` switch
+- [x] Test each tool with real Thunderbird instance
+- [x] Handle edge cases (canHaveFilters, null accounts, empty filter lists)
+- [x] Ensure `saveToDefaultFile()` called after all mutations
+- [x] Verify `searchTerms` iteration works on target Thunderbird version
