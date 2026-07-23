@@ -234,6 +234,8 @@ Key properties:
 
 ### Filter Types (bitmask, combinable)
 
+Source: [`nsMsgFilterCore.idl` L13-L24](https://github.com/mozilla/releases-comm-central/blob/72b8ba0761b3881d926be53f77fbf75d5a9316d5/mailnews/search/public/nsMsgFilterCore.idl#L13-L24) (`nsMsgFilterType`) — verified against upstream 2026-07-23.
+
 ```
 nsMsgFilterType.InboxRule          = 0x1     // Applied on new mail
 nsMsgFilterType.InboxJavaScript    = 0x2     // JS filter on new mail
@@ -253,6 +255,8 @@ Common combination: type `17` = InboxRule (0x1) + Manual (0x10)
 
 ### Search Attributes (nsMsgSearchAttrib)
 
+Source: [`nsMsgSearchCore.idl` L49-L104](https://github.com/mozilla/releases-comm-central/blob/72b8ba0761b3881d926be53f77fbf75d5a9316d5/mailnews/search/public/nsMsgSearchCore.idl#L49-L104) (`nsMsgSearchAttrib`) — verified against upstream 2026-07-23.
+
 ```
 Subject        = 0     // Message subject
 Sender         = 1     // From header
@@ -264,16 +268,18 @@ To             = 6     // To header
 CC             = 7     // CC header
 ToOrCC         = 8     // To or CC
 AllAddresses   = 9     // From, To, CC, BCC
-AgeInDays      = 10    // Message age
-Size           = 11    // Message size
-Keywords       = 12    // Tags/keywords
-HasAttachment  = 13    // Has attachments
-JunkStatus     = 14    // Junk classification
-JunkPercent    = 15    // Junk probability
-OtherHeader    = 16    // Arbitrary header (uses arbitraryHeader property)
+AgeInDays      = 12    // Message age
+Size           = 14    // Message size
+Keywords       = 16    // Tags/keywords
+HasAttachment  = 44    // Has attachments (HasAttachmentStatus)
+JunkStatus     = 45    // Junk classification
+JunkPercent    = 46    // Junk probability
+OtherHeader    = 52    // Arbitrary header (uses arbitraryHeader property)
 ```
 
 ### Search Operators (nsMsgSearchOp)
+
+Source: [`nsMsgSearchCore.idl` L113-L139](https://github.com/mozilla/releases-comm-central/blob/72b8ba0761b3881d926be53f77fbf75d5a9316d5/mailnews/search/public/nsMsgSearchCore.idl#L113-L139) (`nsMsgSearchOp`) — verified against upstream 2026-07-23.
 
 ```
 Contains       = 0
@@ -301,27 +307,29 @@ DoesntMatch    = 20    // Regex no match
 
 ### Filter Actions (nsMsgFilterAction)
 
+Source: [`nsMsgFilterCore.idl` L38-L60](https://github.com/mozilla/releases-comm-central/blob/72b8ba0761b3881d926be53f77fbf75d5a9316d5/mailnews/search/public/nsMsgFilterCore.idl#L38-L60) (`nsMsgRuleActionType`) — verified against upstream 2026-07-23.
+
 ```
-MoveToFolder       = 0x01
-CopyToFolder       = 0x02
-ChangePriority     = 0x03
-Delete             = 0x04
-MarkRead           = 0x05
-KillThread         = 0x06
-WatchThread        = 0x07
-MarkFlagged        = 0x08
-Label              = 0x09    // Deprecated, use AddTag
-Reply              = 0x0A
-Forward            = 0x0B
-StopExecution      = 0x0C    // Stop processing more filters
-DeleteFromServer   = 0x0D    // POP3: don't download
-LeaveOnServer      = 0x0E    // POP3: leave on server
-JunkScore          = 0x0F
-FetchBodyFromServer = 0x10   // IMAP: fetch full body
-AddTag             = 0x11    // Add a tag/keyword
-DeleteBody         = 0x12
-MarkUnread         = 0x14
-Custom             = 0x15    // Custom action via nsIMsgFilterCustomAction
+Custom             = -1      // Custom action via nsIMsgFilterCustomAction
+MoveToFolder       = 1
+ChangePriority     = 2
+Delete             = 3
+MarkRead           = 4
+KillThread         = 5
+WatchThread        = 6
+MarkFlagged        = 7
+// 8 (Label) removed -- use AddTag
+Reply              = 9
+Forward            = 10
+StopExecution      = 11      // Stop processing more filters
+DeleteFromServer   = 12      // POP3: don't download (DeleteFromPop3Server)
+LeaveOnServer      = 13      // POP3: leave on server (LeaveOnPop3Server)
+JunkScore          = 14
+FetchBodyFromServer = 15     // IMAP/POP3: fetch full body (FetchBodyFromPop3Server)
+CopyToFolder       = 16
+AddTag             = 17      // Add a tag/keyword
+KillSubthread      = 18
+MarkUnread         = 19
 ```
 
 ---

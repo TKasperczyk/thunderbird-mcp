@@ -7535,11 +7535,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // ── Filter constant maps ──
 
+            // Values are the real nsMsgSearchAttrib enum (nsMsgSearchCore.idl).
+            // They are NOT sequential past allAddresses -- do not renumber.
             const ATTRIB_MAP = {
               subject: 0, from: 1, body: 2, date: 3, priority: 4,
               status: 5, to: 6, cc: 7, toOrCc: 8, allAddresses: 9,
-              ageInDays: 10, size: 11, tag: 12, hasAttachment: 13,
-              junkStatus: 14, junkPercent: 15, otherHeader: 16,
+              ageInDays: 12, size: 14, tag: 16, hasAttachment: 44,
+              junkStatus: 45, junkPercent: 46, otherHeader: 52,
             };
             const ATTRIB_NAMES = Object.fromEntries(Object.entries(ATTRIB_MAP).map(([k, v]) => [v, k]));
 
@@ -7554,14 +7556,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             };
             const OP_NAMES = Object.fromEntries(Object.entries(OP_MAP).map(([k, v]) => [v, k]));
 
+            // Values are the real nsMsgRuleActionType enum (nsMsgFilterCore.idl).
+            // They are NOT sequential -- copyToFolder jumps to 16, value 8 (Label)
+            // no longer exists, and 18 is killSubthread. Do not renumber.
             const ACTION_MAP = {
-              moveToFolder: 0x01, copyToFolder: 0x02, changePriority: 0x03,
-              delete: 0x04, markRead: 0x05, killThread: 0x06,
-              watchThread: 0x07, markFlagged: 0x08, label: 0x09,
-              reply: 0x0A, forward: 0x0B, stopExecution: 0x0C,
-              deleteFromServer: 0x0D, leaveOnServer: 0x0E, junkScore: 0x0F,
-              fetchBody: 0x10, addTag: 0x11, deleteBody: 0x12,
-              markUnread: 0x14, custom: 0x15,
+              moveToFolder: 1, changePriority: 2, delete: 3,
+              markRead: 4, killThread: 5, watchThread: 6,
+              markFlagged: 7, reply: 9, forward: 10,
+              stopExecution: 11, deleteFromServer: 12, leaveOnServer: 13,
+              junkScore: 14, fetchBody: 15, copyToFolder: 16,
+              addTag: 17, killSubthread: 18, markUnread: 19,
+              custom: -1,
             };
             const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
 
@@ -7589,7 +7594,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     booleanAnd: term.booleanAnd,
                   };
                   try {
-                    if (term.attrib === 3 || term.attrib === 10) {
+                    if (term.attrib === 3 || term.attrib === 12) {
                       // Date or AgeInDays: try date first, then str
                       try {
                         const d = term.value.date;
@@ -7612,11 +7617,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   const action = filter.getActionAt(a);
                   const act = { type: ACTION_NAMES[action.type] || String(action.type) };
-                  if (action.type === 0x01 || action.type === 0x02) {
+                  if (action.type === 1 || action.type === 16) {
+                    // moveToFolder or copyToFolder
                     act.value = action.targetFolderUri || "";
-                  } else if (action.type === 0x03) {
+                  } else if (action.type === 2) {
                     act.value = String(action.priority);
-                  } else if (action.type === 0x0F) {
+                  } else if (action.type === 14) {
                     act.value = String(action.junkScore);
                   } else {
                     try { if (action.strValue) act.value = action.strValue; } catch {}
@@ -7679,14 +7685,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 action.type = typeNum;
 
                 if (act.value) {
-                  if (typeNum === 0x01 || typeNum === 0x02) {
+                  if (typeNum === 1 || typeNum === 16) {
                     // Move/Copy to folder -- verify target is accessible
                     const targetCheck = getAccessibleFolder(act.value);
                     if (targetCheck.error) throw new Error(`Filter target folder not accessible: ${act.value}`);
                     action.targetFolderUri = act.value;
-                  } else if (typeNum === 0x03) {
+                  } else if (typeNum === 2) {
                     action.priority = parseInt(act.value);
-                  } else if (typeNum === 0x0F) {
+                  } else if (typeNum === 14) {
                     action.junkScore = parseInt(act.value);
                   } else {
                     action.strValue = act.value;
