@@ -784,6 +784,252 @@ async function inlineAttachmentPaths(args) {
   args.attachments = resolved;
 }
 
+// Bridge-local tool definition for saveMessage. The extension can only write
+// attachments into the OS temp dir and returns rawSource as text -- neither can
+// save to a caller-chosen path. The bridge already reads/writes host files, so
+// it owns this tool and injects it into tools/list; it is never forwarded to
+// the extension.
+const SAVE_MESSAGE_TOOL = {
+  name: 'saveMessage',
+  description: "Save a message to disk on the local machine: writes the full .eml and/or its attachments into a destination directory. Unlike saveAttachments (temp dir only), this writes to any path you choose. Runs on the bridge, so destDir is a path on the machine running the MCP.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      messageId: { type: 'string', description: 'Message ID (from searchMessages/getRecentMessages).' },
+      folderPath: { type: 'string', description: 'Folder URI path containing the message.' },
+      destDir: { type: 'string', description: 'Directory to write into (created recursively if missing).' },
+      saveEml: { type: 'boolean', description: 'Write the full raw .eml (default true).' },
+      saveAttachments: { type: 'boolean', description: 'Write attachments as loose files (default false).' },
+      emlFilename: { type: 'string', description: 'Filename for the .eml (default: sanitized subject from the raw headers, else messageId). ".eml" is appended if absent.' },
+      overwrite: { type: 'boolean', description: 'Overwrite existing files instead of erroring (default false).' }
+    },
+    required: ['messageId', 'folderPath', 'destDir']
+  }
+};
+
+// Unwrap a tools/call response envelope into its inner data object. Tool results
+// are shaped { result: { content: [ { type:'text', text:'<JSON>' } ] } }; a
+// tool-level failure comes back as { error } inside that JSON, which we surface
+// as a thrown Error so the caller reports it instead of silently continuing.
+function unwrapToolResponse(resp) {
+  const text = resp && resp.result && Array.isArray(resp.result.content)
+    ? resp.result.content[0] && resp.result.content[0].text
+    : undefined;
+  if (typeof text !== 'string') {
+    throw new Error('Unexpected tool response shape from getMessage');
+  }
+  const data = JSON.parse(text);
+  if (data && data.error) {
+    throw new Error(data.error);
+  }
+  return data;
+}
+
+// Turn an arbitrary name into a safe single-path-segment filename: drop path
+// separators and control chars, collapse whitespace, and refuse names that
+// would be empty or traverse ('.'/'..'). Spaces, unicode, and parentheses are
+// kept -- they appear in real-world filenames.
+function sanitizeSaveFilename(name) {
+  let s = String(name == null ? '' : name);
+  // eslint-disable-next-line no-control-regex
+  s = s.replace(/[/\\\x00-\x1f\x7f]/g, ' ');
+  s = s.replace(/\s+/g, ' ').trim();
+  if (!s || s === '.' || s === '..') {
+    throw new Error(`Cannot derive a safe filename from ${JSON.stringify(String(name))}`);
+  }
+  return s;
+}
+
+// Best-effort MIME encoded-word decoder (RFC 2047) for building a nicer .eml
+// filename from a Subject header. Anything it can't decode is left untouched.
+function decodeMimeEncodedWords(input) {
+  try {
+    return String(input).replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, (match, charset, enc, text) => {
+      let buf;
+      if (enc.toUpperCase() === 'B') {
+        buf = Buffer.from(text, 'base64');
+      } else {
+        const bytes = [];
+        for (let i = 0; i < text.length; i++) {
+          const ch = text[i];
+          if (ch === '_') {
+            bytes.push(0x20);
+          } else if (ch === '=' && i + 2 < text.length) {
+            bytes.push(parseInt(text.substr(i + 1, 2), 16));
+            i += 2;
+          } else {
+            bytes.push(ch.charCodeAt(0));
+          }
+        }
+        buf = Buffer.from(bytes);
+      }
+      const cs = charset.toLowerCase();
+      const encoding = (cs === 'iso-8859-1' || cs === 'latin1' || cs === 'us-ascii' || cs === 'ascii')
+        ? 'latin1'
+        : 'utf8';
+      return buf.toString(encoding);
+    });
+  } catch {
+    return input;
+  }
+}
+
+// Parse the first Subject header out of a raw RFC822 message, unfolding any
+// continuation lines. Returns null when there is no Subject in the header block.
+function subjectFromRawSource(raw) {
+  if (typeof raw !== 'string') {
+    return null;
+  }
+  const lines = raw.split(/\r\n|\r|\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    // Headers end at the first blank line.
+    if (line === '') {
+      break;
+    }
+    const m = /^Subject:[ \t]?(.*)$/i.exec(line);
+    if (m) {
+      let value = m[1];
+      while (i + 1 < lines.length && /^[ \t]/.test(lines[i + 1])) {
+        value += ' ' + lines[i + 1].replace(/^[ \t]+/, '');
+        i++;
+      }
+      value = value.trim();
+      return value || null;
+    }
+  }
+  return null;
+}
+
+// Pick a destination filename that does not collide with an existing file or
+// one already written this run. Only suffixes ' (2)', ' (3)', ... before the
+// extension when overwrite is off; with overwrite on the base name is used.
+function uniqueDestName(destDir, baseName, usedNames, overwrite, fsImpl, pathImpl) {
+  if (overwrite) {
+    return baseName;
+  }
+  const collides = (name) =>
+    usedNames.has(name) || fsImpl.existsSync(pathImpl.join(destDir, name));
+  if (!collides(baseName)) {
+    return baseName;
+  }
+  const ext = pathImpl.extname(baseName);
+  const stem = baseName.slice(0, baseName.length - ext.length);
+  let n = 2;
+  let candidate;
+  do {
+    candidate = `${stem} (${n})${ext}`;
+    n++;
+  } while (collides(candidate));
+  return candidate;
+}
+
+// Write a message's .eml and/or attachments into a caller-chosen directory on
+// the host filesystem. fetchMessage(subMessage) returns the parsed JSON-RPC
+// response for a tools/call (forwardToThunderbird in production, a mock in
+// tests). Returns the inner data object { emlPath, attachments, skippedAttachments,
+// destDir }; the handleMessage caller wraps it into the MCP content envelope.
+async function saveMessageToDisk({ args, fetchMessage, fsImpl = fs, pathImpl = path }) {
+  args = args || {};
+  const { messageId, folderPath, destDir } = args;
+  if (typeof messageId !== 'string' || !messageId.trim()) {
+    throw new Error('saveMessage requires a non-empty messageId string');
+  }
+  if (typeof folderPath !== 'string' || !folderPath.trim()) {
+    throw new Error('saveMessage requires a non-empty folderPath string');
+  }
+  if (typeof destDir !== 'string' || !destDir.trim()) {
+    throw new Error('saveMessage requires a non-empty destDir string');
+  }
+
+  const overwrite = args.overwrite === true;
+  const writeEml = args.saveEml !== false;
+  const writeAttachments = args.saveAttachments === true;
+
+  fsImpl.mkdirSync(destDir, { recursive: true });
+
+  let emlPath = null;
+
+  if (writeEml) {
+    const resp = await fetchMessage({
+      jsonrpc: '2.0',
+      id: 'saveMessage-eml',
+      method: 'tools/call',
+      params: {
+        name: 'getMessage',
+        arguments: { messageId, folderPath, rawSource: true }
+      }
+    });
+    const data = unwrapToolResponse(resp);
+    const rawSource = data.rawSource;
+    if (typeof rawSource !== 'string' || rawSource.length === 0) {
+      throw new Error(
+        'getMessage returned no rawSource; saving the .eml requires a local/offline ' +
+        'copy of the message (IMAP messages not cached offline cannot be read).'
+      );
+    }
+
+    let filename;
+    if (typeof args.emlFilename === 'string' && args.emlFilename.trim()) {
+      filename = args.emlFilename;
+    } else {
+      const subject = subjectFromRawSource(rawSource);
+      filename = subject ? decodeMimeEncodedWords(subject) : messageId;
+    }
+    filename = sanitizeSaveFilename(filename);
+    if (!/\.eml$/i.test(filename)) {
+      filename += '.eml';
+    }
+
+    const fullPath = pathImpl.join(destDir, filename);
+    try {
+      fsImpl.writeFileSync(fullPath, rawSource, {
+        encoding: 'utf8',
+        flag: overwrite ? 'w' : 'wx'
+      });
+    } catch (e) {
+      if (e.code === 'EEXIST') {
+        throw new Error(`File already exists: ${fullPath} (set overwrite:true to replace it)`);
+      }
+      throw e;
+    }
+    emlPath = fullPath;
+  }
+
+  const writtenAttachments = [];
+  const skippedAttachments = [];
+
+  if (writeAttachments) {
+    const resp = await fetchMessage({
+      jsonrpc: '2.0',
+      id: 'saveMessage-attachments',
+      method: 'tools/call',
+      params: {
+        name: 'getMessage',
+        arguments: { messageId, folderPath, saveAttachments: true }
+      }
+    });
+    const data = unwrapToolResponse(resp);
+    const attachments = Array.isArray(data.attachments) ? data.attachments : [];
+    const usedNames = new Set();
+    for (const att of attachments) {
+      const srcPath = att && att.filePath;
+      if (typeof srcPath !== 'string' || !srcPath) {
+        skippedAttachments.push((att && att.name) || null);
+        continue;
+      }
+      const baseName = sanitizeSaveFilename(att.name || pathImpl.basename(srcPath));
+      const destName = uniqueDestName(destDir, baseName, usedNames, overwrite, fsImpl, pathImpl);
+      const destPath = pathImpl.join(destDir, destName);
+      fsImpl.copyFileSync(srcPath, destPath);
+      usedNames.add(destName);
+      writtenAttachments.push(destPath);
+    }
+  }
+
+  return { emlPath, attachments: writtenAttachments, skippedAttachments, destDir };
+}
+
 /**
  * Read connection info (port + auth token) written by the Thunderbird extension.
  * Returns { port, token } or null if no valid candidate exists.
@@ -926,6 +1172,41 @@ async function handleMessage(line) {
       && ATTACHMENT_TOOLS.has(message.params.name)) {
     try {
       await inlineAttachmentPaths(message.params.arguments);
+    } catch (e) {
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        error: { code: -32602, message: e.message }
+      };
+    }
+  }
+
+  // tools/list: forward to the extension, then append the bridge-local tools it
+  // doesn't know about (saveMessage runs here, not in the extension). Guard the
+  // shape so a malformed extension response is returned untouched.
+  if (message.method === 'tools/list') {
+    const resp = await forwardToThunderbird(message);
+    if (resp && resp.result && Array.isArray(resp.result.tools)) {
+      resp.result.tools.push(SAVE_MESSAGE_TOOL);
+    }
+    return resp;
+  }
+
+  // saveMessage is a bridge-local tool that writes files on the machine running
+  // the MCP. Handle it here so it is never forwarded to the extension.
+  if (message.method === 'tools/call'
+      && message.params
+      && message.params.name === 'saveMessage') {
+    try {
+      const data = await saveMessageToDisk({
+        args: message.params.arguments || {},
+        fetchMessage: forwardToThunderbird
+      });
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { content: [{ type: 'text', text: JSON.stringify(data) }] }
+      };
     } catch (e) {
       return {
         jsonrpc: '2.0',
@@ -1216,6 +1497,8 @@ module.exports = {
   isSensitiveFilePath,
   isValidAuthToken,
   readConnectionInfo,
+  SAVE_MESSAGE_TOOL,
+  saveMessageToDisk,
   startBridge,
   attachmentLimits: {
     MAX_ATTACHMENT_BYTES,
