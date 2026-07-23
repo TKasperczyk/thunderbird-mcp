@@ -7570,6 +7570,81 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             };
             const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
 
+            // nsIMsgSearchValue is a tagged union: the value lives in a different
+            // member depending on the attribute. Attributes not listed here are
+            // string-valued and use `.str`. Setting the wrong member (e.g. `.str`
+            // on a Date attrib) makes XPCOM throw NS_ERROR_ILLEGAL_VALUE, which
+            // otherwise fails the whole filter operation. Every mapping below
+            // matches upstream nsMsgSearchCore.idl (IS_STRING_ATTRIBUTE),
+            // nsMsgSearchValue.cpp and nsMsgSearchTerm.cpp @ 72b8ba0.
+            const VALUE_KIND = {
+              3: "date",           // Date -> PRTime (microseconds since epoch)
+              4: "priority",       // Priority
+              5: "status",         // MsgStatus bitmask -> .status (u.msgStatus)
+              12: "age",           // AgeInDays (whole days, int32)
+              14: "size",          // Size (bytes)
+              44: "hasAttachment", // HasAttachmentStatus -> .status = Attachment flag
+              45: "junkStatus",    // JunkStatus
+              46: "junkPercent",   // JunkPercent
+            };
+
+            // nsMsgMessageFlags.Attachment: the fixed flag a HasAttachmentStatus
+            // term stores in .status. Has-vs-hasn't is decided by the operator
+            // (is/isnt), not the value; Thunderbird ignores the file token too.
+            const MSG_FLAG_ATTACHMENT = 0x10000000;
+
+            function parseIntStrict(raw, label) {
+              const n = parseInt(raw, 10);
+              if (Number.isNaN(n)) throw new Error(`Invalid numeric value for ${label}: ${raw}`);
+              return n;
+            }
+
+            // Write a condition's value into an nsIMsgSearchValue using the union
+            // member that matches its attribute. Throws on malformed input so the
+            // caller surfaces a clear error rather than persisting a broken filter.
+            function setSearchValue(value, attribNum, raw) {
+              value.attrib = attribNum;
+              switch (VALUE_KIND[attribNum]) {
+                case "date": {
+                  const ms = Date.parse(raw);
+                  if (Number.isNaN(ms)) throw new Error(`Invalid date value: ${raw}`);
+                  value.date = ms * 1000; // PRTime is microseconds since epoch
+                  break;
+                }
+                case "age": value.age = parseIntStrict(raw, "ageInDays"); break;
+                case "size": value.size = parseIntStrict(raw, "size"); break;
+                case "priority": value.priority = parseIntStrict(raw, "priority"); break;
+                case "status": value.status = parseIntStrict(raw, "status"); break;
+                case "hasAttachment": value.status = MSG_FLAG_ATTACHMENT; break; // raw ignored, like TB
+                case "junkStatus": value.junkStatus = parseIntStrict(raw, "junkStatus"); break;
+                case "junkPercent": value.junkPercent = parseIntStrict(raw, "junkPercent"); break;
+                default: value.str = raw || "";
+              }
+            }
+
+            // Read an nsIMsgSearchValue back into a display string, reading the
+            // union member that matches its attribute. Falls back to `.str`.
+            function readSearchValue(term) {
+              try {
+                switch (VALUE_KIND[term.attrib]) {
+                  case "date": {
+                    const d = term.value.date;
+                    return d ? new Date(d / 1000).toISOString() : "";
+                  }
+                  case "age": return String(term.value.age);
+                  case "size": return String(term.value.size);
+                  case "priority": return String(term.value.priority);
+                  case "status": return String(term.value.status);
+                  case "hasAttachment": return (term.value.status & MSG_FLAG_ATTACHMENT) ? "true" : "false";
+                  case "junkStatus": return String(term.value.junkStatus);
+                  case "junkPercent": return String(term.value.junkPercent);
+                  default: return term.value.str || "";
+                }
+              } catch {
+                try { return term.value.str || ""; } catch { return ""; }
+              }
+            }
+
             function getFilterListForAccount(accountId) {
               if (!isAccountAllowed(accountId)) {
                 return { error: `Account not accessible: ${accountId}` };
@@ -7593,17 +7668,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     op: OP_NAMES[term.op] || String(term.op),
                     booleanAnd: term.booleanAnd,
                   };
-                  try {
-                    if (term.attrib === 3 || term.attrib === 12) {
-                      // Date or AgeInDays: try date first, then str
-                      try {
-                        const d = term.value.date;
-                        t.value = d ? new Date(d / 1000).toISOString() : (term.value.str || "");
-                      } catch { t.value = term.value.str || ""; }
-                    } else {
-                      t.value = term.value.str || "";
-                    }
-                  } catch { t.value = ""; }
+                  t.value = readSearchValue(term);
                   if (term.arbitraryHeader) t.header = term.arbitraryHeader;
                   terms.push(t);
                 }
@@ -7661,8 +7726,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 term.op = OP_MAP[cond.op];
 
                 const value = term.value;
-                value.attrib = term.attrib;
-                value.str = cond.value || "";
+                setSearchValue(value, term.attrib, cond.value);
                 term.value = value;
 
                 term.booleanAnd = cond.booleanAnd !== false;
@@ -7867,9 +7931,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         newTerm.attrib = term.attrib;
                         newTerm.op = term.op;
                         const val = newTerm.value;
-                        val.attrib = term.attrib;
-                        try { val.str = term.value.str || ""; } catch {}
-                        try { if (term.attrib === 3) val.date = term.value.date; } catch {}
+                        try { setSearchValue(val, term.attrib, readSearchValue(term)); } catch {}
                         newTerm.value = val;
                         newTerm.booleanAnd = term.booleanAnd;
                         try { newTerm.beginsGrouping = term.beginsGrouping; } catch {}
