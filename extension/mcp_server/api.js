@@ -6986,6 +6986,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
                       author: msgHdr.mime2DecodedAuthor || msgHdr.author,
                       recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                      ccList: msgHdr.ccList,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
                       folder: folder.prettyName,
                       folderPath: folder.URI,
