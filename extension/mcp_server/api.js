@@ -84,6 +84,42 @@ function ensureFreshConnectionInfo({
 }
 // END CONNECTION INFO REFRESH HELPERS
 
+// BEGIN TMP DIR HARDENING HELPERS
+// nsIFile.permissions only carries real POSIX mode bits on platforms that have
+// them. On Windows it returns a mode *synthesized* from the read-only attribute
+// (typically 0o666, or 0o777 for directories), and assigning to it just toggles
+// that attribute -- the group/world bits can never be cleared. Running the
+// shared-/tmp hardening below on Windows therefore rejects every pre-existing
+// directory, permanently: once the connection file is deleted but the directory
+// survives, writeConnectionInfo throws on every call and the refresh timer can
+// never self-heal.
+function tmpDirModeIsPosix(osName) {
+  return osName !== "WINNT";
+}
+
+// POSIX hardening: on a shared /tmp another local user could pre-create the
+// directory with group/world bits set, then race the connection file. The
+// O_EXCL on the file itself blocks a straight overwrite, but a permissive
+// directory still lets the attacker read or rename our file. Force perms back
+// to 0o700 and refuse to write if that does not stick.
+function hardenTmpDirPermissions({ dir, osName }) {
+  if (!tmpDirModeIsPosix(osName)) {
+    // Windows temp is already per-user (%LOCALAPPDATA%\Temp) and ACL-protected;
+    // the shared-/tmp race this guards against does not apply.
+    return { hardened: false, reason: "non-posix-permissions" };
+  }
+  const mode = dir.permissions;
+  if (!mode || (mode & 0o077) === 0) {
+    return { hardened: true, reason: "already-private" };
+  }
+  try { dir.permissions = 0o700; } catch { /* best-effort */ }
+  if ((dir.permissions & 0o077) !== 0) {
+    throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
+  }
+  return { hardened: true, reason: "chmod" };
+}
+// END TMP DIR HARDENING HELPERS
+
 // BEGIN CONTACT FIELD HELPERS
 // BEGIN CONTACT FIELD CONSTANTS
 const CONTACT_PHONE_TYPES = ["work", "home", "mobile", "fax", "pager"];
@@ -2154,21 +2190,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               } else if (tmpDir.isSymlink()) {
                 throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
               } else {
-                // POSIX hardening: on a shared /tmp another local user could
-                // pre-create the directory with group/world bits set, then race
-                // the connection file. The O_EXCL on the file itself blocks a
-                // straight overwrite, but a permissive directory still lets the
-                // attacker read or rename our file. Force perms back to 0o700.
-                // permissions is 0 on platforms that don't expose POSIX modes
-                // (Windows ACLs), so the chmod is a no-op there.
                 try {
-                  const mode = tmpDir.permissions;
-                  if (mode && (mode & 0o077) !== 0) {
-                    try { tmpDir.permissions = 0o700; } catch { /* best-effort */ }
-                    if ((tmpDir.permissions & 0o077) !== 0) {
-                      throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
-                    }
-                  }
+                  hardenTmpDirPermissions({
+                    dir: tmpDir,
+                    osName: Services.appinfo.OS,
+                  });
                 } catch (e) {
                   if (e && e.message && e.message.startsWith("thunderbird-mcp tmp directory")) throw e;
                   // ignore: permissions accessor unsupported on this platform
