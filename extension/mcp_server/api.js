@@ -725,9 +725,16 @@ const _claimedComposeWindows = new WeakSet();
 // BEGIN INLINE ATTACHMENT BASE64 HELPERS
 // Require canonical RFC 4648 base64: complete quartets with padding only in
 // the final quartet. In particular, do not silently discard invalid bytes.
-const STRICT_BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+// Character-class-only pattern: a group quantifier like (?:[...]{4})* pushes a
+// backtrack frame per quartet, and SpiderMonkey throws "InternalError: too
+// much recursion" once the input exceeds a few hundred KB — which any real
+// attachment does. Quartet alignment is enforced by the length % 4 check.
+const STRICT_BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 function isValidBase64(value) {
-  return typeof value === "string" && value.length > 0 && STRICT_BASE64_PATTERN.test(value);
+  return typeof value === "string"
+    && value.length > 0
+    && value.length % 4 === 0
+    && STRICT_BASE64_PATTERN.test(value);
 }
 // END INLINE ATTACHMENT BASE64 HELPERS
 // BEGIN OUTBOUND ATTACHMENT LIMITS
