@@ -141,6 +141,19 @@ describe("daily digest classification", () => {
     assert.ok(appointment.suggestedActions.some(action => action.type === "add_to_calendar"));
   });
 
+  it("ignores generic bank debt monitoring as an action or expense", () => {
+    const analysis = helpers.classifyDailyDigestMessage({
+      subject: "Bireysel Krediler İzleme Bildirimi",
+      author: "Yapı Kredi <yapikredi@iletisim.yapikredi.com.tr>",
+      body: "Toplam borcunuz 25.000,00 TL. Son ödeme tarihi 12.08.2026.",
+    });
+    assert.ok(analysis.categories.includes("banking"));
+    assert.equal(analysis.actionRequired, false);
+    assert.ok(!analysis.categories.includes("action"));
+    assert.ok(!analysis.suggestedActions.some(action => action.type === "record_expense"));
+    assert.ok(!analysis.suggestedActions.some(action => action.type === "review_payment"));
+  });
+
   it("flags explicit spam language without treating normal newsletters as spam", () => {
     const spam = helpers.classifyDailyDigestMessage({
       subject: "Jackpot casino bonus",
