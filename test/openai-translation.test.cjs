@@ -23,9 +23,12 @@ const optionsJs = fs.readFileSync(
   "utf8"
 );
 
-describe("OpenAI high-quality inline translation", () => {
-  it("uses gpt-4o-mini with stateless structured output", () => {
-    assert.match(apiSource, /OPENAI_TRANSLATION_MODEL = "gpt-4o-mini"/);
+describe("OpenAI inline translation", () => {
+  it("offers fast nano and quality mini profiles with structured output", () => {
+    assert.match(apiSource, /model: "gpt-4\.1-nano"/);
+    assert.match(apiSource, /serviceTier: "fast"/);
+    assert.match(apiSource, /model: "gpt-4o-mini"/);
+    assert.match(apiSource, /service_tier: profile\.serviceTier/);
     assert.match(apiSource, /store: false/);
     assert.match(apiSource, /type: "json_schema"/);
     assert.match(apiSource, /name: "email_translation"/);
@@ -45,7 +48,7 @@ describe("OpenAI high-quality inline translation", () => {
     assert.match(apiSource, /detectLanguageForOpenAI/);
     assert.match(apiSource, /supportStatus: "openai"/);
     assert.match(apiSource, /getOpenAITranslationConfig\(openAIApiKey\)/);
-    assert.match(apiSource, /\{ config: openAIConfig, apiKey: openAIApiKey \}/);
+    assert.match(apiSource, /profile: openAIProfile/);
   });
 
   it("handles incomplete, refused, and fenced Responses API output", () => {

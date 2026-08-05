@@ -25,20 +25,24 @@ const popupHtml = fs.readFileSync(
 );
 
 describe("Thunderbird inline translation button", () => {
-  it("uses a message toolbar action with two explicit translation choices", () => {
+  it("uses a message toolbar action with compact translation choices", () => {
     assert.equal(manifest.message_display_action.default_title, "AI / Basit Çeviri");
     assert.equal(manifest.message_display_action.default_popup, "translation-popup.html");
   });
 
   it("dispatches AI and local popup buttons to the inline translation API", () => {
     assert.match(popupSource, /translateDisplayedMessageInline\(/);
-    assert.match(popupSource, /translate\("openai"\)/);
+    assert.match(popupSource, /translate\("openai-fast"\)/);
+    assert.match(popupSource, /translate\("openai-quality"\)/);
     assert.match(popupSource, /translate\("local"\)/);
     assert.match(popupSource, /AI çevirisi gösteriliyor/);
     assert.match(popupSource, /Yerel çeviri gösteriliyor/);
     assert.match(popupSource, /"restore"/);
     assert.match(popupHtml, /id="showOriginal"/);
-    assert.match(popupHtml, /Orijinali Göster/);
+    assert.match(popupHtml, /id="qualityTranslate"/);
+    assert.match(popupHtml, /⚡ Hızlı AI/);
+    assert.match(popupHtml, /Kaliteli AI/);
+    assert.match(popupHtml, />Orijinal</);
     assert.doesNotMatch(backgroundSource, /messageDisplayAction\.onClicked\.addListener/);
   });
 
@@ -97,10 +101,11 @@ describe("Thunderbird inline translation button", () => {
   });
 
   it("keeps the AI button on OpenAI and does not silently fall back", () => {
-    assert.match(apiSource, /provider must be auto, openai, local, or restore/);
+    assert.match(apiSource, /provider must be auto, openai, openai-fast, openai-quality, local, or restore/);
     assert.match(apiSource, /providerMode === "restore"/);
-    assert.match(apiSource, /providerMode === "openai" && !segmentPackage/);
-    assert.match(apiSource, /requestedProvider: "openai"/);
+    assert.match(apiSource, /const explicitOpenAI = providerMode\.startsWith\("openai"\)/);
+    assert.match(apiSource, /explicitOpenAI && !segmentPackage/);
+    assert.match(apiSource, /requestedProvider: providerMode/);
   });
 
   it("does not block detection when the model support catalogue is temporarily unavailable", () => {

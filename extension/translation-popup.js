@@ -1,10 +1,12 @@
 const aiButton = document.getElementById("aiTranslate");
+const qualityButton = document.getElementById("qualityTranslate");
 const localButton = document.getElementById("localTranslate");
 const originalButton = document.getElementById("showOriginal");
 const status = document.getElementById("status");
 
 function setBusy(busy) {
   aiButton.disabled = busy;
+  qualityButton.disabled = busy;
   localButton.disabled = busy;
   originalButton.disabled = busy;
 }
@@ -18,9 +20,11 @@ async function getActiveTab() {
 async function translate(provider) {
   setBusy(true);
   status.className = "";
-  status.textContent = provider === "openai"
-    ? "gpt-4o-mini ile çevriliyor…"
-    : "Cihazda çevriliyor…";
+  status.textContent = provider === "openai-fast"
+    ? "Hızlı AI ile çevriliyor…"
+    : provider === "openai-quality"
+      ? "Kaliteli AI ile çevriliyor…"
+      : "Cihazda çevriliyor…";
   try {
     const tab = await getActiveTab();
     const result = await browser.mcpServer.translateDisplayedMessageInline(
@@ -34,7 +38,7 @@ async function translate(provider) {
       ? "İleti zaten Türkçe görünüyor."
       : result?.translated === false
         ? "Orijinal ileti gösteriliyor."
-        : provider === "openai"
+        : provider.startsWith("openai")
           ? "AI çevirisi gösteriliyor."
           : "Yerel çeviri gösteriliyor.";
   } catch (error) {
@@ -69,6 +73,7 @@ async function restoreOriginal() {
   }
 }
 
-aiButton.addEventListener("click", () => translate("openai"));
+aiButton.addEventListener("click", () => translate("openai-fast"));
+qualityButton.addEventListener("click", () => translate("openai-quality"));
 localButton.addEventListener("click", () => translate("local"));
 originalButton.addEventListener("click", restoreOriginal);

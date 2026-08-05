@@ -1320,7 +1320,25 @@ const PREF_OPENAI_USAGE_MONTH =
   "extensions.thunderbird-mcp.openAITranslationUsageMonth";
 const PREF_OPENAI_USAGE_MICRODOLLARS =
   "extensions.thunderbird-mcp.openAITranslationUsageMicrodollars";
-const OPENAI_TRANSLATION_MODEL = "gpt-4o-mini";
+const OPENAI_TRANSLATION_PROFILES = Object.freeze({
+  fast: Object.freeze({
+    id: "fast",
+    label: "Hızlı AI",
+    model: "gpt-4.1-nano",
+    serviceTier: "fast",
+    inputUsdPerMillionTokens: 0.20,
+    outputUsdPerMillionTokens: 0.80,
+  }),
+  quality: Object.freeze({
+    id: "quality",
+    label: "Kaliteli AI",
+    model: "gpt-4o-mini",
+    serviceTier: null,
+    inputUsdPerMillionTokens: 0.15,
+    outputUsdPerMillionTokens: 0.60,
+  }),
+});
+const OPENAI_DEFAULT_TRANSLATION_PROFILE = OPENAI_TRANSLATION_PROFILES.fast;
 const OPENAI_API_ORIGIN = "https://api.openai.com";
 const OPENAI_API_URL = `${OPENAI_API_ORIGIN}/v1/responses`;
 const OPENAI_LOGIN_REALM = "Thunderbird MCP OpenAI Translation";
@@ -1334,8 +1352,6 @@ const OPENAI_MAX_TEXT_SEGMENTS = 400;
 const OPENAI_TRANSLATION_BATCH_MAX_CHARACTERS = 8000;
 const OPENAI_TRANSLATION_BATCH_MAX_SEGMENTS = 60;
 const OPENAI_TRANSLATION_CONCURRENCY = 3;
-const OPENAI_INPUT_USD_PER_MILLION_TOKENS = 0.15;
-const OPENAI_OUTPUT_USD_PER_MILLION_TOKENS = 0.60;
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 // Valid group and CRUD values for tool metadata validation
 const VALID_GROUPS = ["messages", "folders", "contacts", "calendar", "filters", "system"];
@@ -1406,11 +1422,11 @@ function getOpenAITranslationUsage() {
   };
 }
 
-function addOpenAITranslationUsage(inputTokens, outputTokens) {
+function addOpenAITranslationUsage(inputTokens, outputTokens, profile) {
   const usage = getOpenAITranslationUsage();
   const microdollars = Math.ceil(
-    Number(inputTokens || 0) * OPENAI_INPUT_USD_PER_MILLION_TOKENS +
-    Number(outputTokens || 0) * OPENAI_OUTPUT_USD_PER_MILLION_TOKENS
+    Number(inputTokens || 0) * profile.inputUsdPerMillionTokens +
+    Number(outputTokens || 0) * profile.outputUsdPerMillionTokens
   );
   const total = Math.min(2147483647, usage.microdollars + microdollars);
   Services.prefs.setIntPref(PREF_OPENAI_USAGE_MICRODOLLARS, total);
@@ -1431,7 +1447,13 @@ async function getOpenAITranslationConfig(apiKeyOverride) {
     keyConfigured: typeof apiKeyOverride === "string"
       ? Boolean(apiKeyOverride)
       : Boolean(await getOpenAITranslationApiKey()),
-    model: OPENAI_TRANSLATION_MODEL,
+    model: OPENAI_DEFAULT_TRANSLATION_PROFILE.model,
+    profiles: Object.values(OPENAI_TRANSLATION_PROFILES).map(profile => ({
+      id: profile.id,
+      label: profile.label,
+      model: profile.model,
+      serviceTier: profile.serviceTier,
+    })),
     monthlyLimitUsd: monthlyLimitCents / 100,
     usageMonth: usage.month,
     currentMonthSpendUsd: usage.microdollars / 1000000,
@@ -1439,12 +1461,12 @@ async function getOpenAITranslationConfig(apiKeyOverride) {
   };
 }
 
-function estimateOpenAITranslationMicrodollars(characterCount) {
+function estimateOpenAITranslationMicrodollars(characterCount, profile) {
   const estimatedInputTokens = Math.ceil(characterCount / 3) + 500;
   const estimatedOutputTokens = Math.ceil(characterCount / 2.5) + 300;
   return Math.ceil(
-    estimatedInputTokens * OPENAI_INPUT_USD_PER_MILLION_TOKENS +
-    estimatedOutputTokens * OPENAI_OUTPUT_USD_PER_MILLION_TOKENS
+    estimatedInputTokens * profile.inputUsdPerMillionTokens +
+    estimatedOutputTokens * profile.outputUsdPerMillionTokens
   );
 }
 
@@ -2005,13 +2027,14 @@ function createOpenAITranslationBatches(segments) {
   return batches;
 }
 
-async function translateOpenAIBatch(apiKey, segments) {
+async function translateOpenAIBatch(apiKey, segments, profile) {
   const characterCount = segments.reduce(
     (total, segment) => total + String(segment?.text || "").length,
     0
   );
   const payload = {
-    model: OPENAI_TRANSLATION_MODEL,
+    model: profile.model,
+    ...(profile.serviceTier ? { service_tier: profile.serviceTier } : {}),
     store: false,
     instructions: [
       "You are a high-precision email translator.",
@@ -2093,12 +2116,13 @@ async function translateOpenAIBatch(apiKey, segments) {
 
   const recordedUsage = addOpenAITranslationUsage(
     response?.usage?.input_tokens,
-    response?.usage?.output_tokens
+    response?.usage?.output_tokens,
+    profile
   );
   return {
     translated,
-    provider: "openai",
-    model: OPENAI_TRANSLATION_MODEL,
+    provider: `openai-${profile.id}`,
+    model: profile.model,
     usage: {
       inputTokens: Number(response?.usage?.input_tokens || 0),
       outputTokens: Number(response?.usage?.output_tokens || 0),
@@ -2108,6 +2132,7 @@ async function translateOpenAIBatch(apiKey, segments) {
 }
 
 async function translateSegmentsWithOpenAI(segments, characterCount, prepared = null) {
+  const profile = prepared?.profile || OPENAI_DEFAULT_TRANSLATION_PROFILE;
   const config = prepared?.config || await getOpenAITranslationConfig();
   if (!config.enabled) return { skipped: true, reason: "OpenAI çevirisi kapalı." };
   const apiKey = typeof prepared?.apiKey === "string"
@@ -2117,7 +2142,10 @@ async function translateSegmentsWithOpenAI(segments, characterCount, prepared = 
 
   const usage = getOpenAITranslationUsage();
   const limitMicrodollars = Math.round(config.monthlyLimitUsd * 1000000);
-  const estimatedMicrodollars = estimateOpenAITranslationMicrodollars(characterCount);
+  const estimatedMicrodollars = estimateOpenAITranslationMicrodollars(
+    characterCount,
+    profile
+  );
   if (usage.microdollars + estimatedMicrodollars > limitMicrodollars) {
     return {
       skipped: true,
@@ -2132,7 +2160,7 @@ async function translateSegmentsWithOpenAI(segments, characterCount, prepared = 
   async function worker() {
     while (nextBatch < batches.length) {
       const index = nextBatch++;
-      results[index] = await translateOpenAIBatch(apiKey, batches[index]);
+      results[index] = await translateOpenAIBatch(apiKey, batches[index], profile);
     }
   }
   const workerResults = await Promise.allSettled(
@@ -2156,8 +2184,8 @@ async function translateSegmentsWithOpenAI(segments, characterCount, prepared = 
   }
   return {
     translated,
-    provider: "openai",
-    model: OPENAI_TRANSLATION_MODEL,
+    provider: `openai-${profile.id}`,
+    model: profile.model,
     batchCount: batches.length,
     usage: { inputTokens, outputTokens, monthSpendUsd },
   };
@@ -10636,9 +10664,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { error: "tabId must be a positive integer" };
             }
             const providerMode = String(provider || "auto").toLowerCase();
-            if (!new Set(["auto", "openai", "local", "restore"]).has(providerMode)) {
-              return { error: "provider must be auto, openai, local, or restore" };
+            if (!new Set([
+              "auto",
+              "openai",
+              "openai-fast",
+              "openai-quality",
+              "local",
+              "restore",
+            ]).has(providerMode)) {
+              return {
+                error: "provider must be auto, openai, openai-fast, openai-quality, local, or restore",
+              };
             }
+            const openAIProfile = providerMode === "openai-quality"
+              ? OPENAI_TRANSLATION_PROFILES.quality
+              : OPENAI_TRANSLATION_PROFILES.fast;
+            const explicitOpenAI = providerMode.startsWith("openai");
             const display = getMessageDisplayContext(tabId);
             const cacheKey = `${tabId}:${display.messageURI}`;
             if (!globalThis.__tbMcpInlineTranslationOriginals) {
@@ -10706,23 +10747,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               } catch (e) {
                 openAIFallbackReason = e?.message || String(e);
               }
-            } else if (providerMode === "openai") {
+            } else if (explicitOpenAI) {
               openAIFallbackReason = !openAIConfig?.enabled
                 ? "Kaliteli OpenAI çevirisi ayarlardan kapalı."
                 : "OpenAI API anahtarı ayarlanmamış.";
             }
-            if (providerMode === "openai" && !segmentPackage) {
+            if (explicitOpenAI && !segmentPackage) {
               display.body.innerHTML = originalHtml;
               addInlineNotice(display.document, openAIFallbackReason, true);
               return {
                 error: openAIFallbackReason,
-                requestedProvider: "openai",
+                requestedProvider: providerMode,
               };
             }
             addInlineNotice(
               display.document,
               segmentPackage
-                ? `Dil algılanıyor ve ${OPENAI_TRANSLATION_MODEL} ile kaliteli Türkçeye çevriliyor…`
+                ? `Dil algılanıyor ve ${openAIProfile.label} ile Türkçeye çevriliyor…`
                 : "Dil algılanıyor ve mail cihazınızda yerel olarak Türkçeye çevriliyor…"
             );
 
@@ -10763,7 +10804,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             if (segmentPackage) {
               try {
                 const segmentSignature = JSON.stringify(segmentPackage.segments);
-                const aiCacheKey = `${OPENAI_TRANSLATION_MODEL}:${display.messageURI}`;
+                const aiCacheKey = [
+                  openAIProfile.model,
+                  openAIProfile.serviceTier || "standard",
+                  display.messageURI,
+                ].join(":");
                 if (!globalThis.__tbMcpOpenAITranslationCache) {
                   globalThis.__tbMcpOpenAITranslationCache = new Map();
                 }
@@ -10773,7 +10818,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   aiResult = await translateSegmentsWithOpenAI(
                     segmentPackage.segments,
                     segmentPackage.characterCount,
-                    { config: openAIConfig, apiKey: openAIApiKey }
+                    {
+                      config: openAIConfig,
+                      apiKey: openAIApiKey,
+                      profile: openAIProfile,
+                    }
                   );
                   if (!aiResult.skipped) {
                     if (aiCache.size >= 100) {
@@ -10827,7 +10876,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     display.document,
                     aiResult.provider === "openai-cache"
                       ? "Önbellekteki kaliteli Türkçe çeviri gösteriliyor. Orijinale dönmek için düğmeye tekrar basın."
-                      : `${OPENAI_TRANSLATION_MODEL} kaliteli Türkçe çevirisi gösteriliyor. Bu ay tahmini API harcaması $${aiResult.usage.monthSpendUsd.toFixed(4)}. Orijinale dönmek için düğmeye tekrar basın.`
+                      : `${openAIProfile.label} (${aiResult.model}) Türkçe çevirisi gösteriliyor. Bu ay tahmini API harcaması $${aiResult.usage.monthSpendUsd.toFixed(4)}. Orijinale dönmek için düğmeye tekrar basın.`
                   );
                   return {
                     success: true,
@@ -10845,11 +10894,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 openAIFallbackReason = e?.message || String(e);
               }
               display.body.innerHTML = originalHtml;
-              if (providerMode === "openai") {
+              if (explicitOpenAI) {
                 addInlineNotice(display.document, openAIFallbackReason, true);
                 return {
                   error: openAIFallbackReason,
-                  requestedProvider: "openai",
+                  requestedProvider: providerMode,
                 };
               }
               addInlineNotice(

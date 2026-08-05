@@ -257,7 +257,7 @@
           {
             "name": "provider",
             "type": "string",
-            "description": "Translation provider: openai forces AI; local forces Mozilla; auto chooses; restore only returns to the cached original",
+            "description": "Translation provider: openai/openai-fast uses low-latency AI, openai-quality uses quality AI, local forces Mozilla, auto chooses, restore returns the cached original",
             "optional": true
           }
         ]
