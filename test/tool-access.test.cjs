@@ -77,6 +77,8 @@ const ALL_TOOLS = [
   { name: "searchMessages", group: "messages", crud: "read" },
   { name: "getMessage", group: "messages", crud: "read" },
   { name: "getMessages", group: "messages", crud: "read" },
+  { name: "getDailyMailDigest", group: "messages", crud: "read" },
+  { name: "translateMessageToTurkish", group: "messages", crud: "read" },
   { name: "getRecentMessages", group: "messages", crud: "read" },
   { name: "displayMessage", group: "messages", crud: "read" },
   { name: "sendMail", group: "messages", crud: "create" },

@@ -480,6 +480,84 @@ saveToolsBtn.addEventListener("click", async () => {
   saveToolsBtn.disabled = false;
 });
 
+const openAITranslationEnabledCheckbox = document.getElementById(
+  "openAITranslationEnabled"
+);
+const openAIApiKeyInput = document.getElementById("openAIApiKey");
+const openAIMonthlyLimitInput = document.getElementById("openAIMonthlyLimit");
+const openAITranslationUsage = document.getElementById("openAITranslationUsage");
+const saveOpenAITranslationBtn = document.getElementById(
+  "saveOpenAITranslationBtn"
+);
+const clearOpenAIApiKeyBtn = document.getElementById("clearOpenAIApiKeyBtn");
+const openAITranslationStatus = document.getElementById(
+  "openAITranslationStatus"
+);
+
+function renderOpenAITranslationConfig(config) {
+  openAITranslationEnabledCheckbox.checked = !!config.enabled;
+  openAIMonthlyLimitInput.value = Number(config.monthlyLimitUsd || 2).toFixed(2);
+  openAIApiKeyInput.value = "";
+  openAIApiKeyInput.placeholder = config.keyConfigured
+    ? "Anahtar güvenli olarak kayıtlı — değiştirmek için yenisini girin"
+    : "sk-…";
+  clearOpenAIApiKeyBtn.disabled = !config.keyConfigured;
+  saveOpenAITranslationBtn.disabled = false;
+  openAITranslationUsage.textContent =
+    `${config.usageMonth}: $${Number(config.currentMonthSpendUsd || 0).toFixed(4)} / ` +
+    `$${Number(config.monthlyLimitUsd || 2).toFixed(2)} · Model: ${config.model}`;
+}
+
+async function loadOpenAITranslationConfig() {
+  try {
+    const config = await browser.mcpServer.getOpenAITranslationConfig();
+    renderOpenAITranslationConfig(config);
+    openAITranslationStatus.textContent = "";
+  } catch (e) {
+    openAITranslationStatus.textContent = "Hata: " + e.message;
+    openAITranslationStatus.className = "save-status error";
+  }
+}
+
+async function saveOpenAITranslationConfig(clearApiKey = false) {
+  const monthlyLimitUsd = Number(openAIMonthlyLimitInput.value);
+  if (!Number.isFinite(monthlyLimitUsd) || monthlyLimitUsd < 0.1 || monthlyLimitUsd > 100) {
+    openAITranslationStatus.textContent = "Aylık limit 0,10 ile 100 USD arasında olmalı.";
+    openAITranslationStatus.className = "save-status error";
+    return;
+  }
+
+  saveOpenAITranslationBtn.disabled = true;
+  clearOpenAIApiKeyBtn.disabled = true;
+  openAITranslationStatus.textContent = "Kaydediliyor…";
+  openAITranslationStatus.className = "save-status";
+  try {
+    const result = await browser.mcpServer.setOpenAITranslationConfig(
+      openAITranslationEnabledCheckbox.checked,
+      monthlyLimitUsd,
+      openAIApiKeyInput.value,
+      clearApiKey
+    );
+    if (result.error) throw new Error(result.error);
+    renderOpenAITranslationConfig(result);
+    openAITranslationStatus.textContent = clearApiKey
+      ? "API anahtarı silindi; yerel çeviri kullanılacak."
+      : "Kaydedildi.";
+  } catch (e) {
+    openAITranslationStatus.textContent = "Hata: " + e.message;
+    openAITranslationStatus.className = "save-status error";
+    saveOpenAITranslationBtn.disabled = false;
+  }
+}
+
+saveOpenAITranslationBtn.addEventListener("click", async () => {
+  await saveOpenAITranslationConfig(false);
+});
+
+clearOpenAIApiKeyBtn.addEventListener("click", async () => {
+  await saveOpenAITranslationConfig(true);
+});
+
 const blockSkipReviewCheckbox = document.getElementById("blockSkipReview");
 const saveSkipReviewBtn = document.getElementById("saveSkipReviewBtn");
 const saveSkipReviewStatus = document.getElementById("saveSkipReviewStatus");
@@ -520,6 +598,7 @@ loadAuthenticationConfig().catch(e => console.error("thunderbird-mcp options:", 
 loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAccountAccess failed:", e));
 loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
 loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
+loadOpenAITranslationConfig().catch(e => console.error("thunderbird-mcp options:", "loadOpenAITranslationConfig failed:", e));
 
 const listenAllCheckbox = document.getElementById("listenAll");
 const listenAllWarning = document.getElementById("listenAllWarning");

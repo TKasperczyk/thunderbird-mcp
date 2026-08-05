@@ -3,6 +3,10 @@
 // would trigger no-redeclare.
 async function init() {
   try {
+    const translationResult = await browser.mcpServer.enableLocalTranslations();
+    if (translationResult?.error) {
+      console.error("Could not enable local translations:", translationResult.error);
+    }
     const result = await browser.mcpServer.start();
     if (result.success) {
       console.log("MCP server started on port", result.port);
@@ -16,6 +20,12 @@ async function init() {
 
 browser.runtime.onInstalled.addListener(init);
 browser.runtime.onStartup.addListener(init);
+browser.messageDisplay.onMessageDisplayed.addListener((tab) => {
+  browser.messageDisplayAction.setTitle({
+    tabId: tab.id,
+    title: "AI / Basit Çeviri",
+  }).catch((e) => console.error("Could not reset translation button title:", e));
+});
 
 // Also call init() directly — the event listeners above don't fire when
 // a user disables and re-enables the extension.

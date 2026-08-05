@@ -1,7 +1,7 @@
 # Thunderbird MCP
 
 [![CI](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/TKasperczyk/thunderbird-mcp/actions/workflows/ci.yml)
-[![Tools](https://img.shields.io/badge/40_Tools-email%2C_compose%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
+[![Tools](https://img.shields.io/badge/42_Tools-email%2C_digest%2C_translation%2C_filters%2C_calendar%2C_contacts-blue.svg)](#what-you-can-do)
 [![Localhost Only](https://img.shields.io/badge/Privacy-localhost_only-green.svg)](#security)
 [![Thunderbird](https://img.shields.io/badge/Thunderbird-102%2B-0a84ff.svg)](https://www.thunderbird.net/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-grey.svg)](LICENSE)
@@ -18,7 +18,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 ## Why?
 
-Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 40 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
+Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 42 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
 Mail sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. **By default, nothing is sent or created without your review.**
 
@@ -44,12 +44,14 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 |------|-------------|
 | `listAccounts` | List all email accounts and their identities |
 | `listFolders` | Browse folder tree with message counts -- filter by account or subtree |
-| `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Multi-word queries are AND-of-tokens (every word must appear somewhere). Prefix with `from:`, `subject:`, `to:`, or `cc:` to restrict to one field. Set `searchBody: true` for full-text body search via Thunderbird's Gloda index. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. By default, `dedupByMessageId` collapses the same RFC Message-ID found in multiple folders/labels into one row and reports the other folder paths in `dupLocations`; set `dedupByMessageId: false` to return every location. |
+| `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Multi-word queries are AND-of-tokens (every word must appear somewhere). Prefix with `from:`, `subject:`, `to:`, or `cc:` to restrict to one field. Set `searchBody: true` for full-text body search via Thunderbird's Gloda index. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId`, folder-local `messageKey`, and a `preview` snippet. By default, `dedupByMessageId` collapses the same RFC Message-ID found in multiple folders/labels into one row and reports the other folder paths in `dupLocations`; set `dedupByMessageId: false` to return every location. |
 | `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Set `rawSource: true` for the complete RFC 2822 source (all headers + MIME parts). Optional attachment saving. Set `includeInlineImages: true` to append supported inline CID images as MCP image blocks (PNG, JPEG, GIF, or WebP; max 1 MiB base64 per image and 4 MiB total). Skipped images are reported in attachment metadata. |
 | `getMessages` | Read full email content for up to the configured batch limit in one call (default 10, max 20). Uses the same `bodyFormat`, `rawSource`, and attachment options as `getMessage`; each item supplies `messageId` and `folderPath`. |
+| `getDailyMailDigest` | Read every message received on a local calendar day across accessible incoming folders (including routed notification/newsletter folders), excluding sent/drafts/trash/junk. Reads bounded full-text bodies, deduplicates messages, and separates action, invoice, payment status, banking, subscription, order, appointment, GitHub, security, newsletter, and possible-spam signals. Stable suggested-action types let an app offer expense, recurring-subscription, calendar, and order-tracking workflows without creating anything automatically. |
+| `translateMessageToTurkish` | Read one message with translation instructions for the connected AI client. Produces a faithful Turkish translation while preserving Markdown/text structure, links, dates, amounts, names, and identifiers. |
 | `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
 | `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
-| `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move between folders, or trash -- supports bulk via `messageIds` |
+| `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move between folders, or trash. Supports bulk RFC IDs and unambiguous folder-local `messageKey`/`messageKeys` for duplicate copies. |
 | `deleteMessages` | Delete messages -- drafts are safely moved to Trash |
 | `createFolder` | Create new subfolders to organize your mail |
 | `renameFolder` | Rename an existing mail folder |
@@ -57,6 +59,32 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | `moveFolder` | Move a folder to a new parent within the same account |
 | `emptyTrash` | Permanently delete all messages in Trash (including subfolders) |
 | `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
+
+### Daily briefing and Turkish translation
+
+The digest remains provider-independent: it reads and structures local Thunderbird data, while the connected MCP-capable AI performs the natural-language synthesis. Inline translation can stay entirely local or optionally use the explicitly configured OpenAI high-quality mode described below.
+
+Example requests:
+
+- “Bugünün maillerini bana özetle.”
+- “Dünkü e-postalarda ödenmemiş fatura veya güvenlik uyarısı var mı?”
+- “Bu e-postayı biçimini bozmadan Türkçeye çevir.”
+
+`getDailyMailDigest` defaults to the current local day, includes read and unread mail, and reads up to 200 messages. It searches all accessible incoming folders so server-side routing to folders such as `Notification` or `Newsletter` does not hide important mail. Classification uses the complete extracted body even when the returned display body is shortened. Each message has one `primaryCategory` for a simple UI plus optional overlapping signals, a distinct `paymentStatus` (`paid`, `due`, `overdue`, `failed`, or `unknown`), and stable `suggestedActions`. Suggested actions always carry `requiresConfirmation: true`; the add-on never records an expense, creates a calendar entry, marks spam, or unsubscribes by itself. Returned classification is heuristic; the AI client should explain uncertainty rather than treating spam or urgency signals as infallible.
+
+#### Translate inside Thunderbird
+
+Open a foreign-language email and click **Türkçeye Çevir** in the message toolbar. The add-on detects the source language locally, then translates the subject and rendered message body directly in the existing reading pane while preserving its HTML layout, links, colors, tables, and paragraphs. A message already detected as Turkish is left untouched. Click the same button again to restore both the original subject and body. Duplicate clicks and results from a message that is no longer open are ignored safely. It uses Thunderbird's built-in Mozilla language detector and translation engine. The add-on enables that local engine during startup; after installing or updating the add-on, fully quit and reopen Thunderbird once.
+
+Thunderbird's translation model catalogue can be absent even though the local engine is bundled. In that case the add-on reads only the two official Mozilla Firefox Remote Settings catalogues and downloads the required compressed model/Wasm files from Mozilla over HTTPS. Every attachment is checked against Mozilla's advertised byte size and SHA-256 hash before use. The initial English-to-Turkish translation is roughly a 16 MB download and models are cached in memory for the current Thunderbird session. The email subject and body are never included in those requests and are not sent to Google, OpenAI, or another translation service.
+
+#### Optional high-quality OpenAI translation
+
+The settings page can enable a second translation provider using `gpt-4o-mini`. When configured, the same **Türkçeye Çevir** button tries the high-quality provider first and automatically falls back to Mozilla's local engine if the API key is absent, the request fails, the message exceeds the bounded text limit, validation fails, or the monthly application limit has been reached.
+
+The OpenAI API key is stored in Thunderbird's password manager and is never returned by the configuration API or written to extension preferences. Only the visible subject and bounded text nodes are sent: raw HTML, attachments, account passwords, and hidden script/style content are excluded. The request uses `store: false`, strict structured JSON output, and no tools. Returned segment IDs must match exactly, and URLs, email addresses, identifiers, dates, and numbers are checked before the translated text is inserted back into the existing DOM. Successful translations are cached in memory for the Thunderbird session.
+
+The default application-enforced limit is USD 2.00 per calendar month. The add-on estimates the request cost before sending, records actual API input/output token usage afterward using the configured model's fixed rate constants, and displays the running estimate in settings and in the translated-message notice. This limit is a local safety guard, not an OpenAI billing limit. API use is billed separately from a ChatGPT subscription. Email content leaves the device only when this optional provider is enabled and a key is configured.
 
 ### Compose
 
@@ -82,6 +110,13 @@ Compose tools validate the `from` identity strictly -- if the specified sender d
 | `applyFilters` | Run filters on a folder on demand -- let your AI organize your inbox |
 
 Full control over Thunderbird's message filters. Changes persist immediately. Your AI can create sorting rules, adjust priorities, and run them on existing mail.
+
+For a deliberately small Turkish tag structure, the repository also contains a mailbox organizer. It assigns at most one primary tag (`Bankalar`, `Faturalar`, `Ödemeler`, `Siparişler`, `Randevular`, `Bültenler`, or `Teknik`) and optionally the separate `Aksiyon` tag. The default command is read-only and reports proposed additions/removals; applying it also removes conflicting tags managed by this organizer:
+
+```bash
+npm run mail:categories:preview
+npm run mail:categories:apply
+```
 
 ### Contacts
 
@@ -240,7 +275,7 @@ thunderbird-mcp/
 │   ├── options.js              # Settings page logic
 │   ├── icons/                  # Extension icons
 │   └── mcp_server/
-│       ├── api.js              # All 40 MCP tools + auth + access control
+│       ├── api.js              # All 42 MCP tools + auth + access control
 │       └── schema.json
 ├── test/                       # Test suite (node:test, zero dependencies)
 └── scripts/

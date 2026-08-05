@@ -4,6 +4,13 @@
     "description": "MCP HTTP server for AI integration",
     "functions": [
       {
+        "name": "enableLocalTranslations",
+        "type": "function",
+        "async": true,
+        "description": "Enable Thunderbird's built-in local translation engine across restarts",
+        "parameters": []
+      },
+      {
         "name": "start",
         "type": "function",
         "async": true,
@@ -119,6 +126,42 @@
         "parameters": []
       },
       {
+        "name": "getOpenAITranslationConfig",
+        "type": "function",
+        "async": true,
+        "description": "Get the secure OpenAI translation status, model, monthly limit, and usage without exposing the API key",
+        "parameters": []
+      },
+      {
+        "name": "setOpenAITranslationConfig",
+        "type": "function",
+        "async": true,
+        "description": "Configure high-quality OpenAI translation. API keys are stored in Thunderbird's password manager, not extension preferences.",
+        "parameters": [
+          {
+            "name": "enabled",
+            "type": "boolean",
+            "description": "Use OpenAI translation when a key is configured; otherwise fall back to Mozilla local translation"
+          },
+          {
+            "name": "monthlyLimitUsd",
+            "type": "number",
+            "description": "Application-enforced monthly translation limit in USD, from 0.10 to 100"
+          },
+          {
+            "name": "apiKey",
+            "type": "string",
+            "description": "New OpenAI API key. Leave empty to retain the currently stored key."
+          },
+          {
+            "name": "clearApiKey",
+            "type": "boolean",
+            "description": "Remove the stored API key",
+            "optional": true
+          }
+        ]
+      },
+      {
         "name": "getListenAll",
         "type": "function",
         "async": true,
@@ -135,6 +178,87 @@
             "name": "listenAll",
             "type": "boolean",
             "description": "When true, server binds to 0.0.0.0 instead of 127.0.0.1. Server will be restarted."
+          }
+        ]
+      },
+      {
+        "name": "detectLanguage",
+        "type": "function",
+        "async": true,
+        "description": "Detect the source language locally with Thunderbird's built-in detector",
+        "parameters": [
+          {
+            "name": "text",
+            "type": "string",
+            "description": "Plain text or HTML whose language should be detected"
+          },
+          {
+            "name": "isHtml",
+            "type": "boolean",
+            "description": "Strip markup before detecting the language",
+            "optional": true
+          }
+        ]
+      },
+      {
+        "name": "translateText",
+        "type": "function",
+        "async": true,
+        "description": "Translate text locally with Thunderbird's built-in Mozilla translation engine",
+        "parameters": [
+          {
+            "name": "text",
+            "type": "string",
+            "description": "Plain text to translate"
+          },
+          {
+            "name": "targetLanguage",
+            "type": "string",
+            "description": "BCP-47 target language code, defaults to tr",
+            "optional": true
+          },
+          {
+            "name": "sourceLanguage",
+            "type": "string",
+            "description": "Optional BCP-47 source language code; defaults to auto detection",
+            "optional": true
+          },
+          {
+            "name": "isHtml",
+            "type": "boolean",
+            "description": "Preserve HTML structure while translating",
+            "optional": true
+          }
+        ]
+      },
+      {
+        "name": "translateDisplayedMessageInline",
+        "type": "function",
+        "async": true,
+        "description": "Detect the source language, translate the displayed subject and body in place, and toggle back to the original",
+        "parameters": [
+          {
+            "name": "tabId",
+            "type": "integer",
+            "description": "Thunderbird message display tab ID"
+          },
+          {
+            "name": "targetLanguage",
+            "type": "string",
+            "description": "BCP-47 target language code, defaults to tr",
+            "optional": true
+          },
+          {
+            "name": "sourceLanguage",
+            "type": "string",
+            "description": "BCP-47 source language code, defaults to auto detection",
+            "optional": true
+          },
+          {
+            "name": "provider",
+            "type": "string",
+            "description": "Translation provider: openai forces AI; local forces Mozilla; auto chooses; restore only returns to the cached original",
+            "optional": true
           }
         ]
       }

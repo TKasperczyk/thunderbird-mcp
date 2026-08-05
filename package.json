@@ -1,6 +1,6 @@
 {
   "name": "thunderbird-mcp",
-  "version": "0.7.4",
+  "version": "0.9.4",
   "description": "MCP server for Thunderbird - enables AI assistants to access email, contacts, and calendars",
   "author": "Tomasz Kasperczyk",
   "license": "MIT",
@@ -31,7 +31,9 @@
   "scripts": {
     "test": "node --test test/*.cjs",
     "lint": "eslint .",
-    "lint:fix": "eslint . --fix"
+    "lint:fix": "eslint . --fix",
+    "mail:categories:preview": "node scripts/categorize-mail.cjs",
+    "mail:categories:apply": "node scripts/categorize-mail.cjs --apply"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
