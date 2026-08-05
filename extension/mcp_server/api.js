@@ -1618,7 +1618,10 @@ function classifyDailyDigestMessage(message) {
   const subject = String(message?.subject || "");
   const author = String(message?.author || "");
   const body = String(message?.body || "");
-  const source = `${subject}\n${author}\n${body}`;
+  const attachmentNames = Array.isArray(message?.attachments)
+    ? message.attachments.map(attachment => String(attachment?.name || "")).join(" ")
+    : "";
+  const source = `${subject}\n${author}\n${body}\n${attachmentNames}`;
   const folded = normalizeDailyDigestText(source);
   const categories = [];
   const reasons = [];
@@ -1631,27 +1634,43 @@ function classifyDailyDigestMessage(message) {
     addCategory("github");
     reasons.push("GitHub bildirimi");
   }
-  const hasInvoiceSignal = /\bfatura\b|\binvoice\b|hesap ozeti|receipt|makbuz|billing statement/.test(folded);
-  if (hasInvoiceSignal) {
-    addCategory("invoice");
-    reasons.push("Fatura veya hesap özeti");
-  }
-
   const paymentFailed = /charge failed|payment failed|card declined|odeme basarisiz|odemeniz alinamadi|tahsilat basarisiz/.test(folded);
   const paymentOverdue = /overdue|past due|vadesi gecti|gecikmis odeme|gecikmis borc/.test(folded);
   const paymentPaid = /payment received|payment successful|paid successfully|odemen basariyla alindi|odeme alindi|odendi|tahsil edildi|odemeniz icin tesekkur/.test(folded);
-  const rawPaymentDue = !paymentPaid && /payment due|amount due|pay by|son odeme|odemeniz var|odenmesi gereken|vade tarihi|borcunuz/.test(folded);
-  const hasDirectPaymentSignal =
-    /\bodeme\b|\bpayment\b|charge|card declined|billing|past due|overdue|tahsilat/.test(folded);
+  const paymentCharged = /\bcharged\b|charge was successful|ucretlendirildi|hesabinizdan cekildi|kartinizdan cekildi|tahsil edildi/.test(folded);
+  const rawPaymentDue = !paymentPaid && /payment due|amount due|pay by|son odeme|odenecek tutar|odenmesi gereken|vade tarihi/.test(folded);
   const hasBankingSignal =
     /\bbanka\b|bankasi|bank account|hesap hareket|hesap ozeti|kart ekstresi|para transfer|havale|eft|swift|kredi kart|debit card|credit card|enpara|yapi kredi|garanti bbva|akbank|is bankasi|ziraat|vakifbank|halkbank|qnb|kuveyt turk|denizbank|\bteb\b/.test(folded);
+  const foldedAuthor = normalizeDailyDigestText(author);
+  const hasBankIdentity =
+    /\bbanka\b|bankasi|\bbank\b|enpara|yapi kredi|garanti bbva|akbank|is bankasi|ziraat|vakifbank|halkbank|qnb|kuveyt turk|denizbank|\bteb\b/.test(foldedAuthor);
   const bankDebtNotice = hasBankingSignal && (
     /(?:bireysel|perakende)?\s*krediler?\s+izleme|kredi(?:ler)?\s+izleme\s+bildirimi|(?:kredi\s*karti|kart|ekstre|hesap)\s+borcu|borcunuz|minimum\s+odeme|asgari\s+odeme/.test(folded)
   );
   const paymentDue = rawPaymentDue && !bankDebtNotice;
-  if (hasDirectPaymentSignal || paymentFailed || paymentOverdue || paymentDue || paymentPaid) {
+  const amount = extractDailyDigestAmount(source);
+  const hasInvoiceTerm = /\be[ -]?fatura\w*|\bfatura\w*|\binvoice\b|tax invoice|billing statement|bill is ready/.test(folded);
+  const hasInvoiceLifecycle = /fatura\w*\s+(?:hazir|olusturuldu|duzenlendi|kesildi)|invoice\s+(?:is\s+)?(?:ready|issued|available)|fatura\s*(?:no|numarasi)|invoice\s*(?:no|number|#)|donem\s+faturasi|billing period/.test(folded);
+  const hasInvoiceAttachment = /(?:fatura|invoice|receipt|makbuz)[^\n]{0,60}\.(?:pdf|xml)\b|\b(?:ekte|attached)[^\n]{0,60}(?:fatura|invoice|receipt|makbuz|pdf)/.test(folded);
+  const marketingSignal = /kampanya|indirim|firsat|promosyon|promotion|discount|special offer|cashback|nakit iade|puan kazan|hemen basvur|simdi basvur|planlar ve fiyatlar|plans? and pricing/.test(folded);
+  const invoiceDocument = hasInvoiceTerm && (
+    Boolean(amount) || paymentDue || paymentOverdue || paymentFailed || hasInvoiceLifecycle || hasInvoiceAttachment
+  );
+  const paymentReceipt = paymentPaid && Boolean(amount);
+  const marketingOnly = marketingSignal && !(
+    Boolean(amount) && (hasInvoiceLifecycle || paymentDue || paymentPaid || paymentCharged || paymentFailed)
+  );
+  const hasInvoiceSignal = !hasBankIdentity && !marketingOnly && invoiceDocument;
+  const hasPaymentDocument = !hasBankIdentity && !marketingOnly && (
+    hasInvoiceSignal || paymentReceipt || ((paymentFailed || paymentCharged) && Boolean(amount))
+  );
+  if (hasInvoiceSignal) {
+    addCategory("invoice");
+    reasons.push("Doğrulanmış fatura belgesi");
+  }
+  if (hasPaymentDocument && (paymentFailed || paymentOverdue || paymentDue || paymentPaid || paymentCharged)) {
     addCategory("payment");
-    reasons.push("Ödeme veya tahsilat bildirimi");
+    reasons.push("Doğrulanmış ödeme veya tahsilat bildirimi");
   }
 
   if (hasBankingSignal) {
@@ -1659,7 +1678,12 @@ function classifyDailyDigestMessage(message) {
     reasons.push("Banka, kart veya hesap hareketi");
   }
   const hasSubscriptionSignal =
-    /\babonelik\b|subscription|membership|recurring|renewal|auto.?renew|uyelik|plan yenile|paket yenile/.test(folded);
+    /\baboneli\w*|\buyeli\w*|subscriptions?|memberships?|recurring|renewal|renewed|auto.?renew|plan yenile|paket yenile/.test(folded);
+  const subscriptionTransaction = hasSubscriptionSignal
+    && (paymentCharged || paymentPaid || paymentFailed || /renewal|renewed|auto.?renew|yenilendi|yenilenecek|yenileme/.test(folded))
+    && (Boolean(amount) || hasInvoiceSignal)
+    && !hasBankIdentity
+    && !marketingOnly;
   if (hasSubscriptionSignal && !categories.includes("github")) {
     addCategory("subscription");
     reasons.push("Abonelik veya düzenli ödeme");
@@ -1713,7 +1737,7 @@ function classifyDailyDigestMessage(message) {
     reasons.push("Olası spam veya kimlik avı");
   }
 
-  const subscriptionNeedsAttention = hasSubscriptionSignal &&
+  const subscriptionNeedsAttention = subscriptionTransaction &&
     /expire|suresi dol|yenilemeniz gerekiyor|renew now|payment failed|odeme basarisiz|iptal edilecek/.test(folded);
   const appointmentNeedsAttention = hasAppointmentSignal &&
     /confirm|onayla|rsvp|yanitla|reschedule|yeniden planla|iptal/.test(folded);
@@ -1724,9 +1748,9 @@ function classifyDailyDigestMessage(message) {
     /expire|suresi dol|kalan gun/.test(folded);
   const actionRequired = !bankDebtNotice && (
     /action required|islem gerekiyor|needs attention|verify|dogrula|teblig|kalan gun|review required/.test(folded) ||
-    paymentFailed ||
-    paymentOverdue ||
-    paymentDue ||
+    (hasPaymentDocument && paymentFailed) ||
+    (hasPaymentDocument && paymentOverdue) ||
+    (hasPaymentDocument && paymentDue) ||
     subscriptionNeedsAttention ||
     appointmentNeedsAttention ||
     orderNeedsAttention ||
@@ -1738,24 +1762,24 @@ function classifyDailyDigestMessage(message) {
   if (categories.length === 0) categories.push("other");
 
   let paymentStatus = null;
-  if (paymentFailed) paymentStatus = "failed";
-  else if (paymentOverdue) paymentStatus = "overdue";
-  else if (paymentDue) paymentStatus = "due";
-  else if (paymentPaid) paymentStatus = "paid";
+  if (hasPaymentDocument && paymentFailed) paymentStatus = "failed";
+  else if (hasPaymentDocument && paymentOverdue) paymentStatus = "overdue";
+  else if (hasPaymentDocument && paymentDue) paymentStatus = "due";
+  else if (hasPaymentDocument && paymentPaid) paymentStatus = "paid";
   else if (categories.includes("payment") || categories.includes("invoice")) paymentStatus = "unknown";
 
   let priority = "normal";
   if (
     categories.includes("security") ||
     categories.includes("spam") ||
-    paymentFailed ||
-    paymentOverdue ||
+    (hasPaymentDocument && paymentFailed) ||
+    (hasPaymentDocument && paymentOverdue) ||
     /kalan gun\s*:?\s*[01]\b/.test(folded)
   ) {
     priority = "urgent";
   } else if (
     actionRequired ||
-    paymentDue ||
+    (hasPaymentDocument && paymentDue) ||
     (categories.includes("invoice") && paymentStatus !== "paid")
   ) {
     priority = "high";
@@ -1787,13 +1811,13 @@ function classifyDailyDigestMessage(message) {
   if (categories.includes("spam")) {
     suggest("mark_spam", "Spam olarak değerlendir", "Olası spam veya kimlik avı sinyali bulundu");
   }
-  if ((categories.includes("invoice") || categories.includes("payment")) && !categories.includes("banking")) {
+  if (hasPaymentDocument && (categories.includes("invoice") || categories.includes("payment"))) {
     if (["failed", "overdue", "due"].includes(paymentStatus)) {
       suggest("review_payment", "Ödeme durumunu kontrol et", `Ödeme durumu: ${paymentStatus}`);
     }
     suggest("record_expense", "Giderlere eklemeyi değerlendir", "Finansal belge veya ödeme bulundu");
   }
-  if (categories.includes("subscription")) {
+  if (subscriptionTransaction) {
     suggest("review_subscription", "Düzenli aboneliğe eklemeyi değerlendir", "Abonelik sinyali bulundu");
   }
   if (categories.includes("banking") && !bankDebtNotice) {
@@ -1818,7 +1842,7 @@ function classifyDailyDigestMessage(message) {
     actionRequired,
     priority,
     reasons: [...new Set(reasons)],
-    amount: extractDailyDigestAmount(source),
+    amount,
     deadline: extractDailyDigestDeadline(source),
     paymentStatus,
     suggestedActions,

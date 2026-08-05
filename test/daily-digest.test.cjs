@@ -107,6 +107,60 @@ describe("daily digest classification", () => {
     assert.ok(!paid.suggestedActions.some(action => action.type === "review_payment"));
   });
 
+  it("recognizes telecom and internet invoices as real finance documents", () => {
+    const turkNet = helpers.classifyDailyDigestMessage({
+      subject: "TurkNet Ağustos faturanız hazır",
+      author: "TurkNet <fatura@turk.net>",
+      body: "Fatura tutarınız 599,90 TL. Son ödeme tarihi 18.08.2026.",
+    });
+    assert.ok(turkNet.categories.includes("invoice"));
+    assert.ok(turkNet.categories.includes("payment"));
+    assert.equal(turkNet.paymentStatus, "due");
+    assert.ok(turkNet.suggestedActions.some(action => action.type === "record_expense"));
+
+    const turkTelekom = helpers.classifyDailyDigestMessage({
+      subject: "E-faturanız oluşturuldu",
+      author: "Türk Telekom <efatura@turktelekom.com.tr>",
+      body: "Ödenecek tutar 489,90 TL, son ödeme tarihi 20.08.2026.",
+    });
+    assert.ok(turkTelekom.categories.includes("invoice"));
+    assert.ok(turkTelekom.suggestedActions.some(action => action.type === "record_expense"));
+  });
+
+  it("recognizes a charged game subscription but rejects its plan advertisement", () => {
+    const charge = helpers.classifyDailyDigestMessage({
+      subject: "Game Pass aboneliğiniz yenilendi",
+      author: "Xbox <billing@microsoft.com>",
+      body: "Aylık aboneliğiniz için 209,00 TL kartınızdan tahsil edildi.",
+    });
+    assert.ok(charge.categories.includes("subscription"));
+    assert.ok(charge.categories.includes("payment"));
+    assert.ok(charge.suggestedActions.some(action => action.type === "review_subscription"));
+    assert.ok(charge.suggestedActions.some(action => action.type === "record_expense"));
+
+    const promotion = helpers.classifyDailyDigestMessage({
+      subject: "Yeni abonelik planları ve fiyatlar",
+      author: "GameBox <offers@gamebox.example>",
+      body: "Premium üyelik şimdi aylık 199 TL. Kampanyayı keşfet.",
+    });
+    assert.ok(promotion.categories.includes("subscription"));
+    assert.ok(!promotion.categories.includes("invoice"));
+    assert.ok(!promotion.categories.includes("payment"));
+    assert.ok(!promotion.suggestedActions.some(action => action.type === "record_expense"));
+    assert.ok(!promotion.suggestedActions.some(action => action.type === "review_subscription"));
+  });
+
+  it("does not classify a ZEN cash promotion as a finance document", () => {
+    const analysis = helpers.classifyDailyDigestMessage({
+      subject: "ZEN'e nakit yatırın, her yerde harcayın",
+      author: "ZEN.COM <hi@zen.com>",
+      body: "Hesabınıza 500 TL yatırın ve kampanya avantajlarından yararlanın.",
+    });
+    assert.ok(!analysis.categories.includes("invoice"));
+    assert.ok(!analysis.categories.includes("payment"));
+    assert.ok(!analysis.suggestedActions.some(action => action.type === "record_expense"));
+  });
+
   it("classifies banking, subscriptions, orders, and appointments independently", () => {
     const bank = helpers.classifyDailyDigestMessage({
       subject: "Para Transferi Bilgilendirmesi",
@@ -121,7 +175,8 @@ describe("daily digest classification", () => {
       body: "Your membership will auto-renew next month.",
     });
     assert.ok(subscription.categories.includes("subscription"));
-    assert.ok(subscription.suggestedActions.some(action => action.type === "review_subscription"));
+    assert.ok(!subscription.suggestedActions.some(action => action.type === "review_subscription"));
+    assert.equal(subscription.actionRequired, false);
 
     const order = helpers.classifyDailyDigestMessage({
       subject: "Siparişiniz kargoya verildi",
