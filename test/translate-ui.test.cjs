@@ -68,13 +68,26 @@ describe("Thunderbird inline translation button", () => {
   it("translates the rendered HTML and subject while caching both originals", () => {
     assert.match(apiSource, /translator\.translate\(text, Boolean\(isHtml\)\)/);
     assert.match(apiSource, /const originalHtml = display\.body\.innerHTML/);
-    assert.match(apiSource, /const originalSubject = readSubject\(display\.subjectElement\)/);
+    assert.match(
+      apiSource,
+      /const originalSubject =\s+display\.canonicalSubject \|\| readSubject\(display\.subjectElement\)/
+    );
     assert.match(apiSource, /display\.body\.innerHTML = result\.text/);
     assert.match(apiSource, /writeSubject\(display\.subjectElement, subjectResult\.text\)/);
     assert.match(apiSource, /subjectTitle: originalSubjectTitle/);
     assert.match(apiSource, /data-thunderbird-mcp-translated/);
     assert.match(apiSource, /LanguageDetector\.detectLanguage/);
     assert.match(popupSource, /"auto"/);
+  });
+
+  it("restores the canonical database subject even after an extension reload", () => {
+    assert.match(apiSource, /displayedHeader\?\.mime2DecodedSubject/);
+    assert.match(apiSource, /canonicalSubject: display\.canonicalSubject/);
+    assert.match(
+      apiSource,
+      /original\.canonicalSubject \|\| display\.canonicalSubject \|\| original\.subject/
+    );
+    assert.match(apiSource, /if \(display\.canonicalSubject\) \{/);
   });
 
   it("enables Thunderbird's local translation actor during startup and keeps it enabled", () => {

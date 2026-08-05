@@ -10600,10 +10600,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             if (!messageDocument?.body) {
               throw new Error("Açık ileti gövdesi henüz yüklenmedi.");
             }
+            const displayedHeader =
+              messageWindow.gMessageDisplay?.displayedMessage ||
+              messageWindow.gMessage ||
+              messageWindow.gFolderDisplay?.selectedMessage ||
+              null;
             return {
               document: messageDocument,
               body: messageDocument.body,
               messageURI: messageWindow.gMessageURI,
+              canonicalSubject: String(
+                displayedHeader?.mime2DecodedSubject || displayedHeader?.subject || ""
+              ).trim(),
               subjectElement:
                 messageWindow.document.getElementById("expandedsubjectBox") ||
                 messageWindow.document.getElementById("expandedsubjectLabel") ||
@@ -10694,13 +10702,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: "Bu iletinin özgün görünümü önbellekte bulunamadı." };
               }
               display.body.innerHTML = original.html;
-              writeSubject(display.subjectElement, original.subject, original.subjectTitle);
+              const restoredSubject =
+                original.canonicalSubject || display.canonicalSubject || original.subject;
+              writeSubject(display.subjectElement, restoredSubject, restoredSubject);
               display.body.removeAttribute("data-thunderbird-mcp-translated");
               originals.delete(cacheKey);
               return { success: true, translated: false, messageURI: display.messageURI };
             }
 
             if (providerMode === "restore") {
+              // The body marker/cache is intentionally in-memory. After an extension
+              // reload an older translated subject can remain visible even though the
+              // original body is already back. Always reconcile the header from the
+              // immutable message database when the user explicitly requests Original.
+              if (display.canonicalSubject) {
+                writeSubject(
+                  display.subjectElement,
+                  display.canonicalSubject,
+                  display.canonicalSubject
+                );
+              }
               return {
                 success: true,
                 translated: false,
@@ -10726,10 +10747,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // Capture detection input before adding the Turkish progress notice;
             // otherwise short English messages can be misclassified as Turkish.
             const originalTextContent = display.body.textContent || "";
-            const originalSubject = readSubject(display.subjectElement);
-            const originalSubjectTitle = display.subjectElement?.hasAttribute("title")
-              ? display.subjectElement.getAttribute("title")
-              : null;
+            const originalSubject =
+              display.canonicalSubject || readSubject(display.subjectElement);
+            const originalSubjectTitle = display.canonicalSubject || (
+              display.subjectElement?.hasAttribute("title")
+                ? display.subjectElement.getAttribute("title")
+                : null
+            );
             const openAIApiKey = providerMode === "local"
               ? ""
               : await getOpenAITranslationApiKey();
@@ -10862,6 +10886,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     html: originalHtml,
                     subject: originalSubject,
                     subjectTitle: originalSubjectTitle,
+                    canonicalSubject: display.canonicalSubject,
                   });
                   for (const [id, binding] of segmentPackage.bindings) {
                     binding.node.nodeValue =
@@ -10948,6 +10973,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               html: originalHtml,
               subject: originalSubject,
               subjectTitle: originalSubjectTitle,
+              canonicalSubject: display.canonicalSubject,
             });
             display.body.innerHTML = result.text;
             writeSubject(display.subjectElement, subjectResult.text);
