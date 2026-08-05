@@ -32,6 +32,22 @@ describe("OpenAI high-quality inline translation", () => {
     assert.match(apiSource, /temperature: 0/);
   });
 
+  it("translates long messages in bounded concurrent batches", () => {
+    assert.match(apiSource, /OPENAI_TRANSLATION_BATCH_MAX_CHARACTERS = 8000/);
+    assert.match(apiSource, /OPENAI_TRANSLATION_BATCH_MAX_SEGMENTS = 60/);
+    assert.match(apiSource, /OPENAI_TRANSLATION_CONCURRENCY = 3/);
+    assert.match(apiSource, /createOpenAITranslationBatches/);
+    assert.match(apiSource, /Promise\.allSettled\(/);
+    assert.match(apiSource, /results\[index\] = await translateOpenAIBatch/);
+  });
+
+  it("uses the fast AI detection path and reads the API key once", () => {
+    assert.match(apiSource, /detectLanguageForOpenAI/);
+    assert.match(apiSource, /supportStatus: "openai"/);
+    assert.match(apiSource, /getOpenAITranslationConfig\(openAIApiKey\)/);
+    assert.match(apiSource, /\{ config: openAIConfig, apiKey: openAIApiKey \}/);
+  });
+
   it("handles incomplete, refused, and fenced Responses API output", () => {
     assert.match(apiSource, /response\?\.status === "incomplete"/);
     assert.match(apiSource, /reason === "max_output_tokens"/);
@@ -75,6 +91,6 @@ describe("OpenAI high-quality inline translation", () => {
     assert.match(schemaSource, /setOpenAITranslationConfig/);
     assert.match(optionsJs, /getOpenAITranslationConfig/);
     assert.match(optionsJs, /setOpenAITranslationConfig/);
-    assert.match(apiSource, /keyConfigured: Boolean\(await getOpenAITranslationApiKey\(\)\)/);
+    assert.match(apiSource, /keyConfigured: typeof apiKeyOverride === "string"/);
   });
 });

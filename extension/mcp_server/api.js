@@ -1328,6 +1328,12 @@ const OPENAI_LOGIN_USERNAME = "thunderbird-mcp";
 const OPENAI_DEFAULT_MONTHLY_LIMIT_CENTS = 200;
 const OPENAI_MAX_VISIBLE_CHARACTERS = 60000;
 const OPENAI_MAX_TEXT_SEGMENTS = 400;
+// Large emails used to wait for one very large structured response. Keep each
+// request small enough to finish quickly and translate a few independent
+// batches concurrently. Results are still validated and applied atomically.
+const OPENAI_TRANSLATION_BATCH_MAX_CHARACTERS = 8000;
+const OPENAI_TRANSLATION_BATCH_MAX_SEGMENTS = 60;
+const OPENAI_TRANSLATION_CONCURRENCY = 3;
 const OPENAI_INPUT_USD_PER_MILLION_TOKENS = 0.15;
 const OPENAI_OUTPUT_USD_PER_MILLION_TOKENS = 0.60;
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
@@ -1411,7 +1417,7 @@ function addOpenAITranslationUsage(inputTokens, outputTokens) {
   return { month: usage.month, microdollars: total, addedMicrodollars: microdollars };
 }
 
-async function getOpenAITranslationConfig() {
+async function getOpenAITranslationConfig(apiKeyOverride) {
   const usage = getOpenAITranslationUsage();
   const monthlyLimitCents = Math.max(
     10,
@@ -1422,7 +1428,9 @@ async function getOpenAITranslationConfig() {
   );
   return {
     enabled: Services.prefs.getBoolPref(PREF_OPENAI_TRANSLATION_ENABLED, true),
-    keyConfigured: Boolean(await getOpenAITranslationApiKey()),
+    keyConfigured: typeof apiKeyOverride === "string"
+      ? Boolean(apiKeyOverride)
+      : Boolean(await getOpenAITranslationApiKey()),
     model: OPENAI_TRANSLATION_MODEL,
     monthlyLimitUsd: monthlyLimitCents / 100,
     usageMonth: usage.month,
@@ -1923,6 +1931,37 @@ function extractOpenAIOutputText(response) {
   return "";
 }
 
+async function detectLanguageForOpenAI(text) {
+  try {
+    const sample = getLanguageDetectionSample(text, false);
+    if (sample.length < 4) {
+      return { error: "Dil algılamak için yeterli metin bulunamadı." };
+    }
+    const { LanguageDetector } = ChromeUtils.importESModule(
+      "resource://gre/modules/translations/LanguageDetector.sys.mjs"
+    );
+    const detection = await LanguageDetector.detectLanguage({ text: sample });
+    const detectedLanguage = String(detection?.language || "").toLowerCase();
+    return {
+      language: detectedLanguage || "un",
+      // OpenAI does not need a downloaded Mozilla language model or a Remote
+      // Settings support lookup. The detected BCP-47 tag is enough.
+      supportedLanguage: detectedLanguage && detectedLanguage !== "un"
+        ? detectedLanguage
+        : null,
+      supportStatus: "openai",
+      confident: Boolean(detection?.confident),
+      alternatives: Array.isArray(detection?.languages)
+        ? detection.languages.slice(0, 3)
+        : [],
+      sampleCharacters: sample.length,
+      local: true,
+    };
+  } catch (e) {
+    return { error: `Yerel dil algılama başlatılamadı: ${e?.message || String(e)}` };
+  }
+}
+
 function getOpenAIResponseProblem(response) {
   if (response?.status === "incomplete") {
     const reason = response?.incomplete_details?.reason;
@@ -1944,23 +1983,33 @@ function getOpenAIResponseProblem(response) {
   return null;
 }
 
-async function translateSegmentsWithOpenAI(segments, characterCount) {
-  const config = await getOpenAITranslationConfig();
-  if (!config.enabled) return { skipped: true, reason: "OpenAI çevirisi kapalı." };
-  const apiKey = await getOpenAITranslationApiKey();
-  if (!apiKey) return { skipped: true, reason: "OpenAI API anahtarı ayarlanmamış." };
-
-  const usage = getOpenAITranslationUsage();
-  const limitMicrodollars = Math.round(config.monthlyLimitUsd * 1000000);
-  const estimatedMicrodollars = estimateOpenAITranslationMicrodollars(characterCount);
-  if (usage.microdollars + estimatedMicrodollars > limitMicrodollars) {
-    return {
-      skipped: true,
-      limitReached: true,
-      reason: "Aylık OpenAI çeviri limiti dolduğu için yerel çeviri kullanıldı.",
-    };
+function createOpenAITranslationBatches(segments) {
+  const batches = [];
+  let current = [];
+  let currentCharacters = 0;
+  for (const segment of segments) {
+    const segmentCharacters = String(segment?.text || "").length;
+    if (
+      current.length &&
+      (current.length >= OPENAI_TRANSLATION_BATCH_MAX_SEGMENTS ||
+        currentCharacters + segmentCharacters > OPENAI_TRANSLATION_BATCH_MAX_CHARACTERS)
+    ) {
+      batches.push(current);
+      current = [];
+      currentCharacters = 0;
+    }
+    current.push(segment);
+    currentCharacters += segmentCharacters;
   }
+  if (current.length) batches.push(current);
+  return batches;
+}
 
+async function translateOpenAIBatch(apiKey, segments) {
+  const characterCount = segments.reduce(
+    (total, segment) => total + String(segment?.text || "").length,
+    0
+  );
   const payload = {
     model: OPENAI_TRANSLATION_MODEL,
     store: false,
@@ -2055,6 +2104,62 @@ async function translateSegmentsWithOpenAI(segments, characterCount) {
       outputTokens: Number(response?.usage?.output_tokens || 0),
       monthSpendUsd: recordedUsage.microdollars / 1000000,
     },
+  };
+}
+
+async function translateSegmentsWithOpenAI(segments, characterCount, prepared = null) {
+  const config = prepared?.config || await getOpenAITranslationConfig();
+  if (!config.enabled) return { skipped: true, reason: "OpenAI çevirisi kapalı." };
+  const apiKey = typeof prepared?.apiKey === "string"
+    ? prepared.apiKey
+    : await getOpenAITranslationApiKey();
+  if (!apiKey) return { skipped: true, reason: "OpenAI API anahtarı ayarlanmamış." };
+
+  const usage = getOpenAITranslationUsage();
+  const limitMicrodollars = Math.round(config.monthlyLimitUsd * 1000000);
+  const estimatedMicrodollars = estimateOpenAITranslationMicrodollars(characterCount);
+  if (usage.microdollars + estimatedMicrodollars > limitMicrodollars) {
+    return {
+      skipped: true,
+      limitReached: true,
+      reason: "Aylık OpenAI çeviri limiti dolduğu için yerel çeviri kullanıldı.",
+    };
+  }
+
+  const batches = createOpenAITranslationBatches(segments);
+  const results = new Array(batches.length);
+  let nextBatch = 0;
+  async function worker() {
+    while (nextBatch < batches.length) {
+      const index = nextBatch++;
+      results[index] = await translateOpenAIBatch(apiKey, batches[index]);
+    }
+  }
+  const workerResults = await Promise.allSettled(
+    Array.from(
+      { length: Math.min(OPENAI_TRANSLATION_CONCURRENCY, batches.length) },
+      () => worker()
+    )
+  );
+  const failedWorker = workerResults.find(result => result.status === "rejected");
+  if (failedWorker) throw failedWorker.reason;
+
+  const translated = new Map();
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let monthSpendUsd = usage.microdollars / 1000000;
+  for (const result of results) {
+    for (const [id, text] of result.translated) translated.set(id, text);
+    inputTokens += result.usage.inputTokens;
+    outputTokens += result.usage.outputTokens;
+    monthSpendUsd = Math.max(monthSpendUsd, result.usage.monthSpendUsd);
+  }
+  return {
+    translated,
+    provider: "openai",
+    model: OPENAI_TRANSLATION_MODEL,
+    batchCount: batches.length,
+    usage: { inputTokens, outputTokens, monthSpendUsd },
   };
 }
 // END DAILY DIGEST HELPERS
@@ -10584,9 +10689,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const originalSubjectTitle = display.subjectElement?.hasAttribute("title")
               ? display.subjectElement.getAttribute("title")
               : null;
+            const openAIApiKey = providerMode === "local"
+              ? ""
+              : await getOpenAITranslationApiKey();
             const openAIConfig = providerMode === "local"
               ? null
-              : await getOpenAITranslationConfig();
+              : await getOpenAITranslationConfig(openAIApiKey);
             let segmentPackage = null;
             let openAIFallbackReason = null;
             if (openAIConfig?.enabled && openAIConfig.keyConfigured) {
@@ -10622,7 +10730,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             let detection = null;
             if (resolvedSourceLanguage === "auto") {
               const detectionText = `${originalSubject}\n${originalTextContent}`;
-              detection = await this.detectLanguage(detectionText, false);
+              detection = segmentPackage
+                ? await detectLanguageForOpenAI(detectionText)
+                : await this.detectLanguage(detectionText, false);
               if (detection?.error) {
                 display.body.innerHTML = originalHtml;
                 addInlineNotice(display.document, detection.error, true);
@@ -10662,7 +10772,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!aiResult || aiResult.signature !== segmentSignature) {
                   aiResult = await translateSegmentsWithOpenAI(
                     segmentPackage.segments,
-                    segmentPackage.characterCount
+                    segmentPackage.characterCount,
+                    { config: openAIConfig, apiKey: openAIApiKey }
                   );
                   if (!aiResult.skipped) {
                     if (aiCache.size >= 100) {
