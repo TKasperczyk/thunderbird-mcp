@@ -2165,7 +2165,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const mode = tmpDir.permissions;
                   if (mode && (mode & 0o077) !== 0) {
                     try { tmpDir.permissions = 0o700; } catch { /* best-effort */ }
-                    if ((tmpDir.permissions & 0o077) !== 0) {
+                    if ((tmpDir.permissions & 0o077) !== 0 && Services.appinfo.OS !== "WINNT") {
                       throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
                     }
                   }
