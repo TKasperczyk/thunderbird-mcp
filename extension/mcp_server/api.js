@@ -7558,10 +7558,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               5: "status",        // MsgStatus
               12: "age",          // AgeInDays
               14: "size",         // Size
-              44: "status",       // HasAttachmentStatus
+              44: "status",       // HasAttachmentStatus -- see MSG_FLAG_ATTACHMENT
               45: "junkStatus",   // JunkStatus
               46: "junkPercent",  // JunkPercent
             };
+
+            // nsMsgMessageFlags.Attachment. A HasAttachmentStatus term always
+            // stores this fixed flag in .status; has-vs-hasn't is decided by the
+            // operator (is/isnt), not the value, so any caller-supplied value is
+            // ignored. Credit: rdkr, PR #175.
+            const MSG_FLAG_ATTACHMENT = 0x10000000;
 
             const OP_MAP = {
               contains: 0, doesntContain: 1, is: 2, isnt: 3, isEmpty: 4,
@@ -7683,6 +7689,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   );
                 }
                 value.date = parsed * 1000;
+                return;
+              }
+
+              if (attrib === 44) {
+                // HasAttachmentStatus: the flag is fixed, the operator carries
+                // the meaning. Writing a caller-supplied number here produces a
+                // filter that silently matches nothing.
+                value.status = MSG_FLAG_ATTACHMENT;
                 return;
               }
 

@@ -107,6 +107,8 @@ function parseFilterDate(raw) {
   return Date.parse(raw);
 }
 
+const MSG_FLAG_ATTACHMENT = 0x10000000;
+
 function setSearchValue(value, attrib, raw) {
   if (attrib === 3) {
     const parsed = parseFilterDate(raw);
@@ -114,6 +116,10 @@ function setSearchValue(value, attrib, raw) {
       throw new Error(`Invalid date value: ${JSON.stringify(raw)}`);
     }
     value.date = parsed * 1000;
+    return;
+  }
+  if (attrib === 44) {
+    value.status = MSG_FLAG_ATTACHMENT;
     return;
   }
   const field = NUMERIC_VALUE_FIELDS[attrib];
@@ -169,6 +175,18 @@ describe("setSearchValue routing", () => {
     const junk = {};
     setSearchValue(junk, 46, 80);
     assert.strictEqual(junk.junkPercent, 80);
+  });
+
+  it("writes the fixed Attachment flag for hasAttachment, ignoring the raw value", () => {
+    // The operator (is/isnt) carries has-vs-hasn't. Writing a caller-supplied
+    // number here yields a filter that silently matches nothing.
+    const value = {};
+    setSearchValue(value, 44, "whatever");
+    assert.strictEqual(value.status, 0x10000000);
+
+    const ignored = {};
+    setSearchValue(ignored, 44, "1");
+    assert.strictEqual(ignored.status, 0x10000000);
   });
 
   it("still writes string attributes to .str", () => {
