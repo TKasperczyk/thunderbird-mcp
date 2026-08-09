@@ -1759,9 +1759,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               items: {
                 type: "object",
                 properties: {
-                  attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, body, date, priority, status, size, ageInDays, hasAttachment, junkStatus, tag, otherHeader" },
+                  attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, allAddresses, body, anyText, date, priority, status, size, ageInDays, hasAttachment, junkStatus, junkPercent, tag, otherHeader" },
                   op: { type: "string", description: "Operator: contains, doesntContain, is, isnt, isEmpty, beginsWith, endsWith, isGreaterThan, isLessThan, isBefore, isAfter, matches, doesntMatch" },
-                  value: { type: "string", description: "Value to match against" },
+                  value: { type: "string", description: "Value to match against. For date use a parseable date (e.g. '2024-01-01'); for ageInDays/size/priority/status/junkPercent use a number." },
                   booleanAnd: { type: "boolean", description: "true=AND with previous, false=OR (default: true)" },
                   header: { type: "string", description: "Custom header name (only when attrib is otherHeader)" },
                 },
@@ -1803,9 +1803,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               items: {
                 type: "object",
                 properties: {
-                  attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, body, date, priority, status, size, ageInDays, hasAttachment, junkStatus, tag, otherHeader" },
+                  attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, allAddresses, body, anyText, date, priority, status, size, ageInDays, hasAttachment, junkStatus, junkPercent, tag, otherHeader" },
                   op: { type: "string", description: "Operator: contains, doesntContain, is, isnt, isEmpty, beginsWith, endsWith, isGreaterThan, isLessThan, isBefore, isAfter, matches, doesntMatch" },
-                  value: { type: "string", description: "Value to match against" },
+                  value: { type: "string", description: "Value to match against. For date use a parseable date (e.g. '2024-01-01'); for ageInDays/size/priority/status/junkPercent use a number." },
                   booleanAnd: { type: "boolean", description: "true=AND with previous, false=OR (default: true)" },
                   header: { type: "string", description: "Custom header name (only when attrib is otherHeader)" },
                 },
@@ -7535,13 +7535,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // ── Filter constant maps ──
 
+            // Values must match nsMsgSearchAttrib in
+            // mailnews/search/public/nsMsgSearchCore.idl. They are NOT a dense
+            // 0..n run -- HasAttachmentStatus/JunkStatus/JunkPercent/OtherHeader
+            // sit far above the contiguous block.
             const ATTRIB_MAP = {
               subject: 0, from: 1, body: 2, date: 3, priority: 4,
               status: 5, to: 6, cc: 7, toOrCc: 8, allAddresses: 9,
-              ageInDays: 10, size: 11, tag: 12, hasAttachment: 13,
-              junkStatus: 14, junkPercent: 15, otherHeader: 16,
+              ageInDays: 12, size: 14, anyText: 15, tag: 16,
+              hasAttachment: 44, junkStatus: 45, junkPercent: 46,
+              otherHeader: 52,
             };
             const ATTRIB_NAMES = Object.fromEntries(Object.entries(ATTRIB_MAP).map(([k, v]) => [v, k]));
+
+            // nsIMsgSearchValue is a tagged union: which member may be written is
+            // determined by `attrib`. Writing `.str` for a numeric or date
+            // attribute throws NS_ERROR_ILLEGAL_VALUE, so route each attribute to
+            // its own member. Date (3) is handled separately. Keep in sync with
+            // ATTRIB_MAP.
+            const NUMERIC_VALUE_FIELDS = {
+              4: "priority",      // Priority
+              5: "status",        // MsgStatus
+              12: "age",          // AgeInDays
+              14: "size",         // Size
+              44: "status",       // HasAttachmentStatus
+              45: "junkStatus",   // JunkStatus
+              46: "junkPercent",  // JunkPercent
+            };
 
             const OP_MAP = {
               contains: 0, doesntContain: 1, is: 2, isnt: 3, isEmpty: 4,
@@ -7554,14 +7574,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             };
             const OP_NAMES = Object.fromEntries(Object.entries(OP_MAP).map(([k, v]) => [v, k]));
 
+            // Values must match nsMsgFilterAction in
+            // mailnews/search/public/nsMsgFilterCore.idl. Note the gap at 8 and
+            // that CopyToFolder is 16, not 2.
             const ACTION_MAP = {
-              moveToFolder: 0x01, copyToFolder: 0x02, changePriority: 0x03,
-              delete: 0x04, markRead: 0x05, killThread: 0x06,
-              watchThread: 0x07, markFlagged: 0x08, label: 0x09,
-              reply: 0x0A, forward: 0x0B, stopExecution: 0x0C,
-              deleteFromServer: 0x0D, leaveOnServer: 0x0E, junkScore: 0x0F,
-              fetchBody: 0x10, addTag: 0x11, deleteBody: 0x12,
-              markUnread: 0x14, custom: 0x15,
+              moveToFolder: 1, changePriority: 2, delete: 3,
+              markRead: 4, killThread: 5, watchThread: 6,
+              markFlagged: 7, reply: 9, forward: 10,
+              stopExecution: 11, deleteFromServer: 12, leaveOnServer: 13,
+              junkScore: 14, fetchBody: 15, copyToFolder: 16,
+              addTag: 17, killSubthread: 18, markUnread: 19,
             };
             const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
 
@@ -7589,12 +7611,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     booleanAnd: term.booleanAnd,
                   };
                   try {
-                    if (term.attrib === 3 || term.attrib === 10) {
-                      // Date or AgeInDays: try date first, then str
-                      try {
-                        const d = term.value.date;
-                        t.value = d ? new Date(d / 1000).toISOString() : (term.value.str || "");
-                      } catch { t.value = term.value.str || ""; }
+                    if (term.attrib === 3) {
+                      // Date: PRTime (microseconds) -> ISO string
+                      const d = term.value.date;
+                      t.value = d ? new Date(d / 1000).toISOString() : "";
+                    } else if (NUMERIC_VALUE_FIELDS[term.attrib]) {
+                      t.value = String(term.value[NUMERIC_VALUE_FIELDS[term.attrib]]);
                     } else {
                       t.value = term.value.str || "";
                     }
@@ -7612,11 +7634,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   const action = filter.getActionAt(a);
                   const act = { type: ACTION_NAMES[action.type] || String(action.type) };
-                  if (action.type === 0x01 || action.type === 0x02) {
+                  if (action.type === ACTION_MAP.moveToFolder || action.type === ACTION_MAP.copyToFolder) {
                     act.value = action.targetFolderUri || "";
-                  } else if (action.type === 0x03) {
+                  } else if (action.type === ACTION_MAP.changePriority) {
                     act.value = String(action.priority);
-                  } else if (action.type === 0x0F) {
+                  } else if (action.type === ACTION_MAP.junkScore) {
                     act.value = String(action.junkScore);
                   } else {
                     try { if (action.strValue) act.value = action.strValue; } catch {}
@@ -7638,6 +7660,47 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               };
             }
 
+            function parseFilterDate(raw) {
+              if (typeof raw === "string") {
+                const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw.trim());
+                if (m) {
+                  // A date-only string means a local calendar day. Date.parse()
+                  // would read it as UTC midnight, which Thunderbird then renders
+                  // in local time -- shifting the stored day by one west of UTC.
+                  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime();
+                }
+              }
+              return Date.parse(raw);
+            }
+
+            function setSearchValue(value, attrib, raw) {
+              if (attrib === 3) {
+                // Date: PRTime, microseconds since the epoch.
+                const parsed = parseFilterDate(raw);
+                if (!Number.isFinite(parsed)) {
+                  throw new Error(
+                    `Invalid date value: ${JSON.stringify(raw)} (expected a parseable date, e.g. "2024-01-01")`
+                  );
+                }
+                value.date = parsed * 1000;
+                return;
+              }
+
+              const field = NUMERIC_VALUE_FIELDS[attrib];
+              if (field) {
+                const num = typeof raw === "number" ? raw : parseInt(raw, 10);
+                if (!Number.isFinite(num)) {
+                  throw new Error(
+                    `Invalid numeric value: ${JSON.stringify(raw)} (attribute ${ATTRIB_NAMES[attrib] || attrib} expects a number)`
+                  );
+                }
+                value[field] = num;
+                return;
+              }
+
+              value.str = raw == null ? "" : String(raw);
+            }
+
             function buildTerms(filter, conditions) {
               for (const cond of conditions) {
                 const term = filter.createTerm();
@@ -7656,7 +7719,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const value = term.value;
                 value.attrib = term.attrib;
-                value.str = cond.value || "";
+                setSearchValue(value, term.attrib, cond.value);
                 term.value = value;
 
                 term.booleanAnd = cond.booleanAnd !== false;
@@ -7679,14 +7742,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 action.type = typeNum;
 
                 if (act.value) {
-                  if (typeNum === 0x01 || typeNum === 0x02) {
+                  if (typeNum === ACTION_MAP.moveToFolder || typeNum === ACTION_MAP.copyToFolder) {
                     // Move/Copy to folder -- verify target is accessible
                     const targetCheck = getAccessibleFolder(act.value);
                     if (targetCheck.error) throw new Error(`Filter target folder not accessible: ${act.value}`);
                     action.targetFolderUri = act.value;
-                  } else if (typeNum === 0x03) {
+                  } else if (typeNum === ACTION_MAP.changePriority) {
                     action.priority = parseInt(act.value);
-                  } else if (typeNum === 0x0F) {
+                  } else if (typeNum === ACTION_MAP.junkScore) {
                     action.junkScore = parseInt(act.value);
                   } else {
                     action.strValue = act.value;
