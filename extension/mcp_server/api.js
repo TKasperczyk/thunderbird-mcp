@@ -1098,13 +1098,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "listFolders",
         group: "system", crud: "read",
         title: "List Folders",
-        description: "List all mail folders with URIs and message counts",
+        description: "List all mail folders with URIs, message counts, and favorite status",
         inputSchema: {
           type: "object",
           properties: {
             accountId: { type: "string", description: "Optional account ID (from listAccounts) to limit results to a single account" },
             folderPath: { type: "string", description: "Optional folder URI (from listFolders) to list only that folder and its subfolders" },
             format: { type: "string", enum: ["objects", "table"], description: "Response format: 'objects' (default, existing array of folder objects) or 'table' ({ columns, rows } compact form)" },
+            favoritesOnly: { type: "boolean", description: "If true, return only folders the user has marked as favorites in Thunderbird (default: false). Useful for finding the folders that matter without listing hundreds." },
           },
           required: [],
         },
@@ -2425,17 +2426,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Lists all folders (optionally limited to a single account).
              * Depth is 0 for root children, increasing for subfolders.
              */
-            function listFolders(accountId, folderPath, format) {
+            function listFolders(accountId, folderPath, format, favoritesOnly) {
               const results = [];
               const outputFormat = format == null ? "objects" : format;
-              const folderKeys = ["name", "path", "type", "accountId", "totalMessages", "unreadMessages", "depth"];
+              const folderKeys = ["name", "path", "type", "accountId", "totalMessages", "unreadMessages", "depth", "isFavorite"];
 
               if (outputFormat !== "objects" && outputFormat !== "table") {
                 return { error: `Invalid format: "${outputFormat}". Must be one of: objects, table` };
               }
 
               function formatFolderResults() {
-                return outputFormat === "table" ? toColumnarTable(results, folderKeys) : results;
+                // Favorites are filtered after the walk so that a favorited
+                // subfolder is still reached through its non-favorited parents.
+                const selected = favoritesOnly ? results.filter(folder => folder.isFavorite) : results;
+                return outputFormat === "table" ? toColumnarTable(selected, folderKeys) : selected;
+              }
+
+              // nsMsgFolderFlags.Favorite. Note 0x00100000 is ImapPublic, not Favorite.
+              function isFavoriteFolder(flags) {
+                return Boolean(flags & 0x80000000);
               }
 
               function folderType(flags) {
@@ -2463,7 +2472,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     accountId: accountKey,
                     totalMessages: folder.getTotalMessages(false),
                     unreadMessages: folder.getNumUnread(false),
-                    depth
+                    depth,
+                    isFavorite: isFavoriteFolder(folder.flags)
                   });
                 } catch (e) {
                   console.warn("thunderbird-mcp: listFolders skipped inaccessible folder", folder?.URI || folder?.name, e);
@@ -8235,7 +8245,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listAccounts":
                   return listAccounts();
                 case "listFolders":
-                  return listFolders(args.accountId, args.folderPath, args.format);
+                  return listFolders(args.accountId, args.folderPath, args.format, args.favoritesOnly);
                 case "searchMessages":
                   return await searchMessages(args.query || "", args.folderPath, args.startDate, args.endDate, args.maxResults, args.offset, args.sortOrder, args.unreadOnly, args.flaggedOnly, args.tag, args.includeSubfolders, args.countOnly, args.searchBody, args.dedupByMessageId);
                 case "getMessage":
