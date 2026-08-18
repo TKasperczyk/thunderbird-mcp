@@ -41,6 +41,7 @@ platform_profile_roots() {
     Linux)
         printf '%s\n' \
             "$HOME/.thunderbird" \
+            "$HOME/snap/thunderbird/common/.thunderbird" \
             "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird" \
             "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird" \
             "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
@@ -62,6 +63,7 @@ platform_profile_config_dirs() {
     Linux)
         printf '%s\n' \
             "$HOME/.thunderbird" \
+            "$HOME/snap/thunderbird/common/.thunderbird" \
             "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird" \
             "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird" \
             "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
