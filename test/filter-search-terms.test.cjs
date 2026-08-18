@@ -23,6 +23,16 @@ const ATTACHMENT_FLAG = 0x10000000; // nsMsgMessageFlags.Attachment
 
 // The real nsMsgSearchOp enum (nsMsgSearchCore.idl), including the
 // kNumMsgSearchOperators sentinel that must NOT become an operator.
+// The real nsMsgFilterAction enum (nsMsgFilterCore.idl). Note the hole at 8:
+// Label existed only up to TB 102.
+const ACTIONS = {
+  Custom: -1, None: 0, MoveToFolder: 1, ChangePriority: 2, Delete: 3,
+  MarkRead: 4, KillThread: 5, WatchThread: 6, MarkFlagged: 7, Reply: 9,
+  Forward: 10, StopExecution: 11, DeleteFromPop3Server: 12,
+  LeaveOnPop3Server: 13, JunkScore: 14, FetchBodyFromPop3Server: 15,
+  CopyToFolder: 16, AddTag: 17, KillSubthread: 18, MarkUnread: 19,
+};
+
 const OPS = {
   Contains: 0, DoesntContain: 1, Is: 2, Isnt: 3, IsEmpty: 4,
   IsBefore: 5, IsAfter: 6, IsHigherThan: 7, IsLowerThan: 8,
@@ -65,6 +75,7 @@ function makeCi(overrides = {}) {
   return {
     nsMsgSearchAttrib: nonEnumerable(attribs),
     nsMsgSearchOp: nonEnumerable({ ...OPS }),
+    nsMsgFilterAction: nonEnumerable({ ...ACTIONS, ...(overrides.actions || {}) }),
     nsMsgMessageFlags: { Attachment: ATTACHMENT_FLAG },
   };
 }
@@ -98,7 +109,11 @@ this.buildTerms = buildTerms;
 this.FILTER_ATTRIB_DESCRIPTION = FILTER_ATTRIB_DESCRIPTION;
 this.FILTER_OP_DESCRIPTION = FILTER_OP_DESCRIPTION;
 this.FILTER_VALUE_DESCRIPTION = FILTER_VALUE_DESCRIPTION;
-this.FILTER_HEADER_DESCRIPTION = FILTER_HEADER_DESCRIPTION;`,
+this.FILTER_HEADER_DESCRIPTION = FILTER_HEADER_DESCRIPTION;
+this.ACTION_MAP = ACTION_MAP;
+this.ACTION_SPECS = ACTION_SPECS;
+this.FILTER_ACTION_TYPE_DESCRIPTION = FILTER_ACTION_TYPE_DESCRIPTION;
+this.FILTER_ACTION_VALUE_DESCRIPTION = FILTER_ACTION_VALUE_DESCRIPTION;`,
     sandbox
   );
   return sandbox;
@@ -486,5 +501,80 @@ describe("version compatibility", () => {
       () => helpers.setSearchValue(value, ATTRIB.AgeInDays, "3"),
       /no "age" member \(needed for attribute "ageInDays"\)/
     );
+  });
+});
+
+describe("ACTION_MAP matches the real nsMsgFilterAction enum", () => {
+  const helpers = loadFilterHelpers();
+
+  it("maps every action to the id Thunderbird actually uses", () => {
+    // The old table invented an ordering and numbered it 1..21, so only
+    // moveToFolder and addTag were right. Every row below is a value that
+    // used to point at a different action entirely.
+    assert.deepEqual({ ...helpers.ACTION_MAP }, {
+      moveToFolder: ACTIONS.MoveToFolder,
+      copyToFolder: ACTIONS.CopyToFolder,
+      changePriority: ACTIONS.ChangePriority,
+      junkScore: ACTIONS.JunkScore,
+      addTag: ACTIONS.AddTag,
+      reply: ACTIONS.Reply,
+      forward: ACTIONS.Forward,
+      delete: ACTIONS.Delete,
+      markRead: ACTIONS.MarkRead,
+      markUnread: ACTIONS.MarkUnread,
+      markFlagged: ACTIONS.MarkFlagged,
+      killThread: ACTIONS.KillThread,
+      killSubthread: ACTIONS.KillSubthread,
+      watchThread: ACTIONS.WatchThread,
+      stopExecution: ACTIONS.StopExecution,
+      deleteFromServer: ACTIONS.DeleteFromPop3Server,
+      leaveOnServer: ACTIONS.LeaveOnPop3Server,
+      fetchBody: ACTIONS.FetchBodyFromPop3Server,
+      // label is absent: removed from Thunderbird in 115.
+    });
+  });
+
+  it("does not confuse markRead with killThread", () => {
+    // The concrete symptom found on Thunderbird 153: a filter asked to mark
+    // read was persisted as action="Ignore thread".
+    assert.notEqual(helpers.ACTION_MAP.markRead, ACTIONS.KillThread);
+    assert.equal(helpers.ACTION_MAP.markRead, ACTIONS.MarkRead);
+    assert.equal(helpers.ACTION_SPECS[ACTIONS.KillThread].action, "killThread");
+  });
+
+  it("offers label only where Thunderbird still has it", () => {
+    const withLabel = loadFilterHelpers({ ci: makeCi({ actions: { Label: 8 } }) });
+    assert.equal(withLabel.ACTION_MAP.label, 8);
+    assert.equal(helpers.ACTION_MAP.label, undefined);
+    assert.ok(!helpers.FILTER_ACTION_TYPE_DESCRIPTION.includes("label"));
+  });
+
+  it("drops the invented action names", () => {
+    // deleteBody never existed in any nsMsgFilterAction; its old value 0x12
+    // was KillSubthread, which is now exposed under its real name.
+    assert.equal(helpers.ACTION_MAP.deleteBody, undefined);
+    assert.equal(helpers.ACTION_MAP.killSubthread, ACTIONS.KillSubthread);
+    // custom needs a customId we do not expose, and its old value 0x15 was
+    // not the real Custom(-1) either.
+    assert.equal(helpers.ACTION_MAP.custom, undefined);
+  });
+
+  it("refuses instead of inventing action ids without XPCOM", () => {
+    const bare = loadFilterHelpers({ ci: null });
+    assert.deepEqual({ ...bare.ACTION_MAP }, {});
+    assert.match(bare.FILTER_ACTION_TYPE_DESCRIPTION, /unavailable/);
+  });
+
+  it("describes exactly the actions the tools accept", () => {
+    const listed = helpers.FILTER_ACTION_TYPE_DESCRIPTION.split(": ")[1].split(", ");
+    assert.deepEqual(listed.slice().sort(), Object.keys({ ...helpers.ACTION_MAP }).sort());
+  });
+
+  it("documents which actions take a value and which do not", () => {
+    const d = helpers.FILTER_ACTION_VALUE_DESCRIPTION;
+    assert.match(d, /moveToFolder\/copyToFolder: a folder URI/);
+    assert.match(d, /changePriority\/junkScore: an integer/);
+    assert.match(d, /no value/);
+    assert.ok(/markRead/.test(d.split("no value")[0].split(";").pop() + "no value"));
   });
 });

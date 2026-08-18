@@ -1270,6 +1270,73 @@ const FILTER_HEADER_DESCRIPTION = (() => {
   return `Header name to match on. Required when attrib is ${names.join(" or ")}, rejected otherwise`;
 })();
 
+// ── Filter actions ──
+//
+// Same story as the attributes: the old ACTION_MAP invented an ordering and
+// numbered it 1..21. The real nsMsgFilterAction is neither contiguous (8 is a
+// hole since Label was dropped in TB 115) nor in that order, so only
+// moveToFolder(1) and addTag(17) were ever right -- markRead(5) actually meant
+// KillThread, copyToFolder(2) meant ChangePriority, junkScore(15) meant
+// FetchBodyFromPop3Server. Real values come from
+// nsMsgFilterCore.idl. Resolved by name from the running Thunderbird, with no
+// fallback ids for the same reason as the search attributes above.
+//
+// member/codec say where an action's value goes (nsIMsgRuleAction); actions
+// with neither take no value at all.
+const FILTER_ACTION_DEFS = [
+  { action: "moveToFolder", idl: "MoveToFolder", member: "targetFolderUri", codec: "folder" },
+  { action: "copyToFolder", idl: "CopyToFolder", member: "targetFolderUri", codec: "folder" },
+  { action: "changePriority", idl: "ChangePriority", member: "priority", codec: "integer" },
+  { action: "junkScore", idl: "JunkScore", member: "junkScore", codec: "integer" },
+  { action: "addTag", idl: "AddTag", member: "strValue", codec: "text", hint: 'a tag key such as "$label1"' },
+  { action: "reply", idl: "Reply", member: "strValue", codec: "text", hint: "a reply template message URI" },
+  { action: "forward", idl: "Forward", member: "strValue", codec: "text", hint: "an email address" },
+  { action: "delete", idl: "Delete" },
+  { action: "markRead", idl: "MarkRead" },
+  { action: "markUnread", idl: "MarkUnread" },
+  { action: "markFlagged", idl: "MarkFlagged" },
+  { action: "killThread", idl: "KillThread" },
+  { action: "killSubthread", idl: "KillSubthread" },
+  { action: "watchThread", idl: "WatchThread" },
+  { action: "stopExecution", idl: "StopExecution" },
+  { action: "deleteFromServer", idl: "DeleteFromPop3Server" },
+  { action: "leaveOnServer", idl: "LeaveOnPop3Server" },
+  { action: "fetchBody", idl: "FetchBodyFromPop3Server" },
+  // Only in Thunderbird < 115; dropped automatically where it no longer exists.
+  { action: "label", idl: "Label", member: "strValue", codec: "text", hint: "a label index 0-5" },
+];
+
+const FILTER_ACTIONS = FILTER_ACTION_DEFS
+  .map((def) => {
+    const resolved = resolveXpcomConstant("nsMsgFilterAction", def.idl);
+    if (resolved === undefined) return null; // not in this Thunderbird
+    return { ...def, value: resolved };
+  })
+  .filter(Boolean);
+
+const FILTER_ACTIONS_AVAILABLE = FILTER_ACTIONS.length > 0;
+
+const ACTION_MAP = Object.fromEntries(FILTER_ACTIONS.map((a) => [a.action, a.value]));
+const ACTION_SPECS = Object.fromEntries(FILTER_ACTIONS.map((a) => [a.value, a]));
+
+const FILTER_ACTION_TYPE_DESCRIPTION = FILTER_ACTIONS_AVAILABLE
+  ? `Action, one of: ${FILTER_ACTIONS.map((a) => a.action).join(", ")}`
+  : "Action -- unavailable: this Thunderbird did not expose nsMsgFilterAction";
+
+const FILTER_ACTION_VALUE_DESCRIPTION = (() => {
+  const byHint = new Map();
+  const valueless = [];
+  for (const spec of FILTER_ACTIONS) {
+    if (!spec.member) { valueless.push(spec.action); continue; }
+    const hint = spec.hint || (spec.codec === "folder" ? "a folder URI" : VALUE_CODECS[spec.codec].hint);
+    if (!byHint.has(hint)) byHint.set(hint, []);
+    byHint.get(hint).push(spec.action);
+  }
+  const groups = [...byHint].map(([hint, names]) => `${names.join("/")}: ${hint}`);
+  if (valueless.length) groups.push(`${valueless.join("/")}: no value`);
+  return `Action parameter. ${groups.join("; ")}`;
+})();
+
 function buildTerms(filter, conditions) {
   if (!FILTER_VOCABULARY_AVAILABLE) {
     throw new Error(`Cannot build filter conditions -- ${FILTER_VOCABULARY_UNAVAILABLE_NOTE}`);
@@ -2072,8 +2139,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               items: {
                 type: "object",
                 properties: {
-                  type: { type: "string", description: "Action: moveToFolder, copyToFolder, markRead, markUnread, markFlagged, addTag, changePriority, delete, stopExecution, forward, reply" },
-                  value: { type: "string", description: "Action parameter (folder URI for move/copy, tag name for addTag, priority for changePriority, email for forward)" },
+                  type: { type: "string", description: FILTER_ACTION_TYPE_DESCRIPTION },
+                  value: { type: "string", description: FILTER_ACTION_VALUE_DESCRIPTION },
                 },
               },
               description: "Array of actions to perform",
@@ -2116,8 +2183,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               items: {
                 type: "object",
                 properties: {
-                  type: { type: "string", description: "Action: moveToFolder, copyToFolder, markRead, markUnread, markFlagged, addTag, changePriority, delete, stopExecution, forward, reply" },
-                  value: { type: "string", description: "Action parameter (folder URI for move/copy, tag name for addTag, priority for changePriority, email for forward)" },
+                  type: { type: "string", description: FILTER_ACTION_TYPE_DESCRIPTION },
+                  value: { type: "string", description: FILTER_ACTION_VALUE_DESCRIPTION },
                 },
               },
             },
@@ -7843,19 +7910,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            // ── Filter action maps ──
-
-            const ACTION_MAP = {
-              moveToFolder: 0x01, copyToFolder: 0x02, changePriority: 0x03,
-              delete: 0x04, markRead: 0x05, killThread: 0x06,
-              watchThread: 0x07, markFlagged: 0x08, label: 0x09,
-              reply: 0x0A, forward: 0x0B, stopExecution: 0x0C,
-              deleteFromServer: 0x0D, leaveOnServer: 0x0E, junkScore: 0x0F,
-              fetchBody: 0x10, addTag: 0x11, deleteBody: 0x12,
-              markUnread: 0x14, custom: 0x15,
-            };
-            const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
-
             function getFilterListForAccount(accountId) {
               if (!isAccountAllowed(accountId)) {
                 return { error: `Account not accessible: ${accountId}` };
@@ -7895,15 +7949,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               for (let a = 0; a < filter.actionCount; a++) {
                 try {
                   const action = filter.getActionAt(a);
-                  const act = { type: ACTION_NAMES[action.type] || String(action.type) };
-                  if (action.type === 0x01 || action.type === 0x02) {
-                    act.value = action.targetFolderUri || "";
-                  } else if (action.type === 0x03) {
-                    act.value = String(action.priority);
-                  } else if (action.type === 0x0F) {
-                    act.value = String(action.junkScore);
-                  } else {
-                    try { if (action.strValue) act.value = action.strValue; } catch {}
+                  const spec = ACTION_SPECS[action.type];
+                  const act = { type: spec ? spec.action : String(action.type) };
+                  if (spec && spec.member) {
+                    try {
+                      const stored = action[spec.member];
+                      act.value = spec.codec === "folder"
+                        ? (stored || "")
+                        : VALUE_CODECS[spec.codec].format(stored);
+                    } catch {
+                      // Member not applicable on this action -- report no value.
+                    }
                   }
                   actions.push(act);
                 } catch {
@@ -7923,6 +7979,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             function buildActions(filter, actions) {
+              if (!FILTER_ACTIONS_AVAILABLE) {
+                throw new Error("Cannot build filter actions -- this Thunderbird did not expose nsMsgFilterAction");
+              }
               for (const act of actions) {
                 const action = filter.createAction();
                 // SECURITY: strict allow-list. The previous `?? parseInt(...)`
@@ -7932,21 +7991,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!Object.prototype.hasOwnProperty.call(ACTION_MAP, act.type)) {
                   throw new Error(`Unknown action type: ${act.type}`);
                 }
-                const typeNum = ACTION_MAP[act.type];
-                action.type = typeNum;
+                const spec = ACTION_SPECS[ACTION_MAP[act.type]];
+                action.type = spec.value;
 
                 if (act.value) {
-                  if (typeNum === 0x01 || typeNum === 0x02) {
+                  if (!spec.member) {
+                    throw new Error(`Action "${act.type}" does not take a value`);
+                  }
+                  if (spec.codec === "folder") {
                     // Move/Copy to folder -- verify target is accessible
                     const targetCheck = getAccessibleFolder(act.value);
                     if (targetCheck.error) throw new Error(`Filter target folder not accessible: ${act.value}`);
                     action.targetFolderUri = act.value;
-                  } else if (typeNum === 0x03) {
-                    action.priority = parseInt(act.value);
-                  } else if (typeNum === 0x0F) {
-                    action.junkScore = parseInt(act.value);
                   } else {
-                    action.strValue = act.value;
+                    action[spec.member] = VALUE_CODECS[spec.codec].parse(act.value, act.type);
                   }
                 }
                 filter.appendAction(action);
