@@ -2159,19 +2159,29 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // the connection file. The O_EXCL on the file itself blocks a
                 // straight overwrite, but a permissive directory still lets the
                 // attacker read or rename our file. Force perms back to 0o700.
-                // permissions is 0 on platforms that don't expose POSIX modes
-                // (Windows ACLs), so the chmod is a no-op there.
-                try {
-                  const mode = tmpDir.permissions;
-                  if (mode && (mode & 0o077) !== 0) {
-                    try { tmpDir.permissions = 0o700; } catch { /* best-effort */ }
-                    if ((tmpDir.permissions & 0o077) !== 0) {
-                      throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
+                //
+                // Windows is exempt. nsIFile.permissions does not return 0 there
+                // as the comment below previously assumed -- nsLocalFileWin
+                // synthesises a POSIX-looking mode (0777 for any directory)
+                // from the read-only attribute alone, ignoring the ACL, and
+                // assigning .permissions is a no-op on NTFS. The check therefore
+                // always throws on Windows, including for the directory this
+                // function itself just created with 0o700, which leaves the
+                // server unable to start. Access there is governed by the ACL
+                // inherited from the user's own %TEMP%, which is user-only.
+                if (Services.appinfo.OS !== "WINNT") {
+                  try {
+                    const mode = tmpDir.permissions;
+                    if (mode && (mode & 0o077) !== 0) {
+                      try { tmpDir.permissions = 0o700; } catch { /* best-effort */ }
+                      if ((tmpDir.permissions & 0o077) !== 0) {
+                        throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
+                      }
                     }
+                  } catch (e) {
+                    if (e && e.message && e.message.startsWith("thunderbird-mcp tmp directory")) throw e;
+                    // ignore: permissions accessor unsupported on this platform
                   }
-                } catch (e) {
-                  if (e && e.message && e.message.startsWith("thunderbird-mcp tmp directory")) throw e;
-                  // ignore: permissions accessor unsupported on this platform
                 }
               }
               const connFile = tmpDir.clone();
