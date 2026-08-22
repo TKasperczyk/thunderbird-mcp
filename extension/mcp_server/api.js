@@ -7638,6 +7638,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               };
             }
 
+            // BEGIN FILTER SEARCH TERM HELPERS
             function buildTerms(filter, conditions) {
               for (const cond of conditions) {
                 const term = filter.createTerm();
@@ -7654,9 +7655,43 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 term.op = OP_MAP[cond.op];
 
+                // nsIMsgSearchValue is a tagged union: only the member matching
+                // the attribute's type may be written. Assigning .str to a
+                // status/numeric/date attribute throws NS_ERROR_ILLEGAL_VALUE,
+                // so dispatch on the attribute instead of assuming a string.
                 const value = term.value;
                 value.attrib = term.attrib;
-                value.str = cond.value || "";
+                const raw = cond.value == null ? "" : String(cond.value);
+                const num = parseInt(raw, 10);
+                switch (term.attrib) {
+                  case 13: // hasAttachment -- matched via the message flag
+                    value.status = Ci.nsMsgMessageFlags.Attachment;
+                    break;
+                  case 5:  // status
+                  case 14: // junkStatus
+                    value.status = Number.isNaN(num) ? 0 : num;
+                    break;
+                  case 4: // priority
+                    value.priority = Number.isNaN(num) ? 0 : num;
+                    break;
+                  case 10: // ageInDays
+                    value.age = Number.isNaN(num) ? 0 : num;
+                    break;
+                  case 11: // size
+                    value.size = Number.isNaN(num) ? 0 : num;
+                    break;
+                  case 15: // junkPercent
+                    value.junkPercent = Number.isNaN(num) ? 0 : num;
+                    break;
+                  case 3: { // date -- nsIMsgSearchValue.date is PRTime (microseconds)
+                    const parsed = Date.parse(raw);
+                    if (Number.isNaN(parsed)) throw new Error(`Invalid date value: ${raw}`);
+                    value.date = parsed * 1000;
+                    break;
+                  }
+                  default:
+                    value.str = raw;
+                }
                 term.value = value;
 
                 term.booleanAnd = cond.booleanAnd !== false;
@@ -7664,6 +7699,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 filter.appendTerm(term);
               }
             }
+            // END FILTER SEARCH TERM HELPERS
 
             function buildActions(filter, actions) {
               for (const act of actions) {
