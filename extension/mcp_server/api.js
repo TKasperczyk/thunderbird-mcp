@@ -84,6 +84,24 @@ function ensureFreshConnectionInfo({
 }
 // END CONNECTION INFO REFRESH HELPERS
 
+// BEGIN TMP DIR PERMISSION HELPERS
+/**
+ * Decide whether the connection-file directory's POSIX mode is unsafe, i.e.
+ * whether it grants group/world access.
+ *
+ * Windows has no POSIX modes to inspect: nsIFile.permissions reports 0o777 for
+ * every writable directory and assigning 0o700 back is a no-op, so enforcing
+ * the check there rejects every start except the one that created the
+ * directory. Access is governed by NTFS ACLs on a per-user %TEMP% instead.
+ */
+function tmpDirModeUnsafe(mode, osName) {
+  if (osName === "WINNT") {
+    return false;
+  }
+  return Boolean(mode) && (mode & 0o077) !== 0;
+}
+// END TMP DIR PERMISSION HELPERS
+
 // BEGIN CONTACT FIELD HELPERS
 // BEGIN CONTACT FIELD CONSTANTS
 const CONTACT_PHONE_TYPES = ["work", "home", "mobile", "fax", "pager"];
@@ -2159,13 +2177,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // the connection file. The O_EXCL on the file itself blocks a
                 // straight overwrite, but a permissive directory still lets the
                 // attacker read or rename our file. Force perms back to 0o700.
-                // permissions is 0 on platforms that don't expose POSIX modes
-                // (Windows ACLs), so the chmod is a no-op there.
+                // Windows exposes no POSIX modes: permissions reads back as
+                // 0o777 for any writable directory and the chmod is a no-op, so
+                // tmpDirModeUnsafe() skips the check there (NTFS ACLs on a
+                // per-user %TEMP% govern access instead).
                 try {
-                  const mode = tmpDir.permissions;
-                  if (mode && (mode & 0o077) !== 0) {
+                  const osName = Services.appinfo.OS;
+                  if (tmpDirModeUnsafe(tmpDir.permissions, osName)) {
                     try { tmpDir.permissions = 0o700; } catch { /* best-effort */ }
-                    if ((tmpDir.permissions & 0o077) !== 0) {
+                    if (tmpDirModeUnsafe(tmpDir.permissions, osName)) {
                       throw new Error("thunderbird-mcp tmp directory has group/world permissions — refusing to write connection info");
                     }
                   }
