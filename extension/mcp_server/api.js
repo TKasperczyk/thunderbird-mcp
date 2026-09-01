@@ -2153,14 +2153,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
               } else if (tmpDir.isSymlink()) {
                 throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
-              } else {
+              } else if (Services.appinfo.OS !== "WINNT") {
                 // POSIX hardening: on a shared /tmp another local user could
                 // pre-create the directory with group/world bits set, then race
                 // the connection file. The O_EXCL on the file itself blocks a
                 // straight overwrite, but a permissive directory still lets the
                 // attacker read or rename our file. Force perms back to 0o700.
-                // permissions is 0 on platforms that don't expose POSIX modes
-                // (Windows ACLs), so the chmod is a no-op there.
                 try {
                   const mode = tmpDir.permissions;
                   if (mode && (mode & 0o077) !== 0) {
@@ -2174,6 +2172,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // ignore: permissions accessor unsupported on this platform
                 }
               }
+              // On Windows, nsIFile.permissions returns a synthesized POSIX-like
+              // value (typically 0777 for directories) that is not derived from
+              // the real ACL/DACL, so it can't detect an insecure directory and
+              // chmod() can't fix one — it's a no-op against NTFS. This branch
+              // is therefore skipped on Windows; the symlink check above and
+              // the O_CREAT|O_EXCL exclusive create below still apply, and the
+              // multi-user shared-/tmp threat this hardening targets doesn't
+              // apply on Windows, where %TEMP% is already private per-user.
               const connFile = tmpDir.clone();
               connFile.append("connection.json");
               // Symlink defense: remove any existing file first, then create
