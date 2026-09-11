@@ -63,7 +63,7 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | Tool | Description |
 |------|-------------|
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
-| `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block |
+| `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block; `saveAsDraft` saves the threaded reply to Drafts without sending |
 | `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
 
 All compose tools open a window for you to review and edit before sending by default. The **Block `skipReview`** preference is on by default, so `skipReview: true` is rejected until you explicitly disable the preference; only then can it send directly. Attachments can be file paths or inline base64 objects.
