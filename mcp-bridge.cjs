@@ -891,7 +891,9 @@ function validateBase64Attachments(args) {
     }
     if (Object.keys(entry).some(key => !['name', 'contentType', 'base64'].includes(key)) ||
         typeof entry.name !== 'string' || !entry.name.trim() ||
-        /[\/\\\x00-\x1f]/.test(entry.name) || ['.', '..'].includes(entry.name) ||
+        (entry.name.includes('/') || entry.name.includes('\\') ||
+         [...entry.name].some(char => char.charCodeAt(0) < 32)) ||
+        ['.', '..'].includes(entry.name) ||
         typeof entry.contentType !== 'string' || !entry.contentType.trim()) {
       throw new Error('Each attachment must contain only name (filename, not a path), contentType (MIME type), and base64 (encoded file bytes).');
     }
