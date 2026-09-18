@@ -827,6 +827,84 @@ function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = []
 // on the bridge side and shipping inline base64 sidesteps the sandbox entirely.
 const ATTACHMENT_TOOLS = new Set(['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage']);
 
+// Optional remote/container deployment contract. Keep local stdio path support
+// unchanged unless the operator explicitly enables this mode.
+const INLINE_ONLY_ATTACHMENT_TOOLS = new Set(['saveDraft', 'sendMail', 'replyToMessage', 'forwardMessage']);
+const MAX_BASE64_SIZE = 25 * 1024 * 1024;
+function inlineOnlyAttachmentsEnabled(env = process.env) {
+  return env.THUNDERBIRD_MCP_INLINE_ATTACHMENTS_ONLY === 'true';
+}
+
+const ATTACHMENT_INSTRUCTIONS =
+  'ATTACHMENTS: Use inline Base64 objects only: {"name":"document.pdf",' +
+  '"contentType":"application/pdf","base64":"<actual Base64 file bytes>"}. ' +
+  'Read an original file accessible in your own environment and Base64-encode its exact bytes. ' +
+  'Never pass file paths (including /root/...), URLs, or data: URLs. ' +
+  'Thunderbird runs in a separate container and cannot read files from your container. ' +
+  'Do not invent or truncate Base64 data. Omit attachments when none are needed. ' +
+  'Limits: 20 attachments, 25 MiB of Base64 per attachment, 32 MiB for the complete JSON request.';
+
+const ATTACHMENT_TITLES = {
+  saveDraft: 'Save email draft — Base64 attachments only',
+  sendMail: 'Send email — Base64 attachments only',
+  replyToMessage: 'Reply to email — Base64 attachments only',
+  forwardMessage: 'Forward email — Base64 attachments only',
+};
+
+function describeBase64Attachments(response) {
+  if (!Array.isArray(response?.result?.tools)) return response;
+  for (const tool of response.result.tools) {
+    if (!INLINE_ONLY_ATTACHMENT_TOOLS.has(tool.name)) continue;
+    tool.title = ATTACHMENT_TITLES[tool.name];
+    tool.description = ATTACHMENT_INSTRUCTIONS + '\n\n' + (tool.description || '');
+    tool.inputSchema.properties.attachments = {
+      type: 'array',
+      maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
+      description: ATTACHMENT_INSTRUCTIONS,
+      items: {
+        type: 'object',
+        required: ['name', 'contentType', 'base64'],
+        additionalProperties: false,
+        properties: {
+          name: { type: 'string', minLength: 1, description: 'Filename only, e.g. document.pdf. Never a path.' },
+          contentType: { type: 'string', minLength: 1, description: 'MIME type, e.g. application/pdf.' },
+          base64: {
+            type: 'string', minLength: 1, maxLength: MAX_BASE64_SIZE,
+            contentEncoding: 'base64',
+            description: 'Standard Base64 encoding of the complete original file bytes. No data: prefix, whitespace, placeholders, or truncation.',
+          },
+        },
+      },
+    };
+  }
+  return response;
+}
+
+function validateBase64Attachments(args) {
+  if (!args || args.attachments === undefined) return;
+  if (!Array.isArray(args.attachments) || args.attachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+    throw new Error('attachments must be an array with at most 20 inline Base64 objects.');
+  }
+  for (const entry of args.attachments) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new Error('File paths are not supported. Read the file in your container and pass {name, contentType, base64} with its actual Base64-encoded bytes.');
+    }
+    if (Object.keys(entry).some(key => !['name', 'contentType', 'base64'].includes(key)) ||
+        typeof entry.name !== 'string' || !entry.name.trim() ||
+        /[\/\\\x00-\x1f]/.test(entry.name) || ['.', '..'].includes(entry.name) ||
+        typeof entry.contentType !== 'string' || !entry.contentType.trim()) {
+      throw new Error('Each attachment must contain only name (filename, not a path), contentType (MIME type), and base64 (encoded file bytes).');
+    }
+    const encoded = entry.base64;
+    if (typeof encoded !== 'string' || !encoded.length || encoded.length > MAX_BASE64_SIZE) {
+      throw new Error('Attachment base64 must be non-empty and at most 25 MiB; the complete JSON request must fit within 32 MiB.');
+    }
+    if (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+      throw new Error('Invalid Base64 attachment. Encode the complete file bytes as standard Base64, without whitespace or a data: URL prefix.');
+    }
+  }
+}
+
 // Minimal MIME map covering common attachment types (documents, images,
 // archives, A/V). Falls back to application/octet-stream which Thunderbird
 // handles fine.
@@ -1262,7 +1340,16 @@ async function handleMessage(line) {
       return { jsonrpc: '2.0', id: message.id, result: { prompts: [] } };
   }
 
-  // For mail tools (including drafts), inline attachments passed as file paths.
+  if (inlineOnlyAttachmentsEnabled() && message.method === 'tools/call'
+      && INLINE_ONLY_ATTACHMENT_TOOLS.has(message.params?.name)) {
+    try {
+      validateBase64Attachments(message.params.arguments);
+    } catch (e) {
+      return { jsonrpc: '2.0', id: message.id, error: { code: -32602, message: e.message } };
+    }
+  }
+
+  // For mail-sending tools, inline any attachments passed as file paths.
   // The Thunderbird extension may run inside a sandboxed snap that cannot
   // see /data/..., the host /tmp, or any path outside its confined view —
   // passing such paths through would fail attachment validation.
@@ -1281,7 +1368,9 @@ async function handleMessage(line) {
     }
   }
 
-  return forwardToThunderbird(message);
+  const response = await forwardToThunderbird(message);
+  return inlineOnlyAttachmentsEnabled() && message.method === 'tools/list'
+    ? describeBase64Attachments(response) : response;
 }
 
 // BEGIN BRIDGE HTTP REQUEST HELPERS
@@ -1605,6 +1694,9 @@ if (process.env.THUNDERBIRD_MCP_NO_AUTOSTART !== '1') {
 // END BRIDGE STARTUP
 
 module.exports = {
+  describeBase64Attachments,
+  inlineOnlyAttachmentsEnabled,
+  validateBase64Attachments,
   advanceToNextCandidate,
   buildCandidateGroups,
   buildConnectionDiscoveryErrorMessage,
