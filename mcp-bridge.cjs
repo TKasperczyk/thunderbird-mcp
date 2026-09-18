@@ -901,7 +901,7 @@ function validateBase64Attachments(args) {
     if (typeof encoded !== 'string' || !encoded.length || encoded.length > MAX_BASE64_SIZE) {
       throw new Error('Attachment base64 must be non-empty and at most 25 MiB; the complete JSON request must fit within 32 MiB.');
     }
-    if (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded)) {
+    if (encoded.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}(?![\s\S])/.test(encoded)) {
       throw new Error('Invalid Base64 attachment. Encode the complete file bytes as standard Base64, without whitespace or a data: URL prefix.');
     }
   }

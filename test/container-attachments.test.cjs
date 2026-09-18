@@ -33,7 +33,9 @@ it('accepts original file bytes and rejects paths, truncation and malformed obje
   assert.doesNotThrow(() => validateBase64Attachments({ attachments: [attachment] }));
   assert.doesNotThrow(() => validateBase64Attachments({}));
   for (const entry of ['/tmp/thunderbird-mcp/image.png', { ...attachment, base64: 'AAA' },
-    { ...attachment, base64: 'AA A' }, { ...attachment, name: '../image.png' },
+    { ...attachment, base64: 'AA A' }, { ...attachment, base64: 'AAA\n' },
+    { ...attachment, base64: 'AAA\r' }, { ...attachment, base64: 'AAA\u2028' },
+    { ...attachment, name: 'bad\0.png' }, { ...attachment, name: 'dir\\image.png' }, { ...attachment, name: '../image.png' },
     { ...attachment, base64: 'data:image/png;base64,AAAA' }]) {
     assert.throws(() => validateBase64Attachments({ attachments: [entry] }));
   }
