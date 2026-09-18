@@ -31,4 +31,3 @@ Raw source access requires a local/offline message copy; an uncached IMAP
 message may fail. Report that specific failure or obtain an accessible
 original rather than silently omitting the requested attachment.
 These hints use the existing raw-source API and add no new transfer tool.
-
