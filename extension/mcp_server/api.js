@@ -1504,7 +1504,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
-            saveAsDraft: { type: "boolean", description: "Build the reply in Thunderbird's native reply window (quote, identity signature, threading headers), save it to the identity's Drafts folder and close the window without sending (default: false). Cannot be combined with skipReview." },
+            saveAsDraft: { type: "boolean", description: "Build the reply in Thunderbird's native reply window (quote, identity signature, threading headers), save it to the identity's Drafts folder and close the window without sending (default: false). Cannot be combined with skipReview. Requires the saveDraft tool to be enabled." },
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
@@ -3016,30 +3016,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * close prompt). Going through the compose window keeps the native
              * reply quote, identity signature and References/In-Reply-To.
              *
-             * The "message saved to Drafts" alert is suppressed for the duration
-             * of the save so it cannot block the MCP call.
+             * The "message saved to Drafts" alert is suppressed by overriding
+             * DisplaySaveFolderDlg on this compose window instance only --
+             * never the identity's showSaveMsgDlg pref, which is shared across
+             * all windows/identities and would otherwise leak a stuck `false`
+             * into unrelated saves (including concurrent ones on the same
+             * identity).
              */
-            function saveComposeWindowAsDraft(composeWin, identity) {
+            function saveComposeWindowAsDraft(composeWin) {
               return new Promise((resolve) => {
                 const SAVE_TIMEOUT_MS = 60000;
-                const RESTORE_DIALOG_PREF_DELAY_MS = 10000;
                 let settled = false;
-                let dialogPrefRestored = false;
-                let previousShowSaveMsgDlg = null;
-
-                try {
-                  previousShowSaveMsgDlg = identity.showSaveMsgDlg;
-                  identity.showSaveMsgDlg = false;
-                } catch {
-                  previousShowSaveMsgDlg = null;
-                }
-
-                const restoreDialogPref = () => {
-                  if (dialogPrefRestored) return;
-                  dialogPrefRestored = true;
-                  if (previousShowSaveMsgDlg === null) return;
-                  try { identity.showSaveMsgDlg = previousShowSaveMsgDlg; } catch {}
-                };
 
                 const compose = composeWin.gMsgCompose;
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
@@ -3048,11 +3035,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
                   NotifyComposeFieldsReady() {},
                   NotifyComposeBodyReady() {},
-                  // TB's own listener (registered first) reads showSaveMsgDlg
-                  // here, so restoring afterwards is safe.
-                  SaveInFolderDone() {
-                    restoreDialogPref();
-                  },
+                  SaveInFolderDone() {},
                   ComposeProcessDone(aResult) {
                     if (Components.isSuccessCode(aResult)) {
                       settle({ success: true });
@@ -3067,13 +3050,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   settled = true;
                   try { timer.cancel(); } catch {}
                   try { compose?.UnregisterStateListener(stateListener); } catch {}
-                  if (!dialogPrefRestored) {
-                    // SaveInFolderDone may still be pending; restore a bit later
-                    // so the alert stays suppressed for this save.
-                    const restoreTimer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
-                    restoreTimer.initWithCallback({ notify() { restoreDialogPref(); } },
-                      RESTORE_DIALOG_PREF_DELAY_MS, Ci.nsITimer.TYPE_ONE_SHOT);
-                  }
                   resolve(result);
                 };
 
@@ -3088,6 +3064,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     settle({ error: "Compose window does not support SaveAsDraft" });
                     return;
                   }
+                  // Window-local override: only suppresses the "saved to
+                  // Drafts" dialog for this save, leaving identity.showSaveMsgDlg
+                  // (and any other in-flight save on the same identity) alone.
+                  composeWin.DisplaySaveFolderDlg = () => {};
                   compose.RegisterStateListener(stateListener);
                   composeWin.gCloseWindowAfterSave = true;
                   Promise.resolve(composeWin.SaveAsDraft()).catch((e) => {
@@ -6708,6 +6688,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    resolve({ error: "saveAsDraft cannot be combined with skipReview" });
 	                    return;
 	                  }
+	                  if (saveAsDraft && !isToolEnabled("saveDraft")) {
+	                    resolve({ error: "saveAsDraft requires the saveDraft tool to be enabled" });
+	                    return;
+	                  }
 	                  if (skipReview && isSkipReviewBlocked()) {
 	                    resolve({ error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." });
 	                    return;
@@ -6842,7 +6826,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    bcc,
 	                    fileDescs,
 	                    saveAsDraft
-	                      ? (composeWin) => saveComposeWindowAsDraft(composeWin, msgComposeParams.identity)
+	                      ? (composeWin) => saveComposeWindowAsDraft(composeWin)
 	                      : undefined
 	                  ).then(result => {
 	                    if (result.success) {
