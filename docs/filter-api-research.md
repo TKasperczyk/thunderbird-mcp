@@ -611,6 +611,19 @@ function createFilter(accountId, name, enabled, type, conditions, actions, inser
 }
 ```
 
+**Implementation note — rebuilding.** `nsIMsgFilter` has no `clearTerms`/`clearActions`, so
+replacing only the conditions or only the actions means creating a new filter, copying the
+untouched half, then `removeFilterAt` + `insertFilterAt`. The copy (`copySearchTerms` /
+`copyActions` in `api.js`) is exact: every property `nsMsgFilter` writes to
+`msgFilterRules.dat` is carried over — `attrib`, `op`, `booleanAnd`, `beginsGrouping`,
+`endsGrouping`, `matchAll`, `arbitraryHeader`, `hdrProperty`, `customId` and the value
+through the union member its attribute owns (see Section 6); actions copy `type`, the typed
+member of that type, `strValue` and `customId`. Failures propagate and abort the update. An
+earlier copy read `.str` for everything and swallowed the resulting
+`NS_ERROR_ILLEGAL_VALUE`, which silently reset priority, status, age, size, junk status and
+junk percent conditions to 0 on every `updateFilter` — changing only the action of an
+"age in days > 30" rule left "age in days > 0". The typed copy follows #175 (@rdkr).
+
 ### 5.4 deleteFilter
 
 **Purpose**: Remove a filter.
@@ -780,11 +793,28 @@ The authoritative dispatch is Thunderbird's own, in
 | `Size` | `value.size` | integer KB |
 | `JunkStatus` | `value.junkStatus` | `nsMsgJunkStatus`: 0 unclassified, 1 good, 2 junk |
 | `JunkPercent` | `value.junkPercent` | 0–100 |
-| `HasAttachmentStatus` | `value.status` | always `nsMsgMessageFlags.Attachment`; `is`/`isnt` carries has/hasn't |
-| everything else | `value.str` | including `Keywords`/tags and `OtherHeader` |
+| `HasAttachmentStatus` | `value.status` | always `nsMsgMessageFlags.Attachment`; `is`/`isnt` carries has/hasn't. A caller-supplied value is ignored by Thunderbird (`is` + `"false"` persists as `is,true`), so the tools refuse one |
+| `Custom` (-2) | `value.str` | plus `term.customId`, the add-on's term id, which is what the `.dat` file names the term by. Read and copied, never created here |
+| everything else | `value.str` | including `Keywords`/tags, `JunkScoreOrigin` and `OtherHeader`. This is also the union member for every attribute not in `IS_STRING_ATTRIBUTE`'s exclusion list (`nsMsgSearchCore.idl`) |
 
 - `OtherHeader` additionally needs the header name in `term.arbitraryHeader`, otherwise the
-  term never matches.
+  term never matches. `HdrProperty`/`Uint32HdrProperty` terms name their property in
+  `term.hdrProperty`.
+- **Dates are local days.** `nsMsgSearchTerm` writes `Date` values with
+  `PR_LocalTimeParameters` as `%d-%b-%Y` and reads them back as local midnight, so the day is
+  all that survives a restart. A date-only tool value (`YYYY-MM-DD`) is therefore parsed as a
+  *local* calendar day — `Date.parse` would take it as UTC midnight, which is the previous day
+  anywhere west of UTC (`"2026-01-01"` in America/Toronto was saved as `31-Dec-2025`; fix from
+  #175, @ncrosty58). Date-times keep their instant. Bare numbers are refused: `"2026"` used to
+  be taken as epoch milliseconds and saved as `01-Jan-1970`. Read-back reports a local-midnight
+  value as `YYYY-MM-DD`, anything else as an ISO-8601 instant.
+- **Integers are strict and bounded.** Values are matched with `/^-?\d+$/` (no `parseInt`,
+  which took `"30abc"` as 30 and `"1.5"` as 1). `size` and `age` are non-negative (`size` is
+  `unsigned long`: -5 was stored as 4294967291), `junkPercent` is 0–100, `junkStatus` 0–2 (or
+  `junk`/`good`/`unclassified`), `priority` is `nsMsgPriority.lowest`..`highest` (2–6) and
+  `status` a non-zero `nsMsgMessageFlags` bitmask. The schema hints spell the values out
+  (`4=normal`, `2=replied`, `(KB)`), with the numbers resolved from `Ci.nsMsgPriority` and
+  `Ci.nsMsgMessageFlags` by name — the same way the attribute ids are.
 
 The implementation reads the whole vocabulary from the running Thunderbird instead of
 hardcoding it: attribute ids are resolved by name from `Ci.nsMsgSearchAttrib` (**not** by
@@ -832,11 +862,22 @@ these tools use) are so far untouched by it.
 
 ### Action Value Setting
 - `MoveToFolder` / `CopyToFolder`: set `action.targetFolderUri`
-- `ChangePriority`: set `action.priority`
+- `ChangePriority`: set `action.priority` (`nsMsgPriority.lowest`..`highest`, 2–6; anything
+  else is written as "Change priority" with no value)
 - `AddTag`: tag value goes in `action.strValue` (the keyword, e.g., `"$label1"` or custom tag keyword)
-- `Forward` / `Reply`: email address in `action.strValue`
-- `JunkScore`: set `action.junkScore`
-- Actions like `MarkRead`, `MarkFlagged`, `StopExecution`, `Delete` have no value parameter
+- `Forward` / `Reply`: email address / template URI in `action.strValue`
+- `JunkScore`: set `action.junkScore` — `nsMsgRuleAction::SetJunkScore` rejects anything
+  outside 0..100
+- `Custom` (-1): `action.customId` names the add-on's `nsIMsgFilterCustomAction`, the
+  optional argument is in `action.strValue`. Read back and copied by the tools, never created
+- Actions like `MarkRead`, `MarkFlagged`, `StopExecution`, `Delete` have no value parameter;
+  the tools refuse a value on them
+- The typed accessors are guarded (`nsMsgFilter.cpp`): `priority` throws
+  `NS_ERROR_ILLEGAL_VALUE` unless `type` is `ChangePriority`, `targetFolderUri` unless
+  Move/Copy, `junkScore` unless `JunkScore`. `strValue` and `customId` are unguarded. This is
+  why writing and copying are table-driven off `FILTER_ACTION_DEFS` in `api.js`, and why the
+  tools require a value for every action that takes one: Thunderbird itself saves
+  "Move to folder" with no folder, and the rule then does nothing when it runs
 
 ### Async Considerations
 - `applyFiltersToFolders` returns immediately — the actual filtering happens asynchronously
