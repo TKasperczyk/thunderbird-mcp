@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -21,16 +21,21 @@ concurrency:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and push the update manifest to gh-pages
     steps:
+      # Credentials are kept (no persist-credentials: false): the gh-pages step below pushes with them.
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '20'
+          # Never restore a dependency cache in the job that can write the release and the update channel.
+          package-manager-cache: false
 
       - name: Verify package.json version matches the tag
         run: |
@@ -68,12 +73,21 @@ jobs:
       - name: Rename XPI to versioned filename
         run: mv dist/thunderbird-mcp.xpi "dist/thunderbird-mcp-${GITHUB_REF_NAME}.xpi"
 
+      # GitHub CLI (preinstalled on the runner) rather than a third-party action: no external code runs in the job
+      # that holds a token able to write the repository, including gh-pages (the update channel).
       - name: Create / update GitHub release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ github.ref_name }}
-          fail_on_unmatched_files: true
-          files: dist/thunderbird-mcp-${{ github.ref_name }}.xpi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          XPI="dist/thunderbird-mcp-${TAG}.xpi"
+          test -f "$XPI" || { echo "::error::$XPI not found"; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$XPI" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$XPI" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes ""
+          fi
 
       - name: Publish update manifest to gh-pages
         if: startsWith(github.ref, 'refs/tags/v')

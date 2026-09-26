@@ -22,11 +22,11 @@ jobs:
       matrix:
         channel: [stable, beta, esr]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "22.x"
 
@@ -309,7 +309,7 @@ jobs:
 
       - name: Upload compatibility result
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tb-compat-${{ matrix.channel }}
           path: ${{ runner.temp }}/tb-compat-${{ matrix.channel }}.json
@@ -328,7 +328,7 @@ jobs:
       issues: write
     steps:
       - name: Download compatibility results
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         continue-on-error: true
         with:
           pattern: tb-compat-*
@@ -443,7 +443,7 @@ jobs:
 
       - name: Open compatibility issue
         if: ${{ steps.evaluate.outputs.load_failed == 'true' }}
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           ISSUE_BODY_FILE: ${{ steps.evaluate.outputs.issue_body_file }}
           ISSUE_TITLE: Thunderbird compatibility load test failed
