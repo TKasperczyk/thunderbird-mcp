@@ -6806,6 +6806,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                            result.message = msg;
 	                          }
 	                          resolve(result);
+	                        }).catch(e => {
+	                          // The promise helpers above resolve rather than reject today, but
+	                          // nothing in their signature guarantees it and this promise has no
+	                          // timeout of its own -- an unhandled rejection would hang the request
+	                          // forever instead of failing it.
+	                          resolve({ error: e.toString() });
 	                        });
 	                      } catch (e) {
 	                        resolve({ error: e.toString() });
@@ -6835,6 +6841,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                      result.message = msg;
 	                    }
 	                    resolve(result);
+	                  }).catch(e => {
+	                    // The promise helpers above resolve rather than reject today, but
+	                    // nothing in their signature guarantees it and this promise has no
+	                    // timeout of its own -- an unhandled rejection would hang the request
+	                    // forever instead of failing it.
+	                    resolve({ error: e.toString() });
 	                  });
 
 	                } catch (e) {
@@ -6981,6 +6993,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             result.message = msg;
                           }
                           resolve(result);
+                        }).catch(e => {
+                          // The promise helpers above resolve rather than reject today, but
+                          // nothing in their signature guarantees it and this promise has no
+                          // timeout of its own -- an unhandled rejection would hang the request
+                          // forever instead of failing it.
+                          resolve({ error: e.toString() });
                         });
                       } catch (e) {
                         resolve({ error: e.toString() });
@@ -7012,6 +7030,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       result.message = msg;
                     }
                     resolve(result);
+                  }).catch(e => {
+                    // The promise helpers above resolve rather than reject today, but
+                    // nothing in their signature guarantees it and this promise has no
+                    // timeout of its own -- an unhandled rejection would hang the request
+                    // forever instead of failing it.
+                    resolve({ error: e.toString() });
                   });
                 } catch (e) {
                   resolve({ error: e.toString() });
