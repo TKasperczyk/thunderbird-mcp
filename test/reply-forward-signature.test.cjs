@@ -17,7 +17,7 @@ function buildBodyWithSignatureAndBlock(body, sigFragment, block, useHtml) {
   if (useHtml) {
     return `<html><head><meta charset="UTF-8"></head><body>${body}${sigFragment}${block}</body></html>`;
   }
-  return `${body || ""}${sigFragment}${sigFragment ? "\n\n" : "\n\n"}${block}`;
+  return `${body || ""}${sigFragment}\n\n${block}`;
 }
 
 function getFunctionSource(functionName, nextFunctionName) {

@@ -3743,6 +3743,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
+             * Builds a manually composed reply or forward body with its
+             * identity signature placed before the quoted/forwarded block.
+             */
+            function buildBodyWithSignatureAndBlock(body, sigFragment, block, useHtml) {
+              if (useHtml) {
+                return `<html><head><meta charset="UTF-8"></head><body>${body}${sigFragment}${block}</body></html>`;
+              }
+              return `${body || ""}${sigFragment}\n\n${block}`;
+            }
+
+            /**
              * Decides whether a compose operation will (or should) run in HTML
              * mode, and returns the matching msgComposeParams.format value.
              *
@@ -6870,10 +6881,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                          const quoteBlock = isHtml
 	                            ? `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<blockquote type="cite">${quotedHtml}</blockquote>`
 	                            : `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<br>${quotedLines}`;
-	                          composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
-	                        } else {
-	                          const quotedLines = originalBody.split('\n').map(line => `> ${line}`).join('\n');
-	                          composeFields.body = `${body || ""}\n\nOn ${dateStr}, ${author} wrote:\n${quotedLines}`;
+                          const sigFragment = buildSignatureFragment(msgComposeParams.identity, replyUseHtml);
+                          composeFields.body = buildBodyWithSignatureAndBlock(
+                            formatBodyHtml(body, isHtml), sigFragment, quoteBlock, replyUseHtml
+                          );
+                        } else {
+                          const quotedLines = originalBody.split('\n').map(line => `> ${line}`).join('\n');
+                          const sigFragment = buildSignatureFragment(msgComposeParams.identity, replyUseHtml);
+                          const quoteBlock = `On ${dateStr}, ${author} wrote:\n${quotedLines}`;
+                          composeFields.body = buildBodyWithSignatureAndBlock(
+                            body || "", sigFragment, quoteBlock, replyUseHtml
+                          );
 	                        }
 
 	                        sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType, Ci.nsIMsgCompDeliverMode.Now, replyUseHtml ? "text/html" : "text/plain").then(result => {
@@ -7037,7 +7055,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             ? `<blockquote type="cite">${fwdHeaderHtml}${quotedHtml}</blockquote>`
                             : `${fwdHeaderHtml}${quotedLinesHtml}`;
                           const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
-                          composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
+                          const sigFragment = buildSignatureFragment(msgComposeParams.identity, fwdUseHtml);
+                          composeFields.body = buildBodyWithSignatureAndBlock(
+                            introHtml, sigFragment, forwardBlock, fwdUseHtml
+                          );
                         } else {
                           const fwdHeader =
                             `-------- Forwarded Message --------\n` +
@@ -7045,7 +7066,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             `Date: ${dateStr}\n` +
                             `From: ${fwdAuthor}\n` +
                             `To: ${fwdRecipients}\n\n`;
-                          composeFields.body = `${body ? body + '\n\n' : ''}${fwdHeader}${originalBody}`;
+                          const sigFragment = buildSignatureFragment(msgComposeParams.identity, fwdUseHtml);
+                          const introText = body ? body + '\n\n' : "";
+                          const forwardBlock = `${fwdHeader}${originalBody}`;
+                          composeFields.body = sigFragment
+                            ? buildBodyWithSignatureAndBlock(introText, sigFragment, forwardBlock, fwdUseHtml)
+                            : `${introText}${forwardBlock}`;
                         }
 
                         const origDescs = [];
