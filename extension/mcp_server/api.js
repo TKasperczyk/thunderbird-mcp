@@ -3504,8 +3504,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Returns { text, isHtml } without any format conversion.
              * Does NOT use coerceBodyToPlaintext -- callers that want
              * the raw HTML (for markdown/html output) need this.
+             * multipart/alternative selects the requested representation;
+             * other multipart containers preserve message order.
              */
-            function extractBodyContent(aMimeMsg) {
+            function extractBodyContent(aMimeMsg, preferHtml = false) {
               if (!aMimeMsg) return { text: "", isHtml: false };
               try {
                 function findBody(part, isRoot = false) {
@@ -3516,13 +3518,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (ct === "text/html" && part.body) return { text: part.body, isHtml: true };
                   }
                   if (part.parts) {
-                    let htmlFallback = null;
-                    for (const sub of part.parts) {
-                      const r = findBody(sub);
-                      if (r && !r.isHtml) return r;
-                      if (r && r.isHtml && !htmlFallback) htmlFallback = r;
+                    if (ct === "multipart/alternative") {
+                      let fallback = null;
+                      for (const sub of part.parts) {
+                        const candidate = findBody(sub);
+                        if (!candidate) continue;
+                        if (candidate.isHtml === preferHtml) return candidate;
+                        if (!fallback) fallback = candidate;
+                      }
+                      return fallback;
                     }
-                    if (htmlFallback) return htmlFallback;
+                    for (const sub of part.parts) {
+                      const candidate = findBody(sub);
+                      if (candidate) return candidate;
+                    }
                   }
                   return null;
                 }
@@ -3557,7 +3566,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { body: extractPlainTextBody(aMimeMsg), bodyIsHtml: false };
               }
               // For markdown/html: need raw MIME content, not coerced text
-              const { text, isHtml } = extractBodyContent(aMimeMsg);
+              const { text, isHtml } = extractBodyContent(aMimeMsg, true);
               if (!text) {
                 // MIME tree empty -- try coerce as last resort
                 const fallback = extractPlainTextBody(aMimeMsg);
