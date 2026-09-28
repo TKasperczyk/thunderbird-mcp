@@ -153,7 +153,7 @@ The bridge re-discovers `connection.json` on every cache miss. It tries these lo
 2. Native temp dir: `<os.tmpdir()>/thunderbird-mcp/connection.json`
 3. macOS fallback: `/var/folders/*/*/T/thunderbird-mcp/connection.json` owned by the current user
 4. Linux Snap: Thunderbird's live `TMPDIR` from `/proc/<pid>/environ`, plus the official snap fallback under `~/Downloads/thunderbird.tmp`
-5. Linux Flatpak / Betterbird Flatpak: `$XDG_RUNTIME_DIR/app/*/thunderbird-mcp/connection.json`
+5. Linux Flatpak / Betterbird Flatpak: `$XDG_RUNTIME_DIR/app/*/thunderbird-mcp/connection.json` and `~/.var/app/*/cache/tmp/thunderbird-mcp/connection.json`
 
 This covers native installs, the official Thunderbird snap, Thunderbird Flatpak, Thunderbird Beta Flatpak, and Betterbird Flatpak without changing the extension side. If multiple sandbox candidates exist at once, the bridge tries the newest file first. Set `THUNDERBIRD_MCP_CONNECTION_FILE` to force a single explicit path.
 

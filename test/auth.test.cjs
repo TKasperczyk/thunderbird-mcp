@@ -25,6 +25,9 @@ const BRIDGE_PATH = path.resolve(__dirname, '..', 'mcp-bridge.cjs');
 const CONN_DIR = path.join(os.tmpdir(), 'thunderbird-mcp');
 const CONN_FILE = path.join(CONN_DIR, 'connection.json');
 const DEFAULT_PORT = 8765;
+// Pin discovery to the test's file so the bridge can't fall through to a
+// live Thunderbird's connection file (e.g. a Flatpak one under ~/.var/app).
+const BRIDGE_ENV = { ...process.env, THUNDERBIRD_MCP_CONNECTION_FILE: CONN_FILE };
 
 /**
  * Check if a port is already in use (e.g. real Thunderbird running).
@@ -45,6 +48,7 @@ function sendToBridge(message, { timeout = 10000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BRIDGE_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: BRIDGE_ENV,
     });
 
     let stdout = '';
@@ -649,6 +653,7 @@ describe('Auth: bridge handles MCP lifecycle locally', () => {
     // Notifications have no id — bridge should not respond
     const child = spawn(process.execPath, [BRIDGE_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: BRIDGE_ENV,
     });
 
     let stdout = '';

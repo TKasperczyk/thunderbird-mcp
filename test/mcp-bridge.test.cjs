@@ -405,6 +405,29 @@ describe('Bridge discovery', () => {
     assert.equal(connInfo.token, 'flatpak-token');
   });
 
+  it('flatpak scan finds a connection file under ~/.var/app/*/cache/tmp', () => {
+    const options = makeTestOptions(root, { platform: 'linux' });
+
+    const flatpakConnFile = path.join(
+      options.homeDir,
+      '.var',
+      'app',
+      'net.thunderbird.Thunderbird',
+      'cache',
+      'tmp',
+      'thunderbird-mcp',
+      'connection.json'
+    );
+    writeConnectionFile(flatpakConnFile, {
+      port: 20005,
+      token: 'flatpak-home-token',
+    });
+
+    const connInfo = readConnectionInfo(options);
+    assert.equal(connInfo.port, 20005);
+    assert.equal(connInfo.token, 'flatpak-home-token');
+  });
+
   it('macOS scan finds current uid files and ignores other owners', () => {
     // Pin a synthetic uid rather than process.getuid(). On Windows the real
     // fs.statSync reports uid=0 for every file regardless of the caller, so we

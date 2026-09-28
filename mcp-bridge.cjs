@@ -340,63 +340,83 @@ function findSnapConnectionCandidates(context) {
 }
 
 function findFlatpakConnectionCandidates(context) {
-  const { fsImpl, pathImpl, runtimeDir } = context;
-  const patternBase = runtimeDir || '$XDG_RUNTIME_DIR';
-  const pattern = pathImpl.join(
-    patternBase,
-    'app',
-    '*',
-    THUNDERBIRD_MCP_SUBDIR,
-    CONNECTION_FILE_BASENAME
-  );
+  const { fsImpl, pathImpl, runtimeDir, homeDir } = context;
+  // Flatpak apps get TMPDIR under either $XDG_RUNTIME_DIR/app/<id> or, on
+  // newer runtimes, ~/.var/app/<id>/cache/tmp. Scan both.
+  const roots = [
+    {
+      base: runtimeDir,
+      label: '$XDG_RUNTIME_DIR',
+      appRoot: pathImpl.join(runtimeDir || '$XDG_RUNTIME_DIR', 'app'),
+      tmpSuffix: [],
+    },
+    {
+      base: homeDir,
+      label: '$HOME',
+      appRoot: pathImpl.join(homeDir || '$HOME', '.var', 'app'),
+      tmpSuffix: ['cache', 'tmp'],
+    },
+  ];
 
-  if (!runtimeDir) {
-    return {
-      notes: [makeAttempt('Flatpak scan', pattern, 'runtime dir unavailable')],
-      candidates: [],
-    };
-  }
-
-  const appRoot = pathImpl.join(runtimeDir, 'app');
-  let appEntries;
-  try {
-    appEntries = fsImpl.readdirSync(appRoot, { withFileTypes: true });
-  } catch (err) {
-    return {
-      notes: [makeAttempt('Flatpak scan', pattern, normalizeFsError(err))],
-      candidates: [],
-    };
-  }
-
+  const notes = [];
   const candidates = [];
   const seenPaths = new Set();
 
-  for (const appEntry of appEntries) {
-    if (!appEntry.isDirectory()) {
-      continue;
-    }
-
-    const candidatePath = pathImpl.join(
-      appRoot,
-      appEntry.name,
+  for (const root of roots) {
+    const pattern = pathImpl.join(
+      root.appRoot,
+      '*',
+      ...root.tmpSuffix,
       THUNDERBIRD_MCP_SUBDIR,
       CONNECTION_FILE_BASENAME
     );
 
+    if (!root.base) {
+      notes.push(makeAttempt('Flatpak scan', pattern, `${root.label} unavailable`));
+      continue;
+    }
+
+    let appEntries;
     try {
-      const stat = fsImpl.statSync(candidatePath);
-      if (!stat.isFile()) {
-        continue;
-      }
-      addUniqueCandidate(candidates, seenPaths, makeCandidate('Flatpak runtime scan', candidatePath, stat.mtimeMs));
+      appEntries = fsImpl.readdirSync(root.appRoot, { withFileTypes: true });
     } catch (err) {
-      if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') {
+      notes.push(makeAttempt('Flatpak scan', pattern, normalizeFsError(err)));
+      continue;
+    }
+
+    let found = 0;
+    for (const appEntry of appEntries) {
+      // Skip symlinked aliases (e.g. org.mozilla.Thunderbird -> net.thunderbird.Thunderbird)
+      if (!appEntry.isDirectory()) {
         continue;
       }
+
+      const candidatePath = pathImpl.join(
+        root.appRoot,
+        appEntry.name,
+        ...root.tmpSuffix,
+        THUNDERBIRD_MCP_SUBDIR,
+        CONNECTION_FILE_BASENAME
+      );
+
+      try {
+        const stat = fsImpl.statSync(candidatePath);
+        if (!stat.isFile()) {
+          continue;
+        }
+        addUniqueCandidate(candidates, seenPaths, makeCandidate('Flatpak scan', candidatePath, stat.mtimeMs));
+        found++;
+      } catch {
+        // ENOENT/ENOTDIR are expected for non-Thunderbird apps; skip anything else too.
+      }
+    }
+
+    if (found === 0) {
+      notes.push(makeAttempt('Flatpak scan', pattern, 'no matching files'));
     }
   }
 
-  return buildScanGroup('Flatpak scan', pattern, candidates, 'no matching files');
+  return { notes, candidates: sortCandidatesByMtime(candidates) };
 }
 
 function buildCandidateGroups(options = {}) {
