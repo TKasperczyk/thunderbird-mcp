@@ -1019,6 +1019,728 @@ const INTERNAL_KEYWORDS = new Set([
   "seen", "answered", "flagged", "deleted", "draft", "recent",
 ]);
 
+
+// BEGIN FILTER SEARCH TERM HELPERS
+const PREF_ALLOW_FILTER_SEND_ACTIONS = "extensions.thunderbird-mcp.allowFilterSendActions";
+const FILTER_SEND_OPTION = '"Allow automatic Forward/Reply filter actions" in Thunderbird MCP Options';
+
+function isFilterSendAllowed() {
+  try {
+    return Services.prefs.getBoolPref(PREF_ALLOW_FILTER_SEND_ACTIONS, false) === true;
+  } catch {
+    return false;
+  }
+}
+
+function validateFilterText(value, field) {
+  if (typeof value === "string" && /[\x00-\x1f\x7f\\]/.test(value)) {
+    throw new Error(`${field} must not contain control characters or backslashes`);
+  }
+}
+
+// ── Filter search-term vocabulary ──
+//
+// Attribute and operator ids are resolved from the running Thunderbird by
+// name, so they cannot drift from the enum the way a hardcoded table did.
+// Enumerating the interface object (Object.keys(Ci.nsMsgSearchAttrib)) is NOT
+// usable here: in the extension experiment context Ci supports named access
+// but yields no own keys, so enumeration silently produced an empty
+// vocabulary. Named lookup is the only reliable form.
+//
+// There are deliberately no fallback ids. Ci itself is guaranteed here -- this
+// file dereferences it at module load (line 21) and would not load without it
+// -- so the only way resolution fails is the whole search interface being
+// absent or renamed, which is also the case where nsIMsgSearchTerm,
+// nsIMsgSearchValue and the filter list are gone and no filter tool can work
+// anyway. Correct ids would then just describe a vocabulary nothing can
+// execute. Thunderbird's own filter UI takes the same position: searchWidgets,
+// searchTerm and FilterEditor dereference these constants 49 times between
+// them without a single guard. If the interface is missing we say so and
+// refuse, rather than inventing a map.
+
+function resolveXpcomConstant(interfaceName, constantName) {
+  try {
+    const value = Ci[interfaceName][constantName];
+    if (typeof value === "number") return value;
+  } catch {
+    // Interface unavailable (no XPCOM, or renamed constant).
+  }
+  return undefined;
+}
+
+// The operator names we accept are the IDL constant names with a lowered
+// first letter (Contains -> contains, IsInAB -> isInAB). Only the names are
+// listed; every value comes from the running Thunderbird.
+const FILTER_OP_IDL_NAMES = [
+  "Contains", "DoesntContain", "Is", "Isnt", "IsEmpty",
+  "IsBefore", "IsAfter", "IsHigherThan", "IsLowerThan",
+  "BeginsWith", "EndsWith", "SoundsLike", "LdapDwim",
+  "IsGreaterThan", "IsLessThan", "NameCompletion",
+  "IsInAB", "IsntInAB", "IsntEmpty", "Matches", "DoesntMatch",
+];
+
+// Values the hints and range checks refer to, resolved the same way.
+// nsMsgPriority bounds the priority condition and the changePriority action;
+// the nsMsgMessageFlags rows are the status bits Thunderbird's own filter UI
+// offers (it persists them under these names in msgFilterRules.dat).
+const PRIORITY_LEVELS = ["lowest", "low", "normal", "high", "highest"]
+  .map((name) => ({ name, value: resolveXpcomConstant("nsMsgPriority", name) }))
+  .filter((level) => level.value !== undefined);
+const STATUS_FLAGS = [
+  ["read", "Read"], ["replied", "Replied"], ["flagged", "Marked"],
+  ["forwarded", "Forwarded"], ["new", "New"],
+]
+  .map(([name, idl]) => ({ name, value: resolveXpcomConstant("nsMsgMessageFlags", idl) }))
+  .filter((flag) => flag.value !== undefined);
+const ATTACHMENT_FLAG = resolveXpcomConstant("nsMsgMessageFlags", "Attachment");
+// Custom terms and actions carry a customId naming an add-on's implementation.
+// This API does not create custom terms or actions. Existing custom terms can
+// be copied; custom actions are readable but cannot be written or executed.
+const CUSTOM_SEARCH_ATTRIB = resolveXpcomConstant("nsMsgSearchAttrib", "Custom");
+const CUSTOM_ACTION = resolveXpcomConstant("nsMsgFilterAction", "Custom");
+
+const describeLevels = (levels) => levels.map((level) => `${level.value}=${level.name}`).join(", ");
+const PRIORITY_HINT = PRIORITY_LEVELS.length
+  ? `an integer from ${PRIORITY_LEVELS[0].value} to ${PRIORITY_LEVELS[PRIORITY_LEVELS.length - 1].value} (${describeLevels(PRIORITY_LEVELS)})`
+  : "a signed 32-bit integer";
+const PRIORITY_RANGE = PRIORITY_LEVELS.length
+  ? { min: PRIORITY_LEVELS[0].value, max: PRIORITY_LEVELS[PRIORITY_LEVELS.length - 1].value }
+  : { min: -0x80000000, max: 0x7fffffff };
+const STATUS_HINT = STATUS_FLAGS.length
+  ? `a message-flag bitmask from 1 to 4294967295 (${describeLevels(STATUS_FLAGS)})`
+  : "a message-flag bitmask from 1 to 4294967295";
+
+// Our API name, the IDL constant it resolves against, and where its value
+// lives. member/codec default to "str"/"text". No numbers: see above.
+const FILTER_ATTRIBUTE_DEFS = [
+  { attrib: "subject", idl: "Subject" },
+  { attrib: "from", idl: "Sender" },
+  { attrib: "body", idl: "Body" },
+  { attrib: "date", idl: "Date", member: "date", codec: "date" },
+  { attrib: "priority", idl: "Priority", member: "priority", codec: "priority" },
+  { attrib: "status", idl: "MsgStatus", member: "status", codec: "status" },
+  { attrib: "to", idl: "To" },
+  { attrib: "cc", idl: "CC" },
+  { attrib: "toOrCc", idl: "ToOrCC" },
+  { attrib: "allAddresses", idl: "AllAddresses" },
+  // nsIMsgSearchValue.age is signed 32-bit; size and status are unsigned 32-bit.
+  { attrib: "ageInDays", idl: "AgeInDays", member: "age", codec: "integer", min: 0, max: 0x7fffffff, hint: "a non-negative integer (days), at most 2147483647" },
+  // Thunderbird labels this attribute "Size (KB)" and compares against the
+  // message size in kilobytes.
+  { attrib: "size", idl: "Size", member: "size", codec: "integer", min: 0, max: 0xffffffff, hint: "a non-negative integer (KB), at most 4294967295" },
+  // Thunderbird has no separate tag attribute -- tags are stored as keywords,
+  // so a tag condition is Keywords with the tag key in .str.
+  { attrib: "tag", idl: "Keywords", hint: 'a tag key such as "$label1"' },
+  { attrib: "hasAttachment", idl: "HasAttachmentStatus", member: "status", codec: "attachmentFlag" },
+  { attrib: "junkStatus", idl: "JunkStatus", member: "junkStatus", codec: "junkStatus" },
+  { attrib: "junkPercent", idl: "JunkPercent", member: "junkPercent", codec: "integer", min: 0, max: 100, hint: "an integer from 0 to 100" },
+  // OtherHeader matches a named header, which Thunderbird reads from
+  // term.arbitraryHeader -- without it the term never matches.
+  { attrib: "otherHeader", idl: "OtherHeader", needsHeader: true },
+  // Preserve UI-created typed terms without adding them to the creation API.
+  { attrib: "folderFlag", idl: "FolderFlag", member: "status", codec: "integer", min: 0, max: 0xffffffff, copyOnly: true },
+  { attrib: "uint32HdrProperty", idl: "Uint32HdrProperty", member: "status", codec: "integer", min: 0, max: 0xffffffff, copyOnly: true },
+  { attrib: "label", idl: "Label", member: "label", codec: "integer", min: 0, max: 0xffffffff, copyOnly: true },
+];
+
+const OP_MAP = (() => {
+  const map = {};
+  for (const idl of FILTER_OP_IDL_NAMES) {
+    const value = resolveXpcomConstant("nsMsgSearchOp", idl);
+    if (value === undefined) continue; // not in this Thunderbird
+    map[idl[0].toLowerCase() + idl.slice(1)] = value;
+  }
+  return map;
+})();
+const OP_NAMES = Object.fromEntries(Object.entries(OP_MAP).map(([k, v]) => [v, k]));
+
+const JUNK_STATUS_MAP = { unclassified: 0, good: 1, notJunk: 1, junk: 2 };
+const JUNK_STATUS_NAMES = { 0: "unclassified", 1: "good", 2: "junk" };
+
+// Integers are matched with a regexp rather than parseInt, which would take
+// "30abc" as 30 and "1.5" as 1; the range check catches values Thunderbird
+// would store as something else (size -5 became 4294967291).
+function parseStrictInteger(raw, label, hint, { min, max } = {}) {
+  const text = String(raw ?? "").trim();
+  const parsed = /^-?\d+$/.test(text) ? Number(text) : NaN;
+  const inRange = Number.isSafeInteger(parsed)
+    && (min === undefined || parsed >= min)
+    && (max === undefined || parsed <= max);
+  if (!inRange) {
+    throw new Error(`${label} must be ${hint}, got: ${JSON.stringify(raw)}`);
+  }
+  return parsed;
+}
+
+// nsMsgFilterTypeType is a signed 32-bit long. Resolve individual flags:
+// nsMsgFilterType.All omits PostPlugin, PostOutgoing, Archive and Periodic.
+const FILTER_TYPE_MASK = [
+  "InboxRule", "InboxJavaScript", "NewsRule", "NewsJavaScript",
+  "Manual", "PostPlugin", "PostOutgoing", "Archive", "Periodic",
+].reduce((mask, name) => mask | (resolveXpcomConstant("nsMsgFilterType", name) ?? 0), 0);
+
+function parseFilterType(raw) {
+  const type = parseStrictInteger(raw, "type", "a positive signed 32-bit integer", { min: 1, max: 0x7fffffff });
+  // Check the native range before bitwise operations can truncate the input.
+  if ((type & ~FILTER_TYPE_MASK) !== 0) {
+    throw new Error("type contains unknown or unavailable nsMsgFilterType bits");
+  }
+  return type;
+}
+
+const LOCAL_DAY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+const ISO_DATE_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
+const pad2 = (n) => String(n).padStart(2, "0");
+const formatLocalDay = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+
+// Each codec: the hint shown in the schema and in error messages, parse(raw,
+// label, spec) for writing, format(stored) for reading back.
+const VALUE_CODECS = {
+  text: {
+    hint: "text",
+    parse: (raw) => (raw == null ? "" : String(raw)),
+    format: (stored) => stored || "",
+  },
+  folder: {
+    hint: "a folder URI (from listFolders)",
+    parse: (raw) => String(raw),
+    format: (stored) => stored || "",
+  },
+  integer: {
+    hint: "an integer",
+    parse: (raw, label, spec) => parseStrictInteger(raw, label, spec.hint, spec),
+    format: (stored) => String(stored),
+  },
+  priority: {
+    hint: PRIORITY_HINT,
+    parse: (raw, label) => parseStrictInteger(raw, label, PRIORITY_HINT, PRIORITY_RANGE),
+    format: (stored) => String(stored),
+  },
+  status: {
+    hint: STATUS_HINT,
+    parse: (raw, label) => parseStrictInteger(raw, label, STATUS_HINT, { min: 1, max: 0xffffffff }),
+    format: (stored) => String(stored),
+  },
+  date: {
+    hint: "YYYY-MM-DD (a local calendar day) or an ISO-8601 date-time",
+    parse: (raw, label) => {
+      const text = String(raw ?? "").trim();
+      let ms = NaN;
+      const day = LOCAL_DAY_RE.exec(text);
+      if (day) {
+        // Thunderbird stores and displays filter dates in local time, to the
+        // day. Date.parse reads a date-only string as UTC midnight, which is
+        // the previous day anywhere west of UTC: "is before 2026-01-01" was
+        // saved as 31-Dec-2025 in America/Toronto. Fix from #175 (@ncrosty58).
+        const [year, month, dayOfMonth] = [Number(day[1]), Number(day[2]), Number(day[3])];
+        const local = new Date(year, month - 1, dayOfMonth);
+        const valid = local.getFullYear() === year
+          && local.getMonth() === month - 1
+          && local.getDate() === dayOfMonth;
+        if (valid) ms = local.getTime();
+      } else if (ISO_DATE_TIME_RE.test(text)) {
+        // A date-time is unambiguous: with a zone it means that instant, without
+        // one it is local time. Bare numbers are deliberately not accepted:
+        // "2026" used to be taken as epoch milliseconds and saved as 01-Jan-1970.
+        ms = Date.parse(text);
+      }
+      if (!Number.isFinite(ms)) {
+        throw new Error(`${label} must be ${VALUE_CODECS.date.hint}, got: ${JSON.stringify(raw)}`);
+      }
+      return ms * 1000; // nsIMsgSearchValue.date is PRTime (microseconds)
+    },
+    format: (stored) => {
+      if (!stored) return "";
+      const d = new Date(Math.floor(stored / 1000));
+      // Thunderbird persists filter dates as local days, so a term reloaded
+      // from msgFilterRules.dat always sits at local midnight: report it in
+      // the same form it is written in. Anything else keeps its instant.
+      const localMidnight = d.getHours() === 0 && d.getMinutes() === 0
+        && d.getSeconds() === 0 && d.getMilliseconds() === 0;
+      return localMidnight ? formatLocalDay(d) : d.toISOString();
+    },
+  },
+  junkStatus: {
+    hint: "junk, good or unclassified (or 2, 1, 0)",
+    parse: (raw, label) => {
+      const text = String(raw ?? "").trim();
+      if (Object.prototype.hasOwnProperty.call(JUNK_STATUS_MAP, text)) {
+        return JUNK_STATUS_MAP[text];
+      }
+      return parseStrictInteger(text, label, VALUE_CODECS.junkStatus.hint, { min: 0, max: 2 });
+    },
+    format: (stored) => JUNK_STATUS_NAMES[stored] ?? String(stored),
+  },
+  attachmentFlag: {
+    // The stored value is always the attachment flag; has / hasn't is
+    // expressed by the operator. A value would be silently ignored by
+    // Thunderbird (is + "false" persists as is,true), so it is refused.
+    hint: 'no value -- op "is" means has an attachment, "isnt" means has none',
+    available: ATTACHMENT_FLAG !== undefined,
+    parse: (raw, label) => {
+      if (String(raw ?? "").trim() !== "") {
+        throw new Error(`${label} must be empty: hasAttachment takes no value, the operator carries has / hasn't, got: ${JSON.stringify(raw)}`);
+      }
+      return ATTACHMENT_FLAG;
+    },
+    format: () => "",
+  },
+};
+
+// One row per attribute the tools expose: our API name, the IDL constant it
+// resolves against, and the value member/codec (default "str"/"text"). No
+// numeric ids anywhere -- they are resolved from the running Thunderbird, and
+// rows whose IDL constant this version does not define are dropped.
+const FILTER_ATTRIBUTE_SPECS = FILTER_ATTRIBUTE_DEFS
+  .map((def) => {
+    const resolved = resolveXpcomConstant("nsMsgSearchAttrib", def.idl);
+    if (resolved === undefined) return null; // not in this Thunderbird
+    const member = def.member || "str";
+    const codec = def.codec || "text";
+    if (VALUE_CODECS[codec].available === false) return null;
+    return {
+      ...def,
+      value: resolved,
+      member,
+      codec,
+      hint: def.hint || VALUE_CODECS[codec].hint,
+    };
+  })
+  .filter(Boolean);
+
+const FILTER_ATTRIBUTES = FILTER_ATTRIBUTE_SPECS.filter((a) => !a.copyOnly);
+const ATTRIB_MAP = Object.fromEntries(FILTER_ATTRIBUTES.map((a) => [a.attrib, a.value]));
+const ATTRIB_NAMES = Object.fromEntries(FILTER_ATTRIBUTES.map((a) => [a.value, a.attrib]));
+const ATTRIB_SPECS = Object.fromEntries(FILTER_ATTRIBUTE_SPECS.map((a) => [a.value, a]));
+// Attributes we don't model (e.g. a UI-created JunkScoreOrigin term) read as
+// text, which is also the union member Thunderbird uses for every attribute
+// it does not list as numeric.
+const UNKNOWN_ATTRIB_SPEC = { attrib: "unknown", member: "str", codec: "text" };
+
+// Filters are only workable if both interfaces answered. When they did not,
+// every generated description says so and buildTerms refuses, instead of
+// reporting each attribute as individually "unknown".
+const FILTER_VOCABULARY_AVAILABLE =
+  FILTER_ATTRIBUTES.length > 0 && Object.keys(OP_MAP).length > 0;
+const FILTER_VOCABULARY_UNAVAILABLE_NOTE =
+  "unavailable: this Thunderbird did not expose nsMsgSearchAttrib/nsMsgSearchOp";
+
+// nsMsgSearchAttrib.OtherHeader is only the UI's "Customize..." placeholder.
+// A real arbitrary-header term uses OtherHeader + 1 + i, where i is the
+// header's index in the mailnews.customHeaders pref; Thunderbird writes an
+// empty attribute name for a term left at OtherHeader itself, which silently
+// breaks the filter on reload. Mirrors NS_MsgGetAttributeFromString in
+// mailnews/search/src/nsMsgSearchTerm.cpp.
+const MAX_SEARCH_ATTRIB = 100; // nsMsgSearchAttrib.kNumMsgSearchAttributes
+
+function isArbitraryHeaderAttrib(attrib) {
+  const otherHeader = ATTRIB_MAP.otherHeader;
+  return otherHeader !== undefined && attrib > otherHeader && attrib < MAX_SEARCH_ATTRIB;
+}
+
+function arbitraryHeaderAttrib(header) {
+  // Same validity rule as the C++ side (IsRFC822HeaderFieldName).
+  if (!/^[!-9;-~]+$/.test(header)) {
+    throw new Error(`Invalid header name: ${JSON.stringify(header)}`);
+  }
+  const base = ATTRIB_MAP.otherHeader + 1;
+  let custom = "";
+  try {
+    custom = Services.prefs.getCharPref("mailnews.customHeaders", "");
+  } catch {
+    // Pref unreadable -- fall through to the unregistered-header id.
+  }
+  const headers = custom.replace(/\s+/g, "").split(":").filter(Boolean);
+  const index = headers.findIndex((h) => h.toLowerCase() === header.toLowerCase());
+  // Not in the pref is explicitly tolerated by Thunderbird: the header name is
+  // persisted with the term, so it still round-trips.
+  const attrib = index >= 0 ? base + index : base;
+  return attrib < MAX_SEARCH_ATTRIB ? attrib : base;
+}
+
+function attribSpec(attrib) {
+  if (ATTRIB_SPECS[attrib]) return ATTRIB_SPECS[attrib];
+  if (isArbitraryHeaderAttrib(attrib)) return ATTRIB_SPECS[ATTRIB_MAP.otherHeader];
+  return UNKNOWN_ATTRIB_SPEC;
+}
+
+function attribName(attrib) {
+  if (ATTRIB_NAMES[attrib]) return ATTRIB_NAMES[attrib];
+  if (isArbitraryHeaderAttrib(attrib)) return "otherHeader";
+  if (CUSTOM_SEARCH_ATTRIB !== undefined && attrib === CUSTOM_SEARCH_ATTRIB) return "custom";
+  return String(attrib);
+}
+
+function setSearchValue(value, attrib, raw) {
+  const spec = attribSpec(attrib);
+  // Union members can disappear across Thunderbird versions (label did in TB
+  // 115). The read path degrades via its catch; here a clear error beats an
+  // opaque XPCOM one.
+  if (!(spec.member in value)) {
+    throw new Error(`This Thunderbird's nsIMsgSearchValue has no "${spec.member}" member (needed for attribute "${spec.attrib}")`);
+  }
+  value[spec.member] = VALUE_CODECS[spec.codec].parse(raw, `Condition value for "${spec.attrib}"`, spec);
+}
+
+function getSearchValue(value, attrib) {
+  const spec = attribSpec(attrib);
+  try {
+    return VALUE_CODECS[spec.codec].format(value[spec.member]);
+  } catch {
+    // Union member not set as expected -- fall back to the string form.
+    try { return value.str || ""; } catch { return ""; }
+  }
+}
+
+// Copies one nsIMsgSearchValue into another through the member its attribute
+// owns. Reading .str from an AgeInDays value throws (tagged union), so a
+// copy that only knew .str and .date left every other typed condition at its
+// default: "age in days > 30" came back from updateFilter as "> 0".
+function copySearchValue(from, to, attrib) {
+  const { member } = attribSpec(attrib);
+  to[member] = from[member];
+}
+
+// Schema text generated from the resolved vocabulary, so the documented sets
+// are by construction the sets the tools accept on this Thunderbird.
+const FILTER_ATTRIB_DESCRIPTION = FILTER_VOCABULARY_AVAILABLE
+  ? `Attribute, one of: ${FILTER_ATTRIBUTES.map((a) => a.attrib).join(", ")}`
+  : `Attribute -- ${FILTER_VOCABULARY_UNAVAILABLE_NOTE}`;
+
+const FILTER_OP_DESCRIPTION = FILTER_VOCABULARY_AVAILABLE
+  ? `Operator, one of: ${Object.keys(OP_MAP).join(", ")}`
+  : `Operator -- ${FILTER_VOCABULARY_UNAVAILABLE_NOTE}`;
+
+const FILTER_VALUE_DESCRIPTION = (() => {
+  const byHint = new Map();
+  for (const attribute of FILTER_ATTRIBUTES) {
+    if (!byHint.has(attribute.hint)) byHint.set(attribute.hint, []);
+    byHint.get(attribute.hint).push(attribute.attrib);
+  }
+  const groups = [...byHint].map(([hint, names]) => `${names.join("/")}: ${hint}`);
+  return `Value to match against. ${groups.join("; ")}`;
+})();
+
+const FILTER_HEADER_DESCRIPTION = (() => {
+  const names = FILTER_ATTRIBUTES.filter((a) => a.needsHeader).map((a) => a.attrib);
+  if (names.length === 0) return "Not used by any available attribute";
+  return `Header name to match on. Required when attrib is ${names.join(" or ")}, rejected otherwise`;
+})();
+
+// ── Filter actions ──
+//
+// Same story as the attributes: the old ACTION_MAP invented an ordering and
+// numbered it 1..21. The real nsMsgFilterAction is neither contiguous (8 is a
+// hole since Label was dropped in TB 115) nor in that order, so only
+// moveToFolder(1) and addTag(17) were ever right -- markRead(5) actually meant
+// KillThread, copyToFolder(2) meant ChangePriority, junkScore(15) meant
+// FetchBodyFromPop3Server. Real values come from
+// nsMsgFilterCore.idl. Resolved by name from the running Thunderbird, with no
+// fallback ids for the same reason as the search attributes above.
+//
+// member/codec say where an action's value goes (nsIMsgRuleAction); actions
+// with neither take no value at all. nsIMsgRuleAction's typed members throw
+// unless the action's type owns them (SetPriority checks ChangePriority, and
+// so on), which is why the table, not a guess, decides what is written.
+const FILTER_ACTION_DEFS = [
+  { action: "moveToFolder", idl: "MoveToFolder", member: "targetFolderUri", codec: "folder" },
+  { action: "copyToFolder", idl: "CopyToFolder", member: "targetFolderUri", codec: "folder" },
+  { action: "changePriority", idl: "ChangePriority", member: "priority", codec: "priority" },
+  // nsMsgRuleAction::SetJunkScore rejects anything outside 0..100.
+  { action: "junkScore", idl: "JunkScore", member: "junkScore", codec: "integer", min: 0, max: 100, hint: "an integer from 0 (not junk) to 100 (junk)" },
+  { action: "addTag", idl: "AddTag", member: "strValue", codec: "text", hint: 'a tag key such as "$label1"' },
+  { action: "reply", idl: "Reply", member: "strValue", codec: "text", hint: "a reply template message URI" },
+  { action: "forward", idl: "Forward", member: "strValue", codec: "text", hint: "an email address" },
+  { action: "delete", idl: "Delete" },
+  { action: "markRead", idl: "MarkRead" },
+  { action: "markUnread", idl: "MarkUnread" },
+  { action: "markFlagged", idl: "MarkFlagged" },
+  { action: "killThread", idl: "KillThread" },
+  { action: "killSubthread", idl: "KillSubthread" },
+  { action: "watchThread", idl: "WatchThread" },
+  { action: "stopExecution", idl: "StopExecution" },
+  { action: "deleteFromServer", idl: "DeleteFromPop3Server" },
+  { action: "leaveOnServer", idl: "LeaveOnPop3Server" },
+  { action: "fetchBody", idl: "FetchBodyFromPop3Server" },
+  // Only in Thunderbird < 115; dropped automatically where it no longer exists.
+  { action: "label", idl: "Label", member: "label", codec: "integer", min: 0, max: 5, hint: "a label index 0-5" },
+];
+
+const FILTER_ACTIONS = FILTER_ACTION_DEFS
+  .map((def) => {
+    const resolved = resolveXpcomConstant("nsMsgFilterAction", def.idl);
+    if (resolved === undefined) return null; // not in this Thunderbird
+    return { ...def, value: resolved, hint: def.hint || (def.codec ? VALUE_CODECS[def.codec].hint : undefined) };
+  })
+  .filter(Boolean);
+
+const FILTER_ACTIONS_AVAILABLE = FILTER_ACTIONS.length > 0;
+
+const ACTION_MAP = Object.fromEntries(FILTER_ACTIONS.map((a) => [a.action, a.value]));
+const ACTION_SPECS = Object.fromEntries(FILTER_ACTIONS.map((a) => [a.value, a]));
+
+const FILTER_ACTION_TYPE_DESCRIPTION = FILTER_ACTIONS_AVAILABLE
+  ? `Action, one of: ${FILTER_ACTIONS.map((a) => a.action).join(", ")}`
+  : "Action -- unavailable: this Thunderbird did not expose nsMsgFilterAction";
+
+const FILTER_ACTION_VALUE_DESCRIPTION = (() => {
+  const byHint = new Map();
+  const valueless = [];
+  for (const spec of FILTER_ACTIONS) {
+    if (!spec.member) { valueless.push(spec.action); continue; }
+    if (!byHint.has(spec.hint)) byHint.set(spec.hint, []);
+    byHint.get(spec.hint).push(spec.action);
+  }
+  const groups = [...byHint].map(([hint, names]) => `${names.join("/")}: ${hint}`);
+  if (valueless.length) groups.push(`${valueless.join("/")}: no value`);
+  return `Action parameter, required for every action that takes one. ${groups.join("; ")}`;
+})();
+
+const CUSTOM_ONLY_NOTE = "needs a customId this API does not expose; listFilters reports existing ones and updateFilter keeps them";
+
+function buildTerms(filter, conditions) {
+  if (!FILTER_VOCABULARY_AVAILABLE) {
+    throw new Error(`Cannot build filter conditions -- ${FILTER_VOCABULARY_UNAVAILABLE_NOTE}`);
+  }
+  for (const cond of conditions) {
+    validateFilterText(cond.value, "Condition value");
+    validateFilterText(cond.header, "Custom header name");
+    // SECURITY: strict allow-list. The previous `?? parseInt(...)` fallback let
+    // callers pass raw nsMsgSearchAttrib enum values that aren't in
+    // ATTRIB_MAP, bypassing the intended named-action set.
+    if (cond.attrib === "custom") {
+      throw new Error(`Condition attrib "custom" cannot be created: a custom search term ${CUSTOM_ONLY_NOTE}`);
+    }
+    if (!Object.prototype.hasOwnProperty.call(ATTRIB_MAP, cond.attrib)) {
+      throw new Error(`Unknown attribute: ${cond.attrib}`);
+    }
+    const spec = ATTRIB_SPECS[ATTRIB_MAP[cond.attrib]];
+    if (!Object.prototype.hasOwnProperty.call(OP_MAP, cond.op)) {
+      throw new Error(`Unknown operator: ${cond.op}`);
+    }
+
+    const term = filter.createTerm();
+    term.attrib = spec.value;
+    term.op = OP_MAP[cond.op];
+
+    if (spec.needsHeader) {
+      if (!cond.header) {
+        throw new Error(`Condition with attrib "${spec.attrib}" requires a "header" name`);
+      }
+      term.attrib = arbitraryHeaderAttrib(cond.header);
+      term.arbitraryHeader = cond.header;
+    } else if (cond.header) {
+      throw new Error(`Condition "header" is not valid for attrib "${spec.attrib}"`);
+    }
+
+    const value = term.value;
+    value.attrib = term.attrib;
+    setSearchValue(value, term.attrib, cond.value);
+    term.value = value;
+
+    term.booleanAnd = cond.booleanAnd !== false;
+    filter.appendTerm(term);
+  }
+}
+
+// checkTargetFolder(uri) may return { error } to refuse a move/copy target.
+function buildActions(filter, actions, { checkTargetFolder } = {}) {
+  if (!FILTER_ACTIONS_AVAILABLE) {
+    throw new Error("Cannot build filter actions -- this Thunderbird did not expose nsMsgFilterAction");
+  }
+  for (const act of actions) {
+    validateFilterText(act.value, "Action value");
+    // SECURITY: strict allow-list. The previous `?? parseInt(...)`
+    // fallback accepted any numeric nsMsgFilterAction value, which
+    // would auto-expose new (or legacy) action types we never
+    // intended to surface -- including historic "run program" flavors.
+    if (act.type === "custom") {
+      throw new Error("Custom filter actions are unsupported");
+    }
+    if (!Object.prototype.hasOwnProperty.call(ACTION_MAP, act.type)) {
+      throw new Error(`Unknown action type: ${act.type}`);
+    }
+    const spec = ACTION_SPECS[ACTION_MAP[act.type]];
+    const raw = act.value;
+    const hasValue = raw != null && String(raw).trim() !== "";
+    if (!spec.member) {
+      if (hasValue) throw new Error(`Action "${act.type}" does not take a value`);
+    } else if (!hasValue) {
+      // Thunderbird happily saves "Move to folder" with no folder, which then
+      // does nothing when the filter runs.
+      throw new Error(`Action "${act.type}" requires a value: ${spec.hint}`);
+    }
+
+    const action = filter.createAction();
+    action.type = spec.value;
+    if (spec.member) {
+      if (!(spec.member in action)) {
+        throw new Error(`This Thunderbird's nsIMsgRuleAction has no "${spec.member}" member`);
+      }
+      const parsed = VALUE_CODECS[spec.codec].parse(raw, `Action value for "${act.type}"`, spec);
+      if (spec.codec === "folder" && checkTargetFolder) {
+        const targetCheck = checkTargetFolder(parsed);
+        if (targetCheck && targetCheck.error) {
+          throw new Error(`Filter target folder not accessible: ${parsed}`);
+        }
+      }
+      action[spec.member] = parsed;
+    }
+    filter.appendAction(action);
+  }
+}
+
+// ── Reading filters back ──
+
+function serializeSearchTerm(term) {
+  const t = {
+    attrib: attribName(term.attrib),
+    op: OP_NAMES[term.op] || String(term.op),
+    booleanAnd: term.booleanAnd,
+  };
+  try {
+    t.value = getSearchValue(term.value, term.attrib);
+  } catch { t.value = ""; }
+  if (term.arbitraryHeader) t.header = term.arbitraryHeader;
+  // Custom terms are identified by their customId, HdrProperty terms by the
+  // database property they read; without these the term is not reproducible.
+  try { if (term.customId) t.customId = term.customId; } catch { /* not readable on this build */ }
+  try { if (term.hdrProperty) t.hdrProperty = term.hdrProperty; } catch { /* not readable on this build */ }
+  return t;
+}
+
+function serializeRuleAction(action) {
+  const spec = ACTION_SPECS[action.type];
+  const isCustom = CUSTOM_ACTION !== undefined && action.type === CUSTOM_ACTION;
+  const act = { type: spec ? spec.action : (isCustom ? "custom" : String(action.type)) };
+  if (spec && spec.member) {
+    try {
+      act.value = VALUE_CODECS[spec.codec].format(action[spec.member]);
+    } catch {
+      // Member not applicable on this action -- report no value.
+    }
+  } else if (isCustom) {
+    try { if (action.strValue) act.value = action.strValue; } catch { /* report no value */ }
+  }
+  try { if (action.customId) act.customId = action.customId; } catch { /* not readable on this build */ }
+  return act;
+}
+
+// ── Copying filters ──
+//
+// nsIMsgFilter has no clearTerms/clearActions, so updateFilter replaces one
+// half of a filter by rebuilding it and copying the other half. Both copies
+// are exact: every property that nsMsgFilter writes to msgFilterRules.dat is
+// carried over, values through the member their type owns. Errors propagate
+// so the caller can abort instead of saving a filter with reset conditions
+// (the previous copy swallowed them and left "age in days > 30" at "> 0").
+// The typed copy follows #175 by @rdkr.
+
+function copySearchTerms(fromFilter, toFilter) {
+  let copied = 0;
+  for (const term of fromFilter.searchTerms) {
+    const newTerm = toFilter.createTerm();
+    newTerm.attrib = term.attrib;
+    newTerm.op = term.op;
+    newTerm.booleanAnd = term.booleanAnd;
+    newTerm.beginsGrouping = term.beginsGrouping;
+    newTerm.endsGrouping = term.endsGrouping;
+    newTerm.matchAll = term.matchAll;
+    if (term.arbitraryHeader) newTerm.arbitraryHeader = term.arbitraryHeader;
+    if (term.hdrProperty) newTerm.hdrProperty = term.hdrProperty;
+    if (term.customId) newTerm.customId = term.customId;
+    const value = newTerm.value;
+    value.attrib = term.attrib;
+    copySearchValue(term.value, value, term.attrib);
+    newTerm.value = value;
+    toFilter.appendTerm(newTerm);
+    copied++;
+  }
+  return copied;
+}
+
+function copyActions(fromFilter, toFilter) {
+  let copied = 0;
+  for (let i = 0; i < fromFilter.actionCount; i++) {
+    const action = fromFilter.getActionAt(i);
+    const newAction = toFilter.createAction();
+    newAction.type = action.type;
+    // targetFolderUri, priority and junkScore throw unless the type owns
+    // them, so only the member of this type is touched. strValue and
+    // customId are untyped and are what a Custom action consists of.
+    const spec = ACTION_SPECS[action.type];
+    if (spec && spec.member && spec.member !== "strValue") {
+      newAction[spec.member] = action[spec.member];
+    }
+    if (action.strValue) newAction.strValue = action.strValue;
+    if (action.customId) newAction.customId = action.customId;
+    toFilter.appendAction(newAction);
+    copied++;
+  }
+  return copied;
+}
+
+// Inspect native types, including actions copied from existing rules.
+function getFilterActionRestriction(filter, { allowSending = isFilterSendAllowed(), checkTargetFolder } = {}) {
+  const forward = resolveXpcomConstant("nsMsgFilterAction", "Forward");
+  const reply = resolveXpcomConstant("nsMsgFilterAction", "Reply");
+  if (forward === undefined || reply === undefined || CUSTOM_ACTION === undefined) {
+    throw new Error("Cannot validate filter actions: native action constants are unavailable");
+  }
+  let sending = false;
+  let inaccessibleDestination = false;
+  for (let i = 0; i < filter.actionCount; i++) {
+    const action = filter.getActionAt(i);
+    const type = action.type;
+    if (type === CUSTOM_ACTION) return "custom";
+    const spec = ACTION_SPECS[type];
+    if (!spec) throw new Error(`Unsupported filter action type: ${type}`);
+    if (type === forward || type === reply) sending = true;
+    if (spec.codec === "folder" && checkTargetFolder) {
+      try {
+        const targetCheck = checkTargetFolder(action[spec.member]);
+        if (!targetCheck?.folder || targetCheck.error) inaccessibleDestination = true;
+      } catch {
+        inaccessibleDestination = true;
+      }
+    }
+  }
+  if (inaccessibleDestination) return "inaccessible-destination";
+  return sending && !allowSending ? "sending" : null;
+}
+
+function validateFilterForWrite(filter, { onlyDisable = false, checkTargetFolder } = {}) {
+  if (typeof filter.filterName !== "string" || !filter.filterName.length) {
+    throw new Error("Filter name must be a non-empty string");
+  }
+  validateFilterText(filter.filterName, "Filter name");
+  validateFilterText(filter.filterDesc, "Filter description");
+  for (const term of filter.searchTerms) {
+    validateFilterText(term.value[attribSpec(term.attrib).member], "Condition value");
+    validateFilterText(term.arbitraryHeader, "Custom header name");
+    validateFilterText(term.hdrProperty, "Condition header property");
+    validateFilterText(term.customId, "Custom condition identifier");
+  }
+  for (let i = 0; i < filter.actionCount; i++) {
+    const action = filter.getActionAt(i);
+    const spec = ACTION_SPECS[action.type];
+    if (spec?.member) validateFilterText(action[spec.member], "Action value");
+    validateFilterText(action.strValue, "Action string value");
+    validateFilterText(action.customId, "Custom action identifier");
+  }
+  const restriction = getFilterActionRestriction(filter, {
+    checkTargetFolder: onlyDisable ? undefined : checkTargetFolder,
+  });
+  if (restriction === "custom") throw new Error("Custom filter actions are unsupported");
+  if (restriction === "inaccessible-destination") {
+    throw new Error("Filter target folder not accessible: a Move/Copy destination is missing or restricted");
+  }
+  if (restriction === "sending" && !onlyDisable) {
+    throw new Error(`Forward/Reply filter actions are disabled. Enable ${FILTER_SEND_OPTION} to allow them.`);
+  }
+}
+// END FILTER SEARCH TERM HELPERS
+
 var mcpServer = class extends ExtensionCommon.ExtensionAPI {
   getAPI(context) {
     const extensionRoot = context.extension.rootURI;
@@ -1753,40 +2475,46 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "createFilter",
         group: "filters", crud: "create",
         title: "Create Filter",
-        description: "Create a new mail filter rule on an account",
+        description: `Create and persist a mail filter. Forward/Reply actions require enabling ${FILTER_SEND_OPTION}, even for disabled rules. Custom actions are unsupported. Persisted text cannot contain control characters or backslashes.`,
         inputSchema: {
           type: "object",
           properties: {
             accountId: { type: "string", description: "Account ID" },
-            name: { type: "string", description: "Filter name" },
+            name: { type: "string", minLength: 1, description: "Filter name; control characters and backslashes are rejected" },
             enabled: { type: "boolean", description: "Whether filter is active (default: true)" },
-            type: { type: "number", description: "Filter type bitmask (default: 17 = inbox + manual). 1=inbox, 16=manual, 32=post-plugin, 64=post-outgoing" },
+            type: { type: "integer", minimum: 1, maximum: 0x7fffffff, description: "Non-zero signed 32-bit bitmask of known nsMsgFilterType flags available in this Thunderbird (default: 17 = inbox + manual). 1=inbox, 16=manual, 32=post-plugin, 64=post-outgoing, 128=archive, 256=periodic" },
             conditions: {
               type: "array",
+              minItems: 1,
               items: {
                 type: "object",
                 properties: {
-                  attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, body, date, priority, status, size, ageInDays, hasAttachment, junkStatus, tag, otherHeader" },
-                  op: { type: "string", description: "Operator: contains, doesntContain, is, isnt, isEmpty, beginsWith, endsWith, isGreaterThan, isLessThan, isBefore, isAfter, matches, doesntMatch" },
-                  value: { type: "string", description: "Value to match against" },
+                  attrib: { type: "string", description: FILTER_ATTRIB_DESCRIPTION },
+                  op: { type: "string", description: FILTER_OP_DESCRIPTION },
+                  value: { type: "string", description: FILTER_VALUE_DESCRIPTION },
                   booleanAnd: { type: "boolean", description: "true=AND with previous, false=OR (default: true)" },
-                  header: { type: "string", description: "Custom header name (only when attrib is otherHeader)" },
+                  header: { type: "string", description: FILTER_HEADER_DESCRIPTION },
                 },
+                required: ["attrib", "op"],
+                additionalProperties: false,
               },
               description: "Array of filter conditions",
             },
             actions: {
               type: "array",
+              minItems: 1,
               items: {
                 type: "object",
                 properties: {
-                  type: { type: "string", description: "Action: moveToFolder, copyToFolder, markRead, markUnread, markFlagged, addTag, changePriority, delete, stopExecution, forward, reply" },
-                  value: { type: "string", description: "Action parameter (folder URI for move/copy, tag name for addTag, priority for changePriority, email for forward)" },
+                  type: { type: "string", description: FILTER_ACTION_TYPE_DESCRIPTION },
+                  value: { type: "string", description: FILTER_ACTION_VALUE_DESCRIPTION },
                 },
+                required: ["type"],
+                additionalProperties: false,
               },
               description: "Array of actions to perform",
             },
-            insertAtIndex: { type: "number", description: "Position to insert (0 = top priority, default: end of list)" },
+            insertAtIndex: { type: "integer", description: "Position to insert (0 = top priority, default: end of list)" },
           },
           required: ["accountId", "name", "conditions", "actions"],
         },
@@ -1795,38 +2523,44 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "updateFilter",
         group: "filters", crud: "update",
         title: "Update Filter",
-        description: "Modify an existing filter's properties, conditions, or actions",
+        description: `Validate a complete replacement before updating a filter. A resulting Forward/Reply rule requires ${FILTER_SEND_OPTION}, and all Move/Copy destinations must be accessible, except when enabled:false is the only update field. Custom actions are unsupported. Persisted text cannot contain control characters or backslashes.`,
         inputSchema: {
           type: "object",
           properties: {
             accountId: { type: "string", description: "Account ID" },
-            filterIndex: { type: "number", description: "Filter index (from listFilters)" },
-            name: { type: "string", description: "New filter name (optional)" },
+            filterIndex: { type: "integer", description: "Filter index (from listFilters)" },
+            name: { type: "string", minLength: 1, description: "New filter name (optional); control characters and backslashes are rejected" },
             enabled: { type: "boolean", description: "Enable/disable (optional)" },
-            type: { type: "number", description: "New filter type bitmask (optional)" },
+            type: { type: "integer", minimum: 1, maximum: 0x7fffffff, description: "New non-zero signed 32-bit bitmask of known nsMsgFilterType flags available in this Thunderbird (optional)" },
             conditions: {
               type: "array",
+              minItems: 1,
               description: "Replace all conditions (optional, same format as createFilter)",
               items: {
                 type: "object",
                 properties: {
-                  attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, body, date, priority, status, size, ageInDays, hasAttachment, junkStatus, tag, otherHeader" },
-                  op: { type: "string", description: "Operator: contains, doesntContain, is, isnt, isEmpty, beginsWith, endsWith, isGreaterThan, isLessThan, isBefore, isAfter, matches, doesntMatch" },
-                  value: { type: "string", description: "Value to match against" },
+                  attrib: { type: "string", description: FILTER_ATTRIB_DESCRIPTION },
+                  op: { type: "string", description: FILTER_OP_DESCRIPTION },
+                  value: { type: "string", description: FILTER_VALUE_DESCRIPTION },
                   booleanAnd: { type: "boolean", description: "true=AND with previous, false=OR (default: true)" },
-                  header: { type: "string", description: "Custom header name (only when attrib is otherHeader)" },
+                  header: { type: "string", description: FILTER_HEADER_DESCRIPTION },
                 },
+                required: ["attrib", "op"],
+                additionalProperties: false,
               },
             },
             actions: {
               type: "array",
+              minItems: 1,
               description: "Replace all actions (optional, same format as createFilter)",
               items: {
                 type: "object",
                 properties: {
-                  type: { type: "string", description: "Action: moveToFolder, copyToFolder, markRead, markUnread, markFlagged, addTag, changePriority, delete, stopExecution, forward, reply" },
-                  value: { type: "string", description: "Action parameter (folder URI for move/copy, tag name for addTag, priority for changePriority, email for forward)" },
+                  type: { type: "string", description: FILTER_ACTION_TYPE_DESCRIPTION },
+                  value: { type: "string", description: FILTER_ACTION_VALUE_DESCRIPTION },
                 },
+                required: ["type"],
+                additionalProperties: false,
               },
             },
           },
@@ -1837,12 +2571,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "deleteFilter",
         group: "filters", crud: "delete",
         title: "Delete Filter",
-        description: "Delete a mail filter by index",
+        description: "Delete a mail filter by index, including sending or Custom rules regardless of the sending-action preference. Deleting a StopExecution rule can allow later existing rules to run; the preference does not govern Thunderbird's automatic execution.",
         inputSchema: {
           type: "object",
           properties: {
             accountId: { type: "string", description: "Account ID" },
-            filterIndex: { type: "number", description: "Filter index to delete (from listFilters)" },
+            filterIndex: { type: "integer", description: "Filter index to delete (from listFilters)" },
           },
           required: ["accountId", "filterIndex"],
         },
@@ -1851,13 +2585,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "reorderFilters",
         group: "filters", crud: "update",
         title: "Reorder Filters",
-        description: "Move a filter to a different position in the execution order",
+        description: "Move a filter to a different position in the execution order. Moving a StopExecution rule can change which existing rules run; the sending-action preference does not govern Thunderbird's automatic execution.",
         inputSchema: {
           type: "object",
           properties: {
             accountId: { type: "string", description: "Account ID" },
-            fromIndex: { type: "number", description: "Current filter index" },
-            toIndex: { type: "number", description: "Target index (0 = highest priority)" },
+            fromIndex: { type: "integer", description: "Current filter index" },
+            toIndex: { type: "integer", description: "Final target index (0 = highest priority)" },
           },
           required: ["accountId", "fromIndex", "toIndex"],
         },
@@ -1866,7 +2600,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "applyFilters",
         group: "filters", crud: "update",
         title: "Apply Filters",
-        description: "Manually run all enabled filters on a folder to organize existing messages",
+        description: `Start enabled Manual rules on a folder. Skip disabled, non-manual, unparseable rules, rules with inaccessible Move/Copy destinations and, unless ${FILTER_SEND_OPTION} is enabled, Forward/Reply rules. Eligible Custom actions are unsupported. Returns submittedFilters (count), submitted (names), and skipped (names/reasons); processing completes asynchronously.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -7593,38 +8327,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            // ── Filter constant maps ──
-
-            const ATTRIB_MAP = {
-              subject: 0, from: 1, body: 2, date: 3, priority: 4,
-              status: 5, to: 6, cc: 7, toOrCc: 8, allAddresses: 9,
-              ageInDays: 10, size: 11, tag: 12, hasAttachment: 13,
-              junkStatus: 14, junkPercent: 15, otherHeader: 16,
-            };
-            const ATTRIB_NAMES = Object.fromEntries(Object.entries(ATTRIB_MAP).map(([k, v]) => [v, k]));
-
-            const OP_MAP = {
-              contains: 0, doesntContain: 1, is: 2, isnt: 3, isEmpty: 4,
-              isBefore: 5, isAfter: 6, isHigherThan: 7, isLowerThan: 8,
-              beginsWith: 9, endsWith: 10,
-              soundsLike: 11, ldapDwim: 12,
-              isGreaterThan: 13, isLessThan: 14,
-              nameCompletion: 15, isInAB: 16, isntInAB: 17, isntEmpty: 18,
-              matches: 19, doesntMatch: 20,
-            };
-            const OP_NAMES = Object.fromEntries(Object.entries(OP_MAP).map(([k, v]) => [v, k]));
-
-            const ACTION_MAP = {
-              moveToFolder: 0x01, copyToFolder: 0x02, changePriority: 0x03,
-              delete: 0x04, markRead: 0x05, killThread: 0x06,
-              watchThread: 0x07, markFlagged: 0x08, label: 0x09,
-              reply: 0x0A, forward: 0x0B, stopExecution: 0x0C,
-              deleteFromServer: 0x0D, leaveOnServer: 0x0E, junkScore: 0x0F,
-              fetchBody: 0x10, addTag: 0x11, deleteBody: 0x12,
-              markUnread: 0x14, custom: 0x15,
-            };
-            const ACTION_NAMES = Object.fromEntries(Object.entries(ACTION_MAP).map(([k, v]) => [v, k]));
-
+            // BEGIN FILTER TOOL HANDLERS
             function getFilterListForAccount(accountId) {
               if (!isAccountAllowed(accountId)) {
                 return { error: `Account not accessible: ${accountId}` };
@@ -7643,24 +8346,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const terms = [];
               try {
                 for (const term of filter.searchTerms) {
-                  const t = {
-                    attrib: ATTRIB_NAMES[term.attrib] || String(term.attrib),
-                    op: OP_NAMES[term.op] || String(term.op),
-                    booleanAnd: term.booleanAnd,
-                  };
-                  try {
-                    if (term.attrib === 3 || term.attrib === 10) {
-                      // Date or AgeInDays: try date first, then str
-                      try {
-                        const d = term.value.date;
-                        t.value = d ? new Date(d / 1000).toISOString() : (term.value.str || "");
-                      } catch { t.value = term.value.str || ""; }
-                    } else {
-                      t.value = term.value.str || "";
-                    }
-                  } catch { t.value = ""; }
-                  if (term.arbitraryHeader) t.header = term.arbitraryHeader;
-                  terms.push(t);
+                  terms.push(serializeSearchTerm(term));
                 }
               } catch {
                 // searchTerms iteration may fail on some TB versions
@@ -7670,18 +8356,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const actions = [];
               for (let a = 0; a < filter.actionCount; a++) {
                 try {
-                  const action = filter.getActionAt(a);
-                  const act = { type: ACTION_NAMES[action.type] || String(action.type) };
-                  if (action.type === 0x01 || action.type === 0x02) {
-                    act.value = action.targetFolderUri || "";
-                  } else if (action.type === 0x03) {
-                    act.value = String(action.priority);
-                  } else if (action.type === 0x0F) {
-                    act.value = String(action.junkScore);
-                  } else {
-                    try { if (action.strValue) act.value = action.strValue; } catch {}
-                  }
-                  actions.push(act);
+                  actions.push(serializeRuleAction(filter.getActionAt(a)));
                 } catch {
                   // Skip unreadable actions
                 }
@@ -7696,64 +8371,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 terms,
                 actions,
               };
-            }
-
-            function buildTerms(filter, conditions) {
-              for (const cond of conditions) {
-                const term = filter.createTerm();
-                // SECURITY: strict allow-list. The previous `?? parseInt(...)`
-                // fallback let callers pass raw nsMsgSearchAttrib enum values that
-                // aren't in ATTRIB_MAP, bypassing the intended named-action set.
-                if (!Object.prototype.hasOwnProperty.call(ATTRIB_MAP, cond.attrib)) {
-                  throw new Error(`Unknown attribute: ${cond.attrib}`);
-                }
-                term.attrib = ATTRIB_MAP[cond.attrib];
-
-                if (!Object.prototype.hasOwnProperty.call(OP_MAP, cond.op)) {
-                  throw new Error(`Unknown operator: ${cond.op}`);
-                }
-                term.op = OP_MAP[cond.op];
-
-                const value = term.value;
-                value.attrib = term.attrib;
-                value.str = cond.value || "";
-                term.value = value;
-
-                term.booleanAnd = cond.booleanAnd !== false;
-                if (cond.header) term.arbitraryHeader = cond.header;
-                filter.appendTerm(term);
-              }
-            }
-
-            function buildActions(filter, actions) {
-              for (const act of actions) {
-                const action = filter.createAction();
-                // SECURITY: strict allow-list. The previous `?? parseInt(...)`
-                // fallback accepted any numeric nsMsgFilterAction value, which
-                // would auto-expose new (or legacy) action types we never
-                // intended to surface -- including historic "run program" flavors.
-                if (!Object.prototype.hasOwnProperty.call(ACTION_MAP, act.type)) {
-                  throw new Error(`Unknown action type: ${act.type}`);
-                }
-                const typeNum = ACTION_MAP[act.type];
-                action.type = typeNum;
-
-                if (act.value) {
-                  if (typeNum === 0x01 || typeNum === 0x02) {
-                    // Move/Copy to folder -- verify target is accessible
-                    const targetCheck = getAccessibleFolder(act.value);
-                    if (targetCheck.error) throw new Error(`Filter target folder not accessible: ${act.value}`);
-                    action.targetFolderUri = act.value;
-                  } else if (typeNum === 0x03) {
-                    action.priority = parseInt(act.value);
-                  } else if (typeNum === 0x0F) {
-                    action.junkScore = parseInt(act.value);
-                  } else {
-                    action.strValue = act.value;
-                  }
-                }
-                filter.appendAction(action);
-              }
             }
 
             // ── Filter tool handlers ──
@@ -7819,8 +8436,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   try { actions = JSON.parse(actions); } catch { /* leave as-is */ }
                 }
                 if (typeof enabled === "string") enabled = enabled === "true";
-                if (typeof type === "string") type = parseInt(type);
-                if (typeof insertAtIndex === "string") insertAtIndex = parseInt(insertAtIndex);
+                if (type !== undefined) type = parseFilterType(type);
+                if (insertAtIndex !== undefined) insertAtIndex = parseStrictInteger(insertAtIndex, "insertAtIndex", "a non-negative integer", { min: 0 });
 
                 if (!Array.isArray(conditions) || conditions.length === 0) {
                   return { error: "conditions must be a non-empty array" };
@@ -7828,6 +8445,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!Array.isArray(actions) || actions.length === 0) {
                   return { error: "actions must be a non-empty array" };
                 }
+                validateFilterText(name, "Filter name");
 
                 const fl = getFilterListForAccount(accountId);
                 if (fl.error) return fl;
@@ -7835,16 +8453,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const filter = filterList.createFilter(name);
                 filter.enabled = enabled !== false;
-                filter.filterType = (Number.isFinite(type) && type > 0) ? type : 17; // inbox + manual
+                filter.filterType = type ?? (Ci.nsMsgFilterType.InboxRule | Ci.nsMsgFilterType.Manual);
 
                 buildTerms(filter, conditions);
-                buildActions(filter, actions);
+                buildActions(filter, actions, { checkTargetFolder: getAccessibleFolder });
+                validateFilterForWrite(filter);
 
                 const idx = (insertAtIndex != null && insertAtIndex >= 0)
                   ? Math.min(insertAtIndex, filterList.filterCount)
                   : filterList.filterCount;
                 filterList.insertFilterAt(idx, filter);
-                filterList.saveToDefaultFile();
+                try {
+                  filterList.saveToDefaultFile();
+                } catch (e) {
+                  filterList.removeFilterAt(idx);
+                  throw e;
+                }
 
                 return {
                   success: true,
@@ -7860,10 +8484,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function updateFilter(accountId, filterIndex, name, enabled, type, conditions, actions) {
               try {
                 // Coerce from MCP client
-                if (typeof filterIndex === "string") filterIndex = parseInt(filterIndex);
-                if (!Number.isInteger(filterIndex)) return { error: "filterIndex must be an integer" };
+                filterIndex = parseStrictInteger(filterIndex, "filterIndex", "an integer");
                 if (typeof enabled === "string") enabled = enabled === "true";
-                if (typeof type === "string") type = parseInt(type);
+                if (type !== undefined) type = parseFilterType(type);
                 if (typeof conditions === "string") {
                   try { conditions = JSON.parse(conditions); } catch {
                     return { error: "conditions must be a valid JSON array" };
@@ -7874,6 +8497,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return { error: "actions must be a valid JSON array" };
                   }
                 }
+                if (conditions !== undefined && (!Array.isArray(conditions) || !conditions.length)) {
+                  return { error: "conditions must be a non-empty array" };
+                }
+                if (actions !== undefined && (!Array.isArray(actions) || !actions.length)) {
+                  return { error: "actions must be a non-empty array" };
+                }
+                validateFilterText(name, "Filter name");
 
                 const fl = getFilterListForAccount(accountId);
                 if (fl.error) return fl;
@@ -7885,85 +8515,43 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const filter = filterList.getFilterAt(filterIndex);
                 const changes = [];
-
-                if (name !== undefined) {
-                  filter.filterName = name;
-                  changes.push("name");
-                }
-                if (enabled !== undefined) {
-                  filter.enabled = enabled;
-                  changes.push("enabled");
-                }
-                if (type !== undefined) {
-                  filter.filterType = type;
-                  changes.push("type");
+                if (filter.unparseable) {
+                  return { error: "Cannot update an unparseable filter; repair it in Thunderbird or delete it" };
                 }
 
-                const replaceConditions = Array.isArray(conditions) && conditions.length > 0;
-                const replaceActions = Array.isArray(actions) && actions.length > 0;
+                // Validate a detached replacement even for metadata-only updates.
+                const candidate = filterList.createFilter(name !== undefined ? name : filter.filterName);
+                candidate.enabled = enabled !== undefined ? enabled : filter.enabled;
+                candidate.filterType = type !== undefined ? type : filter.filterType;
+                candidate.filterDesc = filter.filterDesc;
+                candidate.temporary = filter.temporary;
+                if (name !== undefined) changes.push("name");
+                if (enabled !== undefined) changes.push("enabled");
+                if (type !== undefined) changes.push("type");
 
-                if (replaceConditions || replaceActions) {
-                  // No clearTerms/clearActions API -- rebuild filter via remove+insert
-                  const newFilter = filterList.createFilter(filter.filterName);
-                  newFilter.enabled = filter.enabled;
-                  newFilter.filterType = filter.filterType;
-
-                  // Build or copy conditions
-                  if (replaceConditions) {
-                    buildTerms(newFilter, conditions);
-                    changes.push("conditions");
-                  } else {
-                    // Copy existing terms -- abort on failure to prevent data loss
-                    let termsCopied = 0;
-                    try {
-                      for (const term of filter.searchTerms) {
-                        const newTerm = newFilter.createTerm();
-                        newTerm.attrib = term.attrib;
-                        newTerm.op = term.op;
-                        const val = newTerm.value;
-                        val.attrib = term.attrib;
-                        try { val.str = term.value.str || ""; } catch {}
-                        try { if (term.attrib === 3) val.date = term.value.date; } catch {}
-                        newTerm.value = val;
-                        newTerm.booleanAnd = term.booleanAnd;
-                        try { newTerm.beginsGrouping = term.beginsGrouping; } catch {}
-                        try { newTerm.endsGrouping = term.endsGrouping; } catch {}
-                        try { if (term.arbitraryHeader) newTerm.arbitraryHeader = term.arbitraryHeader; } catch {}
-                        newFilter.appendTerm(newTerm);
-                        termsCopied++;
-                      }
-                    } catch (e) {
-                      return { error: `Failed to copy existing conditions: ${e.toString()}` };
-                    }
-                    if (termsCopied === 0) {
-                      return { error: "Cannot update: failed to read existing filter conditions" };
-                    }
-                  }
-
-                  // Build or copy actions
-                  if (replaceActions) {
-                    buildActions(newFilter, actions);
-                    changes.push("actions");
-                  } else {
-                    for (let a = 0; a < filter.actionCount; a++) {
-                      try {
-                        const origAction = filter.getActionAt(a);
-                        const newAction = newFilter.createAction();
-                        newAction.type = origAction.type;
-                        try { newAction.targetFolderUri = origAction.targetFolderUri; } catch {}
-                        try { newAction.priority = origAction.priority; } catch {}
-                        try { newAction.strValue = origAction.strValue; } catch {}
-                        try { newAction.junkScore = origAction.junkScore; } catch {}
-                        newFilter.appendAction(newAction);
-                      } catch {}
-                    }
-                  }
-
-                  filterList.removeFilterAt(filterIndex);
-                  filterList.insertFilterAt(filterIndex, newFilter);
+                if (conditions !== undefined) {
+                  buildTerms(candidate, conditions);
+                  changes.push("conditions");
+                } else if (copySearchTerms(filter, candidate) === 0) {
+                  return { error: "Cannot update: failed to read existing filter conditions" };
                 }
+                if (actions !== undefined) {
+                  buildActions(candidate, actions);
+                  changes.push("actions");
+                } else {
+                  copyActions(filter, candidate);
+                }
+                const onlyDisable = enabled === false && name === undefined && type === undefined
+                  && conditions === undefined && actions === undefined;
+                validateFilterForWrite(candidate, { onlyDisable, checkTargetFolder: getAccessibleFolder });
 
-                filterList.saveToDefaultFile();
+                filterList.setFilterAt(filterIndex, candidate);
+                try {
+                  filterList.saveToDefaultFile();
+                } catch (e) {
+                  filterList.setFilterAt(filterIndex, filter);
+                  throw e;
+                }
 
                 return {
                   success: true,
@@ -7991,7 +8579,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const filter = filterList.getFilterAt(filterIndex);
                 const filterName = filter.filterName;
                 filterList.removeFilterAt(filterIndex);
-                filterList.saveToDefaultFile();
+                try {
+                  filterList.saveToDefaultFile();
+                } catch (e) {
+                  filterList.insertFilterAt(filterIndex, filter);
+                  throw e;
+                }
 
                 return { success: true, deleted: filterName, remainingCount: filterList.filterCount };
               } catch (e) {
@@ -8018,12 +8611,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 // moveFilterAt is unreliable — use remove + insert instead
-                // Adjust toIndex after removal: if moving down, indices shift
+                // toIndex is the final position, including moves toward the end.
                 const filter = filterList.getFilterAt(fromIndex);
                 filterList.removeFilterAt(fromIndex);
-                const adjustedTo = (fromIndex < toIndex) ? toIndex - 1 : toIndex;
-                filterList.insertFilterAt(adjustedTo, filter);
-                filterList.saveToDefaultFile();
+                let inserted = false;
+                try {
+                  filterList.insertFilterAt(toIndex, filter);
+                  inserted = true;
+                  filterList.saveToDefaultFile();
+                } catch (e) {
+                  if (inserted) filterList.removeFilterAt(toIndex);
+                  filterList.insertFilterAt(fromIndex, filter);
+                  throw e;
+                }
 
                 return { success: true, name: filter.filterName, fromIndex, toIndex };
               } catch (e) {
@@ -8055,25 +8655,59 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!filterService) {
                   return { error: "Filter service not available in this Thunderbird version" };
                 }
-                filterService.applyFiltersToFolders(filterList, [folder], null);
+                const manualType = resolveXpcomConstant("nsMsgFilterType", "Manual");
+                if (manualType === undefined) return { error: "Manual filters are unavailable in this Thunderbird version" };
+                const allowSending = isFilterSendAllowed();
+                const temporaryList = filterService.getTempFilterList(folder);
+                const submitted = [];
+                const skipped = [];
+                for (let i = 0; i < filterList.filterCount; i++) {
+                  const filter = filterList.getFilterAt(i);
+                  let reason;
+                  if (!filter.enabled) reason = "disabled";
+                  else if (!(filter.filterType & manualType)) reason = "non-manual";
+                  else if (filter.unparseable) reason = "unparseable";
+                  else reason = getFilterActionRestriction(filter, { allowSending, checkTargetFolder: getAccessibleFolder });
+                  if (reason === "custom") {
+                    return { error: `Custom filter actions are unsupported (filter: ${filter.filterName})` };
+                  }
+                  if (reason) {
+                    skipped.push({ name: filter.filterName, reason });
+                    continue;
+                  }
+                  // The native folder executor runs every supplied rule. Copy
+                  // only eligible rules, leaving the persistent list untouched.
+                  const candidate = temporaryList.createFilter(filter.filterName);
+                  candidate.enabled = true;
+                  candidate.filterType = filter.filterType;
+                  candidate.temporary = true;
+                  copySearchTerms(filter, candidate);
+                  copyActions(filter, candidate);
+                  temporaryList.insertFilterAt(temporaryList.filterCount, candidate);
+                  submitted.push(filter.filterName);
+                }
+                if (submitted.length) {
+                  temporaryList.loggingEnabled = filterList.loggingEnabled;
+                  if (filterList.loggingEnabled) temporaryList.logStream = filterList.logStream;
+                  filterService.applyFiltersToFolders(temporaryList, [folder], null);
+                }
 
-                // applyFiltersToFolders is async — returns immediately
+                // Submission returns before Thunderbird finishes processing.
                 return {
                   success: true,
-                  message: "Filters applied (processing may take a moment)",
+                  message: submitted.length ? "Filter processing started" : "No eligible filters to run",
                   folder: folderPath,
-                  enabledFilters: (() => {
-                    let count = 0;
-                    for (let i = 0; i < filterList.filterCount; i++) {
-                      if (filterList.getFilterAt(i).enabled) count++;
-                    }
-                    return count;
-                  })(),
+                  submittedFilters: submitted.length,
+                  submitted,
+                  skipped,
+                  ...(skipped.some((filter) => filter.reason === "sending")
+                    ? { note: `Enable ${FILTER_SEND_OPTION} to include Forward/Reply rules.` } : {}),
                 };
               } catch (e) {
                 return { error: e.toString() };
               }
             }
+            // END FILTER TOOL HANDLERS
 
             /**
              * Validate tool arguments against the tool's inputSchema.
@@ -8875,6 +9509,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           Services.prefs.setBoolPref(PREF_BLOCK_SKIPREVIEW, blockSkipReview);
           return { success: true, blockSkipReview };
         },
+
+        // BEGIN FILTER SEND PREFERENCE METHODS
+        getAllowFilterSendActions: async function() {
+          return { allowFilterSendActions: isFilterSendAllowed() };
+        },
+
+        setAllowFilterSendActions: async function(allowFilterSendActions) {
+          if (typeof allowFilterSendActions !== "boolean") {
+            return { error: "allowFilterSendActions must be a boolean" };
+          }
+          Services.prefs.setBoolPref(PREF_ALLOW_FILTER_SEND_ACTIONS, allowFilterSendActions);
+          return { success: true, allowFilterSendActions };
+        },
+        // END FILTER SEND PREFERENCE METHODS
 
         getStableAuthToken: async function() {
           return { stableAuthToken: getStableAuthTokenPref() };

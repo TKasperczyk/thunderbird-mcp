@@ -515,11 +515,51 @@ saveSkipReviewBtn.addEventListener("click", async () => {
   saveSkipReviewBtn.disabled = false;
 });
 
+const allowFilterSendActionsCheckbox = document.getElementById("allowFilterSendActions");
+const saveFilterSendActionsBtn = document.getElementById("saveFilterSendActionsBtn");
+const saveFilterSendActionsStatus = document.getElementById("saveFilterSendActionsStatus");
+
+async function loadFilterSendActionsPref() {
+  allowFilterSendActionsCheckbox.checked = false;
+  allowFilterSendActionsCheckbox.disabled = true;
+  saveFilterSendActionsBtn.disabled = true;
+  try {
+    const { allowFilterSendActions } = await browser.mcpServer.getAllowFilterSendActions();
+    allowFilterSendActionsCheckbox.checked = allowFilterSendActions === true;
+    allowFilterSendActionsCheckbox.disabled = false;
+    saveFilterSendActionsBtn.disabled = false;
+    saveFilterSendActionsStatus.textContent = "";
+  } catch (e) {
+    saveFilterSendActionsStatus.textContent = "Error loading setting: " + e.message;
+    saveFilterSendActionsStatus.className = "save-status error";
+  }
+}
+
+saveFilterSendActionsBtn.addEventListener("click", async () => {
+  saveFilterSendActionsBtn.disabled = true;
+  saveFilterSendActionsStatus.textContent = "Saving...";
+  saveFilterSendActionsStatus.className = "save-status";
+  try {
+    const result = await browser.mcpServer.setAllowFilterSendActions(allowFilterSendActionsCheckbox.checked);
+    if (result.error) {
+      saveFilterSendActionsStatus.textContent = result.error;
+      saveFilterSendActionsStatus.className = "save-status error";
+    } else {
+      saveFilterSendActionsStatus.textContent = "Saved.";
+    }
+  } catch (e) {
+    saveFilterSendActionsStatus.textContent = "Error: " + e.message;
+    saveFilterSendActionsStatus.className = "save-status error";
+  }
+  saveFilterSendActionsBtn.disabled = false;
+});
+
 loadServerInfo().catch(e => console.error("thunderbird-mcp options:", "loadServerInfo failed:", e));
 loadAuthenticationConfig().catch(e => console.error("thunderbird-mcp options:", "loadAuthenticationConfig failed:", e));
 loadAccountAccess().catch(e => console.error("thunderbird-mcp options:", "loadAccountAccess failed:", e));
 loadToolAccess().catch(e => console.error("thunderbird-mcp options:", "loadToolAccess failed:", e));
 loadSkipReviewPref().catch(e => console.error("thunderbird-mcp options:", "loadSkipReviewPref failed:", e));
+loadFilterSendActionsPref().catch(e => console.error("thunderbird-mcp options:", "loadFilterSendActionsPref failed:", e));
 
 const listenAllCheckbox = document.getElementById("listenAll");
 const listenAllWarning = document.getElementById("listenAllWarning");

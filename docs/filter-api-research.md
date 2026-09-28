@@ -1,10 +1,39 @@
 # Thunderbird Mail Filters — API Research & Implementation Guide
 
-Research completed 2026-02-21. Everything needed to implement filter control via MCP tools.
+Initial research completed 2026-02-21. The current validation and execution rules below supplement the interface notes and historical sketches.
 
 ## TL;DR
 
 Thunderbird exposes full filter CRUD + execution via XPCOM interfaces. Our extension already uses an Experiment API with full XPCOM access — no new permissions needed. We can list, create, modify, delete, reorder, and manually apply filters.
+
+### Current tool behavior
+
+- **Forward/Reply require user opt-in.** `extensions.thunderbird-mcp.allowFilterSendActions`
+  defaults to `false` and fails closed if unreadable. The extension settings page exposes
+  it as **Allow automatic Forward/Reply filter actions** through
+  `getAllowFilterSendActions()` / `setAllowFilterSendActions(boolean)`, not MCP tools.
+  It is independent of `blockSkipReview`: native filter sends have no compose review
+  window. Turning it off does not change saved filters or Thunderbird's own automatic
+  filter execution.
+- **Check the resulting rule.** While the preference is off, create/update rejects a
+  candidate containing Forward or Reply, even if disabled or if the edit merely retains
+  an existing sending action. An update that only sets `enabled: false` can disable a
+  sending rule. Deleting a rule remains available under the existing account/tool permissions.
+- **Custom actions are unsupported.** They may be listed, but cannot be created, copied
+  by an update (including a disable-only update), or submitted for execution. Enabling
+  Forward/Reply does not enable Custom actions.
+- **Validate before replacing.** All updates, including metadata-only changes, build and
+  validate a complete candidate before replacing the existing rule with `setFilterAt`.
+  The description and temporary flag are preserved. Rejected validation leaves the
+  original rule unchanged. Unparseable rules cannot be updated; deletion remains available.
+  Filter names and condition/action strings that will be persisted reject U+0000–U+001F,
+  U+007F, and backslash; normal Unicode and quotes remain supported.
+- **Apply a selected temporary list.** `applyFilters` submits enabled rules with the
+  Manual flag, skipping disabled, non-manual, unparseable, and disallowed sending rules.
+  An otherwise eligible rule with a Custom action rejects the entire call before
+  submission. Results include `submittedFilters` (count), `submitted` (rule names), and
+  `skipped` (`{ name, reason }` entries). No candidates means no native apply call.
+  Submission starts asynchronous processing; it does not report completion.
 
 ---
 
@@ -162,6 +191,7 @@ Key methods:
 - `getFilterNamed(name)` → `nsIMsgFilter`
 - `createFilter(name)` → `nsIMsgFilter` — Creates a new empty filter (NOT yet in the list)
 - `insertFilterAt(index, filter)` — Insert into list at position
+- `setFilterAt(index, filter)` — Replace the filter at a position
 - `removeFilter(filter)` — Remove from list
 - `removeFilterAt(index)` — Remove by index
 - `moveFilterAt(sourceIndex, destIndex)` — Reorder
@@ -225,6 +255,7 @@ Key properties:
 - `priority` — Priority value when action is "set priority"
 - `targetFolderUri` — Destination folder when action is move/copy
 - `junkScore` — Junk score value
+- `label` — Legacy numeric label value for a Label action
 - `customId` — ID of custom action
 - `customAction` — `nsIMsgFilterCustomAction` reference
 
@@ -251,27 +282,20 @@ nsMsgFilterType.Periodic           = 0x100   // Periodic execution
 
 Common combination: type `17` = InboxRule (0x1) + Manual (0x10)
 
+`nsMsgFilterTypeType` is a signed 32-bit `long`. Explicit `type` values in
+`createFilter` and `updateFilter` must be positive integers at most 2147483647,
+using only the known flags resolved by name from the running Thunderbird's `Ci`.
+The native range is checked before bitmask operations or native assignments, so
+overflow cannot silently become a different type. The allowed mask includes
+PostPlugin, PostOutgoing, Archive and Periodic; `nsMsgFilterType.All` omits them.
+
 ### Search Attributes (nsMsgSearchAttrib)
 
-```
-Subject        = 0     // Message subject
-Sender         = 1     // From header
-Body           = 2     // Message body
-Date           = 3     // Date header
-Priority       = 4     // Priority
-MsgStatus      = 5     // Read/replied/forwarded status
-To             = 6     // To header
-CC             = 7     // CC header
-ToOrCC         = 8     // To or CC
-AllAddresses   = 9     // From, To, CC, BCC
-AgeInDays      = 10    // Message age
-Size           = 11    // Message size
-Keywords       = 12    // Tags/keywords
-HasAttachment  = 13    // Has attachments
-JunkStatus     = 14    // Junk classification
-JunkPercent    = 15    // Junk probability
-OtherHeader    = 16    // Arbitrary header (uses arbitraryHeader property)
-```
+Resolve attributes by their native names, such as `Ci.nsMsgSearchAttrib.Sender`,
+`Ci.nsMsgSearchAttrib.AgeInDays`, and `Ci.nsMsgSearchAttrib.Keywords`. The values are
+not a contiguous sequence. `FILTER_ATTRIBUTE_DEFS` maps tool names to these native
+names and their value codecs; `FILTER_ATTRIBUTES` contains the constants available in
+the running Thunderbird. See the attribute and union-accessor reference in Section 6.
 
 ### Search Operators (nsMsgSearchOp)
 
@@ -295,34 +319,19 @@ NameCompletion = 15    // LDAP name completion
 IsInAB         = 16    // Is in address book
 IsntInAB       = 17    // Not in address book
 IsntEmpty      = 18
-Matches        = 19    // Regex match
-DoesntMatch    = 20    // Regex no match
+Matches        = 19    // Generic match for custom terms
+DoesntMatch    = 20    // Generic non-match for custom terms
 ```
 
 ### Filter Actions (nsMsgFilterAction)
 
-```
-MoveToFolder       = 0x01
-CopyToFolder       = 0x02
-ChangePriority     = 0x03
-Delete             = 0x04
-MarkRead           = 0x05
-KillThread         = 0x06
-WatchThread        = 0x07
-MarkFlagged        = 0x08
-Label              = 0x09    // Deprecated, use AddTag
-Reply              = 0x0A
-Forward            = 0x0B
-StopExecution      = 0x0C    // Stop processing more filters
-DeleteFromServer   = 0x0D    // POP3: don't download
-LeaveOnServer      = 0x0E    // POP3: leave on server
-JunkScore          = 0x0F
-FetchBodyFromServer = 0x10   // IMAP: fetch full body
-AddTag             = 0x11    // Add a tag/keyword
-DeleteBody         = 0x12
-MarkUnread         = 0x14
-Custom             = 0x15    // Custom action via nsIMsgFilterCustomAction
-```
+Resolve action IDs by native name, such as `Ci.nsMsgFilterAction.MoveToFolder`,
+`Ci.nsMsgFilterAction.CopyToFolder`, `Ci.nsMsgFilterAction.Forward`, and
+`Ci.nsMsgFilterAction.Reply`. Do not infer their values from list order or maintain a
+separate numeric map. `FILTER_ACTION_DEFS` supplies tool/native names and typed value
+members; `FILTER_ACTIONS` resolves the available constants. The Action Value Setting
+reference in Section 6 describes the correct accessors, including legacy `action.label`.
+Custom actions are unsupported, and Forward/Reply use the separate opt-in described above.
 
 ---
 
@@ -350,7 +359,12 @@ condition="AND (from,is,boss@company.com)"
 
 ---
 
-## 5. Proposed MCP Tools
+## 5. MCP Tools
+
+The early schema and listing sketches in this section illustrate the interface shapes.
+Production uses the runtime constant tables and validation rules described above and in
+Section 6; numeric fallback parsing and direct use of an unfiltered stored list are not
+supported tool paths.
 
 ### 5.1 listFilters
 
@@ -440,12 +454,10 @@ function listFilters(accountId) {
 }
 ```
 
-**Important**: Map numeric attrib/op/action constants to human-readable names in output. Create lookup objects like:
-```js
-const ATTRIB_NAMES = { 0: "subject", 1: "from", 2: "body", 3: "date", ... };
-const OP_NAMES = { 0: "contains", 1: "doesntContain", 2: "is", 3: "isnt", ... };
-const ACTION_NAMES = { 1: "moveToFolder", 2: "copyToFolder", 5: "markRead", 8: "markFlagged", 0x11: "addTag", ... };
-```
+**Important**: Map numeric attribute/operator/action IDs to human-readable names using
+the production `ATTRIB_NAMES`, `OP_NAMES`, and `ACTION_NAMES` tables, which are generated
+from named native constants. Values must be read through their typed accessors; the
+historical listing sketch above omits that dispatch. Do not recreate numeric maps.
 
 ### 5.2 createFilter
 
@@ -462,13 +474,13 @@ const ACTION_NAMES = { 1: "moveToFolder", 2: "copyToFolder", 5: "markRead", 8: "
       accountId: { type: "string", description: "Account ID" },
       name: { type: "string", description: "Filter name" },
       enabled: { type: "boolean", description: "Whether filter is active (default: true)" },
-      type: { type: "number", description: "Filter type bitmask (default: 17 = inbox + manual). 1=inbox, 16=manual, 32=post-plugin, 64=post-outgoing" },
+      type: { type: "integer", description: "Filter type bitmask (default: 17 = inbox + manual). 1=inbox, 16=manual, 32=post-plugin, 64=post-outgoing" },
       conditions: {
         type: "array",
         items: {
           type: "object",
           properties: {
-            attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, body, date, priority, status, size, ageInDays, hasAttachment, junkStatus, tag, otherHeader" },
+            attrib: { type: "string", description: "Attribute: subject, from, to, cc, toOrCc, allAddresses, body, date, priority, status, size, ageInDays, hasAttachment, junkStatus, junkPercent, tag, otherHeader" },
             op: { type: "string", description: "Operator: contains, doesntContain, is, isnt, isEmpty, beginsWith, endsWith, isGreaterThan, isLessThan, isBefore, isAfter" },
             value: { type: "string", description: "Value to match against" },
             booleanAnd: { type: "boolean", description: "true=AND with previous, false=OR (default: true)" },
@@ -490,99 +502,18 @@ const ACTION_NAMES = { 1: "moveToFolder", 2: "copyToFolder", 5: "markRead", 8: "
         },
         description: "Array of actions to perform"
       },
-      insertAtIndex: { type: "number", description: "Position to insert (0 = top priority, default: end of list)" },
+      insertAtIndex: { type: "integer", description: "Position to insert (0 = top priority, default: end of list)" },
     },
     required: ["accountId", "name", "conditions", "actions"]
   }
 }
 ```
 
-**Implementation sketch**:
-```js
-function createFilter(accountId, name, enabled, type, conditions, actions, insertAtIndex) {
-  const account = MailServices.accounts.getAccount(accountId);
-  if (!account) return { error: "Account not found" };
-  const server = account.incomingServer;
-  if (!server.canHaveFilters) return { error: "Account does not support filters" };
-
-  const filterList = server.getFilterList(null);
-  const filter = filterList.createFilter(name);
-
-  filter.enabled = enabled !== false;
-  filter.filterType = type || 17; // inbox + manual
-
-  // Map string attribute names → numeric constants
-  const ATTRIB_MAP = {
-    subject: 0, from: 1, body: 2, date: 3, priority: 4,
-    status: 5, to: 6, cc: 7, toOrCc: 8, allAddresses: 9,
-    ageInDays: 10, size: 11, tag: 12, hasAttachment: 13,
-    junkStatus: 14, junkPercent: 15, otherHeader: 16,
-  };
-  const OP_MAP = {
-    contains: 0, doesntContain: 1, is: 2, isnt: 3, isEmpty: 4,
-    isBefore: 5, isAfter: 6, isHigherThan: 7, isLowerThan: 8,
-    beginsWith: 9, endsWith: 10,
-    soundsLike: 11, ldapDwim: 12,
-    isGreaterThan: 13, isLessThan: 14,
-    nameCompletion: 15, isInAB: 16, isntInAB: 17, isntEmpty: 18,
-    matches: 19, doesntMatch: 20,
-  };
-
-  for (const cond of conditions) {
-    const term = filter.createTerm();
-    term.attrib = ATTRIB_MAP[cond.attrib] ?? parseInt(cond.attrib);
-    term.op = OP_MAP[cond.op] ?? parseInt(cond.op);
-    // Setting value depends on type — for string attributes:
-    const value = term.value;
-    value.attrib = term.attrib;
-    value.str = cond.value;
-    term.value = value;
-    term.booleanAnd = cond.booleanAnd !== false;
-    if (cond.header) term.arbitraryHeader = cond.header;
-    filter.appendTerm(term);
-  }
-
-  const ACTION_MAP = {
-    moveToFolder: 0x01, copyToFolder: 0x02, changePriority: 0x03,
-    delete: 0x04, markRead: 0x05, killThread: 0x06,
-    watchThread: 0x07, markFlagged: 0x08, reply: 0x0A,
-    forward: 0x0B, stopExecution: 0x0C, deleteFromServer: 0x0D,
-    leaveOnServer: 0x0E, junkScore: 0x0F, addTag: 0x11,
-    markUnread: 0x14, custom: 0x15,
-  };
-
-  for (const act of actions) {
-    const action = filter.createAction();
-    action.type = ACTION_MAP[act.type] ?? parseInt(act.type);
-    if (act.value) {
-      if (action.type === 0x01 || action.type === 0x02) {
-        action.targetFolderUri = act.value;
-      } else if (action.type === 0x03) {
-        action.priority = parseInt(act.value);
-      } else {
-        // For addTag, forward, etc. — check what property to set
-        // addTag uses strValue, forward/reply use strValue as email address
-        action.strValue = act.value;
-      }
-    }
-    filter.appendAction(action);
-  }
-
-  // Insert at position or append
-  const idx = (insertAtIndex != null && insertAtIndex >= 0)
-    ? Math.min(insertAtIndex, filterList.filterCount)
-    : filterList.filterCount;
-  filterList.insertFilterAt(idx, filter);
-  filterList.saveToDefaultFile();
-
-  return {
-    created: true,
-    name: filter.filterName,
-    index: idx,
-    filterCount: filterList.filterCount,
-  };
-}
-```
+**Implementation behavior:** resolve the account through the access checks, validate the
+name, and build the conditions and actions on a candidate filter with the runtime
+allowlists and typed value codecs. Validate the complete candidate, including the
+Forward/Reply permission and persisted text, before inserting it into the list and
+saving. Custom actions and numeric action/attribute/operator fallbacks are unsupported.
 
 ### 5.3 updateFilter
 
@@ -597,7 +528,7 @@ function createFilter(accountId, name, enabled, type, conditions, actions, inser
     type: "object",
     properties: {
       accountId: { type: "string", description: "Account ID" },
-      filterIndex: { type: "number", description: "Filter index (from listFilters)" },
+      filterIndex: { type: "integer", description: "Filter index (from listFilters)" },
       name: { type: "string", description: "New filter name (optional)" },
       enabled: { type: "boolean", description: "Enable/disable (optional)" },
       conditions: { type: "array", description: "Replace conditions (optional, same format as createFilter)" },
@@ -607,6 +538,27 @@ function createFilter(accountId, name, enabled, type, conditions, actions, inser
   }
 }
 ```
+
+**Implementation note — rebuilding.** All updates, including edits to name, enabled
+state, or type alone, create a complete candidate before changing the stored list.
+They preserve `filterDesc` and `temporary`, copy any omitted conditions/actions, and
+validate the result before replacing the original with `filterList.setFilterAt`.
+If saving throws, the original filter is restored in the in-memory list. An unparseable
+rule is rejected before candidate construction; it may still be deleted.
+The copy (`copySearchTerms` /
+`copyActions` in `api.js`) preserves the supported properties `nsMsgFilter` writes to
+`msgFilterRules.dat` — `attrib`, `op`, `booleanAnd`, `beginsGrouping`,
+`endsGrouping`, `matchAll`, `arbitraryHeader`, `hdrProperty`, `customId` and the value
+through the union member its attribute owns (see Section 6); actions copy `type`, the typed
+member of that type and supported string data. Custom actions are rejected, and persisted
+text is validated even when it came from the old rule. Failures propagate and abort the
+update without changing the original. Move/Copy destinations in the resulting rule,
+including retained actions, are checked with `getAccessibleFolder` against current account
+restrictions. An update that only sets `enabled: false` bypasses this destination check;
+deletion remains available too. An earlier copy read `.str` for everything and swallowed the resulting
+`NS_ERROR_ILLEGAL_VALUE`, which silently reset priority, status, age, size, junk status and
+junk percent conditions to 0 on every `updateFilter` — changing only the action of an
+"age in days > 30" rule left "age in days > 0". The typed copy follows #175 (@rdkr).
 
 ### 5.4 deleteFilter
 
@@ -621,7 +573,7 @@ function createFilter(accountId, name, enabled, type, conditions, actions, inser
     type: "object",
     properties: {
       accountId: { type: "string", description: "Account ID" },
-      filterIndex: { type: "number", description: "Filter index to delete (from listFilters)" },
+      filterIndex: { type: "integer", description: "Filter index to delete (from listFilters)" },
     },
     required: ["accountId", "filterIndex"]
   }
@@ -657,8 +609,8 @@ function deleteFilter(accountId, filterIndex) {
     type: "object",
     properties: {
       accountId: { type: "string", description: "Account ID" },
-      fromIndex: { type: "number", description: "Current filter index" },
-      toIndex: { type: "number", description: "Target index (0 = highest priority)" },
+      fromIndex: { type: "integer", description: "Current filter index" },
+      toIndex: { type: "integer", description: "Final target index (0 = highest priority)" },
     },
     required: ["accountId", "fromIndex", "toIndex"]
   }
@@ -678,13 +630,13 @@ function reorderFilters(accountId, fromIndex, toIndex) {
 
 ### 5.6 applyFilters
 
-**Purpose**: Manually run filters on a folder. This is the killer feature — an AI agent can organize mail on demand.
+**Purpose**: Start eligible enabled Manual filters on a folder.
 
 ```js
 {
   name: "applyFilters",
   title: "Apply Filters",
-  description: "Manually run all enabled filters on a folder to organize existing messages",
+  description: "Start eligible enabled Manual filters and report submitted and skipped rules",
   inputSchema: {
     type: "object",
     properties: {
@@ -696,25 +648,24 @@ function reorderFilters(accountId, fromIndex, toIndex) {
 }
 ```
 
-**Implementation sketch**:
-```js
-function applyFilters(accountId, folderPath) {
-  const account = MailServices.accounts.getAccount(accountId);
-  const server = account.incomingServer;
-  const filterList = server.getFilterList(null);
-  const folder = MailServices.folderLookup.getFolderForURL(folderPath);
-  if (!folder) return { error: "Folder not found" };
+**Implementation behavior:** check account/folder access, then select enabled, parseable
+rules with the Manual flag. Check each rule's Move/Copy destinations with
+`getAccessibleFolder` and skip the whole rule if any destination is missing, restricted,
+or cannot be resolved. Skip Forward/Reply rules while the preference is off. An
+otherwise eligible Custom action rejects the operation before any submission. Put the
+eligible rules into `getTempFilterList(folder)` and call
+`applyFiltersToFolders(tempList, [folder], null)` only when the list is nonempty. The
+persisted list is not handed to the execution service or modified for selection.
 
-  // Method signature: applyFiltersToFolders(filterList, folders, msgWindow)
-  const filterService = Cc["@mozilla.org/messenger/filter-service;1"]
-    .getService(Ci.nsIMsgFilterService);
-  filterService.applyFiltersToFolders(filterList, [folder], null);
+The result reports `submittedFilters` (number), `submitted` (names), and `skipped`
+(`{ name, reason }` entries, with reasons `disabled`, `non-manual`, `sending`,
+`inaccessible-destination`, or `unparseable`). These describe selection and submission, not completed processing or a
+count of messages changed. No eligible rules means no native apply call.
 
-  return { applied: true, folder: folderPath, filterCount: filterList.filterCount };
-}
-```
-
-**Note**: `applyFiltersToFolders` may be asynchronous in practice — the function returns immediately but processing continues. We may need to investigate whether there's a completion callback or listener to await.
+The sending-action preference governs rules MCP creates, modifies, or runs manually.
+It does not govern Thunderbird's automatic execution of saved rules. Reordering or
+deleting a rule containing `StopExecution` can change which later existing rules run,
+including rules that Forward or Reply.
 
 ---
 
@@ -729,27 +680,157 @@ function applyFilters(accountId, folderPath) {
 - `server.getEditableFilterList(null)` — may differ from `getFilterList` in some contexts, but usually the same for local/IMAP accounts
 - `server.canHaveFilters` — check this before attempting filter operations (news servers may not support filters)
 
+### Search Term Attribute Values
+
+`nsMsgSearchAttrib` (`mailnews/search/public/nsMsgSearchCore.idl`) is **not contiguous**
+past `AllAddresses = 9` — indices 10/11/13 are `Location`/`MessageKey`/`FolderInfo`, the
+LDAP address-book attributes occupy 17–33, and the junk/attachment/header attributes sit
+in the 44–52 range:
+
+| Name | Value | | Name | Value |
+|---|---|---|---|---|
+| `Subject` | 0 | | `AgeInDays` | 12 |
+| `Sender` | 1 | | `FolderInfo` | 13 |
+| `Body` | 2 | | `Size` | 14 |
+| `Date` | 3 | | `AnyText` | 15 |
+| `Priority` | 4 | | `Keywords` (tags) | 16 |
+| `MsgStatus` | 5 | | `HasAttachmentStatus` | 44 |
+| `To` | 6 | | `JunkStatus` | 45 |
+| `CC` | 7 | | `JunkPercent` | 46 |
+| `ToOrCC` | 8 | | `JunkScoreOrigin` | 47 |
+| `AllAddresses` | 9 | | `HdrProperty` | 49 |
+| `Location` | 10 | | `FolderFlag` | 50 |
+| `MessageKey` | 11 | | `Uint32HdrProperty` | 51 |
+| | | | `OtherHeader` | 52 |
+
+Guessing these numbers is how `ageInDays` ended up pointing at `Location` and `tag` at
+`AgeInDays`. Read them from `Ci.nsMsgSearchAttrib.<Name>` at runtime instead.
+
+Tag conditions have no attribute of their own — Thunderbird stores tags as keywords, so a
+tag condition is `Keywords` with the tag key (e.g. `"$label1"`) in `value.str`.
+
 ### Search Term Value Setting
 - The `value` property on `nsIMsgSearchTerm` is an `nsIMsgSearchValue` object
 - You must set `value.attrib` to match the term's attrib before setting the value content
-- For string attributes: `value.str = "something"`
-- For date attributes: `value.date` (PRTime, microseconds since epoch)
-- For priority: `value.priority` (numeric constant)
-- For status: `value.status` (bitmask)
-- For junk: `value.junkStatus` / `value.junkPercent`
+- `nsIMsgSearchValue` is a **tagged union**: using an accessor that doesn't match the
+  attribute's type throws
+  `Component returned failure code: 0x80070057 (NS_ERROR_ILLEGAL_VALUE) [nsIMsgSearchValue.str]`
+
+The authoritative dispatch is Thunderbird's own, in
+`chrome/messenger/content/messenger/searchWidgets.js` (`save()` / `updateDisplay()`):
+
+| Attribute | Accessor | Notes |
+|---|---|---|
+| `Priority` | `value.priority` | numeric constant |
+| `MsgStatus` | `value.status` | `nsMsgMessageFlags` bitmask |
+| `Date` | `value.date` | PRTime — **microseconds** since epoch |
+| `AgeInDays` | `value.age` | integer days |
+| `Size` | `value.size` | integer KB |
+| `JunkStatus` | `value.junkStatus` | `nsMsgJunkStatus`: 0 unclassified, 1 good, 2 junk |
+| `JunkPercent` | `value.junkPercent` | 0–100 |
+| `HasAttachmentStatus` | `value.status` | always `nsMsgMessageFlags.Attachment`; `is`/`isnt` carries has/hasn't. A caller-supplied value is ignored by Thunderbird (`is` + `"false"` persists as `is,true`), so the tools refuse one |
+| `FolderFlag` | `value.status` | copied from existing terms only; not advertised for creation |
+| `Uint32HdrProperty` | `value.status` | copied from existing terms only, with `term.hdrProperty`; not advertised for creation |
+| legacy `Label` | `value.label` | copied from existing terms only on versions that expose it; not advertised for creation |
+| `Custom` (-2) | `value.str` | plus `term.customId`, the add-on's term id, which is what the `.dat` file names the term by. Read and copied, never created here |
+| everything else | `value.str` | including `Keywords`/tags, `JunkScoreOrigin` and `OtherHeader`. This is also the union member for every attribute not in `IS_STRING_ATTRIBUTE`'s exclusion list (`nsMsgSearchCore.idl`) |
+
+- `OtherHeader` additionally needs the header name in `term.arbitraryHeader`, otherwise the
+  term never matches. `HdrProperty`/`Uint32HdrProperty` terms name their property in
+  `term.hdrProperty`.
+- **Dates are local days.** `nsMsgSearchTerm` writes `Date` values with
+  `PR_LocalTimeParameters` as `%d-%b-%Y` and reads them back as local midnight, so the day is
+  all that survives a restart. A date-only tool value (`YYYY-MM-DD`) is therefore parsed as a
+  *local* calendar day — `Date.parse` would take it as UTC midnight, which is the previous day
+  anywhere west of UTC (`"2026-01-01"` in America/Toronto was saved as `31-Dec-2025`; fix from
+  #175, @ncrosty58). Date-times keep their instant. Bare numbers are refused: `"2026"` used to
+  be taken as epoch milliseconds and saved as `01-Jan-1970`. Read-back reports a local-midnight
+  value as `YYYY-MM-DD`, anything else as an ISO-8601 instant.
+- **Integers are strict and bounded.** Values are matched with `/^-?\d+$/` (no `parseInt`,
+  which took `"30abc"` as 30 and `"1.5"` as 1). The
+  [search-value IDL](https://searchfox.org/comm-central/source/mailnews/search/public/nsIMsgSearchValue.idl)
+  defines `size` and `status` as unsigned 32-bit values and `age` as signed 32-bit.
+  The tools accept `size` from 0 to 4294967295 KB, `age` from 0 to 2147483647 days, and
+  `status` from 1 to 4294967295, rejecting overflow before assigning native fields.
+  Narrower semantic limits still apply: `junkPercent` is 0–100, `junkStatus` 0–2 (or
+  `junk`/`good`/`unclassified`), `priority` is `nsMsgPriority.lowest`..`highest` (2–6) and
+  `status` is a non-zero `nsMsgMessageFlags` bitmask. Priority is signed 32-bit;
+  junk status/percent and the copied-only folder flags, uint32 header properties and
+  legacy Label values are unsigned 32-bit. Dates use signed 64-bit PRTime; parsed
+  JavaScript dates in microseconds fit that native range. The schema hints spell the values out
+  (`4=normal`, `2=replied`, `(KB)`), with the numbers resolved from `Ci.nsMsgPriority` and
+  `Ci.nsMsgMessageFlags` by name — the same way the attribute ids are.
+
+The implementation reads the whole vocabulary from the running Thunderbird instead of
+hardcoding it: attribute ids are resolved by name from `Ci.nsMsgSearchAttrib` (**not** by
+enumerating it — `Object.keys` on an interface object returns nothing in the extension
+experiment context, even though Gecko's `IID_NewEnumerate` implements it), operator ids
+likewise from `Ci.nsMsgSearchOp` (the IDL constant names map to our operator names by
+lowering the first letter — all 21 match), and the
+`createFilter`/`updateFilter` schema text for attrib, op, value and header is generated
+from what that enumeration yields on each `tools/list`. An attribute the running version
+does not define is simply not offered.
+
+The attribute metadata in `FILTER_ATTRIBUTE_DEFS` in `api.js` records each API
+name, the IDL constant to resolve against, and the `nsIMsgSearchValue` member/codec — the
+value typing above has no queryable API and exists only in C++ and in Thunderbird's own
+hardcoded UI dispatch, so it cannot be derived at runtime. There are deliberately **no
+fallback ids**: `Ci` is guaranteed (api.js dereferences it at module load and would not
+load without it), so the only way name resolution fails is the search interface being
+absent or renamed — the same situation in which `nsIMsgSearchTerm`, `nsIMsgSearchValue`
+and the filter list are gone and no filter tool can work regardless. Thunderbird's own
+filter UI takes the same position: `searchWidgets.js`, `searchTerm.js` and
+`FilterEditor.js` dereference these constants 49 times between them without a single
+guard. When the interface is missing, the generated descriptions say so and the tools
+refuse with a message naming the cause.
+
+### Version compatibility (verified TB 102 → 154-beta, Aug 2026)
+
+Checked by diffing `mailnews/search/public/*.idl` across comm-esr102/115/128/140,
+comm-beta and comm-central, plus the commit history of the C++ implementations:
+
+- `nsMsgSearchOp`: byte-identical across the entire range. No compatibility concern.
+- `nsMsgSearchAttrib`: exactly one change in four years — `Label = 48` was removed in
+  TB 115 (Bug 1802815). The runtime enumeration handles this class of change by
+  construction: a constant the running version lacks is simply not offered.
+- `nsIMsgSearchValue`: the `label` member went with it; TB ≥ 141 added a readonly
+  `utf8Str` getter (Bug 1971060). None of the members we write were ever touched. The
+  write path guards against a member disappearing (as `label` did) with a clear error;
+  the read path degrades to the string form.
+- `nsIMsgFilter`/`nsIMsgFilterList`: only string-type refinements
+  (`ACString` → `AUTF8String`, Bug 1999822, TB ~146) — invisible to JS callers.
+- The union-enforcement code in `nsMsgSearchValue.cpp` is unchanged since 2022.
+
+Worth watching: the Panorama database rework converts **virtual folder** search terms to
+SQL (`LiveViewFilters`, Bug 1971060 ff.). Message filter lists (`nsIMsgFilterList`, what
+these tools use) are so far untouched by it.
 
 ### Action Value Setting
 - `MoveToFolder` / `CopyToFolder`: set `action.targetFolderUri`
-- `ChangePriority`: set `action.priority`
+- `ChangePriority`: set `action.priority` (`nsMsgPriority.lowest`..`highest`, 2–6; anything
+  else is written as "Change priority" with no value)
 - `AddTag`: tag value goes in `action.strValue` (the keyword, e.g., `"$label1"` or custom tag keyword)
-- `Forward` / `Reply`: email address in `action.strValue`
-- `JunkScore`: set `action.junkScore`
-- Actions like `MarkRead`, `MarkFlagged`, `StopExecution`, `Delete` have no value parameter
+- `Forward` / `Reply`: email address / template URI in `action.strValue`
+- Legacy `Label`: use the typed `action.label` accessor, not `action.strValue`
+- `JunkScore`: set `action.junkScore` — `nsMsgRuleAction::SetJunkScore` rejects anything
+  outside 0..100
+- `Custom` (`nsMsgFilterAction.Custom`): `action.customId` names the add-on's
+  `nsIMsgFilterCustomAction`; its optional argument is in `action.strValue`. These actions
+  can be listed, but creating, copying by update, and submitting them are unsupported
+- Actions like `MarkRead`, `MarkFlagged`, `StopExecution`, `Delete` have no value parameter;
+  the tools refuse a value on them
+- The typed accessors are guarded (`nsMsgFilter.cpp`): `priority` throws
+  `NS_ERROR_ILLEGAL_VALUE` unless `type` is `ChangePriority`, `targetFolderUri` unless
+  Move/Copy, `junkScore` unless `JunkScore`, and `label` unless `Label`. `strValue` and
+  `customId` are unguarded. This is
+  why writing and copying are table-driven off `FILTER_ACTION_DEFS` in `api.js`, and why the
+  tools require a value for every action that takes one: Thunderbird itself saves
+  "Move to folder" with no folder, and the rule then does nothing when it runs
 
 ### Async Considerations
 - `applyFiltersToFolders` returns immediately — the actual filtering happens asynchronously
 - For move/copy actions, the messages may not be relocated instantly
-- Consider returning a "filters applied, processing may take a moment" status rather than waiting
+- Report submitted rule counts/names and skipped rules; do not claim processing completed
 
 ### nsIMsgSearchTerm Iteration
 - `filter.searchTerms` should be iterable, but depending on Thunderbird version it may return an `nsIMutableArray` requiring `.enumerate()` or similar
@@ -780,6 +861,16 @@ function applyFilters(accountId, folderPath) {
 - Applying filters to local folder
 - Account with `canHaveFilters = false`
 - Filter with special characters in name/values (Unicode, quotes)
+- Rejected C0 controls, DEL, and backslashes in new and copied persisted text
+- Default-off Forward/Reply creation, retained actions in updates, and disable-only updates
+- Retained Move/Copy destinations respect current access restrictions; manual runs skip inaccessible rules and disable/delete recovery remains available
+- Numeric search values accept their boundaries and reject native overflow before mutation
+- Custom actions rejected on create/update/apply, with deletion still available
+- Candidate validation failures leave the original filter and list unchanged
+- Metadata-only updates use a complete typed copy and preserve description and temporary state
+- Unparseable rules reject updates, remain deletable, and are skipped during manual execution
+- Manual execution selects only eligible rules, reports skips, and does not call native apply for an empty selection
+- Typed copies of FolderFlag, Uint32HdrProperty, legacy Label terms, and legacy Label actions
 
 ---
 
@@ -790,7 +881,9 @@ Instead of structured conditions, we could accept raw condition strings:
 "AND (from,contains,newsletter@) OR (subject,contains,[news])"
 ```
 
-The `filterList.parseCondition(filter, conditionString)` method can parse these directly. This would simplify the API for power users but make it harder for AI agents to construct programmatically. **Recommendation**: use the structured format as primary, but consider adding a `rawCondition` escape hatch.
+The native `filterList.parseCondition(filter, conditionString)` method can parse these
+directly. The MCP tools accept structured conditions only, so callers cannot bypass the
+attribute/operator allowlists and persisted-text checks through a raw condition string.
 
 ---
 

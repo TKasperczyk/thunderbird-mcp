@@ -20,7 +20,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 40 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
-Mail sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. **By default, nothing is sent or created without your review.**
+Compose sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. Automatic Forward/Reply filter actions have a separate opt-in, disabled by default.
 
 ---
 
@@ -79,9 +79,17 @@ Compose tools validate the `from` identity strictly -- if the specified sender d
 | `updateFilter` | Modify a filter's name, enabled state, conditions, or actions |
 | `deleteFilter` | Remove a filter by index |
 | `reorderFilters` | Change filter execution priority |
-| `applyFilters` | Run filters on a folder on demand -- let your AI organize your inbox |
+| `applyFilters` | Start eligible enabled Manual filters on a folder; report submitted rules and skipped rules with reasons |
 
-Full control over Thunderbird's message filters. Changes persist immediately. Your AI can create sorting rules, adjust priorities, and run them on existing mail.
+Your AI can create sorting rules, adjust priorities, and run them on existing mail. Changes persist after validation; all updates, including name or enabled-state edits, validate a complete candidate before replacing the existing rule. Unparseable rules cannot be updated, but can still be deleted. Filter names, conditions, and action text reject control characters (U+0000–U+001F and U+007F) and backslashes. Custom add-on actions cannot be created, preserved by an update, or submitted for execution.
+
+**Allow automatic Forward/Reply filter actions** is off by default in the extension settings. While off, `createFilter` and `updateFilter` reject any resulting rule containing Forward or Reply, including disabled rules or edits that retain an existing sending action. An update that only sets `enabled: false` can still disable a sending rule, and deletion remains available. Enabling this setting permits automatic sends without a compose review window, independently of **Block `skipReview`**. Turning it off does not disable saved filters or stop Thunderbird's own automatic filtering.
+
+The sending-action setting governs rules MCP creates, modifies, or runs manually. Reordering or deleting a rule containing `StopExecution` can change which of your existing rules Thunderbird runs automatically, including Forward/Reply rules.
+
+Move/Copy destinations must remain accessible under the current account restrictions, including actions retained by an update. An update that only sets `enabled: false`, or deletion, remains available for rules with inaccessible destinations.
+
+`applyFilters` submits only enabled, parseable rules with the Manual type flag and skips rules with inaccessible Move/Copy destinations, as well as Forward/Reply rules while the setting is off. It returns `submittedFilters`, submitted rule names, and skipped rule names with reasons. An eligible rule containing a Custom action rejects the call before any rule is submitted. A successful submission means processing has started, not completed; if no rules are eligible, nothing is submitted.
 
 ### Contacts
 
@@ -115,6 +123,8 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 Account and tool access are configured via the extension settings page (Tools > Add-ons > Thunderbird MCP > Options). Access control is not MCP-exposed -- only the user can change it.
 
 The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`; their review window or dialog still opens normally. `skipReview` is honored only after you explicitly disable this preference.
+
+The separate "Filter Send Actions" section controls **Allow automatic Forward/Reply filter actions**, which defaults to off. Only the user can change this preference in the settings page; MCP clients cannot enable it.
 
 ---
 
