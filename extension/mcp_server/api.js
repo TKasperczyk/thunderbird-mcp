@@ -2076,6 +2076,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            inReplyTo: { type: "string", description: "RFC Message-ID of the message this draft replies to, with or without angle brackets. Sets In-Reply-To (and References, when that is not given) so the draft threads under the original. Subject line and quoted text stay the caller's job -- saveDraft does not build them." },
+            references: { type: "string", description: "Full References header: space-separated, angle-bracketed Message-IDs, oldest first. Defaults to inReplyTo alone. Pass the original's References plus its Message-ID to keep a long thread intact." },
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
@@ -7666,7 +7668,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * sending or opening a compose window. The destination folder is
              * resolved by Thunderbird from the identity's draft-folder pref.
              */
-            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments) {
+            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, inReplyTo, references) {
               try {
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
@@ -7678,6 +7680,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeFields.cc = cc || "";
                 composeFields.bcc = bcc || "";
                 composeFields.subject = subject || "";
+
+                // Threading. saveDraft composes as nsIMsgCompType.New and has no
+                // originalMsgURI, so Thunderbird cannot derive these itself the
+                // way the reply path does -- the caller supplies the original's
+                // Message-ID. Same header shape as the skipReview branch of
+                // replyToMessage below.
+                if (inReplyTo) {
+                  const trimmed = String(inReplyTo).trim();
+                  const bracketed = /^<[^>]*>$/.test(trimmed) ? trimmed : `<${trimmed}>`;
+                  composeFields.setHeader("In-Reply-To", bracketed);
+                  composeFields.references = references ? String(references).trim() : bracketed;
+                }
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
@@ -9404,7 +9418,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "sendMail":
                   return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
                 case "saveDraft":
-                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
+                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.inReplyTo, args.references);
                 case "replyToMessage":
                   return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.saveAsDraft);
                 case "forwardMessage":
