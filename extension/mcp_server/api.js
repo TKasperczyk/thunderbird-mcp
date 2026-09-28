@@ -2141,6 +2141,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return deduped;
             }
 
+            // BEGIN CONNECTION INFO WRITER
             /**
              * Write connection info (port + auth token) to a well-known file
              * so the bridge can discover how to connect.
@@ -2153,14 +2154,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
               } else if (tmpDir.isSymlink()) {
                 throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
-              } else {
+              } else if (Services.appinfo.OS !== "WINNT") {
                 // POSIX hardening: on a shared /tmp another local user could
                 // pre-create the directory with group/world bits set, then race
                 // the connection file. The O_EXCL on the file itself blocks a
                 // straight overwrite, but a permissive directory still lets the
                 // attacker read or rename our file. Force perms back to 0o700.
-                // permissions is 0 on platforms that don't expose POSIX modes
-                // (Windows ACLs), so the chmod is a no-op there.
+                //
+                // Skipped on Windows: %TEMP% is per-user and protected by NTFS
+                // ACLs, and nsIFile.permissions there returns a synthesised
+                // mode (directories report 0o777) that chmod cannot change --
+                // so the check would always fail and block startup (#178,
+                // #181, #182, #197, #202, #203, #205).
                 try {
                   const mode = tmpDir.permissions;
                   if (mode && (mode & 0o077) !== 0) {
@@ -2194,6 +2199,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               converter.close();
               return connFile.path;
             }
+            // END CONNECTION INFO WRITER
 
             function ensureConnectionInfo(port, token) {
               return ensureFreshConnectionInfo({
