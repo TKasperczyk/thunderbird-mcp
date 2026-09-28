@@ -43,6 +43,15 @@ const ACTIONS = {
   CopyToFolder: 16, AddTag: 17, KillSubthread: 18, MarkUnread: 19,
 };
 
+const LEGACY_ATTRIB = { Label: 48 };
+const LEGACY_ACTIONS = { Label: 8 };
+const FILTER_TYPES = {
+  None: 0, InboxRule: 1, InboxJavaScript: 2, Inbox: 3,
+  NewsRule: 4, NewsJavaScript: 8, News: 12, Incoming: 15,
+  Manual: 16, PostPlugin: 32, PostOutgoing: 64, Archive: 128, Periodic: 256,
+  All: 31,
+};
+
 const OPS = {
   Contains: 0, DoesntContain: 1, Is: 2, Isnt: 3, IsEmpty: 4,
   IsBefore: 5, IsAfter: 6, IsHigherThan: 7, IsLowerThan: 8,
@@ -64,6 +73,9 @@ const LEGAL_ACCESSOR = {
   [ATTRIB.JunkStatus]: "junkStatus",
   [ATTRIB.JunkPercent]: "junkPercent",
   [ATTRIB.HasAttachmentStatus]: "status",
+  [ATTRIB.FolderFlag]: "status",
+  [ATTRIB.Uint32HdrProperty]: "status",
+  [LEGACY_ATTRIB.Label]: "label",
 };
 
 // The real extension context exposes Ci as a wrapper that answers named
@@ -86,6 +98,7 @@ function makeCi(overrides = {}) {
     nsMsgSearchAttrib: nonEnumerable(attribs),
     nsMsgSearchOp: nonEnumerable({ ...OPS }),
     nsMsgFilterAction: nonEnumerable({ ...ACTIONS, ...(overrides.actions || {}) }),
+    nsMsgFilterType: nonEnumerable({ ...FILTER_TYPES, ...(overrides.filterTypes || {}) }),
     nsMsgMessageFlags: nonEnumerable({ ...MESSAGE_FLAGS }),
     nsMsgPriority: nonEnumerable({ ...PRIORITY }),
   };
@@ -93,7 +106,7 @@ function makeCi(overrides = {}) {
 
 let customHeadersPref = null; // value of mailnews.customHeaders for the sandbox
 
-function loadFilterHelpers({ ci = makeCi() } = {}) {
+function loadFilterHelpers({ ci = makeCi(), prefs = {}, globals = {}, handlers = false, preferences = false } = {}) {
   const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
   const source = fs.readFileSync(apiPath, "utf8");
   const startMarker = "// BEGIN FILTER SEARCH TERM HELPERS";
@@ -105,8 +118,13 @@ function loadFilterHelpers({ ci = makeCi() } = {}) {
 
   const sandbox = ci === null ? {} : { Ci: ci };
   sandbox.Services = {
-    prefs: { getCharPref: (_name, fallback) => customHeadersPref ?? fallback },
+    prefs: {
+      getCharPref: (_name, fallback) => customHeadersPref ?? fallback,
+      getBoolPref: (_name, fallback) => fallback,
+      ...prefs,
+    },
   };
+  Object.assign(sandbox, globals);
   vm.createContext(sandbox);
   vm.runInContext(
     `${source.slice(start, end)}
@@ -132,6 +150,26 @@ this.FILTER_ACTION_TYPE_DESCRIPTION = FILTER_ACTION_TYPE_DESCRIPTION;
 this.FILTER_ACTION_VALUE_DESCRIPTION = FILTER_ACTION_VALUE_DESCRIPTION;`,
     sandbox
   );
+  if (handlers) {
+    const handlerStart = source.indexOf("// BEGIN FILTER TOOL HANDLERS");
+    const handlerEnd = source.indexOf("// END FILTER TOOL HANDLERS", handlerStart);
+    assert.ok(handlerStart >= 0, "filter tool handler start marker missing");
+    assert.ok(handlerEnd > handlerStart, "filter tool handler end marker missing");
+    vm.runInContext(`${source.slice(handlerStart, handlerEnd)}
+this.listFilters = listFilters;
+this.createFilter = createFilter;
+this.updateFilter = updateFilter;
+this.deleteFilter = deleteFilter;
+this.reorderFilters = reorderFilters;
+this.applyFilters = applyFilters;`, sandbox);
+  }
+  if (preferences) {
+    const prefStart = source.indexOf("// BEGIN FILTER SEND PREFERENCE METHODS");
+    const prefEnd = source.indexOf("// END FILTER SEND PREFERENCE METHODS", prefStart);
+    assert.ok(prefStart >= 0, "filter send preference start marker missing");
+    assert.ok(prefEnd > prefStart, "filter send preference end marker missing");
+    sandbox.preferenceAPI = vm.runInContext(`({${source.slice(prefStart, prefEnd)}})`, sandbox);
+  }
   return sandbox;
 }
 
@@ -152,7 +190,7 @@ function makeSearchValue() {
       );
     }
   };
-  for (const accessor of ["str", "priority", "date", "status", "size", "age", "junkStatus", "junkPercent"]) {
+  for (const accessor of ["str", "priority", "date", "status", "size", "age", "junkStatus", "junkPercent", "label"]) {
     Object.defineProperty(value, accessor, {
       enumerable: true,
       get() { check(accessor); return state.stored; },
@@ -207,16 +245,25 @@ function makeRuleAction() {
   };
   typed("targetFolderUri", [ACTIONS.MoveToFolder, ACTIONS.CopyToFolder]);
   typed("priority", [ACTIONS.ChangePriority]);
+  typed("label", [LEGACY_ACTIONS.Label], (v) => {
+    if (!Number.isInteger(v) || v < 0 || v > 5) throw new Error("NS_ERROR_ILLEGAL_VALUE [nsIMsgRuleAction.label]");
+  });
   typed("junkScore", [ACTIONS.JunkScore], (v) => {
     if (v < 0 || v > 100) throw new Error("NS_ERROR_ILLEGAL_VALUE [nsIMsgRuleAction.junkScore]");
   });
   return action;
 }
 
-function makeFilter() {
+function makeFilter(name = "") {
   const terms = [];
   const actions = [];
   return {
+    filterName: name,
+    filterDesc: "",
+    enabled: true,
+    filterType: FILTER_TYPES.InboxRule | FILTER_TYPES.Manual,
+    temporary: false,
+    unparseable: false,
     searchTerms: terms,
     createTerm: makeSearchTerm,
     appendTerm(term) { terms.push(term); },
@@ -239,6 +286,108 @@ function buildOneAction(helpers, act, options) {
   helpers.buildActions(filter, [act], options);
   assert.equal(filter.actionCount, 1);
   return filter.getActionAt(0);
+}
+
+// The helper fixtures above model typed values. Handler tests additionally
+// need native list identity, persistence failures and the submitted list.
+function makeFilterHarness({
+  ci = makeCi(), allowSend, prefError = false,
+  getAccessibleFolder = (uri) => ({ folder: { URI: uri } }),
+} = {}) {
+  const prefReads = [];
+  const submissions = [];
+  const temporaryLists = [];
+  const folder = { URI: "imap://account/Inbox" };
+  function makeList() {
+    const filters = [];
+    const mutations = [];
+    return {
+      filters,
+      mutations,
+      loggingEnabled: false,
+      logStream: null,
+      saveAttempts: 0,
+      saveError: false,
+      get filterCount() { return filters.length; },
+      createFilter: makeFilter,
+      getFilterAt(index) {
+        assert.ok(index >= 0 && index < filters.length, `invalid getFilterAt index: ${index}`);
+        return filters[index];
+      },
+      insertFilterAt(index, filter) {
+        assert.ok(index >= 0 && index <= filters.length, `invalid insertFilterAt index: ${index}`);
+        mutations.push("insert");
+        filters.splice(index, 0, filter);
+      },
+      setFilterAt(index, filter) {
+        assert.ok(index >= 0 && index < filters.length, `invalid setFilterAt index: ${index}`);
+        mutations.push("set");
+        filters[index] = filter;
+      },
+      removeFilterAt(index) {
+        assert.ok(index >= 0 && index < filters.length, `invalid removeFilterAt index: ${index}`);
+        mutations.push("remove");
+        filters.splice(index, 1);
+      },
+      saveToDefaultFile() {
+        this.saveAttempts++;
+        if (this.saveError) throw new Error("filter save failed");
+      },
+    };
+  }
+  const filterList = makeList();
+  const account = {
+    key: "account",
+    incomingServer: {
+      canHaveFilters: true,
+      prettyName: "Test account",
+      rootFolder: folder,
+      getFilterList: () => filterList,
+    },
+  };
+  const api = loadFilterHelpers({
+    ci,
+    handlers: true,
+    prefs: {
+      getBoolPref(name, fallback) {
+        prefReads.push(name);
+        if (prefError) throw new Error("preference unreadable");
+        return allowSend === undefined ? fallback : allowSend;
+      },
+    },
+    globals: {
+      isAccountAllowed: (id) => id === account.key,
+      getAccessibleAccounts: () => [account],
+      getAccessibleFolder,
+      MailServices: {
+        accounts: { getAccount: (id) => id === account.key ? account : null },
+        filters: {
+          getTempFilterList() {
+            const list = makeList();
+            temporaryLists.push(list);
+            return list;
+          },
+          applyFiltersToFolders(list, folders) {
+            submissions.push({ list, filters: [...list.filters], folders: [...folders] });
+          },
+        },
+      },
+    },
+  });
+  return {
+    api, ci, filterList, submissions, temporaryLists, prefReads, folder,
+    seed({ name = "Existing", conditions, actions, ...metadata } = {}) {
+      const filter = makeFilter(name);
+      Object.assign(filter, metadata);
+      api.buildTerms(filter, conditions || [{ attrib: "subject", op: "contains", value: "invoice" }]);
+      api.buildActions(filter, actions || [{ type: "markRead" }]);
+      filterList.filters.push(filter);
+      return filter;
+    },
+    snapshot() {
+      return JSON.stringify(api.listFilters(account.key));
+    },
+  };
 }
 
 const localMidnightMicros = (year, month, day) => new Date(year, month - 1, day).getTime() * 1000;
@@ -409,6 +558,86 @@ describe("buildTerms writes the value member the attribute actually requires", (
       () => buildOne(helpers, { attrib: "custom", op: "is", value: "x" }),
       /custom search term needs a customId/
     );
+  });
+});
+
+describe("numeric search values fit their native fields", () => {
+  const cases = [
+    { attrib: "size", min: 0, max: 4294967295 },
+    { attrib: "ageInDays", min: 0, max: 2147483647 },
+    { attrib: "status", min: 1, max: 4294967295 },
+    { attrib: "priority", min: 2, max: 6 },
+    { attrib: "junkPercent", min: 0, max: 100 },
+    { attrib: "junkStatus", min: 0, max: 2 },
+  ];
+
+  for (const { attrib, min, max } of cases) {
+    it(`${attrib} accepts its boundaries and rejects values outside them`, () => {
+      const helpers = loadFilterHelpers();
+      for (const value of [min, max]) {
+        const term = buildOne(helpers, { attrib, op: "is", value: String(value) });
+        assert.equal(storedValue(term), value);
+        const copy = makeFilter();
+        helpers.copySearchTerms({ searchTerms: [term] }, copy);
+        assert.equal(storedValue(copy.searchTerms[0]), value);
+      }
+      for (const value of [min - 1, max + 1, 4294967296, Number.MAX_SAFE_INTEGER]) {
+        assert.throws(
+          () => buildOne(helpers, { attrib, op: "is", value: String(value) }),
+          /Condition value.*must be/,
+          `${attrib} accepted ${value}`
+        );
+      }
+    });
+
+    it(`${attrib} overflow rejects create/update before mutation or save`, () => {
+      const h = makeFilterHarness();
+      const original = h.seed();
+      const before = h.snapshot();
+      const conditions = [{ attrib, op: "is", value: String(max + 1) }];
+      const created = h.api.createFilter("account", "Overflow", true, undefined,
+        conditions, [{ type: "markRead" }]);
+      assert.match(created.error, /Condition value.*must be/);
+      const updated = h.api.updateFilter("account", 0, "Renamed", false, undefined, conditions);
+      assert.match(updated.error, /Condition value.*must be/);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.filters[0], original);
+      assert.equal(h.filterList.saveAttempts, 0);
+      assert.deepEqual(h.filterList.mutations, []);
+    });
+  }
+
+  it("keeps priority within signed 32-bit bounds when level constants are unavailable", () => {
+    const ci = makeCi();
+    delete ci.nsMsgPriority;
+    const helpers = loadFilterHelpers({ ci });
+    for (const value of [-2147483648, 2147483647]) {
+      assert.equal(buildOne(helpers, { attrib: "priority", op: "is", value: String(value) }).value.priority, value);
+    }
+    for (const value of [-2147483649, 2147483648, 4294967296]) {
+      assert.throws(
+        () => buildOne(helpers, { attrib: "priority", op: "is", value: String(value) }),
+        /signed 32-bit integer/
+      );
+    }
+  });
+
+  it("bounds the typed setters for folder flags, uint32 properties and legacy labels", () => {
+    const ci = makeCi({ attribs: LEGACY_ATTRIB });
+    const helpers = loadFilterHelpers({ ci });
+    for (const attrib of [ci.nsMsgSearchAttrib.FolderFlag, ci.nsMsgSearchAttrib.Uint32HdrProperty, ci.nsMsgSearchAttrib.Label]) {
+      const value = makeSearchValue();
+      value.attrib = attrib;
+      const member = LEGAL_ACCESSOR[attrib];
+      for (const boundary of [0, 4294967295]) {
+        helpers.setSearchValue(value, attrib, String(boundary));
+        assert.equal(value[member], boundary);
+      }
+      for (const invalid of [-1, 4294967296]) {
+        assert.throws(() => helpers.setSearchValue(value, attrib, String(invalid)), /must be/);
+        assert.equal(value[member], 4294967295);
+      }
+    }
   });
 });
 
@@ -631,10 +860,10 @@ describe("the tool schema text is generated from the attribute table", () => {
     // is in kilobytes; the hints now say so, with the numbers taken from
     // Ci.nsMsgPriority / Ci.nsMsgMessageFlags rather than typed in.
     const d = helpers.FILTER_VALUE_DESCRIPTION;
-    assert.match(d, /size: a non-negative integer \(KB\)/);
-    assert.match(d, /ageInDays: a non-negative integer \(days\)/);
+    assert.match(d, /size: a non-negative integer \(KB\), at most 4294967295/);
+    assert.match(d, /ageInDays: a non-negative integer \(days\), at most 2147483647/);
     assert.match(d, /priority: an integer from 2 to 6 \(2=lowest, 3=low, 4=normal, 5=high, 6=highest\)/);
-    assert.match(d, /status: a message-flag bitmask \(1=read, 2=replied, 4=flagged, 4096=forwarded, 65536=new\)/);
+    assert.match(d, /status: a message-flag bitmask from 1 to 4294967295 \(1=read, 2=replied, 4=flagged, 4096=forwarded, 65536=new\)/);
     assert.match(d, /date: YYYY-MM-DD \(a local calendar day\) or an ISO-8601 date-time/);
     assert.match(d, /junkPercent: an integer from 0 to 100/);
     assert.match(d, /hasAttachment: no value/);
@@ -739,8 +968,7 @@ describe("ACTION_MAP matches the real nsMsgFilterAction enum", () => {
     // was KillSubthread, which is now exposed under its real name.
     assert.equal(helpers.ACTION_MAP.deleteBody, undefined);
     assert.equal(helpers.ACTION_MAP.killSubthread, ACTIONS.KillSubthread);
-    // custom needs a customId we do not expose, and its old value 0x15 was
-    // not the real Custom(-1) either.
+    // Custom actions are not part of the creation vocabulary.
     assert.equal(helpers.ACTION_MAP.custom, undefined);
   });
 
@@ -820,7 +1048,7 @@ describe("buildActions writes the member the action type owns", () => {
   it("refuses unknown and custom actions with a reason", () => {
     reject({ type: "deleteBody" }, /Unknown action type: deleteBody/);
     reject({ type: "label", value: "1" }, /Unknown action type: label/);
-    reject({ type: "custom", value: "x" }, /custom action needs a customId/);
+    reject({ type: "custom", value: "x" }, /Custom filter actions are unsupported/);
   });
 });
 
@@ -1051,4 +1279,809 @@ describe("copyActions keeps every action exactly", () => {
     source.getActionAt = () => { throw new Error("NS_ERROR_FAILURE"); };
     assert.throws(() => helpers.copyActions(source, makeFilter()), /NS_ERROR_FAILURE/);
   });
+});
+
+describe("filter handlers preserve native values", () => {
+  it("creates and reads typed conditions, then preserves them when replacing actions", () => {
+    const h = makeFilterHarness();
+    const conditions = [
+      { attrib: "date", op: "isBefore", value: "2026-01-01" },
+      { attrib: "priority", op: "is", value: "4" },
+      { attrib: "status", op: "is", value: "2" },
+      { attrib: "ageInDays", op: "isGreaterThan", value: "30" },
+      { attrib: "size", op: "isGreaterThan", value: "1024" },
+      { attrib: "junkStatus", op: "is", value: "2" },
+      { attrib: "junkPercent", op: "isGreaterThan", value: "90" },
+      { attrib: "hasAttachment", op: "is", value: "" },
+      { attrib: "otherHeader", op: "contains", value: "bulk", header: "X-Mailer" },
+    ];
+    const created = h.api.createFilter("account", "Typed", true, undefined, conditions, [{ type: "markRead" }]);
+    assert.equal(created.success, true, created.error);
+    const before = JSON.stringify(h.api.listFilters("account")[0].filters[0].terms);
+    const values = h.filterList.filters[0].searchTerms.map(storedValue);
+
+    const updated = h.api.updateFilter("account", 0, undefined, undefined, undefined, undefined, [{ type: "addTag", value: "$label2" }]);
+    assert.equal(updated.success, true, updated.error);
+    assert.equal(JSON.stringify(updated.filter.terms), before);
+    assert.deepEqual(h.filterList.filters[0].searchTerms.map(storedValue), values);
+    assert.equal(updated.filter.terms[0].value, "2026-01-01");
+    assert.equal(updated.filter.terms[8].header, "X-Mailer");
+  });
+
+  it("keeps typed action members and filter metadata when replacing conditions", () => {
+    const h = makeFilterHarness();
+    const original = h.seed({
+      filterDesc: 'A "quoted" description',
+      temporary: true,
+      actions: [
+        { type: "copyToFolder", value: "imap://account/Archive" },
+        { type: "changePriority", value: "6" },
+        { type: "junkScore", value: "100" },
+        { type: "addTag", value: "$label1" },
+      ],
+    });
+    const before = JSON.stringify(h.api.listFilters("account")[0].filters[0].actions);
+    const result = h.api.updateFilter("account", 0, undefined, undefined, undefined, [{ attrib: "from", op: "contains", value: "sender@example.invalid" }]);
+    assert.equal(result.success, true, result.error);
+    assert.equal(JSON.stringify(result.filter.actions), before);
+    assert.equal(h.filterList.filters[0].filterDesc, original.filterDesc);
+    assert.equal(h.filterList.filters[0].temporary, true);
+    assert.deepEqual(h.filterList.mutations, ["set"]);
+  });
+
+  it("copies uncommon and legacy typed terms without exposing them for creation", () => {
+    const ci = makeCi({ attribs: LEGACY_ATTRIB, actions: LEGACY_ACTIONS });
+    const h = makeFilterHarness({ ci });
+    const original = h.seed();
+    for (const [attrib, member, value] of [
+      [ci.nsMsgSearchAttrib.FolderFlag, "status", 4096],
+      [ci.nsMsgSearchAttrib.Uint32HdrProperty, "status", 23],
+      [ci.nsMsgSearchAttrib.Label, "label", 3],
+    ]) {
+      const term = makeSearchTerm();
+      term.attrib = attrib;
+      term.op = ci.nsMsgSearchOp.Is;
+      term.booleanAnd = false;
+      term.hdrProperty = "custom-property";
+      term.beginsGrouping = true;
+      term.endsGrouping = true;
+      term.value.attrib = attrib;
+      term.value[member] = value;
+      original.appendTerm(term);
+    }
+    const custom = makeSearchTerm();
+    custom.attrib = ci.nsMsgSearchAttrib.Custom;
+    custom.op = ci.nsMsgSearchOp.Contains;
+    custom.customId = "test@example.invalid#condition";
+    custom.matchAll = true;
+    custom.value.attrib = custom.attrib;
+    custom.value.str = "kept";
+    original.appendTerm(custom);
+
+    const result = h.api.updateFilter("account", 0, undefined, undefined, undefined, undefined, [{ type: "markFlagged" }]);
+    assert.equal(result.success, true, result.error);
+    const copied = h.filterList.filters[0].searchTerms;
+    assert.deepEqual(copied.map(storedValue), original.searchTerms.map(storedValue));
+    for (const term of copied.slice(1, 4)) {
+      assert.equal(term.hdrProperty, "custom-property");
+      assert.equal(term.beginsGrouping, true);
+      assert.equal(term.endsGrouping, true);
+      assert.equal(term.booleanAnd, false);
+    }
+    assert.equal(copied[4].customId, custom.customId);
+    assert.equal(copied[4].matchAll, true);
+    for (const attrib of ["folderFlag", "uint32HdrProperty", "label"]) {
+      assert.equal(Object.hasOwn(h.api.ATTRIB_MAP, attrib), false);
+      assert.throws(() => h.api.buildTerms(makeFilter(), [{ attrib, op: "is", value: "1" }]));
+    }
+  });
+
+  it("writes, reads and copies Thunderbird 102 labels through the label member", () => {
+    const h = makeFilterHarness({ ci: makeCi({ actions: LEGACY_ACTIONS, attribs: LEGACY_ATTRIB }) });
+    const created = h.api.createFilter("account", "Label", true, undefined,
+      [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type: "label", value: "5" }]);
+    assert.equal(created.success, true, created.error);
+    assert.equal(h.filterList.filters[0].getActionAt(0).label, 5);
+    assert.equal(h.api.listFilters("account")[0].filters[0].actions[0].value, "5");
+    const copied = h.api.updateFilter("account", 0, undefined, undefined, undefined, [{ attrib: "subject", op: "contains", value: "receipt" }]);
+    assert.equal(copied.success, true, copied.error);
+    assert.equal(h.filterList.filters[0].getActionAt(0).label, 5);
+    assert.equal(h.filterList.filters[0].getActionAt(0).strValue, "");
+    for (const value of ["-1", "6", "1.5", "label"]) {
+      assert.throws(() => buildOneAction(h.api, { type: "label", value }));
+    }
+    assert.equal(buildOneAction(h.api, { type: "label", value: "0" }).label, 0);
+  });
+});
+
+describe("persisted filter text is validated before changing the list", () => {
+  const forbidden = [...Array.from({ length: 32 }, (_, i) => String.fromCharCode(i)), "\x7f", "\\"];
+  const fields = [
+    ["name", (request, text) => { request.name = text; }],
+    ["condition value", (request, text) => { request.conditions[0].value = text; }],
+    ["condition header", (request, text) => {
+      request.conditions[0] = { attrib: "otherHeader", op: "contains", value: "bulk", header: text };
+    }],
+    ...[
+      ["moveToFolder", "imap://account/Archive"], ["copyToFolder", "imap://account/Archive"],
+      ["addTag", "tag"], ["reply", "mailbox://templates?number=1"], ["forward", "target@example.invalid"],
+    ].map(([type, value]) => [
+      `${type} value`, (request, text) => { request.actions = [{ type, value: text }]; }, value,
+    ]),
+    ...[
+      ["priority", "4"], ["status", "1"], ["ageInDays", "1"], ["size", "1"],
+      ["junkStatus", "1"], ["junkPercent", "1"], ["date", "2026-01-01"], ["hasAttachment", ""],
+    ].map(([attrib, value]) => [
+      `${attrib} condition value`, (request, text) => { request.conditions = [{ attrib, op: "is", value: text }]; }, value,
+    ]),
+    ...["changePriority", "junkScore", "label"].map((type) => [
+      `${type} action value`, (request, text) => { request.actions = [{ type, value: text }]; }, "4",
+    ]),
+  ];
+  for (const [field, change, value = "1"] of fields) {
+    it(`rejects every forbidden character in ${field} on create and update`, () => {
+      const h = makeFilterHarness({ allowSend: true, ci: makeCi({ actions: LEGACY_ACTIONS }) });
+      const original = h.seed();
+      const before = h.snapshot();
+      for (const character of forbidden) {
+        for (const operation of ["create", "update"]) {
+          const request = {
+            name: "Updated",
+            conditions: [{ attrib: "subject", op: "contains", value: "invoice" }],
+            actions: [{ type: "markRead" }],
+          };
+          change(request, `${value}${character}`);
+          const result = operation === "create"
+            ? h.api.createFilter("account", request.name, false, undefined, request.conditions, request.actions)
+            : h.api.updateFilter("account", 0, request.name, false, undefined, request.conditions, request.actions);
+          assert.ok(result.error, `${operation} ${field}: ${JSON.stringify(character)}`);
+          assert.equal(h.snapshot(), before);
+          assert.equal(h.filterList.filters[0], original);
+          assert.deepEqual(h.filterList.mutations, []);
+          assert.equal(h.filterList.saveAttempts, 0);
+        }
+      }
+    });
+  }
+
+  it("preserves quotes, Unicode and Unicode separators in valid text", () => {
+    const h = makeFilterHarness();
+    const text = 'Zażółć "gęślą" 日本語\u2028next\u2029last';
+    const result = h.api.createFilter("account", text, true, undefined,
+      [{ attrib: "subject", op: "contains", value: text }], [{ type: "addTag", value: text }]);
+    assert.equal(result.success, true, result.error);
+    const stored = h.api.listFilters("account")[0].filters[0];
+    assert.equal(stored.name, text);
+    assert.equal(stored.terms[0].value, text);
+    assert.equal(stored.actions[0].value, text);
+  });
+
+  it("validates copied text even when only the name changes", () => {
+    const h = makeFilterHarness();
+    const original = h.seed();
+    original.searchTerms[0].value.str = "old\\value";
+    const before = h.snapshot();
+    const result = h.api.updateFilter("account", 0, "Renamed");
+    assert.ok(result.error);
+    assert.equal(h.snapshot(), before);
+    assert.equal(h.filterList.filters[0], original);
+    assert.equal(h.filterList.saveAttempts, 0);
+  });
+
+  it("validates preserved descriptions, headers and identifiers before committing an update", () => {
+    for (const change of [
+      (filter) => { filter.filterDesc = "old\ndescription"; },
+      (filter) => { filter.searchTerms[0].arbitraryHeader = "old\nheader"; },
+      (filter) => { filter.searchTerms[0].hdrProperty = "old\nproperty"; },
+      (filter) => { filter.searchTerms[0].customId = "old\ncondition"; },
+      (filter) => { filter.getActionAt(0).strValue = "old\nvalue"; },
+      (filter) => { filter.getActionAt(0).customId = "old\naction"; },
+    ]) {
+      const h = makeFilterHarness();
+      const original = h.seed();
+      change(original);
+      const before = h.snapshot();
+      const result = h.api.updateFilter("account", 0, "Renamed");
+      assert.ok(result.error);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.filters[0], original);
+      assert.equal(h.filterList.saveAttempts, 0);
+      assert.deepEqual(h.filterList.mutations, []);
+    }
+  });
+});
+
+describe("filter sending preference methods", () => {
+  it("stores explicit boolean choices and reads them in a fresh production context", async () => {
+    const stored = new Map();
+    const writes = [];
+    const prefs = {
+      getBoolPref: (name, fallback) => stored.has(name) ? stored.get(name) : fallback,
+      setBoolPref(name, value) { stored.set(name, value); writes.push([name, value]); },
+    };
+    const first = loadFilterHelpers({ prefs, preferences: true }).preferenceAPI;
+    assert.equal((await first.getAllowFilterSendActions()).allowFilterSendActions, false);
+    assert.equal((await first.setAllowFilterSendActions(true)).success, true);
+    const second = loadFilterHelpers({ prefs, preferences: true }).preferenceAPI;
+    assert.equal((await second.getAllowFilterSendActions()).allowFilterSendActions, true);
+    assert.equal((await second.setAllowFilterSendActions(false)).success, true);
+    assert.equal((await first.getAllowFilterSendActions()).allowFilterSendActions, false);
+    assert.deepEqual(writes, [
+      ["extensions.thunderbird-mcp.allowFilterSendActions", true],
+      ["extensions.thunderbird-mcp.allowFilterSendActions", false],
+    ]);
+  });
+
+  it("rejects non-boolean writes and reads an unavailable preference as false", async () => {
+    const writes = [];
+    const api = loadFilterHelpers({
+      preferences: true,
+      prefs: {
+        getBoolPref() { throw new Error("preference unavailable"); },
+        setBoolPref: (...args) => writes.push(args),
+      },
+    }).preferenceAPI;
+    assert.equal((await api.getAllowFilterSendActions()).allowFilterSendActions, false);
+    for (const value of [undefined, null, 0, 1, "true", "false", {}, []]) {
+      assert.ok((await api.setAllowFilterSendActions(value)).error);
+    }
+    assert.deepEqual(writes, []);
+  });
+});
+
+describe("filter sending requires an explicit preference", () => {
+  for (const [name, options] of [
+    ["default", {}], ["false", { allowSend: false }],
+    ["unreadable", { prefError: true }], ["string", { allowSend: "true" }], ["number", { allowSend: 1 }],
+  ]) {
+    it(`blocks forward and reply with the ${name} preference`, () => {
+      for (const type of ["forward", "reply"]) {
+        for (const enabled of [true, false]) {
+          const h = makeFilterHarness(options);
+          const result = h.api.createFilter("account", "Sending", enabled, undefined,
+            [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type, value: "target@example.invalid" }]);
+          assert.ok(result.error, `${type}, enabled=${enabled}`);
+          assert.equal(h.filterList.filterCount, 0);
+          assert.equal(h.filterList.saveAttempts, 0);
+          assert.ok(h.prefReads.length > 0);
+          assert.ok(h.prefReads.every((pref) => pref === "extensions.thunderbird-mcp.allowFilterSendActions"));
+        }
+      }
+    });
+  }
+
+  it("uses resolved native action identities and leaves stopExecution available", () => {
+    const ci = makeCi({ actions: { Forward: 110, Reply: 109, StopExecution: 111 } });
+    for (const type of ["forward", "reply", "stopExecution"]) {
+      const h = makeFilterHarness({ ci });
+      const action = type === "stopExecution" ? { type } : { type, value: "target@example.invalid" };
+      const result = h.api.createFilter("account", type, true, undefined,
+        [{ attrib: "subject", op: "contains", value: "invoice" }], [action]);
+      if (type === "stopExecution") {
+        assert.equal(result.success, true, result.error);
+        assert.equal(h.filterList.filters[0].getActionAt(0).type, ci.nsMsgFilterAction.StopExecution);
+      } else {
+        assert.ok(result.error);
+        assert.equal(h.filterList.filterCount, 0);
+      }
+    }
+  });
+
+  it("refuses writes and execution if a required native action constant is unavailable", () => {
+    for (const constant of ["Forward", "Reply", "Custom"]) {
+      const h = makeFilterHarness({ allowSend: true, ci: makeCi({ actions: { [constant]: undefined } }) });
+      const original = h.seed();
+      const before = h.snapshot();
+      const created = h.api.createFilter("account", "New", true, undefined,
+        [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type: "markRead" }]);
+      assert.match(created.error, /native action constants are unavailable/);
+      assert.match(h.api.updateFilter("account", 0, "Renamed").error, /native action constants are unavailable/);
+      assert.match(h.api.applyFilters("account", h.folder.URI).error, /native action constants are unavailable/);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.filters[0], original);
+      assert.equal(h.filterList.saveAttempts, 0);
+      assert.deepEqual(h.filterList.mutations, []);
+      assert.equal(h.submissions.length, 0);
+    }
+  });
+
+  it("allows forward and reply creation only with the boolean true preference", () => {
+    const h = makeFilterHarness({ allowSend: true });
+    for (const type of ["forward", "reply"]) {
+      const result = h.api.createFilter("account", type, true, undefined,
+        [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type, value: "target@example.invalid" }]);
+      assert.equal(result.success, true, result.error);
+    }
+    assert.equal(h.filterList.filterCount, 2);
+  });
+
+  it("checks the resulting existing rule for name, enable, type and condition updates", () => {
+    const updates = [
+      ["Renamed"],
+      [undefined, true],
+      [undefined, undefined, FILTER_TYPES.Manual],
+      [undefined, undefined, undefined, [{ attrib: "subject", op: "contains", value: "broader" }]],
+      ["Renamed", false],
+      ["Invalid\nname", false],
+    ];
+    for (const type of ["forward", "reply"]) {
+      for (const update of updates) {
+        const h = makeFilterHarness();
+        const original = h.seed({ enabled: update[1] !== true, actions: [{ type, value: "target@example.invalid" }] });
+        const before = h.snapshot();
+        const result = h.api.updateFilter("account", 0, ...update);
+        assert.ok(result.error, `${type}: ${JSON.stringify(update)}`);
+        assert.equal(h.snapshot(), before);
+        assert.equal(h.filterList.filters[0], original);
+        assert.equal(h.filterList.saveAttempts, 0);
+        assert.deepEqual(h.filterList.mutations, []);
+      }
+    }
+  });
+
+  it("permits a pure disable and safe action replacement on an existing sending rule", () => {
+    const h = makeFilterHarness();
+    h.seed({ actions: [{ type: "forward", value: "target@example.invalid" }] });
+    const disabled = h.api.updateFilter("account", 0, undefined, false);
+    assert.equal(disabled.success, true, disabled.error);
+    assert.equal(h.filterList.filters[0].enabled, false);
+    assert.equal(h.filterList.filters[0].getActionAt(0).type, h.ci.nsMsgFilterAction.Forward);
+    const renamed = h.api.updateFilter("account", 0, "Still blocked");
+    assert.ok(renamed.error);
+    const replaced = h.api.updateFilter("account", 0, undefined, undefined, undefined, undefined, [{ type: "markRead" }]);
+    assert.equal(replaced.success, true, replaced.error);
+    assert.equal(h.filterList.filters[0].getActionAt(0).type, h.ci.nsMsgFilterAction.MarkRead);
+  });
+
+  it("allows copying sending actions in an update after explicit opt-in", () => {
+    const h = makeFilterHarness({ allowSend: true });
+    h.seed({ actions: [{ type: "reply", value: "mailbox://templates?number=1" }] });
+    const result = h.api.updateFilter("account", 0, "Renamed");
+    assert.equal(result.success, true, result.error);
+    assert.equal(h.filterList.filters[0].getActionAt(0).type, h.ci.nsMsgFilterAction.Reply);
+    assert.equal(h.filterList.filters[0].getActionAt(0).strValue, "mailbox://templates?number=1");
+  });
+
+  it("checks replacement sending actions before changing a safe existing rule", () => {
+    const h = makeFilterHarness();
+    const original = h.seed();
+    const before = h.snapshot();
+    const result = h.api.updateFilter("account", 0, "Renamed", false, undefined, undefined,
+      [{ type: "forward", value: "target@example.invalid" }]);
+    assert.ok(result.error);
+    assert.equal(h.snapshot(), before);
+    assert.equal(h.filterList.filters[0], original);
+    assert.equal(h.filterList.saveAttempts, 0);
+  });
+});
+
+describe("retained Move/Copy actions respect current destination access", () => {
+  const inaccessible = [
+    "imap://restricted/Archive",
+    "imap://account/Missing",
+    "imap://account/LookupFailure",
+  ];
+  const accessible = "imap://account/Archive";
+  const getAccessibleFolder = (uri) => {
+    if (uri === inaccessible[0]) return { error: "Account not accessible" };
+    if (uri === inaccessible[1]) return { error: "Folder not found" };
+    if (uri === inaccessible[2]) throw new Error("Folder lookup failed");
+    return { folder: { URI: uri } };
+  };
+
+  for (const type of ["moveToFolder", "copyToFolder"]) {
+    it(`rejects updates retaining an inaccessible ${type} without changing the live rule`, () => {
+      for (const value of inaccessible) {
+        for (const update of [
+          [],
+          ["Renamed"],
+          [undefined, true],
+          [undefined, undefined, FILTER_TYPES.Manual],
+          [undefined, undefined, undefined, [{ attrib: "subject", op: "contains", value: "changed" }]],
+          ["Renamed", false],
+        ]) {
+          const h = makeFilterHarness({ getAccessibleFolder });
+          const original = h.seed({ enabled: false, actions: [{ type, value }] });
+          const before = h.snapshot();
+          const result = h.api.updateFilter("account", 0, ...update);
+          assert.match(result.error, /Filter target folder not accessible/, `${value}: ${JSON.stringify(update)}`);
+          assert.equal(h.snapshot(), before);
+          assert.equal(h.filterList.filters[0], original);
+          assert.equal(h.filterList.saveAttempts, 0);
+          assert.deepEqual(h.filterList.mutations, []);
+        }
+      }
+    });
+
+    it(`permits pure-disable and delete recovery for an inaccessible ${type}`, () => {
+      for (const value of inaccessible) {
+        const h = makeFilterHarness({ getAccessibleFolder });
+        h.seed({ actions: [{ type, value }] });
+        const result = h.api.updateFilter("account", 0, undefined, false);
+        assert.equal(result.success, true, result.error);
+        assert.equal(h.filterList.filters[0].enabled, false);
+        assert.equal(h.filterList.filters[0].getActionAt(0).targetFolderUri, value);
+        assert.equal(h.api.deleteFilter("account", 0).success, true);
+        assert.equal(h.filterList.filterCount, 0);
+      }
+      const h = makeFilterHarness({ getAccessibleFolder });
+      h.seed({ actions: [{ type, value: inaccessible[0] }] });
+      assert.equal(h.api.deleteFilter("account", 0).success, true);
+    });
+
+    it(`checks replacement ${type} destinations and permits repairing an existing rule`, () => {
+      const h = makeFilterHarness({ getAccessibleFolder });
+      const original = h.seed({ actions: [{ type, value: inaccessible[0] }] });
+      const before = h.snapshot();
+      const rejected = h.api.updateFilter("account", 0, undefined, false, undefined, undefined,
+        [{ type, value: inaccessible[1] }]);
+      assert.match(rejected.error, /Filter target folder not accessible/);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.filters[0], original);
+      assert.equal(h.filterList.saveAttempts, 0);
+      assert.deepEqual(h.filterList.mutations, []);
+      const repaired = h.api.updateFilter("account", 0, undefined, undefined, undefined, undefined,
+        [{ type, value: accessible }]);
+      assert.equal(repaired.success, true, repaired.error);
+      assert.equal(h.filterList.filters[0].getActionAt(0).targetFolderUri, accessible);
+      const renamed = h.api.updateFilter("account", 0, "Accessible retained destination");
+      assert.equal(renamed.success, true, renamed.error);
+    });
+  }
+
+  it("allows removing an inaccessible destination from the resulting rule", () => {
+    const h = makeFilterHarness({ getAccessibleFolder });
+    h.seed({ actions: [{ type: "moveToFolder", value: inaccessible[0] }] });
+    const result = h.api.updateFilter("account", 0, undefined, undefined, undefined, undefined, [{ type: "markRead" }]);
+    assert.equal(result.success, true, result.error);
+    assert.equal(h.filterList.filters[0].actionCount, 1);
+    assert.equal(h.filterList.filters[0].getActionAt(0).type, h.ci.nsMsgFilterAction.MarkRead);
+  });
+
+  it("skips entire rules with inaccessible destinations regardless of the sending preference", () => {
+    for (const allowSend of [false, true]) {
+      const h = makeFilterHarness({ allowSend, getAccessibleFolder });
+      const expectedSkipped = [];
+      for (const type of ["moveToFolder", "copyToFolder"]) {
+        for (const value of inaccessible) {
+          const name = `${type}: ${value}`;
+          h.seed({ name, actions: [{ type: "markRead" }, { type, value }] });
+          expectedSkipped.push({ name, reason: "inaccessible-destination" });
+        }
+        h.seed({ name: type, actions: [{ type, value: accessible }] });
+      }
+      const before = h.snapshot();
+      const result = h.api.applyFilters("account", h.folder.URI);
+      assert.equal(result.success, true, result.error);
+      assert.equal(result.submittedFilters, 2);
+      assert.deepEqual(Array.from(result.submitted), ["moveToFolder", "copyToFolder"]);
+      assert.deepEqual(Array.from(result.skipped, (entry) => ({ ...entry })), expectedSkipped);
+      assert.equal(h.submissions.length, 1);
+      assert.deepEqual(h.submissions[0].filters.map((filter) => filter.filterName), ["moveToFolder", "copyToFolder"]);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.saveAttempts, 0);
+      assert.deepEqual(h.filterList.mutations, []);
+    }
+  });
+
+  it("makes no native submission when every destination is inaccessible", () => {
+    const h = makeFilterHarness({ getAccessibleFolder });
+    h.seed({ actions: [{ type: "moveToFolder", value: inaccessible[0] }] });
+    const result = h.api.applyFilters("account", h.folder.URI);
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.submittedFilters, 0);
+    assert.deepEqual(Array.from(result.skipped, (entry) => ({ ...entry })), [
+      { name: "Existing", reason: "inaccessible-destination" },
+    ]);
+    assert.equal(h.submissions.length, 0);
+  });
+});
+
+describe("custom filter actions remain unsupported by mutations", () => {
+  it("rejects custom creation and existing custom updates even with sending allowed", () => {
+    for (const allowSend of [false, true]) {
+      const h = makeFilterHarness({ allowSend });
+      const created = h.api.createFilter("account", "Custom", true, undefined,
+        [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type: "custom", value: "value" }]);
+      assert.ok(created.error);
+      const original = h.seed();
+      const custom = makeRuleAction();
+      custom.type = h.ci.nsMsgFilterAction.Custom;
+      custom.customId = "test@example.invalid#action";
+      custom.strValue = "value";
+      original.appendAction(custom);
+      const before = h.snapshot();
+      assert.equal(h.api.listFilters("account")[0].filters[0].actions[1].customId, custom.customId);
+      for (const update of [["Renamed"], [undefined, false]]) {
+        const result = h.api.updateFilter("account", 0, ...update);
+        assert.ok(result.error);
+        assert.equal(h.snapshot(), before);
+        assert.equal(h.filterList.filters[0], original);
+        assert.equal(h.filterList.saveAttempts, 0);
+      }
+      const deleted = h.api.deleteFilter("account", 0);
+      assert.equal(deleted.success, true, deleted.error);
+      assert.equal(h.filterList.filterCount, 0);
+    }
+  });
+
+  it("allows replacing an existing custom action with a supported safe action", () => {
+    const h = makeFilterHarness();
+    const original = h.seed();
+    const custom = makeRuleAction();
+    custom.type = h.ci.nsMsgFilterAction.Custom;
+    custom.customId = "test@example.invalid#action";
+    original.appendAction(custom);
+    const result = h.api.updateFilter("account", 0, undefined, undefined, undefined, undefined, [{ type: "markRead" }]);
+    assert.equal(result.success, true, result.error);
+    assert.equal(h.filterList.filters[0].actionCount, 1);
+  });
+});
+
+describe("applyFilters submits only eligible native filters", () => {
+  it("separates enabled manual filters from disabled, non-manual, sending and unparseable rules", () => {
+    const h = makeFilterHarness();
+    h.filterList.loggingEnabled = true;
+    h.filterList.logStream = { name: "test log" };
+    h.seed({ name: "Disabled", enabled: false });
+    h.seed({ name: "Outgoing", filterType: h.ci.nsMsgFilterType.PostOutgoing });
+    h.seed({ name: "Unparseable", unparseable: true });
+    h.seed({ name: "Forward", actions: [{ type: "forward", value: "target@example.invalid" }] });
+    h.seed({ name: "Reply", actions: [{ type: "reply", value: "mailbox://templates?number=1" }] });
+    h.seed({ name: "Safe", filterType: h.ci.nsMsgFilterType.Manual });
+    h.seed({ name: "Stop", actions: [{ type: "stopExecution" }] });
+    const before = h.snapshot();
+    const result = h.api.applyFilters("account", h.folder.URI);
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.submittedFilters, 2);
+    assert.deepEqual(Array.from(result.submitted), ["Safe", "Stop"]);
+    assert.deepEqual(Array.from(result.skipped, (entry) => ({ ...entry })), [
+      { name: "Disabled", reason: "disabled" },
+      { name: "Outgoing", reason: "non-manual" },
+      { name: "Unparseable", reason: "unparseable" },
+      { name: "Forward", reason: "sending" },
+      { name: "Reply", reason: "sending" },
+    ]);
+    assert.equal(Object.hasOwn(result, "enabledFilters"), false);
+    assert.equal(h.submissions.length, 1);
+    assert.notEqual(h.submissions[0].list, h.filterList);
+    assert.equal(h.submissions[0].list.loggingEnabled, true);
+    assert.equal(h.submissions[0].list.logStream, h.filterList.logStream);
+    assert.deepEqual(h.submissions[0].filters.map((filter) => filter.filterName), ["Safe", "Stop"]);
+    assert.equal(h.submissions[0].folders[0].URI, h.folder.URI);
+    assert.equal(h.snapshot(), before);
+    assert.equal(h.filterList.saveAttempts, 0);
+    assert.deepEqual(h.filterList.mutations, []);
+  });
+
+  it("does not call the native service when no rule is eligible", () => {
+    const h = makeFilterHarness();
+    h.seed({ enabled: false });
+    h.seed({ name: "Sending", actions: [{ type: "forward", value: "target@example.invalid" }] });
+    const result = h.api.applyFilters("account", h.folder.URI);
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.submittedFilters, 0);
+    assert.deepEqual(Array.from(result.submitted), []);
+    assert.equal(h.submissions.length, 0);
+  });
+
+  it("submits manual sending rules only after explicit opt-in", () => {
+    const h = makeFilterHarness({ allowSend: true });
+    h.seed({ name: "Forward", actions: [{ type: "forward", value: "target@example.invalid" }] });
+    h.seed({ name: "Reply", actions: [{ type: "reply", value: "mailbox://templates?number=1" }] });
+    h.seed({ name: "Disabled", enabled: false, actions: [{ type: "forward", value: "target@example.invalid" }] });
+    const result = h.api.applyFilters("account", h.folder.URI);
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.submittedFilters, 2);
+    assert.deepEqual(Array.from(result.submitted), ["Forward", "Reply"]);
+    assert.deepEqual(h.submissions[0].filters.map((filter) => filter.filterName), ["Forward", "Reply"]);
+  });
+
+  it("rejects an eligible Custom action before submitting any filters", () => {
+    for (const allowSend of [false, true]) {
+      const h = makeFilterHarness({ allowSend });
+      h.seed({ name: "Safe first" });
+      const filter = h.seed({ name: "Custom and sending", actions: [{ type: "forward", value: "target@example.invalid" }] });
+      const custom = makeRuleAction();
+      custom.type = h.ci.nsMsgFilterAction.Custom;
+      custom.customId = "test@example.invalid#action";
+      filter.appendAction(custom);
+      const before = h.snapshot();
+      const result = h.api.applyFilters("account", h.folder.URI);
+      assert.match(result.error, /custom/i);
+      assert.equal(h.submissions.length, 0);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.saveAttempts, 0);
+    }
+  });
+
+  it("does not treat disabled or non-manual Custom rules as eligible", () => {
+    const h = makeFilterHarness();
+    for (const metadata of [{ name: "Disabled", enabled: false }, { name: "Outgoing", filterType: h.ci.nsMsgFilterType.PostOutgoing }]) {
+      const filter = h.seed(metadata);
+      const action = makeRuleAction();
+      action.type = h.ci.nsMsgFilterAction.Custom;
+      action.customId = "test@example.invalid#action";
+      filter.appendAction(action);
+    }
+    h.seed({ name: "Safe" });
+    const result = h.api.applyFilters("account", h.folder.URI);
+    assert.equal(result.success, true, result.error);
+    assert.deepEqual(Array.from(result.submitted), ["Safe"]);
+    assert.deepEqual(Array.from(result.skipped, (entry) => ({ ...entry })), [
+      { name: "Disabled", reason: "disabled" }, { name: "Outgoing", reason: "non-manual" },
+    ]);
+  });
+});
+
+describe("filter type values are validated before native mutation", () => {
+  for (const value of [0, -1, 17.5, 2147483648, 4294967295, 4294967296, 4294967313, Number.MAX_SAFE_INTEGER]) {
+    it(`rejects out-of-range type ${value} in create/update without allocation, mutation or save`, () => {
+      for (const type of [value, String(value)]) {
+        const h = makeFilterHarness();
+        const original = h.seed({ enabled: false });
+        const before = h.snapshot();
+        h.filterList.createFilter = () => assert.fail("unexpected native filter allocation");
+        const created = h.api.createFilter("account", "Overflow", true, type,
+          [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type: "markRead" }]);
+        assert.match(created.error, /type must be a positive signed 32-bit integer/);
+        const updated = h.api.updateFilter("account", 0, "Renamed", true, type);
+        assert.match(updated.error, /type must be a positive signed 32-bit integer/);
+        assert.equal(h.snapshot(), before);
+        assert.equal(h.filterList.filters[0], original);
+        assert.equal(h.filterList.saveAttempts, 0);
+        assert.deepEqual(h.filterList.mutations, []);
+      }
+    });
+  }
+
+  it("rejects unknown bits within the signed native range before mutation or save", () => {
+    for (const value of [512, 529, 1073741824, 2147483647]) {
+      for (const type of [value, String(value)]) {
+        const h = makeFilterHarness();
+        const original = h.seed();
+        const before = h.snapshot();
+        h.filterList.createFilter = () => assert.fail("unexpected native filter allocation");
+        const created = h.api.createFilter("account", "Unknown type", true, type,
+          [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type: "markRead" }]);
+        assert.match(created.error, /unknown or unavailable nsMsgFilterType bits/);
+        const updated = h.api.updateFilter("account", 0, "Renamed", false, type);
+        assert.match(updated.error, /unknown or unavailable nsMsgFilterType bits/);
+        assert.equal(h.snapshot(), before);
+        assert.equal(h.filterList.filters[0], original);
+        assert.equal(h.filterList.saveAttempts, 0);
+        assert.deepEqual(h.filterList.mutations, []);
+      }
+    }
+  });
+
+  it("accepts every known flag and combinations, including flags omitted from All", () => {
+    for (const value of [...Object.values(FILTER_TYPES).filter(Boolean), 17, 511]) {
+      for (const type of [value, String(value)]) {
+        const h = makeFilterHarness();
+        const created = h.api.createFilter("account", "Known type", true, type,
+          [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type: "markRead" }]);
+        assert.equal(created.success, true, created.error);
+        assert.equal(h.filterList.filters[0].filterType, value);
+        const updated = h.api.updateFilter("account", 0, undefined, undefined, type);
+        assert.equal(updated.success, true, updated.error);
+        assert.equal(h.filterList.filters[0].filterType, value);
+      }
+    }
+  });
+
+  it("uses named runtime flags and rejects flags absent from this Thunderbird", () => {
+    for (const periodic of [512, undefined]) {
+      const h = makeFilterHarness({ ci: makeCi({ filterTypes: { Periodic: periodic } }) });
+      const original = h.seed();
+      const before = h.snapshot();
+      const created = h.api.createFilter("account", "Unavailable type", true, 256,
+        [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type: "markRead" }]);
+      assert.match(created.error, /unknown or unavailable nsMsgFilterType bits/);
+      assert.match(h.api.updateFilter("account", 0, undefined, undefined, 256).error,
+        /unknown or unavailable nsMsgFilterType bits/);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.filters[0], original);
+      assert.equal(h.filterList.saveAttempts, 0);
+      assert.deepEqual(h.filterList.mutations, []);
+      if (periodic !== undefined) {
+        const result = h.api.updateFilter("account", 0, undefined, undefined, periodic);
+        assert.equal(result.success, true, result.error);
+        assert.equal(h.filterList.filters[0].filterType, periodic);
+      }
+    }
+  });
+
+  it("keeps the default type and retains the existing type when omitted", () => {
+    const h = makeFilterHarness();
+    assert.equal(h.api.createFilter("account", "Default", true, undefined,
+      [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type: "markRead" }]).success, true);
+    assert.equal(h.filterList.filters[0].filterType, 17);
+    assert.equal(h.api.updateFilter("account", 0, "Renamed").success, true);
+    assert.equal(h.filterList.filters[0].filterType, 17);
+  });
+});
+
+describe("filter writes preserve the live rule when validation or saving fails", () => {
+  it("does not rename, enable or change type before replacement values validate", () => {
+    const h = makeFilterHarness();
+    const original = h.seed({ enabled: false });
+    const before = h.snapshot();
+    const result = h.api.updateFilter("account", 0, "Renamed", true, h.ci.nsMsgFilterType.PostOutgoing,
+      undefined, [{ type: "changePriority", value: "99" }]);
+    assert.ok(result.error);
+    assert.equal(h.snapshot(), before);
+    assert.equal(h.filterList.filters[0], original);
+    assert.equal(h.filterList.saveAttempts, 0);
+    assert.deepEqual(h.filterList.mutations, []);
+  });
+
+  it("leaves the live filter unchanged when an existing typed value cannot be copied", () => {
+    const h = makeFilterHarness();
+    const original = h.seed({ conditions: [{ attrib: "ageInDays", op: "isGreaterThan", value: "30" }] });
+    original.searchTerms[0].value = { attrib: h.ci.nsMsgSearchAttrib.AgeInDays, get age() { throw new Error("value unavailable"); } };
+    const before = h.snapshot();
+    const result = h.api.updateFilter("account", 0, "Renamed", false, undefined, undefined, [{ type: "markFlagged" }]);
+    assert.ok(result.error);
+    assert.equal(h.snapshot(), before);
+    assert.equal(h.filterList.filters[0], original);
+    assert.equal(h.filterList.saveAttempts, 0);
+    assert.deepEqual(h.filterList.mutations, []);
+  });
+
+  for (const operation of ["create", "update", "delete", "reorder"]) {
+    it(`restores the original list after ${operation} cannot be saved`, () => {
+      const h = makeFilterHarness();
+      h.seed({ name: "First" });
+      h.seed({ name: "Second" });
+      const originals = [...h.filterList.filters];
+      const before = h.snapshot();
+      h.filterList.saveError = true;
+      let result;
+      if (operation === "create") {
+        result = h.api.createFilter("account", "New", true, undefined,
+          [{ attrib: "subject", op: "contains", value: "invoice" }], [{ type: "markRead" }], 0);
+      } else if (operation === "update") {
+        result = h.api.updateFilter("account", 0, "Renamed", false);
+      } else if (operation === "delete") {
+        result = h.api.deleteFilter("account", 0);
+      } else {
+        result = h.api.reorderFilters("account", 0, 1);
+      }
+      assert.match(result.error, /filter save failed/);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.filters.length, originals.length);
+      originals.forEach((filter, index) => assert.equal(h.filterList.filters[index], filter));
+      assert.equal(h.filterList.saveAttempts, 1);
+    });
+  }
+});
+
+describe("reorderFilters uses final destination indices", () => {
+  for (const [from, to, names] of [
+    [0, 0, ["A", "B", "C"]], [0, 1, ["B", "A", "C"]], [0, 2, ["B", "C", "A"]],
+    [1, 0, ["B", "A", "C"]], [1, 1, ["A", "B", "C"]], [1, 2, ["A", "C", "B"]],
+    [2, 0, ["C", "A", "B"]], [2, 1, ["A", "C", "B"]], [2, 2, ["A", "B", "C"]],
+  ]) {
+    it(`moves ${from} to ${to}`, () => {
+      const h = makeFilterHarness();
+      for (const name of ["A", "B", "C"]) h.seed({ name });
+      const result = h.api.reorderFilters("account", from, to);
+      assert.equal(result.success, true, result.error);
+      assert.deepEqual(h.filterList.filters.map((filter) => filter.filterName), names);
+    });
+  }
+
+  for (const [from, to] of [[-1, 0], [0, -1], [3, 0], [0, 3], [1.5, 0], [0, 1.5], ["bad", 0], [0, "bad"]]) {
+    it(`rejects indices ${from}, ${to} without mutation`, () => {
+      const h = makeFilterHarness();
+      for (const name of ["A", "B", "C"]) h.seed({ name });
+      const before = h.snapshot();
+      const result = h.api.reorderFilters("account", from, to);
+      assert.ok(result.error);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.saveAttempts, 0);
+      assert.deepEqual(h.filterList.mutations, []);
+    });
+  }
 });

@@ -92,6 +92,26 @@
         ]
       },
       {
+        "name": "getAllowFilterSendActions",
+        "type": "function",
+        "async": true,
+        "description": "Get whether MCP may create, update, or manually run filters with automatic Forward/Reply actions. Defaults to false; this setting is independent of Block skipReview.",
+        "parameters": []
+      },
+      {
+        "name": "setAllowFilterSendActions",
+        "type": "function",
+        "async": true,
+        "description": "Set the user-only permission for automatic Forward/Reply filter actions. Turning it off does not disable saved Thunderbird filters.",
+        "parameters": [
+          {
+            "name": "allowFilterSendActions",
+            "type": "boolean",
+            "description": "Set true explicitly to allow MCP to create, update, and manually run filters that send without a compose review window. Defaults to false; disabling or deleting a sending rule remains available. Custom add-on actions remain unsupported."
+          }
+        ]
+      },
+      {
         "name": "getStableAuthToken",
         "type": "function",
         "async": true,
