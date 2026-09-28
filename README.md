@@ -155,6 +155,19 @@ Add to your MCP client config (e.g. `~/.claude.json` for Claude Code):
 }
 ```
 
+#### Connecting HTTP-capable clients directly
+
+The extension serves MCP over HTTP itself (`POST /`: `initialize`, `tools/list`, `tools/call`, notifications), so clients that support HTTP transport can skip the bridge:
+
+```bash
+claude mcp add --transport http thunderbird http://127.0.0.1:8765/ --header "Authorization: Bearer <token>"
+```
+
+- The port defaults to `8765` (8766-8774 if taken); the token is in `connection.json`, or set a stable token in the settings page so it survives restarts.
+- Responses are plain JSON; there is no SSE stream and no `Mcp-Session-Id`, both optional in the Streamable HTTP spec.
+- Path attachments are then read by the extension itself, under the same attachment policy as the bridge, and inside the Snap/Flatpak sandbox where applicable (the bridge is what makes host paths work for sandboxed installs).
+- Keep this on localhost. For a client on another machine or container, prefer an SSH tunnel or a TLS proxy bound to loopback over "Listen on all interfaces": that mode is plain HTTP, so the token and mail content cross the network unencrypted.
+
 ### Sandbox-aware connection discovery
 
 The bridge re-discovers `connection.json` on every cache miss. It tries these locations in order:
@@ -244,7 +257,7 @@ curl -X POST http://127.0.0.1:$PORT \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-**Dev-only extension reload:** After changing extension source locally, remove the add-on from Thunderbird, restart, reinstall the XPI, and restart again. Thunderbird caches aggressively. Regular users should install v0.7.3 once and let auto-update handle later releases.
+**Dev-only extension reload:** After changing extension source locally, remove the add-on from Thunderbird, restart, reinstall the XPI, and restart again. Thunderbird caches aggressively. Regular users should install the latest release once and let auto-update handle later releases.
 
 ---
 
