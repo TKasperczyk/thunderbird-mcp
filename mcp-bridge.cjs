@@ -784,6 +784,330 @@ async function inlineAttachmentPaths(args) {
   args.attachments = resolved;
 }
 
+// Bridge-local tool definition for saveMessage. The extension can only write
+// attachments into the OS temp dir and returns rawSource as text -- neither can
+// save to a caller-chosen path. The bridge already reads/writes host files, so
+// it owns this tool and injects it into tools/list; it is never forwarded to
+// the extension.
+const SAVE_MESSAGE_TOOL = {
+  name: 'saveMessage',
+  description: "Save a message to disk on the local machine: writes the full .eml and/or its attachments into a destination directory. Unlike saveAttachments (temp dir only), this writes to any path you choose. Runs on the bridge, so destDir is a path on the machine running the MCP.",
+  inputSchema: {
+    type: 'object',
+    properties: {
+      messageId: { type: 'string', description: 'Message ID (from searchMessages/getRecentMessages).' },
+      folderPath: { type: 'string', description: 'Folder URI path containing the message.' },
+      destDir: { type: 'string', description: 'Directory to write into (created recursively if missing).' },
+      saveEml: { type: 'boolean', description: 'Write the full raw .eml (default true).' },
+      saveAttachments: { type: 'boolean', description: 'Write attachments as loose files (default false).' },
+      emlFilename: { type: 'string', description: 'Filename for the .eml (default: the sanitized message subject, else messageId). ".eml" is appended if absent.' },
+      overwrite: { type: 'boolean', description: 'Overwrite existing files instead of erroring (default false).' }
+    },
+    required: ['messageId', 'folderPath', 'destDir']
+  }
+};
+
+// saveMessage hands whatever drives this MCP an arbitrary filesystem-write
+// primitive: attacker-supplied attachment bytes at an attacker-supplied path.
+// A prompt-injected tool call could target ~/.bashrc, ~/.ssh/, or an autostart
+// entry. So the tool is opt-in -- absent from tools/list and refused on
+// tools/call unless THUNDERBIRD_MCP_SAVE_MESSAGE=1 -- and can be narrowed
+// further by THUNDERBIRD_MCP_SAVE_ROOT, which destDir must resolve inside.
+const SAVE_MESSAGE_ENV = 'THUNDERBIRD_MCP_SAVE_MESSAGE';
+const SAVE_ROOT_ENV = 'THUNDERBIRD_MCP_SAVE_ROOT';
+
+// Directories get 0700 and files 0600: saved mail is private, and under a
+// normal umask node would otherwise create them world-readable.
+const SAVE_DIR_MODE = 0o700;
+const SAVE_FILE_MODE = 0o600;
+
+function saveMessageEnabled(env = process.env) {
+  return env[SAVE_MESSAGE_ENV] === '1';
+}
+
+function saveMessageRoot(env = process.env) {
+  const raw = env[SAVE_ROOT_ENV];
+  return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+}
+
+// Resolve a path to its real location even when it does not exist yet: walk up
+// to the nearest existing ancestor, realpath *that* (which is what defeats a
+// symlinked intermediate directory), then re-append the missing tail. Resolving
+// only the existing prefix is the point -- realpathSync on the full path throws
+// ENOENT for a directory we are about to create.
+function resolveIntendedPath(target, fsImpl, pathImpl) {
+  const abs = pathImpl.resolve(target);
+  const missing = [];
+  let cursor = abs;
+  for (;;) {
+    try {
+      const real = fsImpl.realpathSync(cursor);
+      return missing.length ? pathImpl.join(real, ...missing.reverse()) : real;
+    } catch (e) {
+      if (e.code !== 'ENOENT') {
+        throw e;
+      }
+      const parent = pathImpl.dirname(cursor);
+      if (parent === cursor) {
+        return abs;
+      }
+      missing.push(pathImpl.basename(cursor));
+      cursor = parent;
+    }
+  }
+}
+
+// Resolve destDir through any symlinks and, when a save root is configured,
+// refuse anything outside it. Returns the resolved directory, which is what
+// every later path operation uses -- checking the caller's spelling and then
+// writing to the unresolved path would leave the symlink hole open.
+function resolveDestDir(destDir, { env = process.env, fsImpl = fs, pathImpl = path } = {}) {
+  const resolved = resolveIntendedPath(destDir, fsImpl, pathImpl);
+  const root = saveMessageRoot(env);
+  if (!root) {
+    return resolved;
+  }
+  const realRoot = resolveIntendedPath(root, fsImpl, pathImpl);
+  const rel = pathImpl.relative(realRoot, resolved);
+  if (rel !== '' && (rel.startsWith('..') || pathImpl.isAbsolute(rel))) {
+    throw new Error(
+      `destDir resolves to ${resolved}, which is outside ${SAVE_ROOT_ENV} (${realRoot})`
+    );
+  }
+  return resolved;
+}
+
+// Unwrap a tools/call response envelope into its inner data object. Tool results
+// are shaped { result: { content: [ { type:'text', text:'<JSON>' } ] } }; a
+// tool-level failure comes back as { error } inside that JSON, which we surface
+// as a thrown Error so the caller reports it instead of silently continuing.
+function unwrapToolResponse(resp) {
+  const text = resp && resp.result && Array.isArray(resp.result.content)
+    ? resp.result.content[0] && resp.result.content[0].text
+    : undefined;
+  if (typeof text !== 'string') {
+    throw new Error('Unexpected tool response shape from getMessage');
+  }
+  const data = JSON.parse(text);
+  if (data && data.error) {
+    throw new Error(data.error);
+  }
+  return data;
+}
+
+// Windows device names are reserved at every directory level and with any
+// extension: CON, COM3.txt and PRN.eml all resolve to the device, not a file.
+const WINDOWS_RESERVED_STEM = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+
+// Turn an arbitrary name into a safe single-path-segment filename: drop path
+// separators, control chars and the characters Windows forbids (which also
+// closes NTFS alternate-data-stream names, since those need the colon),
+// collapse whitespace, strip the trailing dots and spaces Windows silently
+// discards, and refuse names that would be empty or traverse ('.'/'..').
+// Spaces, unicode, and parentheses are kept -- they appear in real filenames.
+function sanitizeSaveFilename(name) {
+  let s = String(name == null ? '' : name);
+  // eslint-disable-next-line no-control-regex
+  s = s.replace(/[/\\\x00-\x1f\x7f<>:"|?*]/g, ' ');
+  s = s.replace(/\s+/g, ' ').trim();
+  // Do this after trimming: ' .. ' and 'foo...' both need it, and a name of
+  // nothing but dots must collapse to empty so the guard below rejects it.
+  s = s.replace(/[. ]+$/, '');
+  if (!s || s === '.' || s === '..') {
+    throw new Error(`Cannot derive a safe filename from ${JSON.stringify(String(name))}`);
+  }
+  const stem = s.replace(/\..*$/, '');
+  if (WINDOWS_RESERVED_STEM.test(stem)) {
+    s = `_${s}`;
+  }
+  return s;
+}
+
+// Generate ' (2)', ' (3)', ... variants of a filename, suffixed before the
+// extension. Yields the base name first.
+function* collisionCandidates(baseName, pathImpl) {
+  yield baseName;
+  const ext = pathImpl.extname(baseName);
+  const stem = baseName.slice(0, baseName.length - ext.length);
+  for (let n = 2; ; n++) {
+    yield `${stem} (${n})${ext}`;
+  }
+}
+
+// Remove an existing entry so a subsequent exclusive create lands on a fresh
+// file. Used only in overwrite mode, and it is what makes overwrite no-follow:
+// unlinking a symlink removes the link, so the create that follows cannot be
+// redirected through it.
+function unlinkForOverwrite(destPath, fsImpl) {
+  fsImpl.rmSync(destPath, { force: true });
+}
+
+// Copy an attachment out of the extension's temp dir, never following a
+// symlink planted at the destination and never racing an existence check: the
+// exclusive create *is* the check. Retries the ' (n)' suffix on collision
+// unless overwrite is on, in which case the existing entry is unlinked first.
+// COPYFILE_EXCL is the copy-side equivalent of 'wx':
+// without it copyFileSync happily follows and overwrites a symlink planted at
+// the destination, which is exactly what `overwrite: false` promises not to do.
+function copyFileExclusive(srcPath, destDir, baseName, { usedNames, overwrite, fsImpl, pathImpl }) {
+  for (const candidate of collisionCandidates(baseName, pathImpl)) {
+    if (usedNames.has(candidate)) {
+      continue;
+    }
+    const destPath = pathImpl.join(destDir, candidate);
+    try {
+      fsImpl.copyFileSync(srcPath, destPath, fs.constants.COPYFILE_EXCL);
+    } catch (e) {
+      if (e.code !== 'EEXIST') {
+        throw e;
+      }
+      if (!overwrite) {
+        continue;
+      }
+      unlinkForOverwrite(destPath, fsImpl);
+      fsImpl.copyFileSync(srcPath, destPath, fs.constants.COPYFILE_EXCL);
+    }
+    fsImpl.chmodSync(destPath, SAVE_FILE_MODE);
+    usedNames.add(candidate);
+    return destPath;
+  }
+}
+
+// Write a message's .eml and/or attachments into a caller-chosen directory on
+// the host filesystem. fetchMessage(subMessage) returns the parsed JSON-RPC
+// response for a tools/call (forwardToThunderbird in production, a mock in
+// tests). Returns the inner data object { emlPath, attachments, skippedAttachments,
+// destDir }; the handleMessage caller wraps it into the MCP content envelope.
+async function saveMessageToDisk({ args, fetchMessage, fsImpl = fs, pathImpl = path, env = process.env }) {
+  args = args || {};
+  if (!saveMessageEnabled(env)) {
+    throw new Error(
+      `saveMessage is disabled. Set ${SAVE_MESSAGE_ENV}=1 in the MCP server environment ` +
+      `to enable writing files to disk (optionally with ${SAVE_ROOT_ENV} to confine them).`
+    );
+  }
+  const { messageId, folderPath } = args;
+  if (typeof messageId !== 'string' || !messageId.trim()) {
+    throw new Error('saveMessage requires a non-empty messageId string');
+  }
+  if (typeof folderPath !== 'string' || !folderPath.trim()) {
+    throw new Error('saveMessage requires a non-empty folderPath string');
+  }
+  if (typeof args.destDir !== 'string' || !args.destDir.trim()) {
+    throw new Error('saveMessage requires a non-empty destDir string');
+  }
+
+  const overwrite = args.overwrite === true;
+  const writeEml = args.saveEml !== false;
+  const writeAttachments = args.saveAttachments === true;
+
+  // Resolve before creating: a symlinked ancestor must be followed to its real
+  // location and checked against the save root *first*, or the root check
+  // guards a path nothing is ever written to.
+  const destDir = resolveDestDir(args.destDir, { env, fsImpl, pathImpl });
+  fsImpl.mkdirSync(destDir, { recursive: true, mode: SAVE_DIR_MODE });
+
+  // Shared across the .eml and the attachments so a second file can never take
+  // a name already written this run -- including the .eml's own name, which
+  // under the previous overwrite behavior an attachment could clobber.
+  const usedNames = new Set();
+  let emlPath = null;
+
+  if (writeEml) {
+    const resp = await fetchMessage({
+      jsonrpc: '2.0',
+      id: 'saveMessage-eml',
+      method: 'tools/call',
+      params: {
+        name: 'getMessage',
+        arguments: { messageId, folderPath, rawSource: true }
+      }
+    });
+    const data = unwrapToolResponse(resp);
+    const rawSource = data.rawSource;
+    if (typeof rawSource !== 'string' || rawSource.length === 0) {
+      throw new Error(
+        'getMessage returned no rawSource; saving the .eml requires a local/offline ' +
+        'copy of the message (IMAP messages not cached offline cannot be read).'
+      );
+    }
+
+    let filename;
+    if (typeof args.emlFilename === 'string' && args.emlFilename.trim()) {
+      filename = args.emlFilename;
+    } else {
+      // data.subject arrives already RFC 2047-decoded from Thunderbird
+      // (mime2DecodedSubject), so there is nothing left for the bridge to
+      // decode -- and nothing to parse back out of the raw headers.
+      filename = typeof data.subject === 'string' && data.subject.trim()
+        ? data.subject
+        : messageId;
+    }
+    filename = sanitizeSaveFilename(filename);
+    if (!/\.eml$/i.test(filename)) {
+      filename += '.eml';
+    }
+
+    // rawSource is a Latin-1 byte string: the extension reads the message as
+    // bytes and hands each one over as a code point. Writing it as UTF-8 would
+    // re-encode every byte above 0x7f into two, corrupting 8-bit bodies, MIME
+    // parts and signatures. Convert back to the original bytes instead.
+    const emlBytes = Buffer.from(rawSource, 'latin1');
+
+    // The .eml does not get a ' (2)' suffix the way attachments do -- a caller
+    // naming the file expects that name or an error. The exclusive create is
+    // the existence check, so there is no window to lose.
+    const fullPath = pathImpl.join(destDir, filename);
+    try {
+      fsImpl.writeFileSync(fullPath, emlBytes, { flag: 'wx', mode: SAVE_FILE_MODE });
+    } catch (e) {
+      if (e.code !== 'EEXIST') {
+        throw e;
+      }
+      if (!overwrite) {
+        throw new Error(
+          `File already exists: ${fullPath} (set overwrite:true to replace it)`,
+          { cause: e }
+        );
+      }
+      unlinkForOverwrite(fullPath, fsImpl);
+      fsImpl.writeFileSync(fullPath, emlBytes, { flag: 'wx', mode: SAVE_FILE_MODE });
+    }
+    usedNames.add(filename);
+    emlPath = fullPath;
+  }
+
+  const writtenAttachments = [];
+  const skippedAttachments = [];
+
+  if (writeAttachments) {
+    const resp = await fetchMessage({
+      jsonrpc: '2.0',
+      id: 'saveMessage-attachments',
+      method: 'tools/call',
+      params: {
+        name: 'getMessage',
+        arguments: { messageId, folderPath, saveAttachments: true }
+      }
+    });
+    const data = unwrapToolResponse(resp);
+    const attachments = Array.isArray(data.attachments) ? data.attachments : [];
+    for (const att of attachments) {
+      const srcPath = att && att.filePath;
+      if (typeof srcPath !== 'string' || !srcPath) {
+        skippedAttachments.push((att && att.name) || null);
+        continue;
+      }
+      const baseName = sanitizeSaveFilename(att.name || pathImpl.basename(srcPath));
+      writtenAttachments.push(
+        copyFileExclusive(srcPath, destDir, baseName, { usedNames, overwrite, fsImpl, pathImpl })
+      );
+    }
+  }
+
+  return { emlPath, attachments: writtenAttachments, skippedAttachments, destDir };
+}
+
 /**
  * Read connection info (port + auth token) written by the Thunderbird extension.
  * Returns { port, token } or null if no valid candidate exists.
@@ -869,7 +1193,9 @@ function sanitizeJson(data) {
   return sanitized;
 }
 
-async function handleMessage(line) {
+// deps is a seam for tests: production passes nothing and gets the real
+// transport and the process environment.
+async function handleMessage(line, { forward = forwardToThunderbird, env = process.env } = {}) {
   const message = JSON.parse(line);
   const hasId = Object.prototype.hasOwnProperty.call(message, 'id');
   const isNotification =
@@ -926,6 +1252,44 @@ async function handleMessage(line) {
       && ATTACHMENT_TOOLS.has(message.params.name)) {
     try {
       await inlineAttachmentPaths(message.params.arguments);
+    } catch (e) {
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        error: { code: -32602, message: e.message }
+      };
+    }
+  }
+
+  // tools/list: forward to the extension, then append the bridge-local tools it
+  // doesn't know about (saveMessage runs here, not in the extension). Guard the
+  // shape so a malformed extension response is returned untouched.
+  // saveMessage is advertised only when explicitly enabled -- a disabled tool
+  // the model cannot see is a tool prompt injection cannot reach for.
+  if (message.method === 'tools/list') {
+    const resp = await forward(message);
+    if (saveMessageEnabled(env) && resp && resp.result && Array.isArray(resp.result.tools)) {
+      resp.result.tools.push(SAVE_MESSAGE_TOOL);
+    }
+    return resp;
+  }
+
+  // saveMessage is a bridge-local tool that writes files on the machine running
+  // the MCP. Handle it here so it is never forwarded to the extension.
+  if (message.method === 'tools/call'
+      && message.params
+      && message.params.name === 'saveMessage') {
+    try {
+      const data = await saveMessageToDisk({
+        args: message.params.arguments || {},
+        fetchMessage: forward,
+        env
+      });
+      return {
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { content: [{ type: 'text', text: JSON.stringify(data) }] }
+      };
     } catch (e) {
       return {
         jsonrpc: '2.0',
@@ -1212,10 +1576,18 @@ module.exports = {
   findSnapConnectionCandidates,
   formatDiscoveryAttempts,
   compactToolResultJsonText,
+  handleMessage,
   inlineAttachmentPaths,
   isSensitiveFilePath,
   isValidAuthToken,
   readConnectionInfo,
+  resolveDestDir,
+  sanitizeSaveFilename,
+  SAVE_MESSAGE_ENV,
+  SAVE_MESSAGE_TOOL,
+  SAVE_ROOT_ENV,
+  saveMessageEnabled,
+  saveMessageToDisk,
   startBridge,
   attachmentLimits: {
     MAX_ATTACHMENT_BYTES,

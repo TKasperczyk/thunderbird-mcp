@@ -57,6 +57,7 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | `moveFolder` | Move a folder to a new parent within the same account |
 | `emptyTrash` | Permanently delete all messages in Trash (including subfolders) |
 | `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
+| `saveMessage` | Save a message's `.eml` and/or its attachments into a directory you choose (unlike `saveAttachments`, which is temp-dir only). Runs on the bridge, so the path is on the machine running the MCP. **Disabled unless `THUNDERBIRD_MCP_SAVE_MESSAGE=1`** -- see [Security](#security). |
 
 ### Compose
 
@@ -185,6 +186,22 @@ That's it. Your AI can now access Thunderbird.
 - **Tool access control**: Disable specific tools via the settings page. Disabled tools are hidden from `tools/list` and blocked at dispatch.
 - **Localhost only**: By default, the server binds to localhost only. The "Listen on all interfaces" option in settings binds to all IPv4 interfaces for WSL, Docker, or remote access. **This exposes the MCP server to every device on your local network.** Only enable on trusted networks. Auth token is always required.
 - **Auto-update integrity**: Auto-update is a code-delivery channel whose integrity depends on continued control of the GitHub repository, the GitHub Actions token, and the `tomaszkasperczyk.name` registration.
+- **Filesystem writes are opt-in**: `saveMessage` writes caller-named files to a caller-named directory, which is an arbitrary-write primitive in the hands of whatever drives the MCP -- a prompt-injected tool call could aim it at `~/.bashrc`, `~/.ssh/`, or an autostart entry. It is therefore off by default: hidden from `tools/list` and refused at dispatch unless `THUNDERBIRD_MCP_SAVE_MESSAGE=1` is set in the MCP server environment. Set `THUNDERBIRD_MCP_SAVE_ROOT=/path/to/dir` as well to confine every write inside one directory; destinations are resolved through symlinks before the check, so a link cannot escape the root. Saved files are created `0600` and new directories `0700`, and existing files are never written through a symlink.
+
+  ```json
+  {
+    "mcpServers": {
+      "thunderbird": {
+        "command": "npx",
+        "args": ["-y", "thunderbird-mcp"],
+        "env": {
+          "THUNDERBIRD_MCP_SAVE_MESSAGE": "1",
+          "THUNDERBIRD_MCP_SAVE_ROOT": "/home/you/Documents/mail-exports"
+        }
+      }
+    }
+  }
+  ```
 
 ---
 
