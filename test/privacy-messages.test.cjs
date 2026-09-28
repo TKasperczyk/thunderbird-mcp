@@ -414,6 +414,112 @@ describe("Standalone inline PGP armor", () => {
   }
 });
 
+describe("Oversized HTML encryption classification", () => {
+  const cap = 2 * 1024 * 1024;
+  const header = "-----BEGIN PGP MESSAGE-----";
+  const bodies = [
+    ["armor after the cut", `<p>${" ".repeat(cap)}the delimiter is ${header}</p>`],
+    ["armor split by the cut", `<p>${" ".repeat(cap - 3 - 12)}${header} is the delimiter.</p>`],
+  ];
+  const directSends = api => Promise.all([
+    api.replyToMessage("message-1", "folder", "intro", false, false, undefined, undefined, undefined, undefined, undefined, true),
+    api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true),
+  ]);
+
+  for (const [label, html] of bodies) {
+    it(`withholds ${label} in structured reads and direct sends before exposing content`, async () => {
+      const mime = {
+        contentType: "multipart/mixed", parts: [{ contentType: "text/html", body: html }],
+        get allUserAttachments() { return assert.fail("must classify before attachments"); },
+      };
+      const { api, calls } = loadHtmlFixture(html.slice(0, cap), () => documentTree([elementNode("p", [textNode("visible")])]), { mime });
+      assert.equal(api.hasInlinePgpArmor(html), false, "the full raw source has no standalone armor line");
+      for (const format of ["text", "markdown", "html"]) {
+        const result = await api.getMessage("message-1", "folder", true, format);
+        assert.equal(result.encryptedContentWithheld, true);
+        assert.equal(result.subject, "[Encrypted message]");
+      }
+      assert.equal((await api.getMessage("message-1", "folder", false, "html", true)).encryptedContentWithheld, true);
+      for (const send of await directSends(api)) assert.match(send.error, /encrypted messages is blocked/);
+      assert.equal(calls.streams, 0);
+      assert.equal(calls.sends.length, 0);
+    });
+
+    for (const [encoding, raw] of [
+      ["plain", `Content-Type: text/html\r\n\r\n${html}`],
+      ["base64", `Content-Type: text/html\nContent-Transfer-Encoding: base64\n\n${Buffer.from(html).toString("base64")}`],
+      ["UTF-16", `Content-Type: text/html; charset=utf-16le\nContent-Transfer-Encoding: base64\n\n${Buffer.from(html, "utf16le").toString("base64")}`],
+    ]) {
+      it(`withholds ${label} through ${encoding} raw MIME recovery and raw output`, async () => {
+        const { api, calls } = loadMessageTools({ raw, mime: { parts: [] } });
+        for (const rawSource of [false, true]) {
+          const result = await api.getMessage("message-1", "folder", false, "markdown", rawSource);
+          assert.equal(result.encryptedContentWithheld, true);
+          assert.equal(result.rawSource, undefined);
+        }
+        assert.equal(calls.streams, 2);
+      });
+    }
+  }
+
+  it("never classifies a standalone armor line created by the presentation cut", async () => {
+    const encodedHeader = "&#45;----BEGIN PGP MESSAGE-----";
+    const prefix = `<p>${" ".repeat(cap - 3 - encodedHeader.length)}${encodedHeader}`;
+    const html = `${prefix} is the delimiter.</p>`;
+    assert.equal(prefix.length, cap);
+    assert.equal(html.includes(header), false);
+    const { api, calls } = loadHtmlFixture(prefix, () => documentTree([elementNode("p", [textNode(header)])]), {
+      mime: { contentType: "text/html", body: html },
+    });
+    assert.equal(api.hasInlinePgpArmor(api.stripHtml(html)), true, "the cutoff does create a standalone line in presentation");
+    for (const format of ["text", "markdown", "html"]) {
+      const result = await api.getMessage("message-1", "folder", false, format);
+      assert.notEqual(result.encryptedContentWithheld, true);
+      assert.equal(result.body, format === "html" ? html : `${header}\n\n[Message body truncated at 2 MiB]`);
+    }
+    for (const send of await directSends(api)) assert.equal(send.success, true);
+    assert.equal(calls.sends.length, 2);
+
+    const raw = `Content-Type: text/html\n\n${html}`;
+    const fallback = loadHtmlFixture(prefix, () => documentTree([elementNode("p", [textNode(header)])]), { raw, mime: { parts: [] } }).api;
+    assert.equal(fallback.classifyRawMessageEncryption(raw), "clear");
+    const recovered = await fallback.getMessage("message-1", "folder", false, "text");
+    assert.notEqual(recovered.encryptedContentWithheld, true);
+    assert.equal(recovered.body, `${header}\n\n[Message body truncated at 2 MiB]`);
+  });
+
+  it("keeps standalone-line detection for HTML at and below the cap", async () => {
+    for (const [text, encrypted] of [[header, true], [`${header} is the delimiter.`, false]]) {
+      const html = `<p>${text}</p>`;
+      const { api, calls } = loadHtmlFixture(html, () => documentTree([elementNode("p", [textNode(text)])]), {
+        mime: { contentType: "text/html", body: html },
+      });
+      for (const format of ["text", "markdown"]) {
+        const result = await api.getMessage("message-1", "folder", false, format);
+        assert.equal(result.encryptedContentWithheld === true, encrypted);
+      }
+      for (const send of await directSends(api)) {
+        if (encrypted) assert.match(send.error, /encrypted messages is blocked/);
+        else assert.equal(send.success, true);
+      }
+      assert.equal(calls.sends.length, encrypted ? 0 : 2);
+      const exactCap = html + " ".repeat(cap - html.length);
+      assert.equal(api.hasInlinePgpArmor(text, exactCap), encrypted);
+    }
+  });
+
+  it("measures the encryption cap in UTF-8 bytes and honors explicit encrypted access", async () => {
+    const html = `<p>${"é".repeat(cap / 2)}the delimiter is ${header}</p>`;
+    assert.ok(html.length < cap);
+    const { api } = loadMessageTools({ mime: { contentType: "text/html", body: html } });
+    assert.equal(api.isEncryptedMimeMessage({ contentType: "text/html", body: html }), true);
+    const allowed = loadMessageTools({ allowed: true, mime: { contentType: "text/html", body: html } }).api;
+    const result = await allowed.getMessage("message-1", "folder", false, "html");
+    assert.notEqual(result.encryptedContentWithheld, true);
+    assert.equal(result.body, html);
+  });
+});
+
 describe("Encryption classification before raw output or body fallback", () => {
   const armor = "-----BEGIN PGP MESSAGE-----\nciphertext\n-----END PGP MESSAGE-----";
   const plain = "Content-Type: text/plain\n\nvisible";
@@ -622,6 +728,273 @@ function loadHtmlFixture(html, buildTree, options = {}) {
 }
 
 describe("Message text conversion", () => {
+  it("loads encoding helpers only through the production Experiment import", () => {
+    const sandbox = {};
+    const globals = { DOMParser: class {}, atob, btoa, TextDecoder };
+    sandbox.Cu = { importGlobalProperties(names) {
+      for (const name of names) sandbox[name] = globals[name];
+    } };
+    vm.createContext(sandbox);
+    assert.equal(vm.runInContext("typeof atob + ',' + typeof btoa + ',' + typeof TextDecoder", sandbox), "undefined,undefined,undefined");
+    vm.runInContext([
+      snippet("EXPERIMENT GLOBAL IMPORTS"),
+      snippet("INLINE IMAGE CONTENT HELPERS"), snippet("RAW MIME PARSING HELPERS"),
+    ].join("\n"), sandbox);
+    assert.equal(sandbox.encodeByteStringToBase64("\x00\x80\xff"), "AID/");
+    const mime = "Content-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: base64\n\nw6k=";
+    assert.equal(sandbox.extractBodyPartFromRawMime(mime, "text").text, "é");
+    assert.equal(sandbox.decodeRawMimeExtendedParameter("utf-8''caf%C3%A9.txt"), "café.txt");
+  });
+
+  it("warns on failed global imports and continues loading with HTML failing closed", () => {
+    const failure = new Error("global import unavailable");
+    const warnings = [];
+    const sandbox = {
+      Cu: { importGlobalProperties() { throw failure; } },
+      console: { warn: (...args) => warnings.push(args) },
+    };
+    vm.runInNewContext([
+      snippet("EXPERIMENT GLOBAL IMPORTS"),
+      snippet("MCP TEXT SANITIZATION"), snippet("MESSAGE TEXT CONVERSION"),
+    ].join("\n"), sandbox);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0][0], /failed to import Experiment globals/);
+    assert.equal(warnings[0][1], failure);
+    for (const convert of [sandbox.stripHtml, sandbox.htmlToMarkdown]) {
+      assert.equal(convert("<p>private</p>"), "[HTML content withheld: safe HTML parser unavailable.]");
+    }
+    assert.equal(sandbox.extractFormattedBody({ contentType: "text/plain", body: "ordinary message" }).body, "ordinary message");
+  });
+
+  for (const [href, expected] of [
+    ["HTTPS://example.test/", "[label](HTTPS://example.test/)"],
+    [" \x01\thTt\nps://example.test/", "[label](hTtps://example.test/)"],
+    ["MAILTO:reader@example.test", "[label](MAILTO:reader@example.test)"],
+    ["javascript:alert(1)", "label"], [" \x01JaVa\nScRiPt:alert(1)", "label"],
+    ["file:///secret", "label"], ["data:text/html,secret", "label"],
+    ["vbscript:secret", "label"], ["cid:secret", "label"],
+    ["/relative", "label"], ["//remote.test", "label"], ["#fragment", "label"], ["", "label"],
+  ]) {
+    it(`filters Markdown link destination ${JSON.stringify(href)}`, () => {
+      const html = `<a href="${href}">label</a>`;
+      const { api } = loadHtmlFixture(html, () => documentTree([elementNode("a", [textNode("label")], { href })]));
+      assert.equal(api.htmlToMarkdown(html), expected);
+    });
+  }
+  it("escapes literal Markdown, image alt text, and destination delimiters", () => {
+    const html = '<p>fixture with hostile text and attributes</p>';
+    const { api } = loadHtmlFixture(html, () => documentTree([
+      elementNode("a", [textNode("label")], { href: "https://safe.test/) ![pixel](https://tracker.test/p)" }),
+      elementNode("img", [], { src: "https://image.test/secret", srcset: "https://image.test/secret2 2x", alt: "![alt](https://alt.test/)" }),
+      textNode('<img src="https://literal.test/">'),
+      elementNode("img", [], { src: "cid:secret", width: "1", height: "1" }),
+    ]));
+    const result = api.htmlToMarkdown(html);
+    assert.match(result, /safe\.test\/%29%20!%5bpixel%5d%28https:\/\/tracker\.test\/p%29/);
+    assert.ok(result.includes("\\!\\[alt\\](https://alt.test/)"));
+    assert.ok(result.includes('\\<img src="https://literal.test/"\\>'));
+    assert.doesNotMatch(result, /image\.test|cid:secret|(?<!\\)!\[/);
+  });
+  it("escapes a literal bang at generated-link boundaries across comments and elements", () => {
+    const url = "https://tracker.test/p";
+    const linkHtml = `<a href="${url}">x</a>`;
+    const link = () => elementNode("a", [textNode("x")], { href: url });
+    for (const [html, children, expected] of [
+      ["!" + linkHtml, () => [textNode("!"), link()], `\\![x](${url})`],
+      ["!<!--gap-->" + linkHtml, () => [textNode("!"), commentNode("gap"), link()], `\\![x](${url})`],
+      ["!<span></span>" + linkHtml, () => [textNode("!"), elementNode("span"), link()], `\\![x](${url})`],
+      ["!<span>" + linkHtml + "</span>", () => [textNode("!"), elementNode("span", [link()])], `\\![x](${url})`],
+      ["<span>!</span>" + linkHtml, () => [elementNode("span", [textNode("!")]), link()], `\\![x](${url})`],
+      ["!&#x200b;" + linkHtml, () => [textNode("!\u200b"), link()], `\\![x](${url})`],
+      ["\\!" + linkHtml, () => [textNode("\\"), textNode("!"), link()], `\\\\\\![x](${url})`],
+      ['<img alt="!">' + linkHtml, () => [elementNode("img", [], { alt: "!" }), link()], `\\![x](${url})`],
+      ['!<img src="https://image.test/p" alt="Illustration">', () => [textNode("!"), elementNode("img", [], { src: "https://image.test/p", alt: "Illustration" })], "!Illustration"],
+      ['!<img alt="[x](https://tracker.test/p)">', () => [textNode("!"), elementNode("img", [], { alt: `[x](${url})` })], `!\\[x\\](${url})`],
+      ["Thanks!", () => [textNode("Thanks!")], "Thanks!"],
+    ]) {
+      const { api } = loadHtmlFixture(html, () => documentTree(children()));
+      assert.equal(api.htmlToMarkdown(html), expected, html);
+    }
+  });
+  it("uses code fences longer than embedded backtick runs, after invisible-character removal", () => {
+    const html = "<pre>fixture</pre>";
+    const value = "`\u200b``\n![pixel](https://tracker.test/)";
+    const { api } = loadHtmlFixture(html, () => documentTree([elementNode("pre", [textNode(value)])]));
+    assert.equal(api.htmlToMarkdown(html), "````\n```\n![pixel](https://tracker.test/)\n````");
+  });
+  it("keeps code containing image syntax safe inside inline, list, and table contexts", () => {
+    const html = "<p>code fixture</p>";
+    const image = "![pixel](https://tracker.test/)";
+    const { api } = loadHtmlFixture(html, () => documentTree([
+      elementNode("code", [textNode(`first\n\n${image}\n\nlast`)]),
+      elementNode("ul", [elementNode("li", [elementNode("pre", [textNode(image)])])]),
+      elementNode("table", [elementNode("tr", [elementNode("td", [elementNode("pre", [textNode(image)])])])]),
+    ]));
+    const markdown = api.htmlToMarkdown(html);
+    assert.ok(markdown.includes(`\` first ${image} last \``));
+    assert.ok(markdown.includes(`- \`\`\`\n  ${image}\n  \`\`\``));
+    assert.ok(markdown.endsWith("\\!\\[pixel\\](https://tracker.test/)"));
+  });
+  it("preserves ordinary punctuation in HTML text nodes and image alt text", () => {
+    const html = "<p>ordinary text fixture</p>";
+    const ordinary = "some_path C# 5*3 snake_case_name _ * # | ~ ~~~ Wow! ! spaced";
+    const { api } = loadHtmlFixture(html, () => documentTree([
+      elementNode("p", [textNode(ordinary)]),
+      elementNode("img", [], { alt: ordinary, src: "https://image.test/photo" }),
+    ]));
+    assert.equal(api.htmlToMarkdown(html), ordinary + "\n\n" + ordinary);
+  });
+  it("escapes literal link, image, and HTML delimiters without changing other text", () => {
+    const html = "<p>literal syntax fixture</p>";
+    const { api } = loadHtmlFixture(html, () => documentTree([
+      textNode(String.raw`some\path ![x](y) [a](javascript:b) <img src=x> ! hi!`),
+    ]));
+    assert.equal(api.htmlToMarkdown(html), String.raw`some\\path \!\[x\](y) \[a\](javascript:b) \<img src=x\> ! hi!`);
+  });
+  it("escapes literal text and alt backticks beside generated inline code", () => {
+    for (const content of ["![p](https://tracker.test/p)", "[a](javascript:b)", "<img src=x>"]) {
+      for (const prefix of [() => textNode("`"), () => elementNode("img", [], { alt: "`" })]) {
+        const html = "<p>literal-backtick fixture</p>";
+        const { api } = loadHtmlFixture(html, () => documentTree([
+          elementNode("p", [prefix(), elementNode("code", [textNode(content)])]),
+        ]));
+        assert.equal(api.htmlToMarkdown(html), "\\` ` " + content + " `");
+      }
+    }
+  });
+  it("sizes inline and block code delimiters over all nested backtick runs", () => {
+    const content = "![p](https://tracker.test/p)";
+    for (const [tag, expected] of [
+      ["code", "```` outer ```" + content + "`` tail ````"],
+      ["pre", "````\nouter ```" + content + "`` tail\n````"],
+    ]) {
+      const html = "<p>nested-code fixture</p>";
+      const { api } = loadHtmlFixture(html, () => documentTree([
+        elementNode(tag, [textNode("outer `"), elementNode("code", [textNode("``" + content + "``")]), textNode(" tail")]),
+      ]));
+      assert.equal(api.htmlToMarkdown(html), expected);
+    }
+  });
+  it("keeps adjacent inline code fences from merging into unmatched delimiters", () => {
+    const html = "<p>adjacent code fixture</p>";
+    const { api } = loadHtmlFixture(html, () => documentTree([
+      elementNode("code", [textNode("foo")]),
+      elementNode("code", [textNode("``![pixel](https://tracker.test/p)")]),
+    ]));
+    assert.equal(api.htmlToMarkdown(html), "` foo `  ``` ``![pixel](https://tracker.test/p) ```");
+  });
+
+  it("caps HTML input at 2 MiB of UTF-8 without splitting surrogate pairs", () => {
+    const { api } = loadMessageTools();
+    const limit = 2 * 1024 * 1024;
+    for (const unit of ["a", "é", "中", "😀"]) {
+      const size = Buffer.byteLength(unit);
+      const fitting = unit.repeat(Math.floor(limit / size));
+      assert.equal(api.truncateHtmlForParsing(fitting).truncated, false);
+      const limited = api.truncateHtmlForParsing(fitting + unit);
+      assert.equal(limited.truncated, true);
+      assert.equal(limited.html, fitting);
+      assert.ok(Buffer.byteLength(limited.html) <= limit);
+    }
+    const fitting = "x".repeat(limit - 1);
+    assert.equal(api.truncateHtmlForParsing(fitting + "😀tail").html, fitting);
+  });
+  it("parses the capped input and keeps a hidden subtree spanning the cut hidden", () => {
+    const limit = 2 * 1024 * 1024;
+    const prefix = '<p>Before</p><div hidden>secret'.padEnd(limit, "x");
+    const html = prefix + '</div><p>After the cut</p>';
+    const { api } = loadHtmlFixture(prefix, () => documentTree([
+      elementNode("p", [textNode("Before")]),
+      elementNode("div", [textNode("secret")], { hidden: "" }),
+    ]));
+    for (const format of ["text", "markdown"]) {
+      const result = api.extractFormattedBody({ contentType: "text/html", body: html }, format);
+      assert.equal(result.body, "Before\n\n[Message body truncated at 2 MiB]");
+      assert.equal(result.bodyIsHtml, false);
+    }
+    assert.equal(api.extractFormattedBody({ contentType: "text/html", body: html }, "html").body, html);
+    api.escapeHtml = value => value.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    api.formatBodyHtml = value => value;
+    vm.runInContext(snippet("COMPOSE HTML FRAGMENT"), api);
+    assert.equal(api.formatBodyFragmentHtml(html, true), "Before<br><br>[Message body truncated at 2 MiB]");
+  });
+  it("retains readable capped text with a truncation note and bounded output", () => {
+    const limit = 2 * 1024 * 1024;
+    const prefix = "<p>" + "x".repeat(limit - 3);
+    const { api } = loadHtmlFixture(prefix, () => documentTree([elementNode("p", [textNode(prefix.slice(3))])]));
+    for (const convert of [api.stripHtml, api.htmlToMarkdown]) {
+      const result = convert(prefix + "after the cut</p>");
+      assert.ok(result.startsWith("x".repeat(100)));
+      assert.ok(result.endsWith("\n\n[Message body truncated at 2 MiB]"));
+      assert.ok(Buffer.byteLength(result) < limit + 100);
+      assert.doesNotMatch(result, /after the cut|withheld/);
+    }
+  });
+  it("does not append a note for HTML exactly at the input limit", () => {
+    const html = "<p>visible</p><!--".padEnd(2 * 1024 * 1024, "x");
+    const { api } = loadHtmlFixture(html, () => documentTree([elementNode("p", [textNode("visible")])]));
+    assert.equal(api.stripHtml(html), "visible");
+    assert.equal(api.htmlToMarkdown(html), "visible");
+  });
+  it("still fails closed if parsing the truncated input genuinely fails", () => {
+    const inputs = [];
+    const { api } = loadMessageTools({ DOMParser: class {
+      parseFromString(input) { inputs.push(input); throw Error("parser failure"); }
+    } });
+    const html = "<p>" + "x".repeat(2 * 1024 * 1024);
+    for (const convert of [api.stripHtml, api.htmlToMarkdown]) {
+      assert.equal(convert(html), "[HTML content withheld: safe HTML parser unavailable.]");
+    }
+    assert.ok(inputs.length > 0);
+    assert.ok(inputs.every(input => Buffer.byteLength(input) === 2 * 1024 * 1024));
+  });
+  for (const newline of ["\r", "\r\n", "\n"]) {
+    it(`normalizes ${JSON.stringify(newline)} before code, list, and blockquote formatting`, () => {
+      const html = "<p>carriage-return fixture</p>";
+      const pixel = "![pixel](https://tracker.test/p)";
+      for (const [wrap, indent, firstLine] of [
+        [pre => elementNode("ul", [elementNode("li", [pre])]), "  ", "- ```"],
+        [pre => elementNode("blockquote", [pre]), "> ", "> ```"],
+        [pre => elementNode("blockquote", [elementNode("ul", [elementNode("li", [pre])])]), ">   ", "> - ```"],
+        [pre => elementNode("ul", [elementNode("li", [elementNode("blockquote", [pre])])]), "  > ", "- > ```"],
+      ]) {
+        const { api } = loadHtmlFixture(html, () => documentTree([
+          wrap(elementNode("pre", [textNode(`safe${newline}${newline}${pixel}`)])),
+        ]));
+        assert.equal(api.htmlToMarkdown(html), `${firstLine}\n${indent}safe\n${indent}\n${indent}${pixel}\n${indent}\`\`\``);
+      }
+    });
+  }
+  for (const route of ["structured", "coerced", "raw MIME"]) {
+    it(`escapes only image openers in plain-text Markdown via ${route}`, async () => {
+      const body = '# Heading\r\n**bold**\r![pixel](https://tracker.test/p)\n![reference][id]\n' +
+        '[link](javascript:example) <img src="https://literal.test/p">\n' +
+        '\\![escaped](https://tracker.test/p) \\\\![unescaped](https://tracker.test/p)';
+      const expected = '# Heading\r\n**bold**\r\\![pixel](https://tracker.test/p)\n\\![reference][id]\n' +
+        '[link](javascript:example) <img src="https://literal.test/p">\n' +
+        '\\![escaped](https://tracker.test/p) \\\\\\![unescaped](https://tracker.test/p)';
+      const mime = route === "structured" ? { contentType: "text/plain", body }
+        : route === "coerced" ? { parts: [], coerceBodyToPlaintext: () => body } : { parts: [] };
+      const raw = "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n" + Buffer.from(body).toString("base64");
+      const { api } = loadMessageTools({ mime, raw });
+      for (const format of ["markdown", "text", "html", undefined]) {
+        const result = await api.getMessage("message-1", "folder", false, format);
+        assert.equal(result.body, !format || format === "markdown" ? expected : body);
+        assert.equal(result.bodyIsHtml, false);
+      }
+      assert.equal((await api.getMessage("message-1", "folder", false, "markdown", true)).rawSource, raw);
+    });
+  }
+  it("escapes image openers after the existing invisible-character removal", async () => {
+    const body = "!\u200b[pixel](https://tracker.test/p)";
+    for (const mime of [{ contentType: "text/plain", body }, { parts: [] }]) {
+      const raw = "Content-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: base64\n\n" + Buffer.from(body).toString("base64");
+      const { api } = loadMessageTools({ mime, raw });
+      const result = await api.getMessage("message-1", "folder", false, "markdown");
+      assert.equal(result.body, "\\![pixel](https://tracker.test/p)");
+    }
+  });
+
   for (const tag of ["script", "style", "head"]) {
     for (const closing of [`</${tag}>`, `</${tag} >`, `</${tag.toUpperCase()}\t\n >`]) {
       it(`removes the DOM subtree corresponding to ${closing}`, () => {
