@@ -2,135 +2,154 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const { loadCalendarRuntime } = require("./helpers/calendar-runtime.cjs");
 
-// Mirrors the RRULE handling in api.js (normalizeRRule / extractRRuleFromItem).
-// XPCOM is unavailable in node:test, so this covers only the pure string rules
-// and the parentItem fallback -- not calIRecurrenceInfo itself.
+const createArgs = {
+  title: "Recurring meeting", startDate: "2026-09-28T10:00:00Z",
+  calendarId: "calendar-1", skipReview: true,
+};
+const updateArgs = { eventId: "event-1", calendarId: "calendar-1" };
 
-function normalizeRRule(recurrence) {
-  const body = String(recurrence).trim().replace(/^rrule:/i, "").trim();
-  if (!body) throw new Error("Empty recurrence rule");
-  const m = /(?:^|;)FREQ=([^;]*)/i.exec(body);
-  if (!m) throw new Error("Recurrence rule must contain a FREQ part (e.g. FREQ=WEEKLY)");
-  const freq = m[1].toUpperCase();
-  if (freq === "SECONDLY" || freq === "MINUTELY") {
-    throw new Error(`FREQ=${freq} is not supported: Thunderbird's recurrence engine generates no occurrences for it`);
-  }
-  return "RRULE:" + body;
+function assertNotPersisted(runtime) {
+  assert.equal(runtime.calls.adds.length, 0);
+  assert.equal(runtime.calls.modifies.length, 0);
+  assert.equal(runtime.calls.dialogs.length, 0);
 }
 
-function extractRRuleFromItem(item) {
-  const rinfo = (item.parentItem || item).recurrenceInfo;
-  if (!rinfo) return null;
-  try {
-    const rules = rinfo.getRecurrenceItems();
-    for (const r of rules) {
-      if (r && typeof r.icalString === "string") {
-        const line = r.icalString.replace(/\r?\n$/, "");
-        if (line.startsWith("RRULE:")) return line.slice("RRULE:".length);
+describe("Production RRULE normalization", () => {
+  it("accepts an optional case-insensitive prefix and surrounding spaces", () => {
+    const runtime = loadCalendarRuntime();
+    for (const rule of ["FREQ=WEEKLY;BYDAY=MO", "RRULE:FREQ=WEEKLY;BYDAY=MO", "  rrule: FREQ=WEEKLY;BYDAY=MO  "]) {
+      assert.equal(runtime.normalizeRRule(rule), "RRULE:FREQ=WEEKLY;BYDAY=MO");
+    }
+    assert.equal(runtime.normalizeRRule("BYDAY=MO;FREQ=WEEKLY"), "RRULE:BYDAY=MO;FREQ=WEEKLY");
+  });
+
+  it("accepts the supported frequencies", () => {
+    const runtime = loadCalendarRuntime();
+    for (const frequency of ["HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"]) {
+      assert.equal(runtime.normalizeRRule(`FREQ=${frequency}`), `RRULE:FREQ=${frequency}`);
+    }
+  });
+
+  it("rejects missing/unsupported frequencies, duplicate parts and malformed syntax", () => {
+    const runtime = loadCalendarRuntime();
+    for (const rule of [
+      "", " ", "RRULE:", "COUNT=10", "FREQ=", "FREQ=INVALID",
+      "FREQ=SECONDLY", "freq=minutely", "FREQ=DAILY;FREQ=WEEKLY",
+      "FREQ=DAILY;COUNT=2;COUNT=3", "FREQ=DAILY;BROKEN",
+      "FREQ=DAILY;COUNT=", "FREQ=DAILY;;COUNT=2",
+    ]) {
+      assert.throws(() => runtime.normalizeRRule(rule), undefined, `accepted ${JSON.stringify(rule)}`);
+    }
+  });
+
+  it("rejects every C0/C1 control before trimming, including leading/trailing CRLF", () => {
+    const runtime = loadCalendarRuntime();
+    const controls = [...Array.from({ length: 32 }, (_, index) => index),
+      ...Array.from({ length: 33 }, (_, index) => 127 + index)];
+    for (const code of controls) {
+      const control = String.fromCharCode(code);
+      for (const rule of [`${control}FREQ=DAILY`, `FREQ=DAILY${control}`, `FREQ=DAILY;${control}COUNT=2`]) {
+        assert.throws(() => runtime.normalizeRRule(rule), /control/i, `accepted control ${code}`);
       }
     }
-  } catch { /* ignore */ }
-  return null;
-}
-
-function mockRecurrenceInfo(icalStrings) {
-  return {
-    getRecurrenceItems() {
-      return icalStrings.map(s => ({ icalString: s }));
-    },
-  };
-}
-
-describe("normalizeRRule", () => {
-  it("adds the RRULE: prefix when missing", () => {
-    assert.equal(normalizeRRule("FREQ=DAILY;COUNT=10"), "RRULE:FREQ=DAILY;COUNT=10");
-  });
-
-  it("keeps an existing RRULE: prefix without doubling it", () => {
-    assert.equal(normalizeRRule("RRULE:FREQ=DAILY"), "RRULE:FREQ=DAILY");
-  });
-
-  it("accepts a lowercase rrule: prefix without producing RRULE:rrule:", () => {
-    assert.equal(normalizeRRule("rrule:FREQ=DAILY"), "RRULE:FREQ=DAILY");
-  });
-
-  it("trims surrounding whitespace", () => {
-    assert.equal(normalizeRRule("  RRULE:FREQ=WEEKLY;BYDAY=MO  "), "RRULE:FREQ=WEEKLY;BYDAY=MO");
-    assert.equal(normalizeRRule("rrule: FREQ=WEEKLY"), "RRULE:FREQ=WEEKLY");
-  });
-
-  it("rejects FREQ=SECONDLY and FREQ=MINUTELY", () => {
-    assert.throws(() => normalizeRRule("FREQ=SECONDLY"), /SECONDLY/);
-    assert.throws(() => normalizeRRule("RRULE:FREQ=MINUTELY;INTERVAL=5"), /MINUTELY/);
-    assert.throws(() => normalizeRRule("freq=minutely"), /MINUTELY/);
-  });
-
-  it("accepts every expandable frequency", () => {
-    for (const freq of ["HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"]) {
-      assert.equal(normalizeRRule(`FREQ=${freq}`), `RRULE:FREQ=${freq}`);
-    }
-  });
-
-  it("only matches FREQ as a property name, not inside another value", () => {
-    // UNTIL value contains no FREQ; a BYDAY rule with FREQ later still parses.
-    assert.equal(
-      normalizeRRule("BYDAY=MO;FREQ=WEEKLY"),
-      "RRULE:BYDAY=MO;FREQ=WEEKLY",
-    );
-  });
-
-  it("rejects empty and prefix-only rules", () => {
-    assert.throws(() => normalizeRRule(""), /Empty/);
-    assert.throws(() => normalizeRRule("   "), /Empty/);
-    assert.throws(() => normalizeRRule("RRULE:"), /Empty/);
-  });
-
-  it("rejects rules without a FREQ part", () => {
-    assert.throws(() => normalizeRRule("BYDAY=MO,WE,FR"), /FREQ/);
-    assert.throws(() => normalizeRRule("RRULE:COUNT=10;INTERVAL=2"), /FREQ/);
+    assert.throws(() => runtime.normalizeRRule("FREQ=DAILY\r\nATTENDEE:mailto:injected@example.com"), /control/i);
   });
 });
 
-describe("extractRRuleFromItem", () => {
-  it("returns the RRULE body without prefix", () => {
-    const item = { recurrenceInfo: mockRecurrenceInfo(["RRULE:FREQ=WEEKLY;BYDAY=MO,TU"]) };
-    assert.equal(extractRRuleFromItem(item), "FREQ=WEEKLY;BYDAY=MO,TU");
+describe("Production calendar writes parse recurrence before persistence", () => {
+  for (const parser of ["cal", "xpcom"]) {
+    it(`uses Thunderbird's ${parser} recurrence parser to create a recurring event`, async () => {
+      const runtime = loadCalendarRuntime({ blockSkipReview: false, parser });
+      const result = await runtime.invoke("createEvent", { ...createArgs, recurrence: "FREQ=WEEKLY;BYDAY=MO" });
+      assert.equal(result.success, true, result.error);
+      assert.equal(runtime.calls.nativeRules.length, 1);
+      assert.equal(runtime.calls.nativeRules[0].implementation, parser);
+      assert.equal(runtime.calls.nativeRules[0].line, "RRULE:FREQ=WEEKLY;BYDAY=MO");
+      assert.equal(runtime.calls.adds[0].recurrenceInfo.rules[0].type, "WEEKLY");
+    });
+
+    for (const parserFailure of ["throw", "missing-type"]) {
+      for (const name of ["createEvent", "updateEvent"]) {
+        it(`${name} rejects ${parser} parser ${parserFailure} without writing an item`, async () => {
+          const runtime = loadCalendarRuntime({ blockSkipReview: false, parser, parserFailure });
+          const item = runtime.seedEvent();
+          const result = await runtime.invoke(name, {
+            ...(name === "createEvent" ? createArgs : updateArgs), recurrence: "FREQ=WEEKLY;BYDAY=MO",
+          });
+          assert.match(result.error, /recurrence|rule/i);
+          assert.equal(runtime.calls.nativeRules.length, 1);
+          assertNotPersisted(runtime);
+          assert.equal(item.recurrenceInfo, null);
+        });
+      }
+    }
+  }
+
+  for (const name of ["createEvent", "updateEvent"]) {
+    it(`${name} rejects injection before the recurrence parser runs`, async () => {
+      const runtime = loadCalendarRuntime({ blockSkipReview: false });
+      runtime.seedEvent();
+      const result = await runtime.invoke(name, {
+        ...(name === "createEvent" ? createArgs : updateArgs),
+        recurrence: "FREQ=DAILY\r\nATTENDEE:mailto:injected@example.com",
+      });
+      assert.match(result.error, /control/i);
+      assert.equal(runtime.calls.nativeRules.length, 0);
+      assertNotPersisted(runtime);
+    });
+  }
+
+  it("refuses hourly recurrence on an all-day event", async () => {
+    const runtime = loadCalendarRuntime({ blockSkipReview: false });
+    const result = await runtime.invoke("createEvent", {
+      ...createArgs, startDate: "2026-09-28", allDay: true, recurrence: "FREQ=HOURLY",
+    });
+    assert.match(result.error, /all-day/i);
+    assertNotPersisted(runtime);
   });
 
-  it("trims the trailing CRLF an icalString may carry", () => {
-    const item = { recurrenceInfo: mockRecurrenceInfo(["RRULE:FREQ=DAILY;COUNT=3\r\n"]) };
-    assert.equal(extractRRuleFromItem(item), "FREQ=DAILY;COUNT=3");
+  it("replaces the master rule and explicitly discards old recurrence exceptions", async () => {
+    const runtime = loadCalendarRuntime({ blockSkipReview: false });
+    const { master } = runtime.seedSeries();
+    master.recurrenceInfo.excluded.push(runtime.date("2026-09-28T10:00:00Z"));
+    const result = await runtime.invoke("updateEvent", { ...updateArgs, recurrence: "FREQ=DAILY;COUNT=3" });
+    assert.equal(result.success, true, result.error);
+    const written = runtime.calls.modifies[0].item;
+    assert.equal(written.recurrenceInfo.rules[0].icalString, "RRULE:FREQ=DAILY;COUNT=3");
+    assert.equal(written.recurrenceInfo.excluded.length, 0);
+    assert.equal(master.recurrenceInfo.excluded.length, 1);
+    assert.match(result.warning, /series/i);
   });
 
-  it("reads the rule from parentItem on occurrence proxies", () => {
-    const master = { recurrenceInfo: mockRecurrenceInfo(["RRULE:FREQ=MONTHLY"]) };
-    const occurrence = { parentItem: master, recurrenceInfo: null };
-    assert.equal(extractRRuleFromItem(occurrence), "FREQ=MONTHLY");
+  for (const recurrence of [null, ""]) {
+    it(`clears recurrence with ${JSON.stringify(recurrence)} and removes the series warning`, async () => {
+      const runtime = loadCalendarRuntime();
+      const { master } = runtime.seedSeries();
+      const result = await runtime.invoke("updateEvent", { ...updateArgs, recurrence });
+      assert.equal(result.success, true, result.error);
+      assert.equal(runtime.calls.modifies[0].item.recurrenceInfo, null);
+      assert.equal(result.warning, undefined);
+      assert.ok(master.recurrenceInfo, "clearing a clone must leave the stored item alone");
+    });
+  }
+});
+
+describe("Production recurrence extraction", () => {
+  it("reads a parent's RRULE on occurrence proxies and skips EXDATE/RDATE", () => {
+    const runtime = loadCalendarRuntime();
+    const { master, occurrences } = runtime.seedSeries();
+    master.recurrenceInfo.rules.unshift({ icalString: "EXDATE:20260928T100000Z\r\n" });
+    assert.equal(runtime.extractRRuleFromItem(occurrences[0]), "FREQ=WEEKLY");
+    master.recurrenceInfo.rules = [{ icalString: "RDATE:20260928T100000Z" }];
+    assert.equal(runtime.extractRRuleFromItem(master), null);
   });
 
-  it("skips non-RRULE recurrence items (EXDATE, RDATE)", () => {
-    const item = {
-      recurrenceInfo: mockRecurrenceInfo([
-        "EXDATE:20260101T100000Z\r\n",
-        "RRULE:FREQ=YEARLY\r\n",
-      ]),
-    };
-    assert.equal(extractRRuleFromItem(item), "FREQ=YEARLY");
-  });
-
-  it("returns null for RDATE-only recurrences", () => {
-    const item = { recurrenceInfo: mockRecurrenceInfo(["RDATE:20260101T100000Z"]) };
-    assert.equal(extractRRuleFromItem(item), null);
-  });
-
-  it("returns null for non-recurring items", () => {
-    assert.equal(extractRRuleFromItem({ recurrenceInfo: null }), null);
-    assert.equal(extractRRuleFromItem({}), null);
-  });
-
-  it("degrades to null when the provider throws", () => {
-    const item = { recurrenceInfo: { getRecurrenceItems() { throw new Error("quirk"); } } };
-    assert.equal(extractRRuleFromItem(item), null);
+  it("returns null for missing recurrence and provider failures", () => {
+    const runtime = loadCalendarRuntime();
+    assert.equal(runtime.extractRRuleFromItem({}), null);
+    const item = runtime.makeEvent({ recurrenceInfo: { getRecurrenceItems() { throw new Error("provider failure"); } } });
+    assert.equal(runtime.extractRRuleFromItem(item), null);
   });
 });

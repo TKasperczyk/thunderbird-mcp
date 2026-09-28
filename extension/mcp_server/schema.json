@@ -75,19 +75,19 @@
         "name": "getBlockSkipReview",
         "type": "function",
         "async": true,
-        "description": "Get the Block skipReview preference. It defaults to true and gates direct mail sends plus event/task creation.",
+        "description": "Get the Block skipReview preference. It defaults to true, gates direct mail sends and event/task creation without review, blocks adding attendees, and makes meetings with other attendees read-only through MCP.",
         "parameters": []
       },
       {
         "name": "setBlockSkipReview",
         "type": "function",
         "async": true,
-        "description": "Set whether skipReview is blocked. The preference defaults to true; skipReview is honored only after it is explicitly set to false.",
+        "description": "Set whether skipReview and adding calendar attendees are blocked, and meetings with other attendees are read-only through MCP. Defaults to true; explicitly set false to permit these writes.",
         "parameters": [
           {
             "name": "blockSkipReview",
             "type": "boolean",
-            "description": "When true (the default), sendMail, replyToMessage, forwardMessage, createEvent, and createTask reject skipReview=true and require their review window or dialog. Set false explicitly to allow those tools to honor skipReview."
+            "description": "When true (the default), sendMail, replyToMessage, forwardMessage, createEvent, and createTask reject skipReview=true. Adding event attendees is blocked; updateEvent and deleteEvent reject all writes to events with attendees other than the calendar user, including series/occurrence updates and deletions with attendees omitted, because calendar servers can email invitations, updates, or cancellations without review. Set false explicitly to permit these actions."
           }
         ]
       },

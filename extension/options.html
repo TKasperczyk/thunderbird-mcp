@@ -343,8 +343,12 @@
     This setting is enabled by default. While enabled, MCP clients requesting
     <code>skipReview: true</code> on sendMail, replyToMessage, forwardMessage,
     createEvent, or createTask are rejected; the review window or dialog remains
-    available. <code>skipReview</code> is honored only after you explicitly disable
-    this setting.
+    available. Adding event attendees is blocked. Events with attendees other
+    than the calendar user are read-only through MCP: updates and deletions,
+    including individual occurrences, are rejected even when attendees are
+    omitted from the request. Exchange/Owl or CalDAV may email invitations,
+    updates, or cancellations with the event title and description without
+    review. Disabling this setting allows these writes and <code>skipReview</code>.
   </p>
   <ul class="account-list">
     <li>
