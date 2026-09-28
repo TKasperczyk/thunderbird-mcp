@@ -2065,10 +2065,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "saveDraft",
         group: "messages", crud: "create",
         title: "Save Draft",
-        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. Useful when a human will review and send the message later from Thunderbird. On success the result reports `folderPath` -- the folder the draft went to -- so the caller can look it up there without guessing which folder the identity uses.",
+        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. Useful when a human will review and send the message later from Thunderbird. On success the result reports `folderPath` -- the folder the draft went to -- so the caller can look it up there without guessing which folder the identity uses. Pass replaceMessageId to rewrite an existing draft in place instead of adding a second copy.",
         inputSchema: {
           type: "object",
           properties: {
+            replaceMessageId: { type: "string", description: "Message ID of an existing draft to REPLACE (from searchMessages). The new draft carries the full content given here -- nothing is merged from the old one, so pass every field you want kept. Omit to create a new draft." },
+            replaceFolderPath: { type: "string", description: "Folder URI holding the draft named by replaceMessageId (from searchMessages). Required whenever replaceMessageId is set -- the lookup is folder-scoped, it does not search all folders." },
             to: { type: "string", description: "Recipient email address(es), comma-separated. Optional -- a draft can have no recipient." },
             subject: { type: "string", description: "Email subject line (optional)" },
             body: { type: "string", description: "Email body (optional)" },
@@ -4157,7 +4159,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * We try the modern 16-arg call first; if TB throws
              * NS_ERROR_XPC_NOT_ENOUGH_ARGS, fall back to the legacy 18-arg call.
              */
-            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType, deliverMode, bodyType) {
+            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType, deliverMode, bodyType, msgToReplace) {
               if (!identity) {
                 return Promise.resolve({ error: "No identity available for direct send" });
               }
@@ -4268,7 +4270,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     false,                          // isDigest
                     false,                          // dontDeliver
                     mode,                           // deliver mode
-                    null,                           // msgToReplace
+                    msgToReplace || null,           // msgToReplace
                     bodyMimeType,                   // body type
                     body,                           // body
                   ];
@@ -7823,8 +7825,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Saves a composed message to the identity's Drafts folder without
              * sending or opening a compose window. The destination folder is
              * resolved by Thunderbird from the identity's draft-folder pref.
+             *
+             * With replaceMessageId set, the named draft is REPLACED rather than
+             * a second one added: the resolved header goes to createAndSendMessage
+             * as msgToReplace, which is what makes Thunderbird drop the original
+             * once the new draft is written. A draft body cannot be edited in
+             * place through this API surface, so without that argument every
+             * correction of a saved draft would accumulate one more copy in the
+             * Drafts folder, and the caller has no way to remove the stale one.
              */
-            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, inReplyTo, references) {
+            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, inReplyTo, references, replaceMessageId, replaceFolderPath) {
               try {
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
@@ -7849,13 +7859,32 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   composeFields.references = references ? String(references).trim() : bracketed;
                 }
 
-                msgComposeParams.type = Ci.nsIMsgCompType.New;
+                // Resolve the draft to replace BEFORE composing anything: an
+                // unresolvable id must fail the whole call, never silently fall
+                // back to appending a second draft -- that failure mode is
+                // indistinguishable from success at the call site.
+                let msgToReplace = null;
+                if (replaceMessageId) {
+                  // findMessage is folder-scoped; without a folder the lookup
+                  // fails as "Folder not found: undefined", which reads like a
+                  // broken folder rather than a missing argument.
+                  if (!replaceFolderPath) {
+                    return { error: "replaceMessageId requires replaceFolderPath (the folder URI from searchMessages)" };
+                  }
+                  const found = findMessage(replaceMessageId, replaceFolderPath);
+                  if (found.error) return { error: found.error };
+                  msgToReplace = found.msgHdr;
+                }
+
+                msgComposeParams.type = replaceMessageId
+                  ? Ci.nsIMsgCompType.Draft
+                  : Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
 
                 const identityResult = setComposeIdentity(msgComposeParams, from, null);
                 if (identityResult && identityResult.error) return identityResult;
 
-                const { useHtml, format } = resolveComposeFormat(msgComposeParams.identity, isHtml, Ci.nsIMsgCompType.New);
+                const { useHtml, format } = resolveComposeFormat(msgComposeParams.identity, isHtml, msgComposeParams.type);
                 msgComposeParams.format = format;
                 // saveDraft always builds the message directly, so Thunderbird's
                 // compose window never runs and never inserts the signature --
@@ -7869,12 +7898,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   msgComposeParams.identity,
                   fileDescs,
                   null,
-                  Ci.nsIMsgCompType.New,
+                  msgComposeParams.type,
                   Ci.nsIMsgCompDeliverMode.SaveAsDraft,
-                  useHtml ? "text/html" : "text/plain"
+                  useHtml ? "text/html" : "text/plain",
+                  msgToReplace
                 ).then(result => {
                   if (result.success) {
-                    let msg = "Draft saved";
+                    let msg = msgToReplace ? "Draft replaced" : "Draft saved";
                     result.message = msg;
 
                     // Report which folder the draft went to. Thunderbird picks
@@ -9570,7 +9600,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "sendMail":
                   return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
                 case "saveDraft":
-                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.inReplyTo, args.references);
+                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.inReplyTo, args.references, args.replaceMessageId, args.replaceFolderPath);
                 case "replyToMessage":
                   return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.saveAsDraft);
                 case "forwardMessage":
