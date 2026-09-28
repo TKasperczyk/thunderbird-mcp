@@ -112,6 +112,36 @@
         ]
       },
       {
+        "name": "getPrivacySettings",
+        "type": "function",
+        "async": true,
+        "description": "Get user-only encrypted message, calendar, and address-book access preferences. All default to false.",
+        "parameters": []
+      },
+      {
+        "name": "setPrivacySettings",
+        "type": "function",
+        "async": true,
+        "description": "Set privacy preferences from the options page. These settings are not exposed as MCP tools.",
+        "parameters": [
+          {
+            "name": "allowEncryptedMessages",
+            "type": "boolean",
+            "description": "Allow MCP clients to receive decrypted message content. Defaults to false; local S/MIME decryption may still occur while content is withheld."
+          },
+          {
+            "name": "allowAllCalendars",
+            "type": "boolean",
+            "description": "Allow all calendars when mail account restrictions are active. Defaults to false."
+          },
+          {
+            "name": "allowAllAddressBooks",
+            "type": "boolean",
+            "description": "Allow all address books when mail account restrictions are active. Defaults to false."
+          }
+        ]
+      },
+      {
         "name": "getStableAuthToken",
         "type": "function",
         "async": true,
@@ -149,7 +179,7 @@
         "name": "setListenAll",
         "type": "function",
         "async": true,
-        "description": "Set whether the server listens on all network interfaces. When enabled, the server is accessible from other machines on your network (e.g. WSL, Docker). Warning: this bypasses localhost-only binding and exposes the MCP endpoint beyond this machine, though auth token is still required.",
+        "description": "Set whether the server listens on all network interfaces. When enabled, the server is accessible from other machines on your network (e.g. WSL, Docker) over plain HTTP. Warning: the authentication token and mail content travel in clear text on the LAN.",
         "parameters": [
           {
             "name": "listenAll",

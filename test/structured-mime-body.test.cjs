@@ -11,6 +11,9 @@ function loadExtractFormattedBody() {
   const source = fs.readFileSync(apiPath, "utf8");
   const start = source.indexOf("function extractBodyContent(");
   const end = source.indexOf("function formatBodyHtml(", start);
+  const sanitizeStart = source.indexOf("// BEGIN MCP TEXT SANITIZATION");
+  const sanitizeEnd = source.indexOf("// END MCP TEXT SANITIZATION");
+  assert.ok(sanitizeStart >= 0 && sanitizeEnd > sanitizeStart, "text sanitization markers missing");
   assert.ok(start >= 0, "extractBodyContent start marker missing");
   assert.ok(end > start, "extractFormattedBody end marker missing");
 
@@ -20,7 +23,8 @@ function loadExtractFormattedBody() {
   };
   vm.createContext(sandbox);
   vm.runInContext(
-    `${source.slice(start, end)}
+    `${source.slice(sanitizeStart, sanitizeEnd)}
+${source.slice(start, end)}
 this.extractFormattedBody = extractFormattedBody;`,
     sandbox
   );

@@ -64,6 +64,7 @@ function loadProductionAttachmentValidation(overrides = {}) {
   if (sandbox.server) {
     vm.runInContext([
       getMarkedApiSnippet('// BEGIN INLINE IMAGE CONTENT HELPERS', '// END INLINE IMAGE CONTENT HELPERS'),
+      getMarkedApiSnippet('// BEGIN MCP TEXT SANITIZATION', '// END MCP TEXT SANITIZATION'),
       getMarkedApiSnippet('// BEGIN TOOL CALL DISPATCH', '// END TOOL CALL DISPATCH'),
       getMarkedApiSnippet('// BEGIN MCP HTTP HANDLER', '// END MCP HTTP HANDLER'),
     ].join('\n'), sandbox);
