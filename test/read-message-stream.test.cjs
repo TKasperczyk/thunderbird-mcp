@@ -120,6 +120,14 @@ function loadGetMessage({ stream, log, findMessageError }) {
   const sandbox = {
     Cr: { NS_BASE_STREAM_CLOSED },
     console: { error: (...args) => log.push(args) },
+    PREF_ALLOW_ENCRYPTED_MESSAGES: "allowEncryptedMessages",
+    isPrivacyOptInEnabled: () => false,
+    isEncryptedMimeMessage: () => false,
+    ChromeUtils: {
+      importESModule: () => ({
+        MsgHdrToMimeMessage: (hdr, _listener, callback) => callback(hdr, { parts: [] }),
+      }),
+    },
     findMessage() {
       if (findMessageError) throw findMessageError;
       return {

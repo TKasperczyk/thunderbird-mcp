@@ -213,7 +213,9 @@
     </li>
   </ul>
   <p class="mode-note" id="listenAllWarning" style="display:none; color: #d70022;">
-    Warning: this exposes the MCP server to every device on your local network. Enable only on trusted networks.
+    Warning: this exposes the MCP server to every device on your local network over plain HTTP.
+    The authentication token and mail content travel in clear text on the LAN and can be read by
+    anyone able to observe the traffic. Enable only on trusted networks.
   </p>
   <div class="save-row">
     <button id="saveListenAllBtn" disabled>Save</button>
@@ -224,7 +226,8 @@
 <div class="section">
   <h2>Account Access</h2>
   <p class="mode-note">
-    Select which accounts the MCP server can access. If none are checked, all accounts are accessible.
+    Select which accounts the MCP server can access. Saving a changed selection with all accounts
+    checked allows current and future accounts. Select at least one account before saving.
   </p>
   <ul id="accountList" class="account-list">
     <li>Loading...</li>
@@ -232,6 +235,53 @@
   <div class="save-row">
     <button id="saveBtn" disabled>Save</button>
     <span id="saveStatus" class="save-status"></span>
+  </div>
+</div>
+
+<div class="section">
+  <h2>Privacy</h2>
+  <p class="mode-note">
+    Encrypted message bodies, attachments, and inline images are withheld from MCP clients by default.
+    Opaque-signed S/MIME messages are also withheld while encrypted message access is off.
+    Thunderbird may still decrypt S/MIME messages locally. Enabling encrypted message access exposes
+    decrypted content to MCP clients and their AI providers, and allows direct replies and forwards
+    when <code>skipReview</code> is permitted.
+    Search, recent-message, and display tools still return cached headers and previews where available;
+    cached subjects may already contain decrypted protected headers. This setting does not exclude
+    encrypted mail from body-search matches. Thunderbird provides no reliable encryption marker for
+    all message headers.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="allowEncryptedMessages">
+        <span>Allow MCP clients to read encrypted messages</span>
+      </label>
+    </li>
+  </ul>
+  <p class="mode-note">
+    When mail account access is restricted, calendars and address books are blocked unless you
+    allow them below. These permissions allow access to all calendars or all address books,
+    including changes. With unrestricted mail account access, their behavior is unchanged.
+    These settings can only be changed here.
+  </p>
+  <ul class="account-list">
+    <li>
+      <label>
+        <input type="checkbox" id="allowAllCalendars">
+        <span>Allow all calendars</span>
+      </label>
+    </li>
+    <li>
+      <label>
+        <input type="checkbox" id="allowAllAddressBooks">
+        <span>Allow all address books</span>
+      </label>
+    </li>
+  </ul>
+  <div class="save-row">
+    <button id="savePrivacyBtn" disabled>Save</button>
+    <span id="savePrivacyStatus" class="save-status"></span>
   </div>
 </div>
 
@@ -261,6 +311,8 @@
   <p class="mode-note warning-note">
     Stable token mode keeps the same token across restarts. If the connection file leaks,
     the token stays valid until you regenerate or clear it. Changes apply next time the MCP server starts.
+    The stored stable token is cleared on uninstall only while the add-on is enabled (best effort).
+    If you disable the add-on before uninstalling, regenerate the token before using it again.
   </p>
   <ul class="account-list">
     <li>
