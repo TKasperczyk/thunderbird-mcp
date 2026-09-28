@@ -3554,7 +3554,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(`${entry} (exceeds ${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024}MB aggregate attachment limit)`);
                       continue;
                     }
-                    // Thunderbird reads this file later by path; concurrent replacement remains possible.
                     const desc = { url: Services.io.newFileURI(file).spec, name: file.leafName, size: fileSize };
                     descs.push(desc);
                     totalAttachmentBytes += fileSize;
