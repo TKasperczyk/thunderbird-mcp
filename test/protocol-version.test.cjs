@@ -8,15 +8,24 @@
  * but does NOT echo unknown future versions back as if it knew them.
  */
 
-const { describe, it } = require('node:test');
+const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const vm = require('vm');
 
 const BRIDGE_PATH = path.resolve(__dirname, '..', 'mcp-bridge.cjs');
 const API_PATH = path.resolve(__dirname, '..', 'extension', 'mcp_server', 'api.js');
+
+let testRoot;
+let bridgeEnv;
+beforeEach(() => {
+  testRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'tb-mcp-protocol-'));
+  bridgeEnv = { ...process.env, THUNDERBIRD_MCP_CONNECTION_FILE: path.join(testRoot, 'missing.json') };
+});
+afterEach(() => fs.rmSync(testRoot, { recursive: true, force: true }));
 
 function runProductionNotificationBranch(method) {
   const source = fs.readFileSync(API_PATH, 'utf8');
@@ -47,6 +56,7 @@ function sendInitialize(protocolVersion) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BRIDGE_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: bridgeEnv,
     });
 
     let stdout = '';
@@ -147,6 +157,7 @@ describe('protocolVersion negotiation', () => {
     return new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [BRIDGE_PATH], {
         stdio: ['pipe', 'pipe', 'pipe'],
+        env: bridgeEnv,
       });
 
       let stdout = '';

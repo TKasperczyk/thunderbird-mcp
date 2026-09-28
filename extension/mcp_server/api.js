@@ -934,6 +934,16 @@ function buildToolResultContent(toolResult) {
 // BEGIN SENSITIVE ATTACHMENT PATH HELPERS
 // Keep in sync with mcp-bridge.cjs isSensitiveFilePath.
 const SENSITIVE_ATTACHMENT_PATTERNS = [
+  // Network/device namespaces must be rejected before any filesystem access.
+  /^\/\//,
+  // macOS user Library remains denied even when used as a temp directory.
+  /^\/users\/[^/]+\/library(\/|$)/,
+  /\/thunderbird-mcp\/(?:[^/]+\/)?connection\.json$/,
+  // Credential names also occur outside the usual profile directories.
+  /(^|\/)id_[^/]+$/,
+  /(^|\/)private[-_ ]?keys?(\.[^/]+)?$/,
+  /\.(keychain|keychain-db)$/,
+  /(^|\/)(web data|local state|signons\.sqlite|cert[89]\.db|pkcs11\.txt|secmod\.db|prefs\.js|profiles\.ini)$/,
   // SSH / PGP / cloud / kube / docker credentials
   /\/\.ssh(\/|$)/,
   /\/\.gnupg(\/|$)/,
@@ -978,16 +988,36 @@ const SENSITIVE_ATTACHMENT_PATTERNS = [
   /\/appdata\/roaming\/thunderbird(\/|$)/,
 ];
 
-/**
- * Return true if `attachmentPath` looks like a credential, secret, or system
- * file that an MCP caller should not be able to attach to outgoing mail.
- * Path is normalized (backslashes → forward slashes, lower-cased) before
- * matching so the same pattern set works on POSIX and Windows.
- */
-function isSensitiveFilePath(attachmentPath) {
-  if (typeof attachmentPath !== "string" || !attachmentPath) return false;
-  const normalized = attachmentPath.replace(/\\/g, "/").toLowerCase();
-  return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
+function getAttachmentExportPathInfo(attachmentPath, exportRoots = [], windows = false) {
+  // Backslashes are literal filename characters on POSIX, not separators.
+  const nativePath = windows ? attachmentPath.replace(/\\/g, '/') : attachmentPath;
+  if (nativePath.startsWith('//') || nativePath.split('/').some(part => part === '.' || part === '..')) return null;
+  // getMessage exports exactly one sanitized message-id directory and one file.
+  // The sibling "attachments" directory is outbound inline staging, not exports.
+  const match = /^(.*\/thunderbird-mcp)\/([a-zA-Z0-9_]+)\/([^/]+)$/.exec(nativePath);
+  if (!match || match[2].toLowerCase() === 'attachments' ||
+      match[3].startsWith('.') || match[3].toLowerCase() === 'connection.json') return null;
+  const roots = typeof exportRoots === 'function' ? exportRoots() : exportRoots;
+  const root = roots.find(candidate => {
+    const nativeRoot = (windows ? candidate.replace(/\\/g, '/') : candidate).replace(/\/$/, '');
+    return windows ? nativeRoot.toLowerCase() === match[1].toLowerCase() : nativeRoot === match[1];
+  });
+  return root ? { root, parts: [match[2], match[3]] } : null;
+}
+
+function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [] } = {}) {
+  if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
+  const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
+  if (windows && (normalized.replace(/^[a-z]:/, '').includes(':') ||
+      normalized.split('/').some(part => /[. ]$/.test(part)))) return true;
+  // Traversal must never gain the export-directory exemption.
+  if (normalized.split('/').some(part => part === '.' || part === '..')) return true;
+  if (SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized))) return true;
+  // Only inherited dot-directory/AppData restrictions may be waived for exports.
+  if (/(^|\/)(\.[^/]*|appdata)(\/|$)/.test(normalized)) {
+    return !getAttachmentExportPathInfo(attachmentPath, exportRoots, windows);
+  }
+  return false;
 }
 // END SENSITIVE ATTACHMENT PATH HELPERS
 let _tempFileCounter = 0;
@@ -3329,20 +3359,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *   - A string (file path) — resolved from disk
              *   - An object { name, contentType, base64 } — decoded and written
              *     to a temp file under <TmpD>/thunderbird-mcp/attachments/
-             * Returns { descs: [{url, name, size, contentType?}], failed: string[] }
+             * Returns { descs: [{url, name, size, contentType?}], failed: [] }.
+             * Any refused entry throws before a send/draft/window can proceed,
+             * and removes temporary files created by this conversion.
              */
             // BEGIN OUTBOUND ATTACHMENT CONVERSION
             function filePathsToAttachDescs(filePaths) {
               const descs = [];
               const failed = [];
-              if (!filePaths || !Array.isArray(filePaths)) return { descs, failed };
-              let attachmentEntries = filePaths;
+              if (filePaths === undefined || filePaths === null) return { descs, failed };
+              if (!Array.isArray(filePaths)) throw new Error("Attachments must be an array");
               if (filePaths.length > MAX_ATTACHMENTS_PER_MESSAGE) {
-                failed.push(`Attachment count ${filePaths.length} exceeds the ${MAX_ATTACHMENTS_PER_MESSAGE} attachment limit; skipped ${filePaths.length - MAX_ATTACHMENTS_PER_MESSAGE} attachment(s)`);
-                attachmentEntries = filePaths.slice(0, MAX_ATTACHMENTS_PER_MESSAGE);
+                throw new Error(`Attachment count ${filePaths.length} exceeds the ${MAX_ATTACHMENTS_PER_MESSAGE} attachment limit`);
               }
+              const createdTempFiles = [];
               let totalAttachmentBytes = 0;
-              for (const entry of attachmentEntries) {
+              for (const entry of filePaths) {
                 try {
                   if (typeof entry === "string") {
                     // File path attachment.
@@ -3353,7 +3385,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // attacker-controlled email content can prompt-inject an
                     // assistant into calling sendMail with attachments=["/path/to/id_rsa"]
                     // and we never want that to succeed regardless of skipReview.
-                    if (isSensitiveFilePath(entry)) {
+                    let exportRoots;
+                    let canonicalExportRoot;
+                    const attachmentPolicy = {
+                      windows: Services.appinfo?.OS === "WINNT",
+                      // Evaluated only for an otherwise-safe export-shaped path.
+                      exportRoots: () => {
+                        if (!exportRoots) {
+                          const root = Services.dirsvc.get("TmpD", Ci.nsIFile);
+                          canonicalExportRoot = root.clone();
+                          // Trust TmpD's canonical location, not symlinks below it.
+                          canonicalExportRoot.normalize();
+                          root.append("thunderbird-mcp");
+                          canonicalExportRoot.append("thunderbird-mcp");
+                          exportRoots = [root.path, canonicalExportRoot.path];
+                        }
+                        return exportRoots;
+                      },
+                    };
+                    if (isSensitiveFilePath(entry, attachmentPolicy)) {
                       failed.push(`${entry} (sensitive path blocked)`);
                       continue;
                     }
@@ -3373,19 +3423,50 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(`${entry} (symlinked path blocked)`);
                       continue;
                     }
-                    // SECURITY: normalize for lexical cleanup and re-run the
-                    // deny-list against the cleaned path. Do not rely on
-                    // nsIFile.normalize() to resolve symlinks or junctions: that
-                    // is not its cross-platform contract (notably on Windows).
+                    // POSIX normalize resolves parent symlinks. Windows only
+                    // normalizes syntax, so inspect resolved ancestors there too.
                     try {
                       file.normalize();
                     } catch {
                       failed.push(`${entry} (path normalization failed)`);
                       continue;
                     }
-                    if (isSensitiveFilePath(file.path)) {
+                    if (isSensitiveFilePath(file.path, attachmentPolicy)) {
                       failed.push(`${entry} (sensitive path blocked)`);
                       continue;
+                    }
+                    const exportInfo = getAttachmentExportPathInfo(entry, attachmentPolicy.exportRoots, attachmentPolicy.windows);
+                    const resolvedExportInfo = getAttachmentExportPathInfo(file.path, attachmentPolicy.exportRoots, attachmentPolicy.windows);
+                    if (exportInfo || resolvedExportInfo) {
+                      let expectedPath = entry;
+                      if (exportInfo) {
+                        const expectedFile = canonicalExportRoot.clone();
+                        for (const part of exportInfo.parts) expectedFile.append(part);
+                        expectedPath = expectedFile.path;
+                      }
+                      const expected = attachmentPolicy.windows ? expectedPath.replace(/\\/g, "/").toLowerCase() : expectedPath;
+                      const resolved = attachmentPolicy.windows ? file.path.replace(/\\/g, "/").toLowerCase() : file.path;
+                      if (expected !== resolved) {
+                        failed.push(`${entry} (export path is redirected)`);
+                        continue;
+                      }
+                    }
+                    if (Services.appinfo?.OS === "WINNT") {
+                      // Windows isSymlink() does not identify junctions. On a
+                      // fresh nsIFile, isReadable() forces ResolveAndStat, which
+                      // resolves a reparse point before target is read. Check
+                      // every ancestor: a regular leaf below a junction is not
+                      // itself a reparse point. Refuse redirected paths.
+                      for (let component = file.clone(); component; component = component.parent) {
+                        // Parents already have normalized syntax. Normalizing a
+                        // drive root ("C:" in nsIFile) would expand it to its cwd.
+                        if (!component.isReadable()) throw new Error("path resolution failed");
+                        const target = component.target;
+                        if (!target ||
+                            target.replace(/\\/g, "/").toLowerCase() !== component.path.replace(/\\/g, "/").toLowerCase()) {
+                          throw new Error("symlinked or junction path blocked");
+                        }
+                      }
                     }
                     let isRegularFile;
                     try {
@@ -3419,10 +3500,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       failed.push(`${entry} (exceeds ${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024}MB aggregate attachment limit)`);
                       continue;
                     }
-                    // SECURITY: Parent-component symlinks/junctions and a TOCTOU
-                    // window remain between these checks and Thunderbird's later
-                    // MIME read. Fully closing those residual risks would require
-                    // copying each file to a private temp directory before sending.
+                    // Thunderbird reads this file later by path; concurrent replacement remains possible.
                     const desc = { url: Services.io.newFileURI(file).spec, name: file.leafName, size: fileSize };
                     descs.push(desc);
                     totalAttachmentBytes += fileSize;
@@ -3489,14 +3567,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // Write via XPCOM binary stream
                     const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
                       .createInstance(Ci.nsIFileOutputStream);
-                    ostream.init(tmpFile, 0x02 | 0x08 | 0x20, 0o600, 0);
-                    const bstream = Cc["@mozilla.org/binaryoutputstream;1"]
-                      .createInstance(Ci.nsIBinaryOutputStream);
-                    bstream.setOutputStream(ostream);
-                    bstream.writeByteArray(bytes, bytes.length);
-                    bstream.close();
-                    ostream.close();
+                    // Exclusive creation ensures cleanup only removes this call's files.
+                    ostream.init(tmpFile, 0x02 | 0x08 | 0x80, 0o600, 0);
+                    createdTempFiles.push(tmpFile);
                     _tempAttachFiles.add(tmpFile.path);
+                    let bstream;
+                    try {
+                      bstream = Cc["@mozilla.org/binaryoutputstream;1"]
+                        .createInstance(Ci.nsIBinaryOutputStream);
+                      bstream.setOutputStream(ostream);
+                      bstream.writeByteArray(bytes, bytes.length);
+                    } finally {
+                      try { if (bstream) bstream.close(); } finally { ostream.close(); }
+                    }
                     const desc = { url: Services.io.newFileURI(tmpFile).spec, name: entry.name || entry.filename, size: tmpFile.fileSize };
                     if (entry.contentType) desc.contentType = entry.contentType;
                     descs.push(desc);
@@ -3505,8 +3588,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     failed.push(typeof entry === "object" ? JSON.stringify(entry) : String(entry));
                   }
                 } catch (e) {
-                  failed.push(typeof entry === "object" ? (entry.name || JSON.stringify(entry)) : String(entry));
+                  const label = entry && typeof entry === "object" ? (entry.name || JSON.stringify(entry)) : String(entry);
+                  failed.push(`${label} (${e.message || e})`);
                 }
+              }
+              // Materialize native attachments before any send/draft/window.
+              // The helper caches them on the private descriptors for later use.
+              if (!failed.length) {
+                try { descsToMsgAttachments(descs); } catch (e) { failed.push(e.message || String(e)); }
+              }
+              if (failed.length) {
+                for (const tmpFile of createdTempFiles) {
+                  try {
+                    tmpFile.remove(false);
+                    _tempAttachFiles.delete(tmpFile.path);
+                  } catch (e) {
+                    // Retain it in the shutdown cleanup set if removal failed.
+                    console.warn("thunderbird-mcp: temporary attachment cleanup failed:", e);
+                  }
+                }
+                throw new Error(`Attachments refused: ${failed.join(", ")}`);
               }
               return { descs, failed };
             }
@@ -3518,9 +3619,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * the reply/forward observer path (addAttachmentsToComposeWindow),
              * and sendMessageDirectly (headless send).
              */
+            // BEGIN NATIVE ATTACHMENT CONVERSION
             function descsToMsgAttachments(attachDescs) {
               const result = [];
               for (const desc of attachDescs) {
+                if (desc.msgAttachment) {
+                  result.push(desc.msgAttachment);
+                  continue;
+                }
                 try {
                   const att = Cc["@mozilla.org/messengercompose/attachment;1"]
                     .createInstance(Ci.nsIMsgAttachment);
@@ -3528,22 +3634,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   att.name = desc.name;
                   if (desc.size != null) att.size = desc.size;
                   if (desc.contentType) att.contentType = desc.contentType;
+                  desc.msgAttachment = att;
                   result.push(att);
                 } catch (e) {
-                  console.warn("thunderbird-mcp: failed to convert attachment descriptor:", desc?.name || desc?.url || desc, e);
+                  throw new Error(`Attachment refused: ${desc.url || desc.name} (${e.message || e})`, { cause: e });
                 }
               }
               return result;
             }
 
             function addAttachmentsToComposeWindow(composeWin, attachDescs) {
-              if (!composeWin) {
-                console.warn("thunderbird-mcp: skipping attachment add — no compose window");
-                return;
-              }
-              if (typeof composeWin.AddAttachments !== "function") {
-                console.warn("thunderbird-mcp: skipping attachment add — composeWin.AddAttachments not a function");
-                return;
+              if (!attachDescs.length) return;
+              if (!composeWin || typeof composeWin.AddAttachments !== "function") {
+                throw new Error("Cannot add attachments to the compose window");
               }
               const attachList = descsToMsgAttachments(attachDescs);
               if (attachList.length > 0) {
@@ -3552,6 +3655,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeWin.AddAttachments(attachList);
               }
             }
+
+            // END NATIVE ATTACHMENT CONVERSION
 
             function splitAddressHeader(header) {
               return (header || "").match(/(?:[^,"]|"[^"]*")+/g) || [];
@@ -6869,6 +6974,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return name || "attachment";
                     }
 
+                    // BEGIN ATTACHMENT EXPORT DIRECTORY
                     function ensureAttachmentDir(sanitizedId) {
                       const root = Services.dirsvc.get("TmpD", Ci.nsIFile);
                       root.append("thunderbird-mcp");
@@ -6888,6 +6994,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                       return dir;
                     }
+
+                    // END ATTACHMENT EXPORT DIRECTORY
 
                     const sanitizedId = sanitizePathSegment(messageId);
                     let dir;
@@ -7212,6 +7320,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * 2. Encode non-ASCII as HTML entities - compose window has charset issues
              *    with emojis/unicode even with <meta charset="UTF-8">
              */
+            // BEGIN OUTBOUND MAIL TOOLS
             function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview) {
               try {
                 if (skipReview && isSkipReviewBlocked()) {
@@ -7249,13 +7358,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   composeFields.body = body || "";
                 }
 
-                const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
+                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
 
                 if (skipReview) {
                   return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New, Ci.nsIMsgCompDeliverMode.Now, useHtml ? "text/html" : "text/plain").then(result => {
                     if (result.success) {
                       let msg = "Message sent";
-                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                       result.message = msg;
                     }
                     return result;
@@ -7279,7 +7387,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 msgComposeService.OpenComposeWindowWithParams(null, msgComposeParams);
 
                 let msg = "Compose window opened";
-                if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                 return { success: true, message: msg };
               } catch (e) {
                 return { error: e.toString() };
@@ -7321,7 +7428,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   composeFields.body = body || "";
                 }
 
-                const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
+                const { descs: fileDescs } = filePathsToAttachDescs(attachments);
 
                 return sendMessageDirectly(
                   composeFields,
@@ -7334,7 +7441,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 ).then(result => {
                   if (result.success) {
                     let msg = "Draft saved";
-                    if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                     result.message = msg;
                   }
                   return result;
@@ -7367,7 +7473,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    return;
 	                  }
 	                  const { msgHdr, folder } = found;
-	                  const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
+	                  const { descs: fileDescs } = filePathsToAttachDescs(attachments);
 	                  const msgURI = folder.getUriForMsg(msgHdr);
 	                  const compType = replyAll ? Ci.nsIMsgCompType.ReplyAll : Ci.nsIMsgCompType.Reply;
 
@@ -7467,7 +7573,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                            markMessageDispositionState(msgHdr, repliedDisposition);
 
 	                            let msg = "Reply sent";
-	                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
 	                            result.message = msg;
 	                          }
 	                          resolve(result);
@@ -7499,7 +7604,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  ).then(result => {
 	                    if (result.success) {
 	                      let msg = "Reply window opened";
-	                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
 	                      result.message = msg;
 	                    }
 	                    resolve(result);
@@ -7545,7 +7649,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     return;
                   }
                   const { msgHdr, folder } = found;
-                  const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
+                  const { descs: fileDescs } = filePathsToAttachDescs(attachments);
                   const msgURI = folder.getUriForMsg(msgHdr);
                   const compType = Ci.nsIMsgCompType.ForwardInline;
 
@@ -7651,7 +7755,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             markMessageDispositionState(msgHdr, forwardedDisposition);
 
                             let msg = `Forward sent with ${allDescs.length} attachment(s)`;
-                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                             result.message = msg;
                           }
                           resolve(result);
@@ -7688,7 +7791,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   ).then(result => {
                     if (result.success) {
                       let msg = "Forward window opened";
-                      if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                       result.message = msg;
                     }
                     resolve(result);
@@ -7704,6 +7806,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               });
             }
+
+            // END OUTBOUND MAIL TOOLS
 
             function displayMessage(messageId, folderPath, displayMode) {
               const found = findMessage(messageId, folderPath);
@@ -8838,6 +8942,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END TOOL SCHEMA VALIDATOR
 
+            // BEGIN TOOL CALL DISPATCH
             function validateToolArgs(name, args) {
               const tool = buildTools().find(t => t.name === name);
               const schema = tool?.inputSchema;
@@ -9011,8 +9116,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // END TOOL CALL DISPATCH
+
             const server = new HttpServer();
 
+            // BEGIN MCP HTTP HANDLER
             server.registerPathHandler("/", (req, res) => {
               res.processAsync();
 
@@ -9195,6 +9303,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try { res.finish(); } catch {}
               });
             });
+
+            // END MCP HTTP HANDLER
 
             // Try the default port first, then fall back to nearby ports
             let boundPort = null;

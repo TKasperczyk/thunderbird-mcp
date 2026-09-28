@@ -20,7 +20,18 @@ const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
 const DEFAULT_PROC_ROOT = '/proc';
 const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
 const THUNDERBIRD_MCP_SUBDIR = 'thunderbird-mcp';
+const SNAP_TMP_SUBDIR = ['Downloads', 'thunderbird.tmp'];
 const CONNECTION_FILE_BASENAME = 'connection.json';
+const MAX_CONNECTION_FILE_BYTES = 4096;
+// Known upstream (including legacy and ESR), Fedora, and Betterbird IDs.
+// Keep exact case: Flatpak application IDs are case-sensitive.
+const FLATPAK_APP_IDS = new Set([
+  'org.mozilla.Thunderbird',
+  'org.mozilla.thunderbird',
+  'org.mozilla.thunderbird_esr',
+  'net.thunderbird.Thunderbird',
+  'eu.betterbird.Betterbird',
+]);
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
 
 // MCP protocol versions the bridge knows how to speak. Per lifecycle spec the
@@ -174,7 +185,7 @@ function buildScanGroup(label, pattern, candidates, noMatchReason) {
 }
 
 function findMacOsConnectionCandidates(context) {
-  const { fsImpl, pathImpl, darwinFoldersRoot, uid } = context;
+  const { fsImpl, pathImpl, darwinFoldersRoot } = context;
   const pattern = pathImpl.join(
     darwinFoldersRoot,
     '*',
@@ -225,12 +236,7 @@ function findMacOsConnectionCandidates(context) {
 
       try {
         const stat = fsImpl.statSync(candidatePath);
-        if (!stat.isFile()) {
-          continue;
-        }
-        if (uid !== null && uid !== undefined && stat.uid !== uid) {
-          continue;
-        }
+        // Scan metadata only; the opened descriptor decides trust below.
         addUniqueCandidate(candidates, seenPaths, makeCandidate('macOS temp scan', candidatePath, stat.mtimeMs));
       } catch (err) {
         if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') {
@@ -240,11 +246,7 @@ function findMacOsConnectionCandidates(context) {
     }
   }
 
-  const ownerText = uid !== null && uid !== undefined
-    ? `no matching files owned by uid ${uid}`
-    : 'no matching files';
-
-  return buildScanGroup('macOS temp scan', pattern, candidates, ownerText);
+  return buildScanGroup('macOS temp scan', pattern, candidates, 'no matching files');
 }
 
 function findSnapConnectionCandidates(context) {
@@ -285,6 +287,10 @@ function findSnapConnectionCandidates(context) {
           continue;
         }
 
+        // argv[0] and TMPDIR are process-controlled; require the actual Snap executable.
+        const executable = fsImpl.realpathSync(pathImpl.join(procRoot, pid, 'exe'));
+        if (!executable.startsWith('/snap/thunderbird/')) continue;
+
         const environ = fsImpl.readFileSync(pathImpl.join(procRoot, pid, 'environ'), 'utf8');
         const tmpEntry = environ.split('\0').find((entry) => entry.startsWith('TMPDIR='));
         if (!tmpEntry) {
@@ -319,8 +325,7 @@ function findSnapConnectionCandidates(context) {
   // cannot tell us the runtime TMPDIR.
   const fallbackPath = pathImpl.join(
     homeDir,
-    'Downloads',
-    'thunderbird.tmp',
+    ...SNAP_TMP_SUBDIR,
     THUNDERBIRD_MCP_SUBDIR,
     CONNECTION_FILE_BASENAME
   );
@@ -339,64 +344,90 @@ function findSnapConnectionCandidates(context) {
   return buildScanGroup('Snap detection', pattern, candidates, 'no thunderbird TMPDIR candidates found');
 }
 
+// Shared layout definitions for discovery and attachment export recognition.
+function getFlatpakScanRoots(context) {
+  const { pathImpl, runtimeDir, homeDir } = context;
+  return [
+    {
+      base: runtimeDir,
+      label: '$XDG_RUNTIME_DIR',
+      appRoot: pathImpl.join(runtimeDir || '$XDG_RUNTIME_DIR', 'app'),
+      tmpSuffix: [],
+    },
+    {
+      base: homeDir,
+      label: '$HOME',
+      appRoot: pathImpl.join(homeDir || '$HOME', '.var', 'app'),
+      tmpSuffix: ['cache', 'tmp'],
+    },
+  ];
+}
+
 function findFlatpakConnectionCandidates(context) {
-  const { fsImpl, pathImpl, runtimeDir } = context;
-  const patternBase = runtimeDir || '$XDG_RUNTIME_DIR';
-  const pattern = pathImpl.join(
-    patternBase,
-    'app',
-    '*',
-    THUNDERBIRD_MCP_SUBDIR,
-    CONNECTION_FILE_BASENAME
-  );
+  const { fsImpl, pathImpl } = context;
+  const roots = getFlatpakScanRoots(context);
 
-  if (!runtimeDir) {
-    return {
-      notes: [makeAttempt('Flatpak scan', pattern, 'runtime dir unavailable')],
-      candidates: [],
-    };
-  }
-
-  const appRoot = pathImpl.join(runtimeDir, 'app');
-  let appEntries;
-  try {
-    appEntries = fsImpl.readdirSync(appRoot, { withFileTypes: true });
-  } catch (err) {
-    return {
-      notes: [makeAttempt('Flatpak scan', pattern, normalizeFsError(err))],
-      candidates: [],
-    };
-  }
-
+  const notes = [];
   const candidates = [];
   const seenPaths = new Set();
 
-  for (const appEntry of appEntries) {
-    if (!appEntry.isDirectory()) {
-      continue;
-    }
-
-    const candidatePath = pathImpl.join(
-      appRoot,
-      appEntry.name,
+  for (const root of roots) {
+    const pattern = pathImpl.join(
+      root.appRoot,
+      '*',
+      ...root.tmpSuffix,
       THUNDERBIRD_MCP_SUBDIR,
       CONNECTION_FILE_BASENAME
     );
 
+    if (!root.base) {
+      notes.push(makeAttempt('Flatpak scan', pattern, `${root.label} unavailable`));
+      continue;
+    }
+
+    let appEntries;
     try {
-      const stat = fsImpl.statSync(candidatePath);
-      if (!stat.isFile()) {
-        continue;
-      }
-      addUniqueCandidate(candidates, seenPaths, makeCandidate('Flatpak runtime scan', candidatePath, stat.mtimeMs));
+      appEntries = fsImpl.readdirSync(root.appRoot, { withFileTypes: true });
     } catch (err) {
-      if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') {
+      notes.push(makeAttempt('Flatpak scan', pattern, normalizeFsError(err)));
+      continue;
+    }
+
+    let found = 0;
+    for (const appEntry of appEntries) {
+      // Skip symlinked aliases (e.g. org.mozilla.Thunderbird -> net.thunderbird.Thunderbird)
+      if (!appEntry.isDirectory()) {
         continue;
       }
+      if (!FLATPAK_APP_IDS.has(appEntry.name)) {
+        notes.push(makeAttempt('Flatpak scan', pathImpl.join(root.appRoot, appEntry.name), 'application ID not allowed'));
+        continue;
+      }
+
+      const candidatePath = pathImpl.join(
+        root.appRoot,
+        appEntry.name,
+        ...root.tmpSuffix,
+        THUNDERBIRD_MCP_SUBDIR,
+        CONNECTION_FILE_BASENAME
+      );
+
+      try {
+        const stat = fsImpl.statSync(candidatePath);
+        // Scan metadata only; the opened descriptor decides trust below.
+        addUniqueCandidate(candidates, seenPaths, makeCandidate('Flatpak scan', candidatePath, stat.mtimeMs));
+        found++;
+      } catch {
+        // ENOENT/ENOTDIR are expected for non-Thunderbird apps; skip anything else too.
+      }
+    }
+
+    if (found === 0) {
+      notes.push(makeAttempt('Flatpak scan', pattern, 'no matching files'));
     }
   }
 
-  return buildScanGroup('Flatpak scan', pattern, candidates, 'no matching files');
+  return { notes, candidates: sortCandidatesByMtime(candidates) };
 }
 
 function buildCandidateGroups(options = {}) {
@@ -438,25 +469,56 @@ function buildCandidateGroups(options = {}) {
 }
 
 function tryReadConnectionCandidate(candidate, context) {
+  const { fsImpl, platform, uid } = context;
+  let fd;
   try {
-    const raw = context.fsImpl.readFileSync(candidate.path, 'utf8');
+    const constants = fsImpl.constants || fs.constants;
+    if (platform !== 'win32' && (!constants.O_NOFOLLOW || !constants.O_NONBLOCK)) {
+      throw new Error('secure connection file open flags unavailable');
+    }
+    // Open once: no path-based read after checking ownership/type. NONBLOCK
+    // lets fstat reject a FIFO without waiting for a writer to connect.
+    fd = fsImpl.openSync(candidate.path,
+      constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+    const stat = fsImpl.fstatSync(fd);
+    if (!stat.isFile()) throw new Error('connection file is not a regular file');
+    if (platform !== 'win32') {
+      if (!Number.isInteger(uid) || stat.uid !== uid) {
+        throw new Error('connection file is not owned by the current user');
+      }
+      if ((stat.mode & 0o077) !== 0) {
+        throw new Error('connection file permissions must be owner-only (0600)');
+      }
+    }
+    if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > MAX_CONNECTION_FILE_BYTES) {
+      throw new Error(`connection file exceeds ${MAX_CONNECTION_FILE_BYTES} bytes or has an invalid size`);
+    }
+    // Bound the read as well as fstat: the file may grow after it was checked.
+    const buffer = Buffer.alloc(MAX_CONNECTION_FILE_BYTES + 1);
+    let length = 0;
+    while (length < buffer.length) {
+      const count = fsImpl.readSync(fd, buffer, length, buffer.length - length, null);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length > MAX_CONNECTION_FILE_BYTES) {
+      throw new Error(`connection file exceeds ${MAX_CONNECTION_FILE_BYTES} bytes`);
+    }
     let data;
     try {
-      data = JSON.parse(raw);
-    } catch (err) {
-      return {
-        ok: false,
-        attempt: makeAttempt(candidate.label, candidate.path, `malformed JSON (${err.message})`)
-      };
+      data = JSON.parse(buffer.toString('utf8', 0, length));
+    } catch {
+      throw new Error('malformed JSON in connection file');
     }
-
-    if (!data.port || !data.token) {
-      return {
-        ok: false,
-        attempt: makeAttempt(candidate.label, candidate.path, 'missing port or token')
-      };
+    if (!data || !data.port || !data.token) {
+      throw new Error('Invalid connection file: missing port or token');
     }
-
+    if (!Number.isInteger(data.port) || data.port < 1 || data.port > 65535) {
+      throw new Error('Invalid connection file: port must be an integer between 1 and 65535');
+    }
+    if (!isValidAuthToken(data.token)) {
+      throw new Error('Invalid connection file: token must be 64 lowercase hex characters');
+    }
     return {
       ok: true,
       data,
@@ -467,6 +529,8 @@ function tryReadConnectionCandidate(candidate, context) {
       ok: false,
       attempt: makeAttempt(candidate.label, candidate.path, normalizeFsError(err))
     };
+  } finally {
+    if (fd !== undefined) fsImpl.closeSync(fd);
   }
 }
 
@@ -511,6 +575,16 @@ const MAX_ATTACHMENTS_PER_MESSAGE = 20;
 // neither transport can bypass the LLM-confused-deputy defense.
 // Keep in sync with extension/mcp_server/api.js isSensitiveFilePath.
 const SENSITIVE_ATTACHMENT_PATTERNS = [
+  // Network/device namespaces must be rejected before any filesystem access.
+  /^\/\//,
+  // macOS user Library remains denied even when used as a temp directory.
+  /^\/users\/[^/]+\/library(\/|$)/,
+  /\/thunderbird-mcp\/(?:[^/]+\/)?connection\.json$/,
+  // Credential names also occur outside the usual profile directories.
+  /(^|\/)id_[^/]+$/,
+  /(^|\/)private[-_ ]?keys?(\.[^/]+)?$/,
+  /\.(keychain|keychain-db)$/,
+  /(^|\/)(web data|local state|signons\.sqlite|cert[89]\.db|pkcs11\.txt|secmod\.db|prefs\.js|profiles\.ini)$/,
   // SSH / PGP / cloud / kube / docker credentials
   /\/\.ssh(\/|$)/,
   /\/\.gnupg(\/|$)/,
@@ -555,20 +629,45 @@ const SENSITIVE_ATTACHMENT_PATTERNS = [
   /\/appdata\/roaming\/thunderbird(\/|$)/,
 ];
 
-function isSensitiveFilePath(attachmentPath) {
+function getAttachmentExportPathInfo(attachmentPath, exportRoots = [], windows = false) {
+  // Backslashes are literal filename characters on POSIX, not separators.
+  const nativePath = windows ? attachmentPath.replace(/\\/g, '/') : attachmentPath;
+  if (nativePath.startsWith('//') || nativePath.split('/').some(part => part === '.' || part === '..')) return null;
+  // getMessage exports exactly one sanitized message-id directory and one file.
+  // The sibling "attachments" directory is outbound inline staging, not exports.
+  const match = /^(.*\/thunderbird-mcp)\/([a-zA-Z0-9_]+)\/([^/]+)$/.exec(nativePath);
+  if (!match || match[2].toLowerCase() === 'attachments' ||
+      match[3].startsWith('.') || match[3].toLowerCase() === 'connection.json') return null;
+  const roots = typeof exportRoots === 'function' ? exportRoots() : exportRoots;
+  const root = roots.find(candidate => {
+    const nativeRoot = (windows ? candidate.replace(/\\/g, '/') : candidate).replace(/\/$/, '');
+    return windows ? nativeRoot.toLowerCase() === match[1].toLowerCase() : nativeRoot === match[1];
+  });
+  return root ? { root, parts: [match[2], match[3]] } : null;
+}
+
+function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [] } = {}) {
   if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
   const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
-  return SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized));
+  if (windows && (normalized.replace(/^[a-z]:/, '').includes(':') ||
+      normalized.split('/').some(part => /[. ]$/.test(part)))) return true;
+  // Traversal must never gain the export-directory exemption.
+  if (normalized.split('/').some(part => part === '.' || part === '..')) return true;
+  if (SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized))) return true;
+  // Only inherited dot-directory/AppData restrictions may be waived for exports.
+  if (/(^|\/)(\.[^/]*|appdata)(\/|$)/.test(normalized)) {
+    return !getAttachmentExportPathInfo(attachmentPath, exportRoots, windows);
+  }
+  return false;
 }
 
 // Tools whose `attachments` array may contain string file paths that this
 // bridge resolves on the host filesystem before forwarding. Needed because the
 // Thunderbird snap (and other sandboxed installs) cannot see arbitrary host
 // paths like /data/... or the host's /tmp; passing those paths through to the
-// extension results in silent "failed to attach" warnings since file.exists()
-// returns false inside the sandbox. Reading on the bridge side and shipping
-// inline base64 sidesteps the sandbox entirely.
-const ATTACHMENT_TOOLS = new Set(['sendMail', 'replyToMessage', 'forwardMessage']);
+// extension fails when file.exists() returns false inside the sandbox. Reading
+// on the bridge side and shipping inline base64 sidesteps the sandbox entirely.
+const ATTACHMENT_TOOLS = new Set(['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage']);
 
 // Minimal MIME map covering common attachment types (documents, images,
 // archives, A/V). Falls back to application/octet-stream which Thunderbird
@@ -651,10 +750,36 @@ function validateAttachmentStat(filePath, stat) {
   }
 }
 
-async function inspectAttachmentPath(filePath) {
+// Recognize only Thunderbird temp roots, never a root supplied in tool arguments.
+function getAttachmentExportRoots(context) {
+  const { pathImpl, homeDir, platform } = context;
+  const roots = [pathImpl.dirname(getDefaultConnectionFile(context))];
+  if (platform === 'linux') {
+    if (homeDir) roots.push(pathImpl.join(homeDir, ...SNAP_TMP_SUBDIR, THUNDERBIRD_MCP_SUBDIR));
+    for (const root of getFlatpakScanRoots(context)) {
+      if (!root.base) continue;
+      for (const appId of FLATPAK_APP_IDS) {
+        roots.push(pathImpl.join(root.appRoot, appId, ...root.tmpSuffix, THUNDERBIRD_MCP_SUBDIR));
+      }
+    }
+  }
+  // Resolve only the trusted temp root. A redirect below it (including the
+  // thunderbird-mcp directory itself) must not become a trusted export root.
+  const canonicalRoots = roots.flatMap(root => {
+    try {
+      return [pathImpl.join(context.fsImpl.realpathSync(pathImpl.dirname(root)), THUNDERBIRD_MCP_SUBDIR)];
+    } catch {
+      return []; // An unavailable temp layout cannot provide an exemption.
+    }
+  });
+  return [...new Set([...roots, ...canonicalRoots])];
+}
+
+async function inspectAttachmentPath(filePath, context) {
+  const { fsImpl, pathImpl, attachmentPolicy } = context;
   // Check both the supplied path and its lexical normalization before any
   // filesystem access. The latter catches paths such as /tmp/../etc/passwd.
-  if (isSensitiveFilePath(filePath) || isSensitiveFilePath(path.resolve(filePath))) {
+  if (isSensitiveFilePath(filePath, attachmentPolicy) || isSensitiveFilePath(pathImpl.resolve(filePath), attachmentPolicy)) {
     throw new Error(`Sensitive attachment path blocked: ${filePath}`);
   }
 
@@ -662,12 +787,33 @@ async function inspectAttachmentPath(filePath) {
   try {
     // lstat is deliberate: stat would follow the final symlink before policy
     // could reject it.
-    stat = await fs.promises.lstat(filePath);
+    stat = await fsImpl.promises.lstat(filePath);
   } catch (e) {
     throw attachmentError('lstat', filePath, e);
   }
   validateAttachmentStat(filePath, stat);
-  return { filePath, stat };
+  let realPath;
+  try {
+    realPath = fsImpl.realpathSync(filePath);
+  } catch (e) {
+    throw attachmentError('realpath', filePath, e);
+  }
+  if (isSensitiveFilePath(realPath, attachmentPolicy)) {
+    throw new Error(`Sensitive attachment path blocked: ${filePath}`);
+  }
+  const exportInfo = getAttachmentExportPathInfo(filePath, attachmentPolicy.exportRoots, attachmentPolicy.windows);
+  const resolvedExportInfo = getAttachmentExportPathInfo(realPath, attachmentPolicy.exportRoots, attachmentPolicy.windows);
+  if (exportInfo || resolvedExportInfo) {
+    let expectedPath = pathImpl.resolve(filePath);
+    if (exportInfo) {
+      const canonicalTempRoot = fsImpl.realpathSync(pathImpl.dirname(exportInfo.root));
+      expectedPath = pathImpl.join(canonicalTempRoot, THUNDERBIRD_MCP_SUBDIR, ...exportInfo.parts);
+    }
+    if (pathImpl.relative(expectedPath, realPath) !== '') {
+      throw new Error(`Attachment export path is redirected: ${filePath}`);
+    }
+  }
+  return { filePath, realPath, stat, isExport: !!(exportInfo || resolvedExportInfo) };
 }
 
 function sameFile(left, right) {
@@ -700,17 +846,19 @@ async function readFileHandleExactly(handle, filePath, size) {
 // with O_NOFOLLOW where available and comparing the opened file to the lstat
 // snapshot prevents a path swap from redirecting the read to a symlink/other
 // inode between policy validation and I/O.
-async function readAttachmentFromPath(fileInfo) {
+async function readAttachmentFromPath(fileInfo, context) {
+  const { fsImpl, pathImpl, platform, procRoot, attachmentPolicy } = context;
   const { filePath, stat: preflightStat } = fileInfo;
-  const freshInfo = await inspectAttachmentPath(filePath);
-  if (!sameFile(preflightStat, freshInfo.stat) || preflightStat.size !== freshInfo.stat.size) {
+  const freshInfo = await inspectAttachmentPath(filePath, context);
+  if (fileInfo.realPath !== freshInfo.realPath || !sameFile(preflightStat, freshInfo.stat) || preflightStat.size !== freshInfo.stat.size) {
     throw new Error(`Attachment changed after validation: ${filePath}`);
   }
 
-  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  const constants = fsImpl.constants || fs.constants;
+  const noFollow = constants.O_NOFOLLOW || 0;
   let handle;
   try {
-    handle = await fs.promises.open(filePath, fs.constants.O_RDONLY | noFollow);
+    handle = await fsImpl.promises.open(freshInfo.realPath, constants.O_RDONLY | noFollow | (constants.O_NONBLOCK || 0));
   } catch (e) {
     if (e?.code === 'ELOOP') {
       throw new Error(`Attachment path is a symlink and is not allowed: ${filePath}`, { cause: e });
@@ -729,6 +877,25 @@ async function readAttachmentFromPath(fileInfo) {
     if (!sameFile(freshInfo.stat, openedStat) || freshInfo.stat.size !== openedStat.size) {
       throw new Error(`Attachment changed after validation: ${filePath}`);
     }
+    if (platform === 'linux') {
+      let openedPath;
+      try {
+        openedPath = fsImpl.readlinkSync(pathImpl.join(procRoot, 'self', 'fd', String(handle.fd)));
+      } catch (e) {
+        throw attachmentError('resolve opened file', filePath, e);
+      }
+      if (!pathImpl.isAbsolute(openedPath) || openedPath.endsWith(' (deleted)') ||
+          isSensitiveFilePath(openedPath, attachmentPolicy)) {
+        throw new Error(`Sensitive or unresolved opened attachment path blocked: ${filePath}`);
+      }
+      if ((freshInfo.isExport ||
+           getAttachmentExportPathInfo(openedPath, attachmentPolicy.exportRoots, attachmentPolicy.windows)) &&
+          pathImpl.relative(freshInfo.realPath, openedPath) !== '') {
+        throw new Error(`Attachment export path is redirected: ${filePath}`);
+      }
+    }
+    // Other platforms retain a parent-directory swap window after realpath;
+    // inode checks alone cannot detect a file moved into a denied directory.
     const buffer = await readFileHandleExactly(handle, filePath, openedStat.size);
     return {
       name: path.basename(filePath),
@@ -745,8 +912,18 @@ async function readAttachmentFromPath(fileInfo) {
 // Inline objects pass through unchanged. All paths and message-wide limits are
 // preflighted before the first read, then files are read sequentially so a
 // caller cannot force many large buffers to be resident at once.
-async function inlineAttachmentPaths(args) {
-  if (!args || !Array.isArray(args.attachments)) return;
+async function inlineAttachmentPaths(args, options = {}) {
+  if (!args || args.attachments === undefined || args.attachments === null) return;
+  if (!Array.isArray(args.attachments)) {
+    throw new Error('attachments must be an array, not a JSON-encoded string or another value');
+  }
+  const context = createDiscoveryContext(options);
+  let exportRoots;
+  context.attachmentPolicy = {
+    windows: context.platform === 'win32',
+    // Resolve trusted roots only after lexical network/credential checks pass.
+    exportRoots: () => (exportRoots ||= getAttachmentExportRoots(context)),
+  };
 
   if (args.attachments.length > MAX_ATTACHMENTS_PER_MESSAGE) {
     throw new Error(
@@ -756,28 +933,34 @@ async function inlineAttachmentPaths(args) {
   }
 
   const fileInfoByIndex = new Map();
+  const refused = [];
   let totalAttachmentBytes = 0;
   for (let index = 0; index < args.attachments.length; index++) {
     const entry = args.attachments[index];
     if (typeof entry !== 'string') continue;
 
-    const fileInfo = await inspectAttachmentPath(entry);
-    if (fileInfo.stat.size > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
-      throw new Error(
-        `Attachment aggregate too large at ${entry}: exceeds the ` +
-        `${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024} MB aggregate attachment limit`
-      );
+    try {
+      const fileInfo = await inspectAttachmentPath(entry, context);
+      if (fileInfo.stat.size > MAX_TOTAL_ATTACHMENT_BYTES - totalAttachmentBytes) {
+        throw new Error(
+          `Attachment aggregate too large at ${entry}: exceeds the ` +
+          `${MAX_TOTAL_ATTACHMENT_BYTES / 1024 / 1024} MB aggregate attachment limit`
+        );
+      }
+      totalAttachmentBytes += fileInfo.stat.size;
+      fileInfoByIndex.set(index, fileInfo);
+    } catch (error) {
+      refused.push(error.message);
     }
-    totalAttachmentBytes += fileInfo.stat.size;
-    fileInfoByIndex.set(index, fileInfo);
   }
+  if (refused.length) throw new Error(`Attachments refused: ${refused.join('; ')}`);
 
   const resolved = [];
   for (let index = 0; index < args.attachments.length; index++) {
     const entry = args.attachments[index];
     resolved.push(
       typeof entry === 'string'
-        ? await readAttachmentFromPath(fileInfoByIndex.get(index))
+        ? await readAttachmentFromPath(fileInfoByIndex.get(index), context)
         : entry
     );
   }
@@ -916,10 +1099,10 @@ async function handleMessage(line) {
       return { jsonrpc: '2.0', id: message.id, result: { prompts: [] } };
   }
 
-  // For mail-sending tools, inline any attachments passed as file paths.
+  // For mail tools (including drafts), inline attachments passed as file paths.
   // The Thunderbird extension may run inside a sandboxed snap that cannot
   // see /data/..., the host /tmp, or any path outside its confined view —
-  // letting paths through results in silent "failed to attach" warnings.
+  // passing such paths through would fail attachment validation.
   // Reading on the bridge side and shipping base64 sidesteps the sandbox.
   if (message.method === 'tools/call'
       && message.params
@@ -1065,16 +1248,6 @@ async function forwardToThunderbird(message) {
   let rediscoveryAttempted = false;
 
   while (connInfo) {
-    if (!connInfo.port || !connInfo.token) {
-      throw new Error('Invalid connection file: missing port or token');
-    }
-    if (typeof connInfo.port !== 'number' || connInfo.port < 1 || connInfo.port > 65535 || !Number.isInteger(connInfo.port)) {
-      throw new Error('Invalid connection file: port must be an integer between 1 and 65535');
-    }
-    if (!isValidAuthToken(connInfo.token)) {
-      throw new Error('Invalid connection file: token must be 64 lowercase hex characters');
-    }
-
     try {
       return await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token);
     } catch (err) {

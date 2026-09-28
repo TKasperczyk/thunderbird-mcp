@@ -163,9 +163,11 @@ The bridge re-discovers `connection.json` on every cache miss. It tries these lo
 2. Native temp dir: `<os.tmpdir()>/thunderbird-mcp/connection.json`
 3. macOS fallback: `/var/folders/*/*/T/thunderbird-mcp/connection.json` owned by the current user
 4. Linux Snap: Thunderbird's live `TMPDIR` from `/proc/<pid>/environ`, plus the official snap fallback under `~/Downloads/thunderbird.tmp`
-5. Linux Flatpak / Betterbird Flatpak: `$XDG_RUNTIME_DIR/app/*/thunderbird-mcp/connection.json`
+5. Linux Flatpak / Betterbird Flatpak: `$XDG_RUNTIME_DIR/app/<id>/thunderbird-mcp/connection.json` and `~/.var/app/<id>/cache/tmp/thunderbird-mcp/connection.json`
 
-This covers native installs, the official Thunderbird snap, Thunderbird Flatpak, Thunderbird Beta Flatpak, and Betterbird Flatpak without changing the extension side. If multiple sandbox candidates exist at once, the bridge tries the newest file first. Set `THUNDERBIRD_MCP_CONNECTION_FILE` to force a single explicit path.
+This covers native installs, the official Thunderbird snap, Thunderbird Flatpak, Thunderbird Beta Flatpak, and Betterbird Flatpak without changing the extension side. If multiple sandbox candidates exist at once, the bridge tries the newest file first. Flatpak discovery accepts only these application IDs: `org.mozilla.Thunderbird`, `org.mozilla.thunderbird`, `org.mozilla.thunderbird_esr`, `net.thunderbird.Thunderbird`, and `eu.betterbird.Betterbird`. Set `THUNDERBIRD_MCP_CONNECTION_FILE` to force a single explicit path.
+
+Every connection file, including an explicit pin, must be a regular file of at most 4 KiB with a valid port and token. On POSIX it must belong to the bridge's user, have no group/other permissions (normally `0600`), and must not be a symlink. The bridge checks and reads the same opened descriptor. Windows retains the file type and size checks; POSIX ownership/mode bits are not used as an ACL check. Rejected files are reported, never repaired or deleted. An invalid explicit pin does not fall back to discovery.
 
 Example override:
 
@@ -186,6 +188,12 @@ Example override:
 That's it. Your AI can now access Thunderbird.
 
 ---
+
+### Outgoing attachments
+
+For `sendMail`, `saveDraft`, `replyToMessage`, and `forwardMessage`, pass `attachments` as a JSON array, not a JSON-encoded string. The stdio bridge reads file-path attachments on the host and sends inline base64 to Thunderbird. The existing bridge limit is **18 MiB per path attachment**, now also applied to `saveDraft`. The extension's direct-HTTP path limit remains 50 MiB; inline base64 remains limited to 25 MiB of encoded data. Both transports enforce at most 20 attachments and 50 MiB of decoded attachments per operation.
+
+UNC/network and device paths, dotfiles and dot-directories, application-data directories (`AppData` and `Library`), and credential/key filenames are refused. Windows alternate data streams and path components ending in dots or spaces are also refused. The policy checks both supplied and resolved paths, including the opened file on Linux. Files exported by `getMessage(saveAttachments: true)` in its message-specific temp directory can be reattached despite inherited dot-directory or AppData restrictions; credential names, connection files, traversal, and redirected export paths remain blocked. Windows direct-HTTP path attachments also refuse junction/symlink ancestors; ordinary local document paths continue to work. If any attachment is refused, missing, invalid, or over a limit, the entire operation fails before sending, saving a draft, or opening a review window. The error identifies refused entries; temporary files created during the failed conversion are removed. Callers that previously relied on partial attachment success must handle this error explicitly.
 
 ## Security
 

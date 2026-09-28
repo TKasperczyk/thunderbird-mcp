@@ -18,25 +18,27 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const net = require('net');
 const { spawn } = require('child_process');
+const { isSensitiveFilePath } = require('../mcp-bridge.cjs');
 
 const BRIDGE_PATH = path.resolve(__dirname, '..', 'mcp-bridge.cjs');
-const CONN_DIR = path.join(os.tmpdir(), 'thunderbird-mcp');
-const CONN_FILE = path.join(CONN_DIR, 'connection.json');
-const DEFAULT_PORT = 8765;
+let CONN_DIR;
+let CONN_FILE;
+let BRIDGE_ENV;
 
-/**
- * Check if a port is already in use (e.g. real Thunderbird running).
- * Tests that could interfere with a running instance should skip.
- */
-function isPortInUse(port) {
-  return new Promise((resolve) => {
-    const sock = net.createConnection({ port, host: '127.0.0.1' });
-    sock.on('connect', () => { sock.destroy(); resolve(true); });
-    sock.on('error', () => resolve(false));
-  });
-}
+beforeEach(() => {
+  // Windows temp normally lives in denied AppData; outgoing attachment
+  // fixtures need a benign path. Every directory is unique and removed below.
+  const base = isSensitiveFilePath(os.tmpdir()) ? path.resolve(__dirname, '..') : os.tmpdir();
+  CONN_DIR = fs.mkdtempSync(path.join(base, 'tb-mcp-auth-'));
+  CONN_FILE = path.join(CONN_DIR, 'connection.json');
+  // A missing/invalid pin must never fall through to a running instance.
+  BRIDGE_ENV = { ...process.env, THUNDERBIRD_MCP_CONNECTION_FILE: CONN_FILE };
+});
+
+afterEach(() => {
+  fs.rmSync(CONN_DIR, { recursive: true, force: true });
+});
 
 /**
  * Helper: send a JSON-RPC message to the bridge and get the response.
@@ -45,6 +47,7 @@ function sendToBridge(message, { timeout = 10000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [BRIDGE_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: BRIDGE_ENV,
     });
 
     let stdout = '';
@@ -91,40 +94,12 @@ function sendToBridge(message, { timeout = 10000 } = {}) {
  */
 function writeTestConnectionInfo(port, token) {
   fs.mkdirSync(CONN_DIR, { recursive: true });
-  fs.writeFileSync(CONN_FILE, JSON.stringify({ port, token, pid: process.pid }), 'utf8');
-}
-
-/**
- * Back up and restore any existing connection file to avoid
- * interfering with a running Thunderbird instance.
- */
-let savedConnectionData = null;
-
-function backupConnectionFile() {
-  try {
-    savedConnectionData = fs.readFileSync(CONN_FILE, 'utf8');
-  } catch {
-    savedConnectionData = null;
-  }
-}
-
-function restoreConnectionFile() {
-  if (savedConnectionData !== null) {
-    fs.mkdirSync(CONN_DIR, { recursive: true });
-    fs.writeFileSync(CONN_FILE, savedConnectionData, 'utf8');
-  } else {
-    try { fs.unlinkSync(CONN_FILE); } catch { /* ignore */ }
-  }
+  fs.writeFileSync(CONN_FILE, JSON.stringify({ port, token, pid: process.pid }), { encoding: 'utf8', mode: 0o600 });
 }
 
 describe('Auth: connection info file', () => {
-  before(async () => {
-    backupConnectionFile();
-  });
-  after(() => restoreConnectionFile());
-
   it('bridge reads port and token from connection.json', async () => {
-    const TEST_PORT = 18765;
+    let TEST_PORT;
     const TEST_TOKEN = 'a'.repeat(64);
     let receivedHeaders = null;
     let receivedPort = null;
@@ -143,8 +118,9 @@ describe('Auth: connection info file', () => {
 
     await new Promise((resolve, reject) => {
       server.on('error', reject);
-      server.listen(TEST_PORT, '127.0.0.1', resolve);
+      server.listen(0, '127.0.0.1', resolve);
     });
+    TEST_PORT = server.address().port;
 
     try {
       // Write connection info pointing to our mock server
@@ -169,10 +145,7 @@ describe('Auth: connection info file', () => {
     }
   });
 
-  it('bridge fails closed when connection file is missing', async (t) => {
-    if (await isPortInUse(DEFAULT_PORT)) {
-      return t.skip('Thunderbird running on default port, skipping connection file removal test');
-    }
+  it('bridge fails closed when connection file is missing', async () => {
     // Remove connection file
     try { fs.unlinkSync(CONN_FILE); } catch { /* ignore */ }
 
@@ -192,12 +165,10 @@ describe('Auth: connection info file', () => {
 
 describe('Auth: token verification', () => {
   let server;
-  const TEST_PORT = 18766;
+  let TEST_PORT;
   const CORRECT_TOKEN = 'b'.repeat(64);
 
   before(async () => {
-    backupConnectionFile();
-
     // Mock server that checks auth like the extension does
     server = http.createServer((req, res) => {
       let authHeader = req.headers['authorization'] || '';
@@ -226,13 +197,13 @@ describe('Auth: token verification', () => {
 
     await new Promise((resolve, reject) => {
       server.on('error', reject);
-      server.listen(TEST_PORT, '127.0.0.1', resolve);
+      server.listen(0, '127.0.0.1', resolve);
     });
+    TEST_PORT = server.address().port;
   });
 
   after(async () => {
     if (server) await new Promise((resolve) => server.close(resolve));
-    restoreConnectionFile();
   });
 
   it('succeeds with correct token', async () => {
@@ -356,17 +327,10 @@ describe('Timing-safe comparison: correctness', () => {
 // ═══════════════════════════════════════════════════════════════════
 
 describe('Auth: connection file corruption', () => {
-  let thunderbirdRunning = false;
-  before(async () => {
-    thunderbirdRunning = await isPortInUse(DEFAULT_PORT);
-    backupConnectionFile();
-  });
-  after(() => restoreConnectionFile());
 
-  it('rejects empty connection file', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running, skipping connection file mutation test');
+  it('rejects empty connection file', async () => {
     fs.mkdirSync(CONN_DIR, { recursive: true });
-    fs.writeFileSync(CONN_FILE, '', 'utf8');
+    fs.writeFileSync(CONN_FILE, '', { encoding: 'utf8', mode: 0o600 });
 
     const response = await sendToBridge({
       jsonrpc: '2.0',
@@ -378,10 +342,9 @@ describe('Auth: connection file corruption', () => {
     assert.ok(response.error);
   });
 
-  it('rejects connection file with invalid JSON', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('rejects connection file with invalid JSON', async () => {
     fs.mkdirSync(CONN_DIR, { recursive: true });
-    fs.writeFileSync(CONN_FILE, '{not valid json!!!', 'utf8');
+    fs.writeFileSync(CONN_FILE, '{not valid json!!!', { encoding: 'utf8', mode: 0o600 });
 
     const response = await sendToBridge({
       jsonrpc: '2.0',
@@ -393,10 +356,9 @@ describe('Auth: connection file corruption', () => {
     assert.ok(response.error);
   });
 
-  it('rejects connection file with missing port', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('rejects connection file with missing port', async () => {
     fs.mkdirSync(CONN_DIR, { recursive: true });
-    fs.writeFileSync(CONN_FILE, JSON.stringify({ token: 'abc' }), 'utf8');
+    fs.writeFileSync(CONN_FILE, JSON.stringify({ token: 'abc' }), { encoding: 'utf8', mode: 0o600 });
 
     const response = await sendToBridge({
       jsonrpc: '2.0',
@@ -409,10 +371,9 @@ describe('Auth: connection file corruption', () => {
     assert.match(response.error.message, /missing port or token|Bridge error/);
   });
 
-  it('rejects connection file with missing token', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('rejects connection file with missing token', async () => {
     fs.mkdirSync(CONN_DIR, { recursive: true });
-    fs.writeFileSync(CONN_FILE, JSON.stringify({ port: 19999 }), 'utf8');
+    fs.writeFileSync(CONN_FILE, JSON.stringify({ port: 19999 }), { encoding: 'utf8', mode: 0o600 });
 
     const response = await sendToBridge({
       jsonrpc: '2.0',
@@ -425,10 +386,9 @@ describe('Auth: connection file corruption', () => {
     assert.match(response.error.message, /missing port or token|Bridge error/);
   });
 
-  it('rejects connection file with null port', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('rejects connection file with null port', async () => {
     fs.mkdirSync(CONN_DIR, { recursive: true });
-    fs.writeFileSync(CONN_FILE, JSON.stringify({ port: null, token: 'abc' }), 'utf8');
+    fs.writeFileSync(CONN_FILE, JSON.stringify({ port: null, token: 'abc' }), { encoding: 'utf8', mode: 0o600 });
 
     const response = await sendToBridge({
       jsonrpc: '2.0',
@@ -440,10 +400,9 @@ describe('Auth: connection file corruption', () => {
     assert.ok(response.error);
   });
 
-  it('rejects connection file with empty string token', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('rejects connection file with empty string token', async () => {
     fs.mkdirSync(CONN_DIR, { recursive: true });
-    fs.writeFileSync(CONN_FILE, JSON.stringify({ port: 19999, token: '' }), 'utf8');
+    fs.writeFileSync(CONN_FILE, JSON.stringify({ port: 19999, token: '' }), { encoding: 'utf8', mode: 0o600 });
 
     const response = await sendToBridge({
       jsonrpc: '2.0',
@@ -455,10 +414,9 @@ describe('Auth: connection file corruption', () => {
     assert.ok(response.error);
   });
 
-  it('rejects connection file with port=0', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('rejects connection file with port=0', async () => {
     fs.mkdirSync(CONN_DIR, { recursive: true });
-    fs.writeFileSync(CONN_FILE, JSON.stringify({ port: 0, token: 'abc' }), 'utf8');
+    fs.writeFileSync(CONN_FILE, JSON.stringify({ port: 0, token: 'abc' }), { encoding: 'utf8', mode: 0o600 });
 
     const response = await sendToBridge({
       jsonrpc: '2.0',
@@ -470,10 +428,9 @@ describe('Auth: connection file corruption', () => {
     assert.ok(response.error);
   });
 
-  it('handles binary garbage in connection file', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('handles binary garbage in connection file', async () => {
     fs.mkdirSync(CONN_DIR, { recursive: true });
-    fs.writeFileSync(CONN_FILE, Buffer.from([0x00, 0xff, 0xfe, 0x80, 0x90]));
+    fs.writeFileSync(CONN_FILE, Buffer.from([0x00, 0xff, 0xfe, 0x80, 0x90]), { mode: 0o600 });
 
     const response = await sendToBridge({
       jsonrpc: '2.0',
@@ -485,9 +442,8 @@ describe('Auth: connection file corruption', () => {
     assert.ok(response.error);
   });
 
-  it('accepts connection file with extra fields (forward compat)', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
-    const TEST_PORT = 18767;
+  it('accepts connection file with extra fields (forward compat)', async () => {
+    let TEST_PORT;
     const TEST_TOKEN = 'd'.repeat(64);
 
     const server = http.createServer((req, res) => {
@@ -497,15 +453,16 @@ describe('Auth: connection file corruption', () => {
 
     await new Promise((resolve, reject) => {
       server.on('error', reject);
-      server.listen(TEST_PORT, '127.0.0.1', resolve);
+      server.listen(0, '127.0.0.1', resolve);
     });
+    TEST_PORT = server.address().port;
 
     try {
       fs.mkdirSync(CONN_DIR, { recursive: true });
       fs.writeFileSync(CONN_FILE, JSON.stringify({
         port: TEST_PORT, token: TEST_TOKEN, pid: 12345,
         version: '2.0', extraField: 'should be ignored'
-      }), 'utf8');
+      }), { encoding: 'utf8', mode: 0o600 });
 
       const response = await sendToBridge({
         jsonrpc: '2.0',
@@ -520,9 +477,8 @@ describe('Auth: connection file corruption', () => {
     }
   });
 
-  it('rejects malformed tokens before contacting Thunderbird', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
-    const TEST_PORT = 18768;
+  it('rejects malformed tokens before contacting Thunderbird', async () => {
+    let TEST_PORT;
     let requestCount = 0;
     const cases = [
       { name: 'whitespace-only', token: ' '.repeat(64) },
@@ -543,8 +499,9 @@ describe('Auth: connection file corruption', () => {
 
     await new Promise((resolve, reject) => {
       server.on('error', reject);
-      server.listen(TEST_PORT, '127.0.0.1', resolve);
+      server.listen(0, '127.0.0.1', resolve);
     });
+    TEST_PORT = server.address().port;
 
     try {
       for (let i = 0; i < cases.length; i++) {
@@ -578,16 +535,8 @@ describe('Auth: bridge handles MCP lifecycle locally', () => {
   // These methods are handled by the bridge directly without
   // contacting Thunderbird, so they should work even without
   // a connection file.
-  let thunderbirdRunning = false;
 
-  before(async () => {
-    thunderbirdRunning = await isPortInUse(DEFAULT_PORT);
-    backupConnectionFile();
-  });
-  after(() => restoreConnectionFile());
-
-  it('initialize succeeds without connection file', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('initialize succeeds without connection file', async () => {
     try { fs.unlinkSync(CONN_FILE); } catch { /* ignore */ }
 
     const response = await sendToBridge({
@@ -602,8 +551,7 @@ describe('Auth: bridge handles MCP lifecycle locally', () => {
     assert.equal(response.result.serverInfo.name, 'thunderbird-mcp');
   });
 
-  it('ping succeeds without connection file', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('ping succeeds without connection file', async () => {
     try { fs.unlinkSync(CONN_FILE); } catch { /* ignore */ }
 
     const response = await sendToBridge({
@@ -616,8 +564,7 @@ describe('Auth: bridge handles MCP lifecycle locally', () => {
     assert.ok(response.result);
   });
 
-  it('resources/list succeeds without connection file', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('resources/list succeeds without connection file', async () => {
     try { fs.unlinkSync(CONN_FILE); } catch { /* ignore */ }
 
     const response = await sendToBridge({
@@ -630,8 +577,7 @@ describe('Auth: bridge handles MCP lifecycle locally', () => {
     assert.deepStrictEqual(response.result, { resources: [] });
   });
 
-  it('prompts/list succeeds without connection file', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('prompts/list succeeds without connection file', async () => {
     try { fs.unlinkSync(CONN_FILE); } catch { /* ignore */ }
 
     const response = await sendToBridge({
@@ -644,11 +590,11 @@ describe('Auth: bridge handles MCP lifecycle locally', () => {
     assert.deepStrictEqual(response.result, { prompts: [] });
   });
 
-  it('notifications are silently dropped (no response)', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('notifications are silently dropped (no response)', async () => {
     // Notifications have no id — bridge should not respond
     const child = spawn(process.execPath, [BRIDGE_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      env: BRIDGE_ENV,
     });
 
     let stdout = '';
@@ -694,19 +640,12 @@ describe('Auth: bridge handles MCP lifecycle locally', () => {
 });
 
 describe('Auth: bridge retry then fail', () => {
-  let thunderbirdRunning = false;
-  before(async () => {
-    thunderbirdRunning = await isPortInUse(DEFAULT_PORT);
-    backupConnectionFile();
-  });
-  after(() => restoreConnectionFile());
 
-  it('retries and succeeds when connection file appears mid-retry', async (t) => {
-    if (thunderbirdRunning) return t.skip('Thunderbird running');
+  it('retries and succeeds when connection file appears mid-retry', async () => {
     // Remove connection file first
     try { fs.unlinkSync(CONN_FILE); } catch { /* ignore */ }
 
-    const TEST_PORT = 18770;
+    let TEST_PORT;
     const TEST_TOKEN = 'e'.repeat(64);
 
     const server = http.createServer((req, res) => {
@@ -716,8 +655,9 @@ describe('Auth: bridge retry then fail', () => {
 
     await new Promise((resolve, reject) => {
       server.on('error', reject);
-      server.listen(TEST_PORT, '127.0.0.1', resolve);
+      server.listen(0, '127.0.0.1', resolve);
     });
+    TEST_PORT = server.address().port;
 
     try {
       // Write the connection file after 2 seconds (bridge retries every 1s)
@@ -736,6 +676,96 @@ describe('Auth: bridge retry then fail', () => {
       assert.equal(response.result.delayed, true);
     } finally {
       await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
+
+describe('Bridge attachment dispatch', () => {
+  it('refuses mixed attachments for every mail tool before forwarding to HTTP', async () => {
+    let requests = 0;
+    const server = http.createServer((_req, res) => {
+      requests++;
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      writeTestConnectionInfo(server.address().port, 'a'.repeat(64));
+      const valid = path.join(CONN_DIR, 'report.pdf');
+      const refused = path.join(CONN_DIR, '.env');
+      const missing = path.join(CONN_DIR, 'missing.pdf');
+      fs.writeFileSync(valid, 'safe attachment');
+      for (const name of ['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage']) {
+        for (const skipReview of [false, true]) {
+          const response = await sendToBridge({
+            jsonrpc: '2.0', id: 1, method: 'tools/call',
+            params: { name, arguments: { attachments: [valid, refused, missing], skipReview } },
+          });
+          assert.equal(response.error?.code, -32602, name);
+          assert.ok(response.error.message.includes(refused), name);
+          assert.ok(response.error.message.includes(missing), name);
+        }
+      }
+      assert.equal(requests, 0);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+
+  it('rejects JSON-encoded attachment strings for every mail tool before HTTP', async () => {
+    let requests = 0;
+    const server = http.createServer((_req, res) => {
+      requests++;
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      writeTestConnectionInfo(server.address().port, 'a'.repeat(64));
+      const file = path.join(CONN_DIR, 'report.txt');
+      fs.writeFileSync(file, 'attachment fixture');
+      for (const name of ['sendMail', 'saveDraft', 'replyToMessage', 'forwardMessage']) {
+        for (const skipReview of [false, true]) {
+          const response = await sendToBridge({
+            jsonrpc: '2.0', id: 1, method: 'tools/call',
+            params: { name, arguments: { attachments: JSON.stringify([file]), skipReview } },
+          });
+          assert.equal(response.error?.code, -32602, name);
+          assert.match(response.error.message, /attachments must be an array/, name);
+        }
+      }
+      assert.equal(requests, 0);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+
+  it('inlines allowed saveDraft paths and applies the existing 18 MiB bridge limit', async () => {
+    const received = [];
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        received.push(JSON.parse(body));
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: {} }));
+      });
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      writeTestConnectionInfo(server.address().port, 'a'.repeat(64));
+      const file = path.join(CONN_DIR, 'report.txt');
+      fs.writeFileSync(file, 'draft attachment');
+      const message = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'saveDraft', arguments: { attachments: [file] } } };
+      const response = await sendToBridge(message);
+      assert.ok(response.result);
+      assert.equal(received.length, 1);
+      assert.deepEqual(received[0].params.arguments.attachments, [{
+        name: 'report.txt', contentType: 'text/plain', base64: Buffer.from('draft attachment').toString('base64'),
+      }]);
+      fs.truncateSync(file, 18 * 1024 * 1024 + 1);
+      assert.match((await sendToBridge(message)).error.message, /Attachment too large/);
+      assert.equal(received.length, 1);
+    } finally {
+      await new Promise(resolve => server.close(resolve));
     }
   });
 });
