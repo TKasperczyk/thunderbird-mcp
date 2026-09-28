@@ -3,9 +3,20 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
+const { ReadableStream } = require("node:stream/web");
 const vm = require("node:vm");
 
 const source = fs.readFileSync(path.resolve(__dirname, "../../extension/mcp_server/api.js"), "utf8");
+const CALENDAR_FILTERS = Object.freeze({
+  ITEM_FILTER_COMPLETED_YES: 1 << 0,
+  ITEM_FILTER_COMPLETED_NO: 1 << 1,
+  ITEM_FILTER_COMPLETED_ALL: (1 << 0) | (1 << 1),
+  ITEM_FILTER_TYPE_TODO: 1 << 2,
+  ITEM_FILTER_TYPE_EVENT: 1 << 3,
+  ITEM_FILTER_TYPE_JOURNAL: 1 << 4,
+  ITEM_FILTER_TYPE_ALL: (1 << 2) | (1 << 3) | (1 << 4),
+  ITEM_FILTER_CLASS_OCCURRENCES: 1 << 16,
+});
 
 // Reuse the production-marker/VM pattern from privacy-access.test.cjs. Only
 // Thunderbird objects are mocked; handlers, schemas and preference gates run
@@ -101,11 +112,11 @@ class CalendarItem {
   removeAttendee(attendee) { this.attendees = this.attendees.filter(value => value !== attendee); }
 
   clone() {
-    const clone = Object.assign(new CalendarItem(), this);
+    const clone = Object.assign(new this.constructor(), this);
     clone.properties = new Map(this.properties);
     clone.attendees = this.attendees.slice();
     clone.categories = this.categories.slice();
-    for (const name of ["startDate", "endDate", "dueDate", "recurrenceId"]) {
+    for (const name of ["startDate", "endDate", "entryDate", "dueDate", "completedDate", "recurrenceId"]) {
       if (this[name]) clone[name] = this[name].clone();
     }
     if (this.recurrenceInfo) {
@@ -113,6 +124,38 @@ class CalendarItem {
       clone.recurrenceInfo.item = clone;
     }
     return clone;
+  }
+}
+
+class CalendarTodo extends CalendarItem {
+  constructor() {
+    super();
+    this.id = "task-1";
+    this.title = "Existing task";
+    this.percentComplete = 0;
+  }
+
+  get completedDate() { return this.getProperty("COMPLETED"); }
+  set completedDate(value) { this.setProperty("COMPLETED", value); }
+  get status() { return this.getProperty("STATUS"); }
+  set status(value) { this.setProperty("STATUS", value); }
+  get percentComplete() { return this.getProperty("PERCENT-COMPLETE"); }
+  set percentComplete(value) { this.setProperty("PERCENT-COMPLETE", value); }
+
+  // CalTodo derives completion from these properties, not a separate flag.
+  get isCompleted() {
+    return this.completedDate != null || this.percentComplete === 100 || this.status === "COMPLETED";
+  }
+  set isCompleted(completed) {
+    if (completed) {
+      if (!this.completedDate) this.completedDate = new CalendarDate(new Date());
+      this.status = "COMPLETED";
+      this.percentComplete = 100;
+    } else {
+      this.deleteProperty("COMPLETED");
+      this.deleteProperty("STATUS");
+      this.deleteProperty("PERCENT-COMPLETE");
+    }
   }
 }
 
@@ -237,6 +280,7 @@ function loadCalendarRuntime({
   allowAllCalendars = false, parser = "cal", parserFailure,
   identity = { email: "organizer@example.com", fullName: "Organizer" },
   identityKey = "identity-1", unreadableIdentity = false, resolvedIdentity, organizerId,
+  disabled = false,
 } = {}) {
   const prefValues = new Map();
   const prefTypes = { PREF_INVALID: 0, PREF_STRING: 32, PREF_BOOL: 128 };
@@ -254,7 +298,7 @@ function loadCalendarRuntime({
     },
     getIntPref(_name, fallback) { return fallback; },
   };
-  const calendarProperties = new Map([["imip.identity.key", identityKey]]);
+  const calendarProperties = new Map([["imip.identity.key", identityKey], ["disabled", disabled]]);
   if (resolvedIdentity !== undefined) calendarProperties.set("imip.identity", resolvedIdentity);
   if (organizerId !== undefined) calendarProperties.set("organizerId", organizerId);
   const calendar = {
@@ -265,10 +309,44 @@ function loadCalendarRuntime({
       calendarProperties.set(name, value);
     },
     async getItem(id) { calls.reads.push({ kind: "item", id }); return items.get(id) || null; },
-    async getItemsAsArray(_filter, _count, start, end) {
-      calls.reads.push({ kind: "range", start, end });
-      return [...items.values()].filter(item => !start || !item.startDate
-        || (item.startDate.compare(start) >= 0 && item.startDate.compare(end) < 0));
+    getItems(filter, count, start, end) {
+      assert.equal(arguments.length, 4, "calICalendar.getItems requires four arguments");
+      assert.ok(Number.isInteger(filter) && filter >= 0, "item filter must be an unsigned integer");
+      assert.ok(Number.isInteger(count) && count >= 0, "item count must be an unsigned integer");
+      assert.ok(start === null || start instanceof CalendarDate, "range start must be a calIDateTime or null");
+      assert.ok(end === null || end instanceof CalendarDate, "range end must be a calIDateTime or null");
+      calls.reads.push({ kind: "range", filter, count, start, end });
+      // Storage calendars return an empty stream while disabled, even though
+      // addItem and getItem still work. Do not silently bypass this native gate.
+      let selected = this.getProperty("disabled") ? [] : [...items.values()].filter(item => {
+        if (item instanceof CalendarTodo) {
+          if (!(filter & CALENDAR_FILTERS.ITEM_FILTER_TYPE_TODO)) return false;
+          const completionFilter = item.isCompleted
+            ? CALENDAR_FILTERS.ITEM_FILTER_COMPLETED_YES : CALENDAR_FILTERS.ITEM_FILTER_COMPLETED_NO;
+          if (!(filter & completionFilter)) return false;
+        } else if (!(filter & CALENDAR_FILTERS.ITEM_FILTER_TYPE_EVENT)) {
+          return false;
+        }
+        return !item.startDate || ((!start || item.startDate.compare(start) >= 0)
+          && (!end || item.startDate.compare(end) < 0));
+      });
+      if (count) selected = selected.slice(0, count);
+      return new ReadableStream({
+        start(controller) {
+          for (let index = 0; index < selected.length; index += 2) {
+            controller.enqueue(selected.slice(index, index + 2));
+          }
+          controller.close();
+        },
+      });
+    },
+    async getItemsAsArray(filter, count, start, end) {
+      assert.equal(arguments.length, 4, "calICalendar.getItemsAsArray requires four arguments");
+      const result = [];
+      for await (const chunk of cal.iterate.streamValues(this.getItems(filter, count, start, end))) {
+        result.push(...chunk);
+      }
+      return result;
     },
     async addItem(item) { calls.adds.push(item); return item; },
     async modifyItem(item, previous) { calls.modifies.push({ item, previous }); return item; },
@@ -292,6 +370,20 @@ function loadCalendarRuntime({
   }
   const cal = {
     manager: { getCalendars() { calls.reads.push({ kind: "calendars" }); return [calendar]; } },
+    iterate: {
+      async *streamValues(stream) {
+        const reader = stream.getReader();
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) return;
+            yield value;
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      },
+    },
     dtz: {
       defaultTimezone: timezone, floating,
       jsDateToDateTime(date, tz) { return new CalendarDate(date, tz); },
@@ -318,8 +410,8 @@ function loadCalendarRuntime({
     },
   };
   const sandbox = {
-    cal, CalEvent: CalendarItem, CalTodo: CalendarItem, CalAttendee: CalendarAttendee, Cc,
-    Ci: { nsIPrefBranch: prefTypes },
+    cal, CalEvent: CalendarItem, CalTodo: CalendarTodo, CalAttendee: CalendarAttendee, Cc,
+    Ci: { nsIPrefBranch: prefTypes, calICalendar: CALENDAR_FILTERS },
     Services: { prefs: preferences, wm: { getMostRecentWindow: () => window } },
     MailServices: { accounts: { getIdentity() {
       if (unreadableIdentity) throw new Error("Unreadable calendar identity");
@@ -369,6 +461,13 @@ function loadCalendarRuntime({
     items.set(item.id, item);
     return item;
   }
+  function seedTask({ entry = null, due = null, ...fields } = {}) {
+    const item = Object.assign(new CalendarTodo(), {
+      calendar, entryDate: entry ? date(entry) : null, dueDate: due ? date(due) : null,
+    }, fields);
+    items.set(item.id, item);
+    return item;
+  }
   function seedSeries({ allDay = false, ...fields } = {}) {
     const master = seedEvent({
       start: allDay ? "2026-01-05" : "2026-01-05T10:00:00Z",
@@ -403,7 +502,7 @@ function loadCalendarRuntime({
     return master;
   }
   return {
-    ...sandbox, calls, items, calendar, prefValues, date, makeEvent, seedEvent, seedSeries, seedDenseSeries,
+    ...sandbox, calls, items, calendar, prefValues, date, makeEvent, seedEvent, seedTask, seedSeries, seedDenseSeries,
     makeAttendee: fields => new CalendarAttendee(fields),
     async invoke(name, args) {
       sandbox.coerceToolArgs(name, args);

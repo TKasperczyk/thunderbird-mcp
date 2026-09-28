@@ -2137,7 +2137,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "listCalendars",
         group: "calendar", crud: "read",
         title: "List Calendars",
-        description: "Return the user's calendars",
+        description: "Return the user's calendars, including disabled, read-only, event, and task support flags. Disabled calendars must be enabled in Thunderbird's calendar properties before querying or writing them.",
         inputSchema: { type: "object", properties: {}, required: [] },
       },
       {
@@ -2153,7 +2153,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             endDate: { type: "string", description: "End date/time in ISO 8601 (defaults to startDate + 1h for timed, +1 day for all-day)" },
             location: { type: "string", description: "Event location" },
             description: { type: "string", description: "Event description" },
-            calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first writable calendar)" },
+            calendarId: { type: "string", description: "Target calendar ID (from listCalendars, defaults to first enabled writable calendar)" },
             allDay: { type: "boolean", description: "Create an all-day event (default: false)" },
             status: { type: "string", description: "VEVENT STATUS: 'tentative', 'confirmed', or 'cancelled'. Defaults to confirmed if omitted." },
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
@@ -2174,7 +2174,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            calendarId: { type: "string", description: "Calendar ID to query (from listCalendars). If omitted, queries all calendars." },
+            calendarId: { type: "string", description: "Calendar ID to query (from listCalendars). If omitted, queries all enabled calendars. A disabled target or no enabled calendars returns an error." },
             startDate: { type: "string", description: "Start of date range in ISO 8601 format (default: now)" },
             endDate: { type: "string", description: "End of date range in ISO 8601 format (default: 30 days from startDate)" },
             maxResults: { type: "number", description: "Maximum number of events to return (default: 100, max: 500)" },
@@ -2257,7 +2257,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            calendarId: { type: "string", description: "Calendar ID to query (from listCalendars). If omitted, queries all task-capable calendars." },
+            calendarId: { type: "string", description: "Calendar ID to query (from listCalendars). If omitted, queries all enabled task-capable calendars. A disabled target or no enabled calendars returns an error." },
             completed: { type: "boolean", description: "Filter by completion status. true = completed only, false = outstanding only. Omit for all tasks." },
             dueBefore: { type: "string", description: "Return tasks due before this ISO 8601 date" },
             maxResults: { type: "integer", description: "Maximum number of tasks to return (default: 100, max: 500)" },
@@ -5669,12 +5669,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   name: c.name,
                   type: c.type,
                   readOnly: c.readOnly,
+                  disabled: !!c.getProperty("disabled"),
                   supportsEvents: c.getProperty("capabilities.events.supported") !== false,
                   supportsTasks: c.getProperty("capabilities.tasks.supported") !== false,
                 }));
               } catch (e) {
                 return { error: e.toString() };
               }
+            }
+
+            function getEnabledCalendars(calendarId) {
+              const calendars = cal.manager.getCalendars();
+              if (calendarId) {
+                const calendar = calendars.find(c => c.id === calendarId);
+                if (!calendar) throw new Error(`Calendar not found: ${calendarId}`);
+                if (calendar.getProperty("disabled")) {
+                  throw new Error(`Calendar "${calendar.name}" is disabled. Enable it in Thunderbird's calendar properties and retry.`);
+                }
+                return [calendar];
+              }
+              // Thunderbird creates Home disabled. Storage getItems then returns
+              // an empty stream even though addItem/getItem can still succeed.
+              // Do not mistake that state for an empty calendar or enable it here.
+              const enabled = calendars.filter(c => !c.getProperty("disabled"));
+              if (calendars.length && !enabled.length) {
+                throw new Error("All calendars are disabled. Enable a calendar in Thunderbird's calendar properties and retry.");
+              }
+              return enabled;
             }
 
             // Calendar IDs are single cal-address values, unlike mail display
@@ -5918,13 +5939,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 // Find target calendar
-                const calendars = cal.manager.getCalendars();
+                const calendars = getEnabledCalendars(calendarId);
                 let targetCalendar = null;
                 if (calendarId) {
-                  targetCalendar = calendars.find(c => c.id === calendarId);
-                  if (!targetCalendar) {
-                    return { error: `Calendar not found: ${calendarId}` };
-                  }
+                  targetCalendar = calendars[0];
                   if (targetCalendar.readOnly) {
                     return { error: `Calendar is read-only: ${targetCalendar.name}` };
                   }
@@ -6196,8 +6214,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!taskId) return { error: "taskId is required" };
                 if (!calendarId) return { error: "calendarId is required" };
 
-                const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
-                if (!calendar) return { error: `Calendar not found: ${calendarId}` };
+                const calendar = getEnabledCalendars(calendarId)[0];
                 if (calendar.readOnly) return { error: `Calendar is read-only: ${calendar.name}` };
                 if (calendar.getProperty("capabilities.tasks.supported") === false) {
                   return { error: `Calendar "${calendar.name}" does not support tasks. Use listCalendars to find one with supportsTasks=true.` };
@@ -6351,13 +6368,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: "Calendar not available" };
               }
               try {
-                const calendars = cal.manager.getCalendars();
-                let targets = calendars;
-                if (calendarId) {
-                  const found = calendars.find(c => c.id === calendarId);
-                  if (!found) return { error: `Calendar not found: ${calendarId}` };
-                  targets = [found];
-                }
+                const targets = getEnabledCalendars(calendarId);
 
                 const startJs = startDate ? new Date(startDate) : new Date();
                 if (isNaN(startJs.getTime())) return { error: `Invalid startDate: ${startDate}` };
@@ -6457,13 +6468,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             async function listTasks(calendarId, completed, dueBefore, maxResults) {
               if (!cal) return { error: "Calendar not available" };
               try {
-                const calendars = cal.manager.getCalendars();
+                const calendars = getEnabledCalendars(calendarId);
                 let targets = calendars.filter(c =>
                   c.getProperty("capabilities.tasks.supported") !== false
                 );
                 if (calendarId) {
-                  const found = calendars.find(c => c.id === calendarId);
-                  if (!found) return { error: `Calendar not found: ${calendarId}` };
+                  const found = calendars[0];
                   if (found.getProperty("capabilities.tasks.supported") === false) {
                     return { error: `Calendar "${found.name}" does not support tasks` };
                   }
@@ -6704,8 +6714,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "Cannot combine recurrence and recurrenceId: recurrence rules apply to the master event only." };
                 }
 
-                const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
-                if (!calendar) return { error: `Calendar not found: ${calendarId}` };
+                const calendar = getEnabledCalendars(calendarId)[0];
                 if (calendar.readOnly) return { error: `Calendar is read-only: ${calendar.name}` };
 
                 // Use getItem API if available, else scan
@@ -6798,8 +6807,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!eventId) return { error: "eventId is required" };
                 if (!calendarId) return { error: "calendarId is required" };
 
-                const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
-                if (!calendar) return { error: `Calendar not found: ${calendarId}` };
+                const calendar = getEnabledCalendars(calendarId)[0];
                 if (calendar.readOnly) return { error: `Calendar is read-only: ${calendar.name}` };
 
                 let item = null;
@@ -6902,8 +6910,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // Find target calendar (must support tasks)
                 let targetCalendar = null;
                 if (calendarId) {
-                  targetCalendar = cal.manager.getCalendars().find(c => c.id === calendarId);
-                  if (!targetCalendar) return { error: `Calendar not found: ${calendarId}` };
+                  targetCalendar = getEnabledCalendars(calendarId)[0];
                   if (targetCalendar.readOnly) return { error: `Calendar is read-only: ${targetCalendar.name}` };
                   if (targetCalendar.getProperty("capabilities.tasks.supported") === false) {
                     return { error: `Calendar "${targetCalendar.name}" does not support tasks. Use listCalendars to find one with supportsTasks=true.` };
@@ -6930,7 +6937,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (skipReview) {
                   if (!targetCalendar) {
-                    targetCalendar = cal.manager.getCalendars().find(
+                    targetCalendar = getEnabledCalendars().find(
                       c => !c.readOnly && c.getProperty("capabilities.tasks.supported") !== false
                     );
                     if (!targetCalendar) return { error: "No writable task-capable calendar found" };
