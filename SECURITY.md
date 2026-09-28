@@ -36,7 +36,7 @@ This project bridges three trust boundaries; any of them is in scope:
 2. **HTTP transport** between the bridge and the Thunderbird
    extension (`http://localhost:<port>` with token auth). Token
    handling, timing-safe comparison, port-binding hygiene.
-3. **Tool dispatch inside the extension** (`extension/mcp_server/lib/`).
+3. **Tool dispatch inside the extension** (`extension/mcp_server/api.js`).
    The permission engine + per-tool argument validation are the
    primary boundary. Any path that lets a caller exceed their
    declared permission scope, or that accesses Thunderbird state
@@ -57,6 +57,18 @@ This project bridges three trust boundaries; any of them is in scope:
   no production npm `dependencies`; only devDeps are exposed.
 - Pre-release / unmerged feature branches. Report against `main`
   or the latest release.
+
+## Update channel
+
+Installed copies update themselves from
+`https://updates.tomaszkasperczyk.name/thunderbird-mcp/updates.json`,
+which the release workflow publishes to the `gh-pages` branch when a
+`v*` tag is pushed. Only the maintainer can push tags or change
+`gh-pages`; both are protected by repository rulesets, and releases are
+immutable. The domain is the maintainer's personal domain and will stay
+registered. If the project is ever handed over, the maintainer will ship
+a final release that moves `update_url` to the new maintainer's channel,
+and keep the domain serving the last manifest until installs have moved.
 
 ## Coordinated disclosure
 
