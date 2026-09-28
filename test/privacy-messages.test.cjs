@@ -15,7 +15,7 @@ function snippet(name) {
   return source.slice(start, end);
 }
 
-function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "raw MIME", DOMParser: Parser = null, streamError } = {}) {
+function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "raw MIME", DOMParser: Parser = null, streamError, mimeError } = {}) {
   const calls = { options: [], streams: 0, sends: [], reviews: 0, logs: [] };
   const folder = {
     server: {},
@@ -40,6 +40,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     ChromeUtils: { importESModule: () => ({
       MsgHdrToMimeMessage(msgHdr, _listener, callback, _download, options) {
         calls.options.push(options);
+        if (mimeError) throw mimeError;
         callback(msgHdr, mime);
       },
     }) },
@@ -48,6 +49,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     getConfiguredGetMessagesLimit: () => 10,
     readMessageStreamFully: () => raw,
     isSkipReviewBlocked: () => false,
+    isToolEnabled: () => true,
     filePathsToAttachDescs: () => ({ descs: [], failed: [] }),
     Cc: {
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
@@ -237,6 +239,131 @@ describe("Encrypted message privacy", () => {
       assert.equal(calls.sends.length, 0);
     });
   }
+});
+
+describe("Encrypted message privacy for automatic reply drafts", () => {
+  const invoke = api => api.replyToMessage("message-1", "folder", "intro", false, false,
+    undefined, undefined, undefined, undefined, undefined, false, true);
+
+  for (const encrypted of encryptedTrees) {
+    for (const unreadable of [false, true]) {
+      it(`refuses ${encrypted.label} before opening a draft window, pref unreadable=${unreadable}`, async () => {
+        const mime = {
+          ...encrypted,
+          get allUserAttachments() { return assert.fail("attachment metadata must not be read"); },
+        };
+        const { api, calls } = loadMessageTools({ mime, unreadable });
+        const result = await invoke(api);
+
+        assert.match(result.error, /encrypted.*blocked/i);
+        assert.equal(result.success, undefined);
+        assert.equal(calls.reviews, 0);
+        assert.equal(calls.sends.length, 0);
+        assert.equal(calls.streams, 0);
+        assert.equal(calls.options.length, 1);
+        assert.equal(calls.options[0].examineEncryptedParts, false);
+        assert.doesNotMatch(JSON.stringify(result), /decrypted body|protected subject|ciphertext/);
+      });
+    }
+
+    it(`permits a native ${encrypted.label} draft after explicit opt-in`, async () => {
+      const { api, calls } = loadMessageTools({ mime: encrypted, allowed: true });
+      const result = await invoke(api);
+
+      assert.equal(result.success, true);
+      assert.equal(result.message, "Reply saved as draft");
+      assert.equal(calls.reviews, 1);
+      assert.equal(calls.sends.length, 0);
+      assert.equal(calls.options.length, 1);
+      assert.equal(calls.options[0].examineEncryptedParts, true);
+    });
+  }
+
+  for (const unreadable of [false, true]) {
+    it(`refuses armor produced by plaintext coercion, pref unreadable=${unreadable}`, async () => {
+      const { api, calls } = loadMessageTools({
+        mime: { parts: [], coerceBodyToPlaintext: () => "-----BEGIN PGP MESSAGE-----\nciphertext" },
+        unreadable,
+      });
+      const result = await invoke(api);
+
+      assert.match(result.error, /encrypted.*blocked/i);
+      assert.equal(calls.reviews, 0);
+      assert.equal(calls.sends.length, 0);
+      assert.equal(calls.options[0].examineEncryptedParts, false);
+      assert.doesNotMatch(JSON.stringify(result), /ciphertext|protected subject/);
+    });
+  }
+
+  it("permits armor from plaintext coercion after explicit opt-in", async () => {
+    const { api, calls } = loadMessageTools({
+      mime: { parts: [], coerceBodyToPlaintext: () => "-----BEGIN PGP MESSAGE-----\nciphertext" },
+      allowed: true,
+    });
+    const result = await invoke(api);
+
+    assert.equal(result.success, true);
+    assert.equal(result.message, "Reply saved as draft");
+    assert.equal(calls.reviews, 1);
+    assert.equal(calls.sends.length, 0);
+    assert.equal(calls.options[0].examineEncryptedParts, true);
+  });
+
+  for (const [label, options] of [
+    ["null MIME", { mime: null }],
+    ["unclassified content type", { mime: { contentType: "text plain", body: "unclassified private body" } }],
+    ["parser failure", { mimeError: new Error("MIME parser failed") }],
+    ["classification failure", { mime: { get contentType() { throw new Error("MIME classification failed"); } } }],
+  ]) {
+    for (const unreadable of [false, true]) {
+      it(`refuses ${label} before native composition, pref unreadable=${unreadable}`, async () => {
+        const { api, calls } = loadMessageTools({ ...options, unreadable });
+        const result = await invoke(api);
+
+        assert.equal(typeof result.error, "string");
+        assert.equal(result.success, undefined);
+        assert.equal(calls.reviews, 0);
+        assert.equal(calls.sends.length, 0);
+        assert.equal(calls.streams, 0);
+        assert.equal(calls.options.length, 1);
+        assert.equal(calls.options[0].examineEncryptedParts, false);
+        assert.doesNotMatch(JSON.stringify(result), /unclassified private body|protected subject/);
+      });
+    }
+  }
+
+  for (const unreadable of [false, true]) {
+    for (const mime of [
+      { contentType: "text/plain", body: "visible" },
+      { contentType: "multipart/signed", parts: [{ contentType: "text/plain", body: "signed content" }] },
+    ]) {
+      it(`permits native drafts of ${mime.contentType}, pref unreadable=${unreadable}`, async () => {
+        const { api, calls } = loadMessageTools({ mime, unreadable });
+        const result = await invoke(api);
+
+        assert.equal(result.success, true);
+        assert.equal(result.message, "Reply saved as draft");
+        assert.equal(calls.reviews, 1);
+        assert.equal(calls.sends.length, 0);
+        assert.equal(calls.options.length, 1);
+        assert.equal(calls.options[0].examineEncryptedParts, false);
+      });
+    }
+  }
+
+  it("keeps ordinary review available without privacy or MIME extraction", async () => {
+    const { api, calls } = loadMessageTools({
+      mime: encryptedTrees[2], unreadable: true, mimeError: new Error("MIME must not be requested for review"),
+    });
+    const result = await api.replyToMessage("message-1", "folder", "intro", false, false,
+      undefined, undefined, undefined, undefined, undefined, false, false);
+
+    assert.equal(result.success, true);
+    assert.equal(result.message, "Reply window opened");
+    assert.equal(calls.reviews, 1);
+    assert.equal(calls.sends.length, 0);
+    assert.equal(calls.options.length, 0);
+  });
 });
 
 describe("Standalone inline PGP armor", () => {

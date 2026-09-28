@@ -1627,6 +1627,7 @@ function makeOutboundMailRuntime(options = {}) {
     isSkipReviewBlocked: () => false,
     setComposeIdentity(params) { params.identity = {}; },
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
+    buildBodyWithSignature: body => body || '',
     findMessage: () => ({ msgHdr: {}, folder: { server: {}, getUriForMsg: () => 'message://fixture' } }),
     sendMessageDirectly(_fields, _identity, _descs, _uri, _type, mode) {
       if (mode === 1) state.drafts++; else state.sent++;

@@ -63,10 +63,21 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | Tool | Description |
 |------|-------------|
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
-| `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block |
+| `saveDraft` | Save a new or replacement draft without sending or opening a window; supports threading headers and reports an accessible Drafts folder |
+| `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block; `saveAsDraft` saves the threaded reply to Drafts without sending |
 | `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
 
-All compose tools open a window for you to review and edit before sending by default. The **Block `skipReview`** preference is on by default, so `skipReview: true` is rejected until you explicitly disable the preference; only then can it send directly. Attachments can be file paths or inline base64 objects.
+`sendMail`, `replyToMessage`, and `forwardMessage` open a window for you to review and edit before sending by default. The **Block `skipReview`** preference is on by default, so `skipReview: true` is rejected until you explicitly disable the preference; only then can it send directly. Attachments can be file paths or inline base64 objects.
+
+`replyToMessage` accepts `saveAsDraft: true` to build a native reply with quoted text, the identity's signature and threading headers, save it, and close the compose window without sending. This requires the `saveDraft` tool to be enabled and cannot be combined with `skipReview`. Encrypted originals require the **Allow MCP clients to read encrypted messages** opt-in. Before saving, the current compose identity's configured destination must be accessible under account restrictions and carry the Drafts flag. A timeout returns `saveOutcome: "uncertain"`: the outstanding save may still complete, so check Drafts before retrying. Failures and timeouts restore the window's prior close and save-dialog behavior.
+
+`saveDraft` supports these optional parameters:
+
+- `inReplyTo`: one bracketed Message-ID such as `<original@example.com>`. `references`: up to 100 such IDs, oldest first, separated by single ASCII spaces. Each ID is limited to 998 characters and the full References value to 16,384. Missing brackets, extra tokens, whitespace inside IDs, and control characters (including CR/LF) are rejected, never repaired. References defaults to `inReplyTo` when omitted, and may also be supplied independently. The caller supplies the subject and quoted text.
+- `replaceMessageId` and `replaceFolderPath`: replace an existing draft with the supplied content. The folder must be accessible under account restrictions, carry Thunderbird's Drafts flag, and match the selected `from` identity's configured drafts folder. Other folders and missing messages are rejected before saving. Supply all fields and attachments you want retained; content is not merged from the old draft.
+- `includeSignature`: append the identity's signature, defaulting to `true` for a new draft and `false` for a replacement so re-saving a fetched draft does not duplicate its signature. Set it explicitly when needed. `sendMail` with `skipReview: true` accepts the same option, defaulting to `true`; review windows use Thunderbird's own signature preferences. Signature files are limited to 1 MiB; unreadable or oversized signature files are omitted.
+
+On success, `saveDraft` returns `folderPath` when Thunderbird exposes the destination and that folder is accessible under account restrictions. Otherwise the save still succeeds without disclosing the folder URI. It does not return the saved message's ID; look up the draft in the returned folder when available.
 
 Compose tools validate the `from` identity strictly -- if the specified sender doesn't match any configured Thunderbird identity, the tool returns an error instead of silently substituting another account.
 
