@@ -623,73 +623,7 @@ describe("Tool metadata: tools/list stripping", () => {
   });
 });
 
-describe("Tool access: tag keyword validation", () => {
-  // Mirrors production: allowlist of safe IMAP atom characters
-  const VALID_TAG = /^[a-zA-Z0-9_$.-]+$/;
-  function sanitizeTags(tags) {
-    return (tags || []).filter(t => typeof t === "string" && VALID_TAG.test(t));
-  }
-
-  it("rejects tags containing spaces", () => {
-    const result = sanitizeTags(["$label1", "$label1 \\Deleted", "clean"]);
-    assert.deepStrictEqual(result, ["$label1", "clean"]);
-  });
-
-  it("rejects tags containing tabs", () => {
-    const result = sanitizeTags(["valid", "has\ttab"]);
-    assert.deepStrictEqual(result, ["valid"]);
-  });
-
-  it("rejects tags containing newlines", () => {
-    const result = sanitizeTags(["valid", "has\nnewline", "has\rnewline"]);
-    assert.deepStrictEqual(result, ["valid"]);
-  });
-
-  it("accepts valid single-token tags", () => {
-    const result = sanitizeTags(["$label1", "$label2", "project-x", "custom_tag"]);
-    assert.deepStrictEqual(result, ["$label1", "$label2", "project-x", "custom_tag"]);
-  });
-
-  it("rejects tags with IMAP special characters", () => {
-    const specials = [
-      "tag(paren", "tag)paren", "tag{brace", "tag}brace",
-      "tag*wild", "tag%wild", "tag\\backslash", 'tag"quote',
-      "tag[bracket", "tag]bracket",
-    ];
-    const result = sanitizeTags(specials);
-    assert.deepStrictEqual(result, [], "All IMAP special chars should be rejected");
-  });
-
-  it("rejects null bytes", () => {
-    const result = sanitizeTags(["valid", "has\0null"]);
-    assert.deepStrictEqual(result, ["valid"]);
-  });
-
-  it("rejects zero-width spaces and other unicode whitespace", () => {
-    const result = sanitizeTags([
-      "valid",
-      "has\u200Bzwsp",     // zero-width space (not caught by \s)
-      "has\u00A0nbsp",     // non-breaking space
-      "has\uFEFFbom",      // BOM
-    ]);
-    assert.deepStrictEqual(result, ["valid"]);
-  });
-
-  it("rejects empty strings", () => {
-    const result = sanitizeTags(["", "valid", ""]);
-    assert.deepStrictEqual(result, ["valid"]);
-  });
-
-  it("rejects non-string entries", () => {
-    const result = sanitizeTags([42, null, undefined, true, "valid", {}, []]);
-    assert.deepStrictEqual(result, ["valid"]);
-  });
-
-  it("accepts tags with dots and hyphens", () => {
-    const result = sanitizeTags(["project.v2", "work-item", "$label1", "tag_name"]);
-    assert.deepStrictEqual(result, ["project.v2", "work-item", "$label1", "tag_name"]);
-  });
-});
+// Tag-key behavior is exercised through production updateMessage in update-message.test.cjs.
 
 // ── displayMessage validation tests ──────────────────────────────────
 

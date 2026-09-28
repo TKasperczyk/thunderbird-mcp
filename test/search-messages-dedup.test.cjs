@@ -2,77 +2,17 @@
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
+const vm = require("node:vm");
 
-// Mirrors normalizeMessageIdForDedup from api.js.
-function normalizeMessageIdForDedup(value) {
-  if (value === undefined || value === null) return "";
-  let normalized = String(value).trim();
-  if (!normalized) return "";
-  if (normalized.startsWith("<") && normalized.endsWith(">")) {
-    normalized = normalized.slice(1, -1).trim();
-  }
-  return normalized;
-}
-
-// Mirrors dedupeSearchMessageResults from api.js.
-function dedupeSearchMessageResults(results) {
-  const seen = new Map();
-  const deduped = [];
-
-  function addDupLocation(survivor, folderPath) {
-    if (!folderPath || folderPath === survivor.folderPath) return;
-    if (!Array.isArray(survivor.dupLocations)) survivor.dupLocations = [];
-    if (!survivor.dupLocations.includes(folderPath)) {
-      survivor.dupLocations.push(folderPath);
-    }
-  }
-
-  function mergeDupLocations(survivor, row) {
-    addDupLocation(survivor, row.folderPath);
-    if (Array.isArray(row.dupLocations)) {
-      for (const folderPath of row.dupLocations) {
-        addDupLocation(survivor, folderPath);
-      }
-    }
-  }
-
-  for (const row of results) {
-    const normalizedId = normalizeMessageIdForDedup(row?.id);
-    if (!normalizedId) {
-      deduped.push(row);
-      continue;
-    }
-
-    const survivor = seen.get(normalizedId);
-    if (survivor) {
-      mergeDupLocations(survivor, row);
-      continue;
-    }
-
-    if (Array.isArray(row.dupLocations)) {
-      const existingDupLocations = row.dupLocations;
-      delete row.dupLocations;
-      for (const folderPath of existingDupLocations) {
-        addDupLocation(row, folderPath);
-      }
-    }
-    seen.set(normalizedId, row);
-    deduped.push(row);
-  }
-
-  return deduped;
-}
-
-function paginate(results, offset, effectiveLimit) {
-  const effectiveOffset = offset > 0 ? Math.floor(offset) : 0;
-  return {
-    messages: results.slice(effectiveOffset, effectiveOffset + effectiveLimit),
-    totalMatches: results.length,
-    offset: effectiveOffset,
-    limit: effectiveLimit,
-    hasMore: effectiveOffset + effectiveLimit < results.length,
-  };
-}
+const source = fs.readFileSync(path.resolve(__dirname, "../extension/mcp_server/api.js"), "utf8");
+const start = source.indexOf("// BEGIN SEARCH RESULT HELPERS");
+const end = source.indexOf("// END SEARCH RESULT HELPERS", start);
+assert.ok(start >= 0 && end > start, "Production search helper markers must exist");
+const runtime = vm.createContext({});
+vm.runInContext(source.slice(start, end), runtime);
+const { normalizeMessageIdForDedup, dedupeSearchMessageResults, paginate } = runtime;
 
 describe("searchMessages dedup: Message-ID normalization", () => {
   it("strips one pair of angle brackets and trims whitespace, preserving case", () => {
@@ -106,7 +46,7 @@ describe("searchMessages dedup: result collapsing", () => {
 
     assert.equal(result.length, 1);
     assert.equal(result[0], inbox);
-    assert.deepStrictEqual(result[0].dupLocations, [
+    assert.deepStrictEqual(Array.from(result[0].dupLocations), [
       "imap://acct/[Gmail]/Important",
       "imap://acct/[Gmail]/All Mail",
     ]);
@@ -121,7 +61,7 @@ describe("searchMessages dedup: result collapsing", () => {
 
     const result = dedupeSearchMessageResults(rows);
 
-    assert.deepStrictEqual(result, rows);
+    assert.deepStrictEqual(Array.from(result), rows);
     assert.ok(!("dupLocations" in result[0]));
     assert.ok(!("dupLocations" in result[1]));
   });
@@ -136,7 +76,7 @@ describe("searchMessages dedup: result collapsing", () => {
     const result = dedupeSearchMessageResults(rows);
 
     assert.equal(result.length, 3);
-    assert.deepStrictEqual(result, rows);
+    assert.deepStrictEqual(Array.from(result), rows);
   });
 
   it("merges pre-existing dupLocations and excludes the survivor location", () => {
@@ -154,7 +94,7 @@ describe("searchMessages dedup: result collapsing", () => {
     const result = dedupeSearchMessageResults([primary, duplicate]);
 
     assert.equal(result.length, 1);
-    assert.deepStrictEqual(result[0].dupLocations, [
+    assert.deepStrictEqual(Array.from(result[0].dupLocations), [
       "imap://acct/Archive",
       "imap://acct/[Gmail]/Important",
       "imap://acct/Sent",
@@ -188,12 +128,12 @@ describe("searchMessages dedup: before pagination", () => {
 
     assert.equal(firstPage.totalMatches, 3);
     assert.equal(firstPage.messages.length, 3);
-    assert.deepStrictEqual(firstPage.messages.map(row => row.id), [
+    assert.deepStrictEqual(Array.from(firstPage.messages, row => row.id), [
       "same@example.com",
       "second@example.com",
       "third@example.com",
     ]);
     assert.equal(offsetPage.totalMatches, 3);
-    assert.deepStrictEqual(offsetPage.messages.map(row => row.id), ["second@example.com"]);
+    assert.deepStrictEqual(Array.from(offsetPage.messages, row => row.id), ["second@example.com"]);
   });
 });
