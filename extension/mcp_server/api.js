@@ -2065,7 +2065,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "saveDraft",
         group: "messages", crud: "create",
         title: "Save Draft",
-        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. Useful when a human will review and send the message later from Thunderbird.",
+        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. Useful when a human will review and send the message later from Thunderbird. On success the result reports `folderPath` -- the folder the draft went to -- so the caller can look it up there without guessing which folder the identity uses.",
         inputSchema: {
           type: "object",
           properties: {
@@ -7710,6 +7710,29 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (result.success) {
                     let msg = "Draft saved";
                     result.message = msg;
+
+                    // Report which folder the draft went to. Thunderbird picks
+                    // it from the identity, and the caller has no way to know
+                    // that mapping -- it only passed `from`. The property name
+                    // has moved across versions, so probe the known ones and
+                    // accept either a URI string or a folder object.
+                    const identity = msgComposeParams.identity;
+                    for (const prop of ["draftsFolderURI", "draftFolder", "draftsFolder", "fccFolder"]) {
+                      try {
+                        const value = identity?.[prop];
+                        if (typeof value === "string" && /^[a-z]+:\/\//i.test(value)) {
+                          result.folderPath = value;
+                          break;
+                        }
+                        if (value && typeof value.URI === "string") {
+                          result.folderPath = value.URI;
+                          break;
+                        }
+                      } catch {
+                        // A property that does not exist on this version just
+                        // throws; try the next one.
+                      }
+                    }
                   }
                   return result;
                 });
