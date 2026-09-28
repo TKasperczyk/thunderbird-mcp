@@ -20,7 +20,7 @@ Give your AI assistant full access to Thunderbird -- search mail, compose messag
 
 Thunderbird has no official API for AI tools. Your AI assistant can't read your email, can't help you draft replies, can't organize your inbox. This extension fixes that -- it exposes 40 tools over MCP so any compatible AI (Claude, GPT, local models) can work with your mail the way you'd expect.
 
-Compose sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. Automatic Forward/Reply filter actions have a separate opt-in, disabled by default.
+Compose sends and event/task creation require review by default because **Block `skipReview`** starts enabled. `skipReview: true` is honored only after you explicitly disable that safety setting. While enabled, meetings with attendees other than the calendar user are read-only through MCP, and adding attendees is blocked: calendar servers can email invitations, updates, or cancellations without review. Automatic Forward/Reply filter actions have a separate opt-in, disabled by default.
 
 ---
 
@@ -117,13 +117,27 @@ Move/Copy destinations must remain accessible under the current account restrict
 | Tool | Description |
 |------|-------------|
 | `listCalendars` | List all calendars with read-only, event, and task support flags |
-| `createEvent` | Create a calendar event -- opens a review dialog; direct creation via `skipReview` requires explicitly disabling the default safety block. Accepts `status: tentative \| confirmed \| cancelled` (VEVENT STATUS per iCal RFC 5545). |
-| `listEvents` | Query events by date range with recurring event expansion. Returns `status` on each event. |
-| `updateEvent` | Modify an event's title, dates, location, description, or `status` |
-| `deleteEvent` | Delete a calendar event by ID |
+| `createEvent` | Create an event through a review dialog, optionally with RRULE recurrence. Direct creation and non-empty `attendees` require disabling **Block `skipReview`**. Accepts `status: tentative \| confirmed \| cancelled`. |
+| `listEvents` | Query events by date range with bounded recurrence expansion. Returns a plain array capped at `maxResults`, including status, recurrence, organizer, attendees, and your participation status. Series that cannot be expanded return a master marked `recurrenceNotExpanded: true`. |
+| `updateEvent` | Modify an event or series; `recurrenceId` selects one occurrence. Meetings with other attendees are read-only while **Block `skipReview`** is on, even when `attendees` is omitted. |
+| `deleteEvent` | Delete an event or series; `recurrenceId` excludes one occurrence. Meetings with other attendees cannot be deleted while **Block `skipReview`** is on. |
 | `createTask` | Open a pre-filled task dialog for review; direct creation via `skipReview` requires explicitly disabling the default safety block |
 | `listTasks` | List tasks/to-dos from calendars -- filter by completion status, due date, or calendar |
 | `updateTask` | Update a task's title, due date, description, priority, completion status, or percent complete |
+
+`recurrence` accepts a single RRULE, such as `FREQ=WEEKLY;BYDAY=MO,TU` or `RRULE:FREQ=DAILY;COUNT=10`. The optional prefix is case-insensitive. Control characters (including CR/LF), malformed rules, `SECONDLY`/`MINUTELY`, and `HOURLY` on all-day events are rejected; Thunderbird's recurrence parser validates the rule before saving. On update, `recurrence: ""` or `null` clears the rule. Replacing a rule discards existing EXDATEs and modified occurrences.
+
+Use the `recurrenceId` returned by `listEvents` to update or delete one occurrence. Omitted or null IDs select the series; a non-null ID cannot be combined with `recurrence` on update. All-day occurrence IDs preserve their calendar date across timezones. Existing Date-compatible inputs remain accepted for event start/end dates; ISO 8601 is recommended.
+
+Attendees use `{ "email": "alice@example.com", "name": "Alice", "role": "optional" }`; new attendees default to `required`, and a `mailto:` email prefix is accepted. Email addresses must be single mailboxes without control characters or URI headers; names cannot contain control characters either. On update, omitted/null attendees preserve the list, while `[]` removes everyone. Retained attendees match by case-insensitive email and keep their participation status and provider metadata. Only supplied name/role fields change; omitted/null fields preserve existing values, and an empty name clears it. New attendees start with `NEEDS-ACTION`.
+
+Attendee management requires the calendar identity to match an existing organizer. Existing organizers are preserved; a missing organizer is initialized from the calendar identity, which may also set a missing calendar `organizerId` property. Creation with non-empty attendees requires disabling **Block `skipReview`**, even when `skipReview` is false: Exchange/Owl or CalDAV may email invitations containing the event title and description without review.
+
+`listEvents` returns a plain array, capped at `maxResults` (default 100, maximum 500). RRULE generation is limited to `maxResults + 1` candidates per series (hard ceiling 501) and 5,000 per request before expansion can allocate an unbounded occurrence array. Generation limits can leave fewer than `maxResults` results even when more occurrences exist, especially when exclusions remove generated candidates. Use narrower date ranges to reduce this effect.
+
+If a series cannot be expanded safely with a bounded count, expansion fails, or the shared generation budget is exhausted before that series, its master is included once with `recurrenceNotExpanded: true`, subject to the same output cap. This includes EXRULE series: incomplete exclusion expansion could expose excluded dates, so their rules are not expanded. A flagged master carries the series' original dates, which may be outside the requested range; it does not represent a matching occurrence. Ordinary EXDATEs and modified occurrences remain supported during bounded expansion.
+
+Each event includes `organizer: { id, commonName }`, up to 100 `attendees`, `attendeeCount` with the full count, and `myParticipationStatus` (empty when unavailable). Do not use a truncated attendee list as an update replacement, since that would remove the omitted attendees.
 
 ### Access Control
 
@@ -133,7 +147,7 @@ Move/Copy destinations must remain accessible under the current account restrict
 
 Account and tool access are configured via the extension settings page (Tools > Add-ons > Thunderbird MCP > Options). Access control is not MCP-exposed -- only the user can change it.
 
-The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`; their review window or dialog still opens normally. `skipReview` is honored only after you explicitly disable this preference.
+The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`. It also blocks adding attendees and makes meetings with attendees other than the calendar user read-only through MCP: `updateEvent` and `deleteEvent` reject every write, including time/description/recurrence edits, attendee removal, and occurrence deletion, even when `attendees` is omitted. Occurrence writes check both the series and selected occurrence; series writes also check stored exceptions. Events without attendees and events whose only attendee is the identified calendar user remain editable. If the calendar identity cannot be established, existing attendees cannot be treated as self-only. Disabling the setting permits these writes, which may email updates or cancellations without review. Event/task creation review dialogs remain available without attendees.
 
 The separate "Filter Send Actions" section controls **Allow automatic Forward/Reply filter actions**, which defaults to off. Only the user can change this preference in the settings page; MCP clients cannot enable it.
 
@@ -297,7 +311,6 @@ thunderbird-mcp/
 
 - IMAP folder databases can be stale until you click on them in Thunderbird
 - HTML-only emails are converted to plain text (original formatting is lost)
-- Recurring calendar event CRUD operates on the series, not individual occurrences
 - IMAP folder operations (rename, delete, move) are async -- verify with `listFolders` after
 - Combining tags with move/trash on IMAP may not preserve tags on the moved copy -- use separate calls
 - Thunderbird itself still runs pre-existing filters with cross-account move/copy targets automatically; the MCP filter tools refuse to update such rules (except disabling or deleting them) and `applyFilters` skips them

@@ -1877,6 +1877,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     // BEGIN TOOL SCHEMA BUILDER
     function buildTools() {
       const getMessagesLimit = getConfiguredGetMessagesLimit();
+      const attendeeSchema = {
+        type: "object",
+        properties: {
+          email: { type: "string", minLength: 1, description: "Single plain email address, optionally prefixed with mailto:. Control characters and URI headers are rejected." },
+          name: { type: "string", description: "Display name without control characters. Omitted/null preserves a retained attendee's name; empty string clears it." },
+          role: { type: "string", enum: ["required", "optional"], description: "New attendees default to required; omitted/null preserves a retained attendee's role." },
+        },
+        required: ["email"],
+      };
       const contactFieldProperties = {
         email: { type: "string", description: "Primary email address. May be omitted for phone-only contacts." },
         displayName: { type: "string", description: "Display name" },
@@ -2122,7 +2131,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "createEvent",
         group: "calendar", crud: "create",
         title: "Create Event",
-        description: "Create a calendar event through a review dialog. The skipReview safety block is on by default; direct creation is honored only when the user explicitly disables that preference.",
+        description: "Create a calendar event through a review dialog, optionally with an RRULE recurrence. Direct creation and non-empty attendees require disabling the default-on Block skipReview setting. Calendar servers may send invitations without review.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2137,6 +2146,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid block, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Defaults to 'busy'. Overridden per-property by explicit status parameter." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; use listCategories to get exact existing names before setting." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). After creation, OWL embeds the join URL in the event description and exposes it via listEvents (onlineMeetingURL). No-op on non-OWL backends." },
+            recurrence: { type: "string", description: "Single iCalendar RRULE (e.g. 'FREQ=WEEKLY;BYDAY=MO,TU' or 'RRULE:FREQ=DAILY;COUNT=10'). Optional case-insensitive RRULE: prefix. Control characters, malformed rules, SECONDLY/MINUTELY, and HOURLY on all-day events are rejected. Validated with Thunderbird's recurrence parser." },
+            attendees: { type: "array", items: attendeeSchema, description: "Attendees to invite. A non-empty list requires disabling Block skipReview, even when opening a review dialog: Exchange/Owl or CalDAV can email the event title/description without review. Omit, use null, or [] for no attendees. Organizer is initialized from the calendar identity; a missing calendar organizerId may be set." },
             skipReview: { type: "boolean", description: "Request direct creation without a review dialog. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
           },
           required: ["title", "startDate"],
@@ -2146,7 +2157,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "listEvents",
         group: "calendar", crud: "read",
         title: "List Events",
-        description: "List calendar events within a date range",
+        description: "List events as a plain array capped at maxResults (default 100, max 500). Recurring series are expanded within the date range using at most maxResults + 1 RRULE candidates per series (hard ceiling 501) and 5000 per request. A series that cannot be safely expanded (including EXRULEs), fails expansion, or is reached after the shared budget is exhausted returns its master once with recurrenceNotExpanded: true; its original dates may be outside the range. These masters count toward maxResults. Generation limits can leave fewer results even when more occurrences exist. Events include recurrence, recurrenceId, organizer, attendees (first 100), attendeeCount (total), and myParticipationStatus (empty when unavailable).",
         inputSchema: {
           type: "object",
           properties: {
@@ -2162,7 +2173,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "updateEvent",
         group: "calendar", crud: "update",
         title: "Update Event",
-        description: "Update an existing calendar event's title, dates, location, or description",
+        description: "Update an event or recurring series; pass recurrenceId to change one occurrence. While Block skipReview is on (default), events with attendees other than the calendar user are read-only: all updates, even with attendees omitted, are rejected. Checks the series and selected occurrence, or all exceptions for a series update. Adding attendees also requires disabling the setting; calendar servers may email updates without review.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2177,6 +2188,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             showAs: { type: "string", enum: ["busy", "free"], description: "How the event appears in the calendar: 'busy' (solid, TRANSP:OPAQUE + STATUS:CONFIRMED) or 'free' (hatched, TRANSP:TRANSPARENT + STATUS:TENTATIVE). Pass null to clear TRANSP only. Explicit status parameter overrides the STATUS coupling." },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Category names are case-sensitive; pass an empty array to clear all categories. Use listCategories to get exact existing names before setting." },
             onlineMeeting: { type: "boolean", description: "If true, generates a Microsoft Teams meeting link via Exchange (OWL/Office 365 accounts only). Pass false to remove an existing Teams link." },
+            recurrence: { anyOf: [{ type: "string" }, { type: "null" }], description: "Single RRULE validated by Thunderbird; optional RRULE: prefix. Empty string or null clears recurrence. Control characters, malformed rules, SECONDLY/MINUTELY, and HOURLY on all-day events are rejected. Replacing the rule discards EXDATEs and modified occurrences. Cannot be combined with a non-null recurrenceId." },
+            recurrenceId: { anyOf: [{ type: "string" }, { type: "null" }], description: "ISO 8601 recurrence ID from listEvents to modify one occurrence. Omit or pass null to update the series. Cannot combine a non-null recurrenceId with recurrence." },
+            attendees: { type: "array", items: attendeeSchema, description: "Replace the full list on the series or selected occurrence. [] removes all; omitted/null preserves it. Block skipReview prevents adding attendees and all writes to meetings with other attendees. Requires the calendar identity to match an existing organizer; a missing organizer is initialized. Retained attendees match by case-insensitive email and preserve responses/metadata; only supplied name/role changes. Do not round-trip a truncated listEvents attendee list." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -2185,12 +2199,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "deleteEvent",
         group: "calendar", crud: "delete",
         title: "Delete Event",
-        description: "Delete a calendar event",
+        description: "Delete an event or full recurring series; pass recurrenceId to exclude one occurrence. While Block skipReview is on (default), events with attendees other than the calendar user are read-only: series and occurrence deletions are rejected because calendar servers may email cancellations without review. Checks the series and selected occurrence, or all exceptions for a series deletion.",
         inputSchema: {
           type: "object",
           properties: {
             eventId: { type: "string", description: "The event ID (from listEvents results)" },
             calendarId: { type: "string", description: "The calendar ID containing the event (from listEvents results)" },
+            recurrenceId: { anyOf: [{ type: "string" }, { type: "null" }], description: "ISO 8601 recurrence ID from listEvents to exclude one occurrence (EXDATE). Omit or pass null to delete the full series." },
           },
           required: ["eventId", "calendarId"],
         },
@@ -2868,6 +2883,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             let cal = null;
             let CalEvent = null;
             let CalTodo = null;
+            let CalAttendee = null;
             try {
               const calModule = ChromeUtils.importESModule(
                 "resource:///modules/calendar/calUtils.sys.mjs"
@@ -2881,6 +2897,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 "resource:///modules/CalTodo.sys.mjs"
               );
               CalTodo = CT;
+              const { CalAttendee: CA } = ChromeUtils.importESModule(
+                "resource:///modules/CalAttendee.sys.mjs"
+              );
+              CalAttendee = CA;
             } catch {
               // Calendar not available
             }
@@ -3121,6 +3141,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Check if the user has disabled the skipReview shortcut.
              * When true, send/reply/forward/createEvent/createTask tools must open
              * the review window/dialog even if the caller passed skipReview: true.
+             * Adding calendar attendees is blocked, and meetings with other
+             * attendees are read-only: any write can send without review.
              *
              * Default is true: an LLM that reads attacker-controlled email content
              * can be prompt-injected into invoking sendMail with skipReview, so the
@@ -5423,6 +5445,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // BEGIN CALENDAR TOOLS
+            const ATTENDEE_REVIEW_ERROR = 'The "Block skipReview" setting in Thunderbird MCP Options makes events with attendees other than the calendar user read-only through MCP and blocks adding attendees. Updates and deletions can send invitations or cancellations without review. Disable that setting to allow these writes.';
+            const MAX_EVENT_ATTENDEES = 100;
+            const MAX_EVENT_OCCURRENCES = 501;
+            const MAX_EVENT_EXPANSION = 5000;
+            const CALENDAR_EMAIL_PATTERN = /^[a-z0-9!#$%&'*+/=^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=^_`{|}~-]+)*@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$/i;
+
             function listCalendars() {
               if (!cal) {
                 return { error: "Calendar not available" };
@@ -5441,9 +5470,132 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting) {
+            // Calendar IDs are single cal-address values, unlike mail display
+            // headers. Do not use extractAddressEmail or event-supplied identity hints.
+            function normalizeCalendarEmail(value) {
+              return typeof value === "string" ? value.replace(/^mailto:/i, "").toLowerCase() : "";
+            }
+
+            function getCalendarIdentity(calendar) {
+              try {
+                const identity = calendar.getProperty("imip.identity");
+                if (CALENDAR_EMAIL_PATTERN.test(normalizeCalendarEmail(identity?.email))) return identity;
+                const key = calendar.getProperty("imip.identity.key");
+                const configured = key ? MailServices.accounts.getIdentity(key) : null;
+                if (CALENDAR_EMAIL_PATTERN.test(normalizeCalendarEmail(configured?.email))) return configured;
+                const email = normalizeCalendarEmail(calendar.getProperty("organizerId"));
+                return CALENDAR_EMAIL_PATTERN.test(email) ? { email } : null;
+              } catch {
+                return null;
+              }
+            }
+
+            // One write guard for both update/delete paths. Inspect the stored
+            // series before a replacement list or recurrence can erase attendees.
+            function assertEventWriteAllowed(event, calendar, occurrence = null, attendees) {
+              const blocked = isSkipReviewBlocked();
+              if (!blocked && attendees == null) return;
+              const items = [];
+              const ownEmail = normalizeCalendarEmail(getCalendarIdentity(calendar)?.email);
+              let existing;
+              let hasOtherAttendees;
+              try {
+                // A provider lookup/scan may return a proxy or exception first.
+                const series = event.parentItem || event;
+                items.push(series);
+                if (series !== event) items.push(event);
+                if (occurrence) {
+                  if (!items.includes(occurrence)) items.push(occurrence);
+                } else if (series.recurrenceInfo) {
+                  for (const id of series.recurrenceInfo.getExceptionIds()) {
+                    const exception = series.recurrenceInfo.getExceptionFor(id);
+                    if (!exception) throw new Error("Missing exception");
+                    items.push(exception);
+                  }
+                }
+                existing = items.flatMap(item => {
+                  const values = item.getAttendees();
+                  if (!Array.isArray(values)) throw new Error("Unreadable attendees");
+                  return values;
+                });
+                hasOtherAttendees = existing.some(attendee =>
+                  !ownEmail || normalizeCalendarEmail(attendee?.id) !== ownEmail);
+              } catch {
+                throw new Error(blocked
+                  ? `${ATTENDEE_REVIEW_ERROR} Could not verify the event's attendees or exceptions.`
+                  : "Cannot manage attendees: could not verify the event's attendees or exceptions.");
+              }
+              if (blocked && (attendees?.length > 0 || hasOtherAttendees)) {
+                throw new Error(ATTENDEE_REVIEW_ERROR);
+              }
+              if (attendees != null) {
+                for (const item of items) {
+                  if (item.organizer && (!ownEmail || normalizeCalendarEmail(item.organizer.id) !== ownEmail)) {
+                    throw new Error("Cannot manage attendees: the calendar identity is not the event organizer.");
+                  }
+                }
+                if (!ownEmail && (attendees.length > 0 || existing.length > 0)) {
+                  throw new Error("Cannot manage attendees without a calendar identity.");
+                }
+              }
+            }
+
+            function buildAttendee(entry, existing) {
+              if (!entry || typeof entry.email !== "string" || /[\x00-\x1f\x7f-\x9f]/.test(entry.email)) {
+                throw new Error("Attendee email must be an email address without control characters");
+              }
+              const email = entry.email.replace(/^mailto:/i, "");
+              // One plain mailbox only: no display-address syntax, URI headers,
+              // or arbitrary URI schemes. Keep the optional mailto: prefix.
+              if (!CALENDAR_EMAIL_PATTERN.test(email)) {
+                throw new Error("Attendee email must be a single email address (optionally prefixed with mailto:)");
+              }
+              if (entry.name != null && (typeof entry.name !== "string" || /[\x00-\x1f\x7f-\x9f]/.test(entry.name))) {
+                throw new Error("Attendee name must be a string without control characters");
+              }
+              if (entry.role != null && entry.role !== "required" && entry.role !== "optional") {
+                throw new Error("Attendee role must be required or optional");
+              }
+              const attendee = existing ? existing.clone() : new CalAttendee();
+              if (!existing) {
+                attendee.id = `mailto:${email}`;
+                attendee.role = "REQ-PARTICIPANT";
+                attendee.participationStatus = "NEEDS-ACTION";
+              }
+              if (entry.name != null) attendee.commonName = entry.name;
+              if (entry.role != null) attendee.role = entry.role === "optional" ? "OPT-PARTICIPANT" : "REQ-PARTICIPANT";
+              return attendee;
+            }
+
+            // OWL's addItem/modifyItem strip attendees unless the event's
+            // organizer.id matches the calendar's organizerId property (its
+            // heuristic for "new meeting we organise" vs "moved invitation",
+            // which Exchange doesn't support). Initialize missing organizers
+            // from the calendar identity; never replace an existing organizer.
+            function ensureOrganizer(event, targetCalendar) {
+              if (event.organizer || event.getAttendees().length === 0) return;
+              const identity = getCalendarIdentity(targetCalendar);
+              if (!identity?.email) throw new Error("Cannot manage attendees without a calendar identity.");
+              const organizerEmail = `mailto:${normalizeCalendarEmail(identity.email)}`;
+              if (!targetCalendar.getProperty("organizerId")) {
+                targetCalendar.setProperty("organizerId", organizerEmail);
+              }
+              const organizer = new CalAttendee();
+              organizer.id = organizerEmail;
+              organizer.commonName = identity.fullName || identity.email;
+              organizer.isOrganizer = true;
+              organizer.role = "CHAIR";
+              organizer.participationStatus = "ACCEPTED";
+              event.organizer = organizer;
+            }
+
+            async function createEvent(title, startDate, endDate, location, description, calendarId, allDay, skipReview, status, showAs, categories, onlineMeeting, recurrence, attendees) {
               if (!cal || !CalEvent) {
                 return { error: "Calendar module not available" };
+              }
+              if (attendees != null) {
+                if (!Array.isArray(attendees)) return { error: "attendees must be an array" };
+                if (attendees.length > 0 && isSkipReviewBlocked()) return { error: ATTENDEE_REVIEW_ERROR };
               }
               if (skipReview && isSkipReviewBlocked()) {
                 return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review dialog instead." };
@@ -5547,6 +5699,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (categories && categories.length > 0) event.setCategories(categories);
                 if (onlineMeeting) event.setProperty("X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
 
+                if (recurrence) {
+                  try {
+                    setRecurrenceOnItem(event, recurrence);
+                  } catch (re) {
+                    return { error: `Invalid recurrence rule: ${re.toString()}` };
+                  }
+                }
+                if (attendees && attendees.length > 0) {
+                  for (const entry of attendees) event.addAttendee(buildAttendee(entry));
+                }
+
                 // Find target calendar
                 const calendars = cal.manager.getCalendars();
                 let targetCalendar = null;
@@ -5566,6 +5729,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 event.calendar = targetCalendar;
+                ensureOrganizer(event, targetCalendar);
 
                 if (skipReview) {
                   await targetCalendar.addItem(event);
@@ -5627,6 +5791,121 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return VEVENT_STATUS_MAP[String(status).trim().toLowerCase()] || null;
             }
 
+            function formatAttendee(att) {
+              if (!att) return null;
+              return {
+                id: att.id || "",
+                commonName: att.commonName || "",
+                participationStatus: att.participationStatus || "",
+                role: att.role || "",
+              };
+            }
+
+            // The organizer is not an attendee: PARTSTAT and ROLE don't apply.
+            function formatOrganizer(org) {
+              if (!org) return null;
+              return {
+                id: org.id || "",
+                commonName: org.commonName || "",
+              };
+            }
+
+            // Normalize a user-supplied RRULE string: trim, accept an optional
+            // case-insensitive "RRULE:" prefix, require a FREQ part (RFC 5545
+            // makes it mandatory; without it libical fails opaquely or yields a
+            // never-firing rule), and reject FREQ=SECONDLY / FREQ=MINUTELY
+            // upfront -- Thunderbird's rrule engine parses them but generates
+            // no occurrences, so accepting them would silently create a
+            // never-firing recurrence. Returns the full "RRULE:..." line.
+            // Throws on empty or unsupported rules.
+            function normalizeRRule(recurrence) {
+              // Check the original input: trim() would hide leading/trailing
+              // CR/LF, and an RRULE must never introduce another iCal line.
+              if (typeof recurrence !== "string" || /[\x00-\x1f\x7f-\x9f]/.test(recurrence)) {
+                throw new Error("Recurrence rule must be a string without control characters");
+              }
+              const body = String(recurrence).trim().replace(/^rrule:/i, "").trim();
+              if (!body) throw new Error("Empty recurrence rule");
+              const parts = new Set();
+              for (const part of body.split(";")) {
+                const match = /^(FREQ|UNTIL|COUNT|INTERVAL|BYSECOND|BYMINUTE|BYHOUR|BYDAY|BYMONTHDAY|BYYEARDAY|BYWEEKNO|BYMONTH|BYSETPOS|WKST)=([A-Z0-9+-]+(?:,[A-Z0-9+-]+)*)$/i.exec(part);
+                if (!match || parts.has(match[1].toUpperCase())) {
+                  throw new Error("Invalid or duplicate recurrence rule part");
+                }
+                parts.add(match[1].toUpperCase());
+              }
+              if (parts.has("COUNT") && parts.has("UNTIL")) {
+                throw new Error("Recurrence rule cannot combine COUNT and UNTIL");
+              }
+              const m = /(?:^|;)FREQ=([^;]*)/i.exec(body);
+              if (!m) throw new Error("Recurrence rule must contain a FREQ part (e.g. FREQ=WEEKLY)");
+              const freq = m[1].toUpperCase();
+              if (freq === "SECONDLY" || freq === "MINUTELY") {
+                throw new Error(`FREQ=${freq} is not supported: Thunderbird's recurrence engine generates no occurrences for it`);
+              }
+              if (!["HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"].includes(freq)) {
+                throw new Error("Invalid recurrence FREQ");
+              }
+              return "RRULE:" + body.toUpperCase();
+            }
+
+            // Build a calIRecurrenceInfo from an iCal RRULE string and attach it
+            // to `item`. Passing "" or null clears any existing recurrence. The
+            // "RRULE:" prefix is optional. Throws on invalid rules. Note: this
+            // replaces the whole calIRecurrenceInfo, so any existing EXDATEs or
+            // modified occurrences (exceptions) on the item are discarded.
+            function setRecurrenceOnItem(item, recurrence) {
+              if (recurrence === "" || recurrence === null) {
+                item.recurrenceInfo = null;
+                return;
+              }
+              const line = normalizeRRule(recurrence);
+              const fm = /(?:^|[:;])FREQ=([^;]*)/i.exec(line);
+              if (item.startDate && item.startDate.isDate && fm && fm[1].toUpperCase() === "HOURLY") {
+                throw new Error("FREQ=HOURLY cannot be applied to an all-day event: a date-only start cannot expand a sub-daily frequency");
+              }
+              // Both APIs parse through Thunderbird's recurrence engine. Do
+              // not save the text if parsing throws or yields no valid rule.
+              let ritem;
+              if (typeof cal.createRecurrenceRule === "function") {
+                ritem = cal.createRecurrenceRule(line);
+              } else {
+                ritem = Cc["@mozilla.org/calendar/recurrence-rule;1"]
+                  .createInstance(Ci.calIRecurrenceRule);
+                ritem.icalString = line;
+              }
+              if (!ritem || ritem.type !== fm[1]) {
+                throw new Error("Thunderbird could not parse the recurrence rule");
+              }
+              const rinfo = Cc["@mozilla.org/calendar/recurrence-info;1"]
+                .createInstance(Ci.calIRecurrenceInfo);
+              rinfo.item = item;
+              rinfo.appendRecurrenceItem(ritem);
+              item.recurrenceInfo = rinfo;
+            }
+
+            // Return the first RRULE on `item` without its "RRULE:" prefix, or
+            // null if the event is not recurring / has no RRULE among its items
+            // (e.g. RDATE-only recurrences). Occurrence proxies produced by the
+            // listEvents recurrence expansion carry the rule on their
+            // parentItem, not on themselves.
+            function extractRRuleFromItem(item) {
+              const rinfo = (item.parentItem || item).recurrenceInfo;
+              if (!rinfo) return null;
+              try {
+                const rules = rinfo.getRecurrenceItems();
+                for (const r of rules) {
+                  if (r && typeof r.icalString === "string") {
+                    const line = r.icalString.replace(/\r?\n$/, "");
+                    if (line.startsWith("RRULE:")) return line.slice("RRULE:".length);
+                  }
+                }
+              } catch (e) {
+                console.warn("thunderbird-mcp: RRULE extraction failed for", item.id || item.title, e);
+              }
+              return null;
+            }
+
             function formatEvent(item, calendar) {
               const allDay = item.startDate ? item.startDate.isDate : false;
               // For all-day events, iCal DTEND is exclusive. Convert to inclusive
@@ -5655,12 +5934,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 categories: item.getCategories(),
                 onlineMeetingURL: item.getProperty("X-MICROSOFT-SKYPETEAMSMEETINGURL") || null,
                 allDay,
-                isRecurring: !!item.recurrenceInfo,
+                isRecurring: !!(item.parentItem || item).recurrenceInfo,
+                recurrence: extractRRuleFromItem(item),
               };
               // Occurrences of recurring events share the parent's id.
               // Include recurrenceId so callers can distinguish them.
               if (item.recurrenceId) {
                 result.recurrenceId = calDateToISO(item.recurrenceId);
+              }
+              // Organizer + attendees + my own participation status, so callers
+              // can filter out DECLINED invites (e.g. ghost events kept on the
+              // server but no longer attended).
+              try {
+                result.organizer = formatOrganizer(item.organizer);
+              } catch { result.organizer = null; }
+              try {
+                const atts = (typeof item.getAttendees === "function" ? item.getAttendees() : []) || [];
+                result.attendeeCount = atts.length;
+                result.attendees = atts.slice(0, MAX_EVENT_ATTENDEES).map(formatAttendee).filter(Boolean);
+              } catch { result.attendees = []; result.attendeeCount = 0; }
+              try {
+                const me = cal.itip && typeof cal.itip.getInvitedAttendee === "function"
+                  ? cal.itip.getInvitedAttendee(item, calendar)
+                  : null;
+                result.myParticipationStatus = me ? (me.participationStatus || "") : "";
+              } catch (e) {
+                console.warn("thunderbird-mcp: getInvitedAttendee failed for", item.id || item.title, e);
+                result.myParticipationStatus = "";
               }
               return result;
             }
@@ -5800,6 +6100,45 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            function getBoundedEventOccurrences(item, rangeStart, rangeEnd, maxCount) {
+              const info = item.recurrenceInfo.clone();
+              const parts = info.getRecurrenceItems();
+              // EXDATEs are finite. EXRULEs cannot be safely shortened: doing so
+              // could turn excluded dates into apparent occurrences.
+              if (parts.some(part => part.isNegative && !part.date)) {
+                return { occurrences: null, generated: 0 };
+              }
+              const dates = parts.filter(part => part.date);
+              const searchStart = rangeStart.clone();
+              if (item.duration) {
+                const duration = item.duration.clone();
+                duration.isNegative = true;
+                searchStart.addDuration(duration);
+              }
+              let generated = 0;
+              for (const part of parts) {
+                if (part.date) continue;
+                const remaining = maxCount - generated;
+                if (remaining <= 0) break;
+                // RecurrenceInfo ignores its count while generating RRULEs for
+                // bounded ranges. Bound the rule itself, then replace it with
+                // finite RDATEs on a clone so native EXDATE/exception handling,
+                // DTSTART, overlap checks, and ordering remain intact.
+                const occurrences = part.getOccurrences(
+                  item.recurrenceStartDate || item.startDate, searchStart, rangeEnd, remaining
+                );
+                generated += occurrences.length;
+                for (const date of occurrences) {
+                  const recurrenceDate = cal.createRecurrenceDate();
+                  recurrenceDate.date = date.clone();
+                  dates.push(recurrenceDate);
+                }
+              }
+              info.setRecurrenceItems(dates);
+              const occurrences = info.getOccurrences(rangeStart, rangeEnd, maxCount);
+              return { occurrences, generated };
+            }
+
             async function listEvents(calendarId, startDate, endDate, maxResults) {
               if (!cal) {
                 return { error: "Calendar not available" };
@@ -5820,7 +6159,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const rangeStart = cal.dtz.jsDateToDateTime(startJs, cal.dtz.defaultTimezone);
                 const rangeEnd = cal.dtz.jsDateToDateTime(endJs, cal.dtz.defaultTimezone);
-                const limit = Math.min(Math.max(maxResults || 100, 1), 500);
+                const limit = Math.min(Math.max(Math.floor(maxResults || 100), 1), 500);
 
                 // Two-phase query to correctly handle recurring events.
                 //
@@ -5839,6 +6178,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // occurrences that fall within the queried range.
                 const FILTER_EVENT = 1 << 3;
                 const results = [];
+                let generated = 0;
                 for (const calendar of targets) {
                   // Phase 1: non-recurring events + modified-occurrence exceptions.
                   // Bounded by the date range so no expansion cap is needed here --
@@ -5863,26 +6203,31 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     allItems = rangeItems;
                   }
 
-                  // Cap recurring expansion to prevent a malformed daily-over-decades
-                  // master from blowing up the result. Tracked independently of Phase 1
-                  // so a busy date range cannot starve recurring expansion.
-                  const OCCURRENCE_EXPANSION_CAP = limit * 10;
-                  let expanded = 0;
+                  const seenSeries = new Set();
                   for (const item of allItems) {
-                    if (expanded >= OCCURRENCE_EXPANSION_CAP) break;
-                    if (!item.recurrenceInfo) continue;
-                    try {
-                      const occurrences = item.recurrenceInfo.getOccurrences(rangeStart, rangeEnd, 0);
-                      for (const occ of occurrences) {
-                        if (expanded >= OCCURRENCE_EXPANSION_CAP) break;
-                        results.push(formatEvent(occ, calendar));
-                        expanded++;
+                    if (!item.recurrenceInfo || seenSeries.has(item.id)) continue;
+                    seenSeries.add(item.id);
+                    const count = Math.min(limit + 1, MAX_EVENT_OCCURRENCES, MAX_EVENT_EXPANSION - generated);
+                    let occurrences = null;
+                    if (count > 0) {
+                      // Reserve the attempt: a failure may already have generated dates.
+                      generated += count;
+                      try {
+                        const expansion = getBoundedEventOccurrences(item, rangeStart, rangeEnd, count);
+                        generated -= count - expansion.generated;
+                        occurrences = expansion.occurrences;
+                      } catch (e) {
+                        console.warn("thunderbird-mcp: recurrence expansion failed for", item.id || item.title, e);
                       }
-                    } catch (e) {
-                      // Don't push the master on failure -- its event_start is the original
-                      // first-occurrence date and is almost certainly outside the queried
-                      // range, which would pollute results with stale events.
-                      console.warn("thunderbird-mcp: recurrence expansion failed for", item.id || item.title, e);
+                    }
+                    if (occurrences === null) {
+                      // The original dates may be outside the requested range;
+                      // explicitly mark this as a master, not an occurrence.
+                      results.push({ ...formatEvent(item, calendar), recurrenceNotExpanded: true });
+                    } else {
+                      for (const occ of occurrences) {
+                        results.push(formatEvent(occ, calendar));
+                      }
                     }
                   }
                 }
@@ -5985,11 +6330,172 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting) {
+            // Leading calendar-date digits of an ISO 8601 string. For date-only
+            // values, read the date straight from these digits -- round-tripping
+            // through new Date() getters can shift the day by one depending on
+            // the host timezone (listEvents serializes all-day ids as UTC
+            // midnight, which local getters render as the previous day west of
+            // UTC).
+            const DATE_ONLY_RE = /^(\d{4})-(\d{2})-(\d{2})/;
+
+            // Parse an ISO 8601 recurrenceId into a calIDateTime matching what
+            // the rrule engine generates for RECURRENCE-ID. Uses the master's
+            // own timezone so EXDATE / occurrence-lookup comparisons succeed --
+            // parsing as UTC silently no-ops on tz'd events. Returns { recDt }
+            // on success or { error } on an unparseable input.
+            function recurrenceIdToCalDateTime(masterItem, recurrenceId) {
+              const js = new Date(recurrenceId);
+              if (isNaN(js.getTime())) {
+                return { error: `Invalid recurrenceId: ${recurrenceId}` };
+              }
+              if (masterItem.startDate && masterItem.startDate.isDate) {
+                const dm = DATE_ONLY_RE.exec(String(recurrenceId).trim());
+                if (!dm) return { error: `Invalid recurrenceId: ${recurrenceId}` };
+                const recDt = cal.createDateTime();
+                recDt.resetTo(Number(dm[1]), Number(dm[2]) - 1, Number(dm[3]), 0, 0, 0, cal.dtz.floating);
+                recDt.isDate = true;
+                if (recDt.year !== Number(dm[1]) || recDt.month !== Number(dm[2]) - 1 || recDt.day !== Number(dm[3])) {
+                  return { error: `Invalid recurrenceId: ${recurrenceId}` };
+                }
+                return { recDt };
+              }
+              const tz = (masterItem.startDate && masterItem.startDate.timezone) || cal.dtz.defaultTimezone;
+              return { recDt: cal.dtz.jsDateToDateTime(js, tz) };
+            }
+
+            function findEventOccurrence(masterItem, recurrenceId) {
+              const rinfo = masterItem.recurrenceInfo;
+              // getOccurrenceFor can manufacture an off-schedule proxy. Use
+              // its actual start (which may be a moved exception) only to bound
+              // expansion; the generated set proves membership and honors EXDATE.
+              const candidate = rinfo.getOccurrenceFor(recurrenceId);
+              if (!candidate?.startDate) return null;
+              const rangeStart = candidate.startDate;
+              const rangeEnd = rangeStart.clone();
+              if (rangeEnd.isDate) rangeEnd.day += 1;
+              else rangeEnd.second += 1;
+              return rinfo.getOccurrences(rangeStart, rangeEnd, 0)
+                .find(item => item.recurrenceId?.compare(recurrenceId) === 0) || null;
+            }
+
+            // Apply title/dates/location/description on a target item (master clone or
+            // occurrence clone). Returns { changes } on success or { error } on failure.
+            // Used by both the master-update and the single-occurrence-update paths.
+            function applyEventChanges(targetItem, title, startDate, endDate, location, description) {
+              const changes = [];
+              if (title !== undefined) { targetItem.title = title; changes.push("title"); }
+
+              if (startDate !== undefined) {
+                const js = new Date(startDate);
+                if (isNaN(js.getTime())) return { error: `Invalid startDate: ${startDate}` };
+                if (targetItem.startDate && targetItem.startDate.isDate) {
+                  const dm = DATE_ONLY_RE.exec(String(startDate).trim());
+                  const dt = cal.createDateTime();
+                  // Preserve ISO calendar digits, but keep the pre-existing
+                  // Date-compatible inputs (e.g. RFC 2822) working as before.
+                  dt.resetTo(dm ? Number(dm[1]) : js.getFullYear(), dm ? Number(dm[2]) - 1 : js.getMonth(), dm ? Number(dm[3]) : js.getDate(), 0, 0, 0, cal.dtz.floating);
+                  dt.isDate = true;
+                  targetItem.startDate = dt;
+                } else {
+                  targetItem.startDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                }
+                changes.push("startDate");
+              }
+
+              if (endDate !== undefined) {
+                const js = new Date(endDate);
+                if (isNaN(js.getTime())) return { error: `Invalid endDate: ${endDate}` };
+                if (targetItem.endDate && targetItem.endDate.isDate) {
+                  const dm = DATE_ONLY_RE.exec(String(endDate).trim());
+                  const dt = cal.createDateTime();
+                  // iCal DTEND is exclusive for all-day -- bump by 1 day
+                  // (Date.UTC handles month/year rollover on the +1).
+                  const next = new Date(Date.UTC(dm ? Number(dm[1]) : js.getFullYear(), dm ? Number(dm[2]) - 1 : js.getMonth(), (dm ? Number(dm[3]) : js.getDate()) + 1));
+                  dt.resetTo(next.getUTCFullYear(), next.getUTCMonth(), next.getUTCDate(), 0, 0, 0, cal.dtz.floating);
+                  dt.isDate = true;
+                  targetItem.endDate = dt;
+                } else {
+                  targetItem.endDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                }
+                changes.push("endDate");
+              }
+
+              if (location !== undefined) { targetItem.setProperty("LOCATION", location); changes.push("location"); }
+              if (description !== undefined) { targetItem.setProperty("DESCRIPTION", description); changes.push("description"); }
+
+              return { changes };
+            }
+
+            // Apply status/showAs/categories/onlineMeeting/attendees on a target item
+            // (master clone or occurrence clone). Appends to `changes`.
+            // Returns { error } on invalid input, {} otherwise. Used by both
+            // the master-update and the single-occurrence-update paths.
+            function applyEventMetaChanges(targetItem, status, showAs, categories, onlineMeeting, changes, attendees) {
+              if (status !== undefined) {
+                if (status === null || status === "") {
+                  targetItem.deleteProperty("STATUS");
+                } else {
+                  const normalized = normalizeEventStatus(status);
+                  if (!normalized) {
+                    return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
+                  }
+                  targetItem.setProperty("STATUS", normalized);
+                }
+                changes.push("status");
+              }
+              if (showAs !== undefined) {
+                if (showAs === null || showAs === "") {
+                  targetItem.deleteProperty("TRANSP");
+                } else if (showAs === "free") {
+                  targetItem.setProperty("TRANSP", "TRANSPARENT");
+                  // Also set STATUS:TENTATIVE for Thunderbird visual display unless caller overrides
+                  if (status === undefined) { targetItem.setProperty("STATUS", "TENTATIVE"); changes.push("status"); }
+                } else if (showAs === "busy") {
+                  targetItem.setProperty("TRANSP", "OPAQUE");
+                  // Also set STATUS:CONFIRMED for Thunderbird visual display unless caller overrides
+                  if (status === undefined) { targetItem.setProperty("STATUS", "CONFIRMED"); changes.push("status"); }
+                } else {
+                  return { error: `Invalid showAs: "${showAs}". Expected "busy" or "free".` };
+                }
+                changes.push("showAs");
+              }
+              // null/undefined preserves existing categories; empty array clears them.
+              if (Array.isArray(categories)) {
+                targetItem.setCategories(categories);
+                changes.push("categories");
+              }
+              if (onlineMeeting !== undefined) {
+                if (onlineMeeting) {
+                  targetItem.setProperty("X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
+                } else {
+                  targetItem.deleteProperty("X-ONLINE-MEETING-PROVIDER");
+                  targetItem.deleteProperty("X-MICROSOFT-SKYPETEAMSMEETINGURL");
+                }
+                changes.push("onlineMeeting");
+              }
+              // null/undefined is a no-op; [] explicitly removes everyone.
+              if (attendees != null) {
+                const current = targetItem.getAttendees();
+                const byEmail = new Map(current.map(attendee => [normalizeCalendarEmail(attendee.id), attendee]));
+                const built = attendees.map(entry => buildAttendee(entry, byEmail.get(normalizeCalendarEmail(entry?.email))));
+                for (const a of current) targetItem.removeAttendee(a);
+                for (const a of built) targetItem.addAttendee(a);
+                changes.push("attendees");
+              }
+              return {};
+            }
+
+            async function updateEvent(eventId, calendarId, title, startDate, endDate, location, description, status, showAs, categories, onlineMeeting, recurrence, recurrenceId, attendees) {
               if (!cal) return { error: "Calendar not available" };
               try {
+                if (attendees != null) {
+                  if (!Array.isArray(attendees)) return { error: "attendees must be an array" };
+                }
                 if (!eventId) return { error: "eventId is required" };
                 if (!calendarId) return { error: "calendarId is required" };
+                if (recurrenceId != null && recurrence !== undefined) {
+                  return { error: "Cannot combine recurrence and recurrenceId: recurrence rules apply to the master event only." };
+                }
 
                 const calendar = cal.manager.getCalendars().find(c => c.id === calendarId);
                 if (!calendar) return { error: `Calendar not found: ${calendarId}` };
@@ -6007,87 +6513,56 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (!oldItem) return { error: `Event not found: ${eventId}` };
 
+                // ---- Single-occurrence path ----
+                if (recurrenceId != null) {
+                  if (!oldItem.recurrenceInfo) {
+                    return { error: "Event is not recurring; recurrenceId cannot be applied" };
+                  }
+                  const rid = recurrenceIdToCalDateTime(oldItem, recurrenceId);
+                  if (rid.error) return { error: rid.error };
+                  const occurrence = findEventOccurrence(oldItem, rid.recDt);
+                  if (!occurrence) {
+                    return { error: `No occurrence found at recurrenceId: ${recurrenceId}` };
+                  }
+                  assertEventWriteAllowed(oldItem, calendar, occurrence, attendees);
+
+                  const modOcc = occurrence.clone();
+                  const r = applyEventChanges(modOcc, title, startDate, endDate, location, description);
+                  if (r.error) return { error: r.error };
+                  const meta = applyEventMetaChanges(modOcc, status, showAs, categories, onlineMeeting, r.changes, attendees);
+                  if (meta.error) return { error: meta.error };
+                  if (r.changes.length === 0) return { error: "No changes specified" };
+                  if (modOcc.startDate && modOcc.endDate && modOcc.endDate.compare(modOcc.startDate) <= 0) {
+                    return { error: "endDate must be after startDate" };
+                  }
+
+                  // Pass the modified occurrence itself, not a master clone:
+                  // providers detect parentItem and register the exception on
+                  // the series. Sending the master would make OWL/Exchange
+                  // target the whole series and overwrite every occurrence on
+                  // the next sync.
+                  if (attendees != null) ensureOrganizer(modOcc, calendar);
+                  await calendar.modifyItem(modOcc, occurrence);
+                  return { success: true, updated: r.changes, mode: "occurrence", recurrenceId };
+                }
+
+                // ---- Master / series path (default) ----
+                assertEventWriteAllowed(oldItem, calendar, null, attendees);
                 const newItem = oldItem.clone();
-                const changes = [];
+                const r = applyEventChanges(newItem, title, startDate, endDate, location, description);
+                if (r.error) return { error: r.error };
+                const changes = r.changes;
+                const meta = applyEventMetaChanges(newItem, status, showAs, categories, onlineMeeting, changes, attendees);
+                if (meta.error) return { error: meta.error };
 
-                if (title !== undefined) { newItem.title = title; changes.push("title"); }
-
-                if (startDate !== undefined) {
-                  const js = new Date(startDate);
-                  if (isNaN(js.getTime())) return { error: `Invalid startDate: ${startDate}` };
-                  if (newItem.startDate && newItem.startDate.isDate) {
-                    const dt = cal.createDateTime();
-                    dt.resetTo(js.getFullYear(), js.getMonth(), js.getDate(), 0, 0, 0, cal.dtz.floating);
-                    dt.isDate = true;
-                    newItem.startDate = dt;
-                  } else {
-                    newItem.startDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+                if (recurrence !== undefined) {
+                  try {
+                    setRecurrenceOnItem(newItem, recurrence);
+                    changes.push("recurrence");
+                  } catch (re) {
+                    return { error: `Invalid recurrence rule: ${re.toString()}` };
                   }
-                  changes.push("startDate");
                 }
-
-                if (endDate !== undefined) {
-                  const js = new Date(endDate);
-                  if (isNaN(js.getTime())) return { error: `Invalid endDate: ${endDate}` };
-                  if (newItem.endDate && newItem.endDate.isDate) {
-                    const dt = cal.createDateTime();
-                    // iCal DTEND is exclusive for all-day -- bump by 1 day
-                    const next = new Date(js.getFullYear(), js.getMonth(), js.getDate());
-                    next.setDate(next.getDate() + 1);
-                    dt.resetTo(next.getFullYear(), next.getMonth(), next.getDate(), 0, 0, 0, cal.dtz.floating);
-                    dt.isDate = true;
-                    newItem.endDate = dt;
-                  } else {
-                    newItem.endDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
-                  }
-                  changes.push("endDate");
-                }
-
-                if (location !== undefined) { newItem.setProperty("LOCATION", location); changes.push("location"); }
-                if (description !== undefined) { newItem.setProperty("DESCRIPTION", description); changes.push("description"); }
-                if (status !== undefined) {
-                  if (status === null || status === "") {
-                    newItem.deleteProperty("STATUS");
-                  } else {
-                    const normalized = normalizeEventStatus(status);
-                    if (!normalized) {
-                      return { error: `Invalid status: "${status}". Expected tentative, confirmed, or cancelled.` };
-                    }
-                    newItem.setProperty("STATUS", normalized);
-                  }
-                  changes.push("status");
-                }
-                if (showAs !== undefined) {
-                  if (showAs === null || showAs === "") {
-                    newItem.deleteProperty("TRANSP");
-                  } else if (showAs === "free") {
-                    newItem.setProperty("TRANSP", "TRANSPARENT");
-                    // Also set STATUS:TENTATIVE for Thunderbird visual display unless caller overrides
-                    if (status === undefined) { newItem.setProperty("STATUS", "TENTATIVE"); changes.push("status"); }
-                  } else if (showAs === "busy") {
-                    newItem.setProperty("TRANSP", "OPAQUE");
-                    // Also set STATUS:CONFIRMED for Thunderbird visual display unless caller overrides
-                    if (status === undefined) { newItem.setProperty("STATUS", "CONFIRMED"); changes.push("status"); }
-                  } else {
-                    return { error: `Invalid showAs: "${showAs}". Expected "busy" or "free".` };
-                  }
-                  changes.push("showAs");
-                }
-                // null/undefined preserves existing categories; empty array clears them.
-                if (Array.isArray(categories)) {
-                  newItem.setCategories(categories);
-                  changes.push("categories");
-                }
-                if (onlineMeeting !== undefined) {
-                  if (onlineMeeting) {
-                    newItem.setProperty("X-ONLINE-MEETING-PROVIDER", "TeamsForBusiness");
-                  } else {
-                    newItem.deleteProperty("X-ONLINE-MEETING-PROVIDER");
-                    newItem.deleteProperty("X-MICROSOFT-SKYPETEAMSMEETINGURL");
-                  }
-                  changes.push("onlineMeeting");
-                }
-
                 if (changes.length === 0) return { error: "No changes specified" };
 
                 // Validate end > start after all changes
@@ -6095,9 +6570,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "endDate must be after startDate" };
                 }
 
+                if (attendees != null) ensureOrganizer(newItem, calendar);
                 await calendar.modifyItem(newItem, oldItem);
                 const result = { success: true, updated: changes };
-                if (oldItem.recurrenceInfo) {
+                // Read the post-update state: after clearing the recurrence
+                // (recurrence: "" / null) the event is no longer a series and
+                // the warning would state the opposite of what happened.
+                if (newItem.recurrenceInfo) {
                   result.warning = "This is a recurring event -- changes apply to the entire series.";
                 }
                 return result;
@@ -6106,7 +6585,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            async function deleteEvent(eventId, calendarId) {
+            async function deleteEvent(eventId, calendarId, recurrenceId) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!eventId) return { error: "eventId is required" };
@@ -6126,6 +6605,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (!item) return { error: `Event not found: ${eventId}` };
 
+                if (recurrenceId != null) {
+                  if (!item.recurrenceInfo) {
+                    return { error: "Event is not recurring; recurrenceId cannot be applied" };
+                  }
+                  const rid = recurrenceIdToCalDateTime(item, recurrenceId);
+                  if (rid.error) return { error: rid.error };
+                  // removeOccurrenceAt happily EXDATEs a date with no
+                  // occurrence; validate first so a miss is an error, not a
+                  // silent success that leaves the real occurrence in place.
+                  const occurrence = findEventOccurrence(item, rid.recDt);
+                  if (!occurrence) {
+                    return { error: `No occurrence found at recurrenceId: ${recurrenceId}` };
+                  }
+                  assertEventWriteAllowed(item, calendar, occurrence);
+                  const newItem = item.clone();
+                  newItem.recurrenceInfo.removeOccurrenceAt(rid.recDt);
+                  await calendar.modifyItem(newItem, item);
+                  return { success: true, deleted: eventId, recurrenceId, mode: "occurrence" };
+                }
+
+                assertEventWriteAllowed(item, calendar);
                 const isRecurring = !!item.recurrenceInfo;
                 await calendar.deleteItem(item);
                 const result = { success: true, deleted: eventId };
@@ -6246,6 +6746,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: e.toString() };
               }
             }
+
+            // END CALENDAR TOOLS
 
             // BEGIN RAW MIME PARSING HELPERS
             function rawMimeToByteString(input) {
@@ -9671,13 +10173,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCalendars":
                   return listCalendars();
                 case "createEvent":
-                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting);
+                  return await createEvent(args.title, args.startDate, args.endDate, args.location, args.description, args.calendarId, args.allDay, args.skipReview, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence, args.attendees);
                 case "listEvents":
                   return await listEvents(args.calendarId, args.startDate, args.endDate, args.maxResults);
                 case "updateEvent":
-                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories, args.onlineMeeting);
+                  return await updateEvent(args.eventId, args.calendarId, args.title, args.startDate, args.endDate, args.location, args.description, args.status, args.showAs, args.categories, args.onlineMeeting, args.recurrence, args.recurrenceId, args.attendees);
                 case "deleteEvent":
-                  return await deleteEvent(args.eventId, args.calendarId);
+                  return await deleteEvent(args.eventId, args.calendarId, args.recurrenceId);
                 case "listCategories":
                   return listCategories();
                 case "createTask":
