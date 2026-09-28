@@ -3,6 +3,16 @@
 // /* global */ comment triggered no-redeclare.
 "use strict";
 
+// BEGIN EXPERIMENT GLOBAL IMPORTS
+// addon_parent is a sandbox, not a window or a system ES module. These names
+// are supported by xpc::GlobalProperties in js/xpconnect/src/Sandbox.cpp.
+try {
+  Cu.importGlobalProperties(["DOMParser", "atob", "btoa", "TextDecoder"]);
+} catch (e) {
+  console.warn("thunderbird-mcp: failed to import Experiment globals:", e);
+}
+// END EXPERIMENT GLOBAL IMPORTS
+
 /**
  * Thunderbird MCP Server Extension
  * Exposes email, calendar, and contacts via MCP protocol over HTTP.
@@ -1980,7 +1990,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             saveAttachments: { type: "boolean", description: "If true, save attachments to <OS temp dir>/thunderbird-mcp/<messageId>/ and include filePath in response (default: false)" },
             includeInlineImages: { type: "boolean", description: "If true, append supported inline email images as MCP image content blocks after the text result (default: false; max 1 MiB base64 per image and 4 MiB total). Images referenced by the rendered body are attempted first in document order, followed by remaining inline images in MIME order. Ignored when rawSource is true." },
-            bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format: 'markdown' (default, preserves structure), 'text' (plain text), 'html' (raw, untrusted HTML)" },
+            bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format: 'markdown' (default; HTML conversion allows only http/https/mailto links and replaces images with alt text; plain-text bodies only escape image openers, preserving other Markdown/HTML), 'text' (plain text), 'html' (unchanged, untrusted HTML). HTML input over 2 MiB is truncated before markdown/text conversion, with a notice." },
             rawSource: { type: "boolean", description: "If true, return untrusted raw RFC 2822 message source (all headers + MIME parts). Useful for extracting calendar invites, S/MIME data, or debugging. Other fields (body, attachments) are omitted when this is set. Note: requires local/offline message copy; IMAP messages not cached offline may fail." },
           },
           required: ["messageId", "folderPath"],
@@ -2010,7 +2020,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               },
             },
             saveAttachments: { type: "boolean", description: "If true, save attachments for each message and include filePath in attachment metadata (default: false)" },
-            bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format shared by all messages: 'markdown' (default), 'text', or 'html' (raw, untrusted HTML)" },
+            bodyFormat: { type: "string", enum: ["markdown", "text", "html"], description: "Body output format shared by all messages: 'markdown' (default; HTML conversion allows only http/https/mailto links and replaces images with alt text; plain-text bodies only escape image openers, preserving other Markdown/HTML), 'text', or 'html' (unchanged, untrusted HTML). HTML input over 2 MiB is truncated before markdown/text conversion, with a notice." },
             rawSource: { type: "boolean", description: "If true, return untrusted raw RFC 2822 source for each message instead of parsed body fields. Encrypted content is withheld unless allowed in extension options." },
           },
           required: ["messages"],
@@ -3798,10 +3808,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // BEGIN COMPOSE HTML FRAGMENT
             function formatBodyFragmentHtml(body, isHtml) {
               const formatted = formatBodyHtml(body, isHtml);
               if (!isHtml) return formatted;
               if (!formatted) return "";
+              if (truncateHtmlForParsing(formatted).truncated) return escapeHtml(stripHtml(formatted)).replace(/\n/g, "<br>");
 
               const needsParsing = /<(?:html|body|head)\b/i.test(formatted) || /\bmoz-signature\b/i.test(formatted);
               if (!needsParsing) return formatted;
@@ -3816,6 +3828,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return formatted;
               }
             }
+            // END COMPOSE HTML FRAGMENT
 
             function moveComposeSelectionToBodyStartIfRange(composeWin) {
               const browser = typeof composeWin?.getBrowser === "function" ? composeWin.getBrowser() : null;
@@ -4244,8 +4257,44 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             // BEGIN MESSAGE TEXT CONVERSION
+            const MAX_HTML_PARSE_BYTES = 2 * 1024 * 1024;
+
+            const HTML_TRUNCATION_NOTE = "[Message body truncated at 2 MiB]";
+
+            function truncateHtmlForParsing(html) {
+              // Cap UTF-8 input without allocating encoded copies or splitting
+              // a UTF-16 surrogate pair. Only Gecko interprets the markup.
+              let bytes = 0;
+              let end = 0;
+              for (const char of html) {
+                const cp = char.codePointAt(0);
+                bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+                if (bytes > MAX_HTML_PARSE_BYTES) return { html: html.slice(0, end), truncated: true };
+                end += char.length;
+              }
+              return { html, truncated: false };
+            }
+
+            function escapeMarkdownText(text) {
+              // Text/alt attributes must not become Markdown links, images or
+              // raw HTML after the client renders them.
+              return stripInvisibleCharacters(text).replace(/\r\n?/g, "\n").replace(/[\\`[\]<>]|!(?=\[)/g, "\\$&");
+            }
+
+            function markdownCode(text, block = false) {
+              text = stripInvisibleCharacters(text).replace(/\r\n?/g, "\n");
+              if (!block) text = text.replace(/[\r\n]+/g, " ");
+              let width = block ? 3 : 1;
+              for (const match of text.matchAll(/`+/g)) width = Math.max(width, match[0].length + 1);
+              const fence = "`".repeat(width);
+              // Outside spaces prevent adjacent code elements from merging
+              // their closing/opening backtick runs into an unmatched fence.
+              return block ? `\n\n${fence}\n${text.trim()}\n${fence}\n\n` : ` ${fence} ${text} ${fence} `;
+            }
+
             function parseVisibleHtml(html) {
-              const doc = new DOMParser().parseFromString(html, "text/html");
+              const input = truncateHtmlForParsing(html);
+              const doc = new DOMParser().parseFromString(input.html, "text/html");
               for (const node of doc.querySelectorAll("*")) {
                 const tag = node.tagName.toLowerCase();
                 const style = node.style;
@@ -4255,14 +4304,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   node.remove();
                 }
               }
-              return doc;
+              return { doc, truncated: input.truncated };
             }
 
             function stripHtml(html) {
               if (!html) return "";
               let text;
+              let truncated;
               try {
-                const doc = parseVisibleHtml(html);
+                const parsed = parseVisibleHtml(html);
+                const doc = parsed.doc;
+                truncated = parsed.truncated;
                 function walk(node) {
                   if (node.nodeType === 3) return node.textContent;
                   if (node.nodeType !== 1) return "";
@@ -4288,28 +4340,51 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               text = text.replace(/[ \t\f\v]+/g, " ");
               text = text.replace(/ *\n */g, "\n");
               text = text.trim();
-              return stripInvisibleCharacters(text);
+              return stripInvisibleCharacters(text) + (truncated ? (text ? "\n\n" : "") + HTML_TRUNCATION_NOTE : "");
             }
 
             /**
              * Converts HTML to markdown using DOMParser for structure-preserving
              * body extraction. Handles headings, links, bold/italic, lists,
-             * blockquotes, code blocks, images, and horizontal rules. Email
+             * blockquotes, code blocks, image alt text, and horizontal rules. Email
              * tables (usually layout, not data) are flattened to text.
              * Falls back to stripHtml if DOMParser is unavailable.
              */
             function htmlToMarkdown(html) {
               if (!html) return "";
               try {
-                const doc = parseVisibleHtml(html);
+                const { doc, truncated } = parseVisibleHtml(html);
 
                 function walkChildren(node) {
-                  return Array.from(node.childNodes).map(walk).join("");
+                  const parts = [];
+                  let trailingSlashes = 0;
+                  let unescapedBang = false;
+                  for (const child of node.childNodes) {
+                    const part = walk(child);
+                    if (!part) continue;
+                    // Comments and transparent wrappers can separate a literal
+                    // bang from a generated link in the DOM, but not in Markdown.
+                    if (part.startsWith("[") && unescapedBang) {
+                      const last = parts.length - 1;
+                      parts[last] = parts[last].slice(0, -1) + "\\!";
+                    }
+                    parts.push(part);
+                    // Track escape parity across fragments without rescanning
+                    // the accumulated output for every child.
+                    const bang = part.endsWith("!");
+                    const end = part.length - (bang ? 1 : 0);
+                    let start = end;
+                    while (start > 0 && part[start - 1] === "\\") start--;
+                    const slashes = end - start + (start === 0 ? trailingSlashes : 0);
+                    unescapedBang = bang && slashes % 2 === 0;
+                    trailingSlashes = bang ? 0 : slashes;
+                  }
+                  return parts.join("");
                 }
 
                 function walk(node) {
                   if (node.nodeType === 3) { // Text
-                    return node.textContent.replace(/[ \t]+/g, " ");
+                    return escapeMarkdownText(node.textContent.replace(/[ \t]+/g, " "));
                   }
                   if (node.nodeType !== 1) return "";
                   const tag = node.tagName.toLowerCase();
@@ -4336,26 +4411,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return t ? "*" + t + "*" : "";
                     }
                     case "a": {
-                      const href = node.getAttribute("href") || "";
+                      const href = (node.getAttribute("href") || "")
+                        .replace(/[\t\r\n]/g, "").replace(/^[\s\u0000-\u0020\u007f-\u009f]+/, "");
                       const text = inner().trim();
-                      // Skip empty/anchor-only links and mailto: without text
-                      if (!text && !href) return "";
-                      if (href && text && text !== href) return `[${text}](${href})`;
-                      return text || href;
+                      if (!/^(https?:|mailto:)/i.test(href)) return text;
+                      // Prevent a destination from breaking out of Markdown's
+                      // link syntax (including into a tracking image).
+                      const destination = href.replace(/[\u0000-\u0020\u007f<>()[\]\\]/g,
+                        char => "%" + char.charCodeAt(0).toString(16).padStart(2, "0"));
+                      return text ? `[${text}](${destination})` : escapeMarkdownText(href);
                     }
-                    case "img": {
-                      const alt = node.getAttribute("alt") || "";
-                      const src = node.getAttribute("src") || "";
-                      // Skip tracking pixels (1x1, tiny, or data: without alt)
-                      const w = parseInt(node.getAttribute("width")) || 0;
-                      const h = parseInt(node.getAttribute("height")) || 0;
-                      if ((w > 0 && w <= 3) || (h > 0 && h <= 3)) return "";
-                      if (src.startsWith("data:") && !alt) return "";
-                      if (src) return `![${alt}](${src})`;
-                      return alt;
+                    case "img": return escapeMarkdownText(node.getAttribute("alt") || "");
+                    case "code": return markdownCode(node.textContent);
+                    case "pre": {
+                      // Inline wrappers and table cells trim/concatenate their
+                      // contents, so a fenced block cannot stand alone there.
+                      for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+                        if (/^(a|b|strong|em|i|h[1-6]|td|th|code)$/i.test(parent.tagName)) {
+                          return escapeMarkdownText(node.textContent);
+                        }
+                      }
+                      return markdownCode(node.textContent, true);
                     }
-                    case "code": return "`" + node.textContent + "`";
-                    case "pre": return "\n\n```\n" + node.textContent.trim() + "\n```\n\n";
                     case "blockquote": {
                       const text = inner().trim();
                       return "\n\n" + text.split("\n").map(l => "> " + l).join("\n") + "\n\n";
@@ -4364,7 +4441,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     case "li": {
                       const parent = node.parentElement;
                       const isOl = parent && parent.tagName.toLowerCase() === "ol";
-                      return (isOl ? "1. " : "- ") + inner().trim() + "\n";
+                      const marker = isOl ? "1. " : "- ";
+                      return marker + inner().trim().replace(/\n/g, "\n" + " ".repeat(marker.length)) + "\n";
                     }
                     // Tables: extract text with spacing (email tables are usually layout)
                     case "table": return "\n\n" + inner().trim() + "\n\n";
@@ -4376,10 +4454,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
 
                 const body = doc.body || doc.documentElement;
-                let result = walk(body);
+                let result = body ? walk(body) : "";
                 // Collapse excessive newlines, trim
                 result = result.replace(/\n{3,}/g, "\n\n").trim();
-                return stripInvisibleCharacters(result);
+                return stripInvisibleCharacters(result) + (truncated ? (result ? "\n\n" : "") + HTML_TRUNCATION_NOTE : "");
               } catch {
                 // DOMParser unavailable or parse failure -- fall back to stripHtml
                 return stripHtml(html);
@@ -4444,12 +4522,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return "";
             }
 
+            function formatPlainTextBody(text, bodyFormat) {
+              const body = stripInvisibleCharacters(text);
+              // Keep plain text intact except for image openers in Markdown.
+              // Consume existing escape pairs so an already escaped image does
+              // not become active by accidentally doubling its backslash.
+              return bodyFormat === "markdown"
+                ? body.replace(/\\[\s\S]|!\[/g, match => match === "![" ? "\\![" : match)
+                : body;
+            }
+
             /**
              * Extracts body from a MIME message in the requested format.
              * For "text": removes hidden HTML before converting to plain text.
              * For "markdown"/"html": walks MIME tree to find raw HTML content.
              */
-            function extractFormattedBody(aMimeMsg, bodyFormat) {
+            function extractFormattedBody(aMimeMsg, bodyFormat = "markdown") {
               if (bodyFormat === "text") {
                 return { body: extractPlainTextBody(aMimeMsg), bodyIsHtml: false };
               }
@@ -4458,9 +4546,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (!text) {
                 // MIME tree empty -- try coerce as last resort
                 const fallback = extractPlainTextBody(aMimeMsg);
-                return { body: fallback, bodyIsHtml: false };
+                return { body: formatPlainTextBody(fallback, bodyFormat), bodyIsHtml: false };
               }
-              if (!isHtml) return { body: stripInvisibleCharacters(text), bodyIsHtml: false };
+              if (!isHtml) return { body: formatPlainTextBody(text, bodyFormat), bodyIsHtml: false };
               if (bodyFormat === "html") return { body: text, bodyIsHtml: true };
               // Default: markdown
               return { body: htmlToMarkdown(text), bodyIsHtml: false };
@@ -6507,8 +6595,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // END RAW MIME ATTACHMENT HELPERS
 
             // BEGIN ENCRYPTED MESSAGE GUARD
-            function hasInlinePgpArmor(text) {
+            function hasInlinePgpArmor(text, rawHtml = null) {
+              // Presentation truncation must neither hide armor beyond the cap nor
+              // create a standalone armor line by removing the rest of a line.
+              if (typeof rawHtml === "string" && truncateHtmlForParsing(rawHtml).truncated) {
+                return rawHtml.includes("-----BEGIN PGP MESSAGE-----");
+              }
               return typeof text === "string" && /(?:^|\r?\n)[^\S\r\n]*-----BEGIN PGP MESSAGE-----[^\S\r\n]*(?:\r?\n|$)/.test(text);
+            }
+
+            function hasInlinePgpBodyArmor(aMimeMsg, body, preferHtml = false) {
+              const { text, isHtml } = extractBodyContent(aMimeMsg, preferHtml);
+              return hasInlinePgpArmor(body, isHtml ? text : null);
             }
 
             function classifyMimeContentType(value) {
@@ -6531,7 +6629,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const states = contentTypes.map(classifyMimeContentType);
               if (states.some(state => state === "encrypted" || state === "unknown")) return true;
               if (part.isEncrypted) return true;
-              if (hasInlinePgpArmor(part.body)) return true;
+              const isHtml = contentTypes.some(value => parseRawMimeHeaderValue(value).value === "text/html");
+              if (hasInlinePgpArmor(part.body, isHtml ? part.body : null)) return true;
               return Array.isArray(part.parts) && part.parts.some(isEncryptedMimeMessage);
             }
 
@@ -6580,7 +6679,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       (!/^charset\s*=/i.test(charsetParams[0]) || !contentType.params.charset))) return "unknown";
                   const text = decodeRawMimeTextPart({ headers, body: split.body, contentType: { value: "text/plain" } });
                   if (!text || text.charsetFallback) return "unknown";
-                  if (hasInlinePgpArmor(text.text)) return "encrypted";
+                  if (hasInlinePgpArmor(text.text, contentType.value === "text/html" ? text.text : null)) return "encrypted";
                 }
                 return contentType.value ? "clear" : "unknown";
               } catch {
@@ -6673,7 +6772,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     let body = fmt.body;
                     let bodyIsHtml = fmt.bodyIsHtml;
                     let bodyNote = "";
-                    if (!allowEncrypted && hasInlinePgpArmor(body)) {
+                    if (!allowEncrypted && hasInlinePgpBodyArmor(aMimeMsg, body, requestedBodyFormat !== "text")) {
                       resolve(encryptedMessagePlaceholder(msgHdr));
                       return;
                     }
@@ -6735,7 +6834,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                 bodyIsHtml = false;
                               }
                             } else {
-                              body = extracted.text;
+                              body = formatPlainTextBody(extracted.text, requestedBodyFormat);
                               bodyIsHtml = false;
                             }
                           }
@@ -7707,7 +7806,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
 	                      try {
 	                        const originalBody = extractPlainTextBody(aMimeMsg);
-	                        if (!allowEncrypted && (!aMimeMsg || isEncryptedMimeMessage(aMimeMsg) || hasInlinePgpArmor(originalBody))) {
+	                        if (!allowEncrypted && (!aMimeMsg || isEncryptedMimeMessage(aMimeMsg) || hasInlinePgpBodyArmor(aMimeMsg, originalBody))) {
 	                          resolve({ error: "Direct reply/forward of encrypted messages is blocked. Use skipReview: false to review in Thunderbird, or enable \"Allow MCP clients to read encrypted messages\" in the extension options." });
 	                          return;
 	                        }
@@ -7885,7 +7984,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
                       try {
                         const originalBody = extractPlainTextBody(aMimeMsg);
-                        if (!allowEncrypted && (!aMimeMsg || isEncryptedMimeMessage(aMimeMsg) || hasInlinePgpArmor(originalBody))) {
+                        if (!allowEncrypted && (!aMimeMsg || isEncryptedMimeMessage(aMimeMsg) || hasInlinePgpBodyArmor(aMimeMsg, originalBody))) {
                           resolve({ error: "Direct reply/forward of encrypted messages is blocked. Use skipReview: false to review in Thunderbird, or enable \"Allow MCP clients to read encrypted messages\" in the extension options." });
                           return;
                         }

@@ -58,6 +58,16 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | `emptyTrash` | Permanently delete all messages in Trash (including subfolders) |
 | `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
 
+Message body formats (`getMessage` and `getMessages`):
+
+- `markdown` (default) converts HTML to visible structure, allowing only `http:`, `https:`, and `mailto:` link destinations. Other HTML links become their visible text. HTML images become alt text (or nothing); their source URLs are omitted. Text nodes and alt text escape backslashes, backticks, brackets, angle brackets, and `!` before `[` to prevent literal links, images, or raw HTML. A literal `!` immediately before a generated link is also escaped, including across element boundaries. Other punctuation (including underscores, asterisks, hashes, pipes, and tildes) is preserved; HTML code spans and blocks use code formatting.
+- For plain-text MIME bodies, `markdown` escapes Markdown image openers (`![`) while preserving the rest of the text, apart from the existing invisible-character removal. This also applies to coerced text and raw-MIME recovery. Other Markdown, links, and literal HTML in plain-text bodies are **not sanitized**; clients must disable raw HTML and remote-content loading when rendering untrusted message text.
+- `text` extracts visible text. Both text formats remove hidden HTML content and invisible control characters.
+- For `text` and `markdown`, HTML input over 2 MiB (UTF-8) is truncated at a Unicode character boundary before being parsed with the same HTML privacy rules. The output ends with `[Message body truncated at 2 MiB]`. Content after the cut is omitted; retained content keeps the normal formatting and link rules. Oversized compose fragments use the same capped parsing path. Encryption checks inspect the full source: oversized HTML containing `-----BEGIN PGP MESSAGE-----` anywhere is withheld unless encrypted-message access is enabled, even when the marker is only quoted in prose.
+- `html` returns the original HTML unchanged. It is **untrusted** and may contain hidden content, scripts, unsafe links, and remote images; clients must sanitize it before rendering. `rawSource: true` also remains unchanged.
+
+`includeInlineImages: true` is a separate opt-in for supported inline CID images as MCP image blocks; it does not add image URLs to the Markdown body.
+
 ### Compose
 
 | Tool | Description |
