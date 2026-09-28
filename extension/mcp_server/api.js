@@ -44,6 +44,7 @@ function isListenAllEnabled() {
   try { return Services.prefs.getBoolPref(PREF_LISTEN_ALL, false); } catch { return false; }
 }
 
+// BEGIN CONNECTION INFO REFRESH HELPERS
 function stopConnectionInfoRefreshTimer() {
   if (globalThis.__tbMcpConnectionInfoRefreshTimer) {
     try {
@@ -55,7 +56,6 @@ function stopConnectionInfoRefreshTimer() {
   }
 }
 
-// BEGIN CONNECTION INFO REFRESH HELPERS
 function ensureFreshConnectionInfo({
   port,
   token,
@@ -1978,12 +1978,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
     return {
       mcpServer: {
+        // BEGIN SERVER LIFECYCLE
         start: async function() {
           // Guard against double-start on extension reload (port conflict)
           if (globalThis.__tbMcpStartPromise) {
             return await globalThis.__tbMcpStartPromise;
           }
           const startPromise = (async () => {
+          let startedServer = null;
           try {
             // Stop any previously running server (e.g. extension reload)
             if (globalThis.__tbMcpServer) {
@@ -2161,11 +2163,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // straight overwrite, but a permissive directory still lets the
                 // attacker read or rename our file. Force perms back to 0o700.
                 //
-                // Skipped on Windows: %TEMP% is per-user and protected by NTFS
-                // ACLs, and nsIFile.permissions there returns a synthesised
-                // mode (directories report 0o777) that chmod cannot change --
-                // so the check would always fail and block startup (#178,
-                // #181, #182, #197, #202, #203, #205).
+                // Skipped on Windows: nsIFile.permissions synthesises group/
+                // other bits (0o666/0o777 have been observed) that assigning
+                // 0o700 cannot clear. Access is governed by inherited ACLs;
+                // these mode bits neither describe nor enforce ACL privacy.
                 try {
                   const mode = tmpDir.permissions;
                   if (mode && (mode & 0o077) !== 0) {
@@ -2217,6 +2218,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function startConnectionInfoRefresh(port, token) {
               stopConnectionInfoRefreshTimer();
               const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+              // Track it before initialization so failed startup can cancel it.
+              globalThis.__tbMcpConnectionInfoRefreshTimer = timer;
               timer.initWithCallback(() => {
                 try {
                   ensureConnectionInfo(port, token);
@@ -2224,7 +2227,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   console.warn("thunderbird-mcp: failed to refresh connection info:", e);
                 }
               }, CONNECTION_FILE_REFRESH_MS, Ci.nsITimer.TYPE_REPEATING_SLACK);
-              globalThis.__tbMcpConnectionInfoRefreshTimer = timer;
             }
 
             const authToken = getStableAuthTokenPref() || generateAuthToken();
@@ -8540,45 +8542,49 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            globalThis.__tbMcpServer = server;
-            let connFilePath;
-            try {
-              // Write the connection file fresh on initial start so the secure
-              // create path (0600 perms, directory checks) always runs. The
-              // refresh timer self-heals it afterward via ensureConnectionInfo
-              // if the OS deletes it while the server keeps running.
-              connFilePath = writeConnectionInfo(boundPort, authToken);
-              startConnectionInfoRefresh(boundPort, authToken);
-            } catch (writeErr) {
-              // Connection file write failed -- stop the orphaned server
-              try { server.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
-              globalThis.__tbMcpServer = null;
-              stopConnectionInfoRefreshTimer();
-              throw writeErr;
-            }
+            startedServer = server;
+            // Write the connection file fresh on initial start so the secure
+            // create path (0600 perms, directory checks) always runs. The
+            // refresh timer self-heals it afterward via ensureConnectionInfo
+            // if the OS deletes it while the server keeps running.
+            const connFilePath = writeConnectionInfo(boundPort, authToken);
+            startConnectionInfoRefresh(boundPort, authToken);
             console.log(`Thunderbird MCP server listening on port ${boundPort}`);
             console.log(`Connection info written to ${connFilePath}`);
             if (listenAll) {
               console.error(`thunderbird-mcp: WARNING - server is listening on all interfaces (0.0.0.0/[::]). This exposes the MCP server to your local network. Only enable on trusted networks.`);
             }
+            // Publish running state only after startup has fully succeeded.
+            globalThis.__tbMcpServer = server;
             return { success: true, port: boundPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
-            // Stop server if it was started but something else failed
-            if (globalThis.__tbMcpServer) {
-              try { globalThis.__tbMcpServer.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
-              globalThis.__tbMcpServer = null;
-            }
             stopConnectionInfoRefreshTimer();
-            // Clear cached promise so a retry can attempt to bind again
-            globalThis.__tbMcpStartPromise = null;
+            // Clean up before yielding: a reload may install a new connection
+            // file while this listener is still draining.
             removeConnectionInfo();
+            // Keep this attempt cached until the listener has finished stopping,
+            // so concurrent starts cannot rebind during failure cleanup.
+            if (startedServer) {
+              try { await startedServer.stop(); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
+            }
             return { success: false, error: e.toString() };
           }
           })();
           // Set sentinel BEFORE awaiting to prevent race with concurrent start() calls
           globalThis.__tbMcpStartPromise = startPromise;
-          return await startPromise;
+          let result;
+          try {
+            result = await startPromise;
+            return result;
+          } finally {
+            // The IIFE can fail synchronously before the assignment above.
+            // Evict failures/rejections after settlement without clearing a
+            // newer attempt installed by a restart or extension reload.
+            if (!result?.success && globalThis.__tbMcpStartPromise === startPromise) {
+              globalThis.__tbMcpStartPromise = null;
+            }
+          }
         },
 
         getServerInfo: async function() {
@@ -8624,13 +8630,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           }
 
           return {
-            running: !!globalThis.__tbMcpStartPromise,
+            running: !!globalThis.__tbMcpServer,
             port,
             connectionFile,
             buildVersion,
             buildDate,
           };
         },
+
+        // END SERVER LIFECYCLE
 
         getCurrentAuthToken: async function() {
           let authToken = "";
@@ -8859,45 +8867,65 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           return { listenAll };
         },
 
+        // BEGIN LISTEN ALL SETTER
         setListenAll: async function(listenAll) {
           if (typeof listenAll !== "boolean") {
             return { error: "listenAll must be a boolean" };
           }
-          console.log(`[MCP] setListenAll called with: ${listenAll}`);
-          if (listenAll) {
-            Services.prefs.setBoolPref(PREF_LISTEN_ALL, true);
-          } else {
-            try { Services.prefs.clearUserPref(PREF_LISTEN_ALL); } catch { /* ignore */ }
-          }
+          // Serialize settings changes through the entire restart, including
+          // failure cleanup, so another setter cannot bypass a pending stop.
+          const previousRestart = globalThis.__tbMcpRestartPromise;
+          const restartPromise = (async () => {
+            try { await previousRestart; } catch { /* previous restart failed */ }
+            console.log(`[MCP] setListenAll called with: ${listenAll}`);
+            // A failed start may still be stopping its listener. Follow any
+            // newer attempt another caller installs while we are waiting.
+            let startPromise;
+            do {
+              startPromise = globalThis.__tbMcpStartPromise;
+              if (startPromise) {
+                try { await startPromise; } catch { /* startup failed */ }
+              }
+            } while (globalThis.__tbMcpStartPromise &&
+                     globalThis.__tbMcpStartPromise !== startPromise);
+            if (listenAll) {
+              Services.prefs.setBoolPref(PREF_LISTEN_ALL, true);
+            } else {
+              try { Services.prefs.clearUserPref(PREF_LISTEN_ALL); } catch { /* ignore */ }
+            }
 
-          // Stop existing server
-          if (globalThis.__tbMcpServer) {
-            const stopServer = globalThis.__tbMcpServer;
-            globalThis.__tbMcpServer = null;
-            stopConnectionInfoRefreshTimer();
-            // Wait for the socket close callback before rebinding the port.
-            try {
-              await new Promise((resolve) => {
-                try { stopServer.stop(resolve); } catch { resolve(); }
-              });
-            } catch { /* ignore */ }
-          }
-          // Clear sentinels so start() can reinitialize
-          globalThis.__tbMcpStartPromise = null;
+            // Remove stale info before yielding so this stop cannot remove a
+            // newer attempt's connection file.
+            removeConnectionInfo();
+            if (globalThis.__tbMcpServer) {
+              const stopServer = globalThis.__tbMcpServer;
+              globalThis.__tbMcpServer = null;
+              stopConnectionInfoRefreshTimer();
+              // Wait for the socket close callback before rebinding the port.
+              try {
+                await new Promise((resolve) => {
+                  try { stopServer.stop(resolve); } catch { resolve(); }
+                });
+              } catch { /* ignore */ }
+            }
+            // Only release the startup attempt this operation waited for.
+            if (globalThis.__tbMcpStartPromise === startPromise) {
+              globalThis.__tbMcpStartPromise = null;
+            }
 
-          // Remove stale connection file
+            console.log(`[MCP] Restarting server...`);
+            return await this.start();
+          })();
+          globalThis.__tbMcpRestartPromise = restartPromise;
           try {
-            const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-            tmpDir.append("thunderbird-mcp");
-            const connFile = tmpDir.clone();
-            connFile.append("connection.json");
-            if (connFile.exists()) connFile.remove(false);
-          } catch { /* best-effort cleanup */ }
-
-          // Restart server with new binding
-          console.log(`[MCP] Restarting server...`);
-          return await this.start();
+            return await restartPromise;
+          } finally {
+            if (globalThis.__tbMcpRestartPromise === restartPromise) {
+              globalThis.__tbMcpRestartPromise = null;
+            }
+          }
         },
+        // END LISTEN ALL SETTER
       }
     };
   }
