@@ -34,6 +34,8 @@ Compose sends and event/task creation require review by default because **Block 
 
 The Thunderbird extension embeds a local HTTP server with session-scoped auth tokens. The Node.js bridge translates between MCP's stdio protocol and HTTP, discovering the port and token automatically via a connection file. The bridge handles MCP lifecycle methods (initialize, ping) locally, so clients can connect even before Thunderbird is fully loaded.
 
+The bridge starts when executed directly or loaded by a desktop client's Node bootstrap. Tests or library consumers that only need its exports must set `THUNDERBIRD_MCP_NO_AUTOSTART=1` before requiring `mcp-bridge.cjs`.
+
 ---
 
 ## What you can do
@@ -76,6 +78,8 @@ Message body formats (`getMessage` and `getMessages`):
 - For `text` and `markdown`, HTML input over 2 MiB (UTF-8) is truncated at a Unicode character boundary before being parsed with the same HTML privacy rules. The output ends with `[Message body truncated at 2 MiB]`. Content after the cut is omitted; retained content keeps the normal formatting and link rules. Oversized compose fragments use the same capped parsing path. Encryption checks inspect the full source: oversized HTML containing `-----BEGIN PGP MESSAGE-----` anywhere is withheld unless encrypted-message access is enabled, even when the marker is only quoted in prose.
 - `html` returns the original HTML unchanged. It is **untrusted** and may contain hidden content, scripts, unsafe links, and remote images; clients must sanitize it before rendering. `rawSource: true` also remains unchanged.
 
+Structured MIME extraction keeps the first body's representation outside multipart/alternative and joins later fragments of that same type in message order, including after inline attachments. A footer of another type cannot replace the main body. Alternatives select the requested representation; attached text files are excluded using Thunderbird's attachment metadata. Encryption checks also classify the joined content before exposing it.
+
 `includeInlineImages: true` is a separate opt-in for supported inline CID images as MCP image blocks; it does not add image URLs to the Markdown body.
 
 ### Compose
@@ -88,6 +92,8 @@ Message body formats (`getMessage` and `getMessages`):
 | `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
 
 `sendMail`, `replyToMessage`, and `forwardMessage` open a window for you to review and edit before sending by default. The **Block `skipReview`** preference is on by default, so `skipReview: true` is rejected until you explicitly disable the preference; only then can it send directly. Attachments can be file paths or inline base64 objects.
+
+Direct sends report success only after SMTP succeeds, and only then mark originals replied or forwarded. If Thunderbird's 120-second send timeout expires, the outcome is unknown: check Sent and the Outbox before retrying. The bridge waits 150 seconds for direct sends and draft saves, and 30 seconds for other calls. A timeout or lost connection after submitting a mail operation also reports an unknown outcome; check Sent/Outbox for sends or Drafts for saves before retrying.
 
 `replyToMessage` accepts `saveAsDraft: true` to build a native reply with quoted text, the identity's signature and threading headers, save it, and close the compose window without sending. This requires the `saveDraft` tool to be enabled and cannot be combined with `skipReview`. Encrypted originals require the **Allow MCP clients to read encrypted messages** opt-in. Before saving, the current compose identity's configured destination must be accessible under account restrictions and carry the Drafts flag. A timeout returns `saveOutcome: "uncertain"`: the outstanding save may still complete, so check Drafts before retrying. Failures and timeouts restore the window's prior close and save-dialog behavior.
 
@@ -114,11 +120,15 @@ Compose tools validate the `from` identity strictly -- if the specified sender d
 
 Your AI can create sorting rules, adjust priorities, and run them on existing mail. Changes persist after validation; all updates, including name or enabled-state edits, validate a complete candidate before replacing the existing rule. Unparseable rules cannot be updated, but can still be deleted. Filter names, conditions, and action text reject control characters (U+0000–U+001F and U+007F) and backslashes. Custom add-on actions cannot be created, preserved by an update, or submitted for execution.
 
+Date conditions accept only `YYYY-MM-DD` as a local calendar day; date-times are rejected. `listFilters` reports a lone native ALL term as `matchAll: true` with an empty `terms` array. Compound rules retain their terms and Boolean operators, including ALL terms; an empty rule is not reported as matching all messages.
+
 **Allow automatic Forward/Reply filter actions** is off by default in the extension settings. While off, `createFilter` and `updateFilter` reject any resulting rule containing Forward or Reply, including disabled rules or edits that retain an existing sending action. An update that only sets `enabled: false` can still disable a sending rule, and deletion remains available. Enabling this setting permits automatic sends without a compose review window, independently of **Block `skipReview`**. Turning it off does not disable saved filters or stop Thunderbird's own automatic filtering.
 
 The sending-action setting governs rules MCP creates, modifies, or runs manually. Reordering or deleting a rule containing `StopExecution` can change which of your existing rules Thunderbird runs automatically, including Forward/Reply rules.
 
 Move/Copy destinations must remain accessible under the current account restrictions, including actions retained by an update. An update that only sets `enabled: false`, or deletion, remains available for rules with inaccessible destinations.
+
+New or replaced Move/Copy actions store the resolved folder's canonical URI, including when the supplied URI uses another accepted spelling.
 
 `applyFilters` submits only enabled, parseable rules with the Manual type flag and skips rules with inaccessible Move/Copy destinations, as well as Forward/Reply rules while the setting is off. It returns `submittedFilters`, submitted rule names, and skipped rule names with reasons. An eligible rule containing a Custom action rejects the call before any rule is submitted. A successful submission means processing has started, not completed; if no rules are eligible, nothing is submitted.
 

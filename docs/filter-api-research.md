@@ -743,9 +743,16 @@ The authoritative dispatch is Thunderbird's own, in
   all that survives a restart. A date-only tool value (`YYYY-MM-DD`) is therefore parsed as a
   *local* calendar day — `Date.parse` would take it as UTC midnight, which is the previous day
   anywhere west of UTC (`"2026-01-01"` in America/Toronto was saved as `31-Dec-2025`; fix from
-  #175, @ncrosty58). Date-times keep their instant. Bare numbers are refused: `"2026"` used to
+  #175, @ncrosty58). Tool writes reject date-times because their time and timezone would not
+  survive native filter persistence. Bare numbers are refused: `"2026"` used to
   be taken as epoch milliseconds and saved as `01-Jan-1970`. Read-back reports a local-midnight
   value as `YYYY-MM-DD`, anything else as an ISO-8601 instant.
+- **ALL is a term, not a rule-wide override.** Current
+  [`nsMsgLocalSearch.cpp`](https://searchfox.org/comm-central/source/mailnews/search/src/nsMsgLocalSearch.cpp)
+  evaluates ALL as true within its Boolean expression. An empty term list matches nothing
+  for filtering (`MatchTerms` returns `!Filtering`), unlike an empty search. Accordingly,
+  `listFilters` collapses only a lone ALL term to rule-level `matchAll: true`; compound
+  conditions keep their real terms and ALL operators, and empty rules are not match-all.
 - **Integers are strict and bounded.** Values are matched with `/^-?\d+$/` (no `parseInt`,
   which took `"30abc"` as 30 and `"1.5"` as 1). The
   [search-value IDL](https://searchfox.org/comm-central/source/mailnews/search/public/nsIMsgSearchValue.idl)

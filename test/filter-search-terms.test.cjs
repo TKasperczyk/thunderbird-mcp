@@ -494,8 +494,8 @@ describe("buildTerms writes the value member the attribute actually requires", (
   });
 
   it("stores date via .date as PRTime microseconds", () => {
-    const term = buildOne(helpers, { attrib: "date", op: "isBefore", value: "2026-01-02T03:04:05.000Z" });
-    assert.equal(term.value.date, Date.parse("2026-01-02T03:04:05.000Z") * 1000);
+    const term = buildOne(helpers, { attrib: "date", op: "isBefore", value: "2026-01-02" });
+    assert.equal(term.value.date, localMidnightMicros(2026, 1, 2));
   });
 
   it("stores size via .size", () => {
@@ -544,7 +544,7 @@ describe("buildTerms writes the value member the attribute actually requires", (
     );
     assert.throws(
       () => buildOne(helpers, { attrib: "date", op: "isBefore", value: "not-a-date" }),
-      /must be YYYY-MM-DD \(a local calendar day\) or an ISO-8601 date-time/
+      /must be YYYY-MM-DD \(a local calendar day\); date-times are not accepted/
     );
   });
 
@@ -658,10 +658,14 @@ describe("date conditions", () => {
     );
   });
 
-  it("keeps the instant of a zoned date-time and reads an unzoned one as local", () => {
-    assert.equal(dateOf("2026-01-02T03:04:05Z"), Date.parse("2026-01-02T03:04:05Z") * 1000);
-    assert.equal(dateOf("2026-01-02T03:04:05+02:00"), Date.parse("2026-01-02T03:04:05+02:00") * 1000);
-    assert.equal(dateOf("2026-01-02T03:04"), new Date(2026, 0, 2, 3, 4).getTime() * 1000);
+  it("refuses zoned and local date-times, including midnight", () => {
+    for (const value of [
+      "2026-01-02T00:00:00Z", "2026-01-02T03:04:05.000Z",
+      "2026-01-02T03:04:05+02:00", "2026-01-02T03:04:05-07:00",
+      "2026-01-02T03:04", "2026-01-02 03:04:05",
+    ]) {
+      assert.throws(() => dateOf(value), /must be YYYY-MM-DD .*date-times are not accepted/, `accepted ${value}`);
+    }
   });
 
   it("rejects bare numbers instead of taking them as epoch milliseconds", () => {
@@ -681,9 +685,27 @@ describe("date conditions", () => {
     assert.equal(helpers.getSearchValue(term.value, term.attrib), "2026-01-01");
   });
 
-  it("reads a date with a time of day back as an ISO-8601 instant", () => {
-    const term = buildOne(helpers, { attrib: "date", op: "isBefore", value: "2026-01-02T03:04:05.000Z" });
+  it("can still read an existing native date with a time of day", () => {
+    const term = buildOne(helpers, { attrib: "date", op: "isBefore", value: "2026-01-02" });
+    term.value.date = Date.parse("2026-01-02T03:04:05.000Z") * 1000;
     assert.equal(helpers.getSearchValue(term.value, term.attrib), "2026-01-02T03:04:05.000Z");
+  });
+
+  it("rejects date-times on create and update before changing or saving the list", () => {
+    for (const operation of ["create", "update"]) {
+      const h = makeFilterHarness();
+      const original = h.seed();
+      const before = h.snapshot();
+      const conditions = [{ attrib: "date", op: "isBefore", value: "2026-01-01T00:00:00Z" }];
+      const result = operation === "create"
+        ? h.api.createFilter("account", "New", true, undefined, conditions, [{ type: "markRead" }])
+        : h.api.updateFilter("account", 0, "Renamed", false, undefined, conditions);
+      assert.match(result.error, /date-times are not accepted/);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.filters[0], original);
+      assert.equal(h.filterList.saveAttempts, 0);
+      assert.deepEqual(h.filterList.mutations, []);
+    }
   });
 });
 
@@ -812,10 +834,6 @@ describe("getSearchValue reads back what buildTerms wrote", () => {
     assert.equal(roundTrip({ attrib: "junkPercent", op: "isGreaterThan", value: "90" }), "90");
     assert.equal(roundTrip({ attrib: "junkStatus", op: "is", value: "junk" }), "junk");
     assert.equal(roundTrip({ attrib: "date", op: "isBefore", value: "2026-01-01" }), "2026-01-01");
-    assert.equal(
-      roundTrip({ attrib: "date", op: "isBefore", value: "2026-01-02T03:04:05.000Z" }),
-      "2026-01-02T03:04:05.000Z"
-    );
     assert.equal(roundTrip({ attrib: "subject", op: "contains", value: "invoice" }), "invoice");
     assert.equal(roundTrip({ attrib: "tag", op: "is", value: "$label1" }), "$label1");
   });
@@ -864,7 +882,7 @@ describe("the tool schema text is generated from the attribute table", () => {
     assert.match(d, /ageInDays: a non-negative integer \(days\), at most 2147483647/);
     assert.match(d, /priority: an integer from 2 to 6 \(2=lowest, 3=low, 4=normal, 5=high, 6=highest\)/);
     assert.match(d, /status: a message-flag bitmask from 1 to 4294967295 \(1=read, 2=replied, 4=flagged, 4096=forwarded, 65536=new\)/);
-    assert.match(d, /date: YYYY-MM-DD \(a local calendar day\) or an ISO-8601 date-time/);
+    assert.match(d, /date: YYYY-MM-DD \(a local calendar day\); date-times are not accepted/);
     assert.match(d, /junkPercent: an integer from 0 to 100/);
     assert.match(d, /hasAttachment: no value/);
   });
@@ -1038,12 +1056,47 @@ describe("buildActions writes the member the action type owns", () => {
 
   it("lets the caller refuse a move/copy target folder", () => {
     const seen = [];
-    const checkTargetFolder = (uri) => { seen.push(uri); return uri.includes("secret") ? { error: "no" } : { folder: {} }; };
+    const checkTargetFolder = (uri) => { seen.push(uri); return uri.includes("secret") ? { error: "no" } : { folder: { URI: uri } }; };
     reject({ type: "copyToFolder", value: "imap://a/secret" }, /Filter target folder not accessible: imap:\/\/a\/secret/, { checkTargetFolder });
     const ok = buildOneAction(helpers, { type: "copyToFolder", value: "imap://a/ok" }, { checkTargetFolder });
     assert.equal(ok.targetFolderUri, "imap://a/ok");
     assert.deepEqual(seen, ["imap://a/secret", "imap://a/ok"]);
   });
+
+  for (const type of ["moveToFolder", "copyToFolder"]) {
+    it(`writes the resolved URI to the native ${type} action`, () => {
+      const requested = "imap://user@example.invalid/Project Work";
+      const canonicalURI = "imap://user%40example.invalid/Project%20Work";
+      const filter = makeFilter();
+      const native = makeRuleAction();
+      filter.createAction = () => new Proxy(native, {
+        set(target, member, value) {
+          if (member === "targetFolderUri" && value !== canonicalURI) {
+            throw new Error("NS_ERROR_INVALID_ARG: targetFolderUri is not canonical");
+          }
+          return Reflect.set(target, member, value);
+        },
+      });
+      helpers.buildActions(filter, [{ type, value: requested }], {
+        checkTargetFolder(uri) {
+          assert.equal(uri, requested);
+          return { folder: { URI: canonicalURI } };
+        },
+      });
+      assert.equal(filter.actionCount, 1);
+      assert.equal(filter.getActionAt(0).targetFolderUri, canonicalURI);
+    });
+
+    it(`refuses ${type} when resolution supplies no usable folder URI`, () => {
+      for (const resolved of [undefined, null, {}, { folder: {} }, { folder: { URI: "" } }, { folder: { URI: "  " } }]) {
+        const filter = makeFilter();
+        assert.throws(() => helpers.buildActions(filter, [{ type, value: "imap://a/b" }], {
+          checkTargetFolder: () => resolved,
+        }), /Filter target folder not accessible/);
+        assert.equal(filter.actionCount, 0);
+      }
+    });
+  }
 
   it("refuses unknown and custom actions with a reason", () => {
     reject({ type: "deleteBody" }, /Unknown action type: deleteBody/);
@@ -1054,6 +1107,17 @@ describe("buildActions writes the member the action type owns", () => {
 
 describe("reading filters back", () => {
   const helpers = loadFilterHelpers();
+
+  it("recognizes ALL before reading condition members that do not exist", () => {
+    const term = {
+      matchAll: true,
+      booleanAnd: false,
+      get attrib() { throw new Error("ALL has no attribute"); },
+      get op() { throw new Error("ALL has no operator"); },
+      get value() { throw new Error("ALL has no value"); },
+    };
+    assert.deepEqual({ ...helpers.serializeSearchTerm(term) }, { matchAll: true, booleanAnd: false });
+  });
 
   it("reports a custom search term by name with its customId", () => {
     // Thunderbird persists a custom term as "<customId>,<op>,<value>"; the
@@ -1118,6 +1182,115 @@ describe("reading filters back", () => {
       { ...helpers.serializeRuleAction(buildOneAction(helpers, { type: "markRead" })) },
       { type: "markRead" }
     );
+  });
+});
+
+describe("listFilters identifies rules matching all messages", () => {
+  it("does not report an empty native rule as matching all messages", () => {
+    // nsMsgSearchOfflineMail::MatchTerms returns !Filtering for an empty list:
+    // https://searchfox.org/comm-central/source/mailnews/search/src/nsMsgLocalSearch.cpp
+    const h = makeFilterHarness();
+    h.seed({ conditions: [] });
+    const listed = h.api.listFilters("account")[0].filters[0];
+    assert.notEqual(listed.matchAll, true);
+    assert.equal(listed.terms.length, 0);
+  });
+
+  it("reports native ALL as matchAll without exposing a bogus condition", () => {
+    const h = makeFilterHarness();
+    const native = h.seed({ conditions: [] });
+    native.appendTerm({
+      matchAll: true,
+      get attrib() { throw new Error("ALL has no attribute"); },
+      get op() { throw new Error("ALL has no operator"); },
+      get value() { throw new Error("ALL has no value"); },
+    });
+    const listed = h.api.listFilters("account")[0].filters[0];
+    assert.equal(listed.matchAll, true);
+    assert.equal(listed.terms.length, 0);
+    assert.equal(native.searchTerms.length, 1);
+    assert.equal(native.searchTerms[0].matchAll, true);
+  });
+
+  for (const booleanAnd of [true, false]) {
+    for (const allFirst of [false, true]) {
+      it(`retains compound conditions and their operator, AND=${booleanAnd}, ALL first=${allFirst}`, () => {
+        const h = makeFilterHarness();
+        const condition = { attrib: "subject", op: "contains", value: "invoice", booleanAnd };
+        const native = h.seed({ conditions: [condition] });
+        const all = {
+          matchAll: true, booleanAnd,
+          get attrib() { throw new Error("ALL has no attribute"); },
+          get op() { throw new Error("ALL has no operator"); },
+          get value() { throw new Error("ALL has no value"); },
+        };
+        if (allFirst) native.searchTerms.unshift(all);
+        else native.appendTerm(all);
+        const listed = h.api.listFilters("account")[0].filters[0];
+        assert.notEqual(listed.matchAll, true);
+        const allTerm = { matchAll: true, booleanAnd };
+        assert.deepEqual(Array.from(listed.terms, term => ({ ...term })),
+          allFirst ? [allTerm, condition] : [condition, allTerm]);
+        assert.equal(native.searchTerms.length, 2);
+      });
+    }
+  }
+
+  it("only collapses a lone ALL, leaving multiple native terms explicit", () => {
+    const h = makeFilterHarness();
+    const native = h.seed({ conditions: [] });
+    native.appendTerm({ matchAll: true, booleanAnd: true });
+    native.appendTerm({ matchAll: true, booleanAnd: false });
+    const listed = h.api.listFilters("account")[0].filters[0];
+    assert.notEqual(listed.matchAll, true);
+    assert.deepEqual(Array.from(listed.terms, term => ({ ...term })), [
+      { matchAll: true, booleanAnd: true }, { matchAll: true, booleanAnd: false },
+    ]);
+  });
+
+  it("keeps real conditions, including an empty subject value", () => {
+    const h = makeFilterHarness();
+    h.seed({ conditions: [{ attrib: "subject", op: "isEmpty", value: "" }] });
+    const listed = h.api.listFilters("account")[0].filters[0];
+    assert.notEqual(listed.matchAll, true);
+    assert.equal(listed.terms.length, 1);
+    assert.deepEqual({ ...listed.terms[0] }, {
+      attrib: "subject", op: "isEmpty", booleanAnd: true, value: "",
+    });
+  });
+
+  it("preserves native ALL on update and reports replacement conditions normally", () => {
+    const h = makeFilterHarness();
+    const native = h.seed({ conditions: [{ attrib: "subject", op: "contains", value: "" }] });
+    native.searchTerms[0].matchAll = true;
+    const renamed = h.api.updateFilter("account", 0, "All messages");
+    assert.equal(renamed.success, true, renamed.error);
+    assert.equal(renamed.filter.matchAll, true);
+    assert.equal(renamed.filter.terms.length, 0);
+    assert.equal(h.filterList.filters[0].searchTerms[0].matchAll, true);
+
+    const replaced = h.api.updateFilter("account", 0, undefined, undefined, undefined,
+      [{ attrib: "from", op: "contains", value: "sender@example.invalid" }]);
+    assert.equal(replaced.success, true, replaced.error);
+    assert.notEqual(replaced.filter.matchAll, true);
+    assert.deepEqual({ ...replaced.filter.terms[0] }, {
+      attrib: "from", op: "contains", booleanAnd: true, value: "sender@example.invalid",
+    });
+  });
+
+  it("does not infer matchAll when native terms cannot be read", () => {
+    for (const firstTerm of [undefined, { matchAll: true }]) {
+      const h = makeFilterHarness();
+      const native = h.seed();
+      native.searchTerms = {
+        *[Symbol.iterator]() {
+          if (firstTerm) yield firstTerm;
+          throw new Error("native terms unavailable");
+        },
+      };
+      const listed = h.api.listFilters("account")[0].filters[0];
+      assert.notEqual(listed.matchAll, true);
+    }
   });
 });
 
@@ -1653,6 +1826,60 @@ describe("filter sending requires an explicit preference", () => {
     assert.equal(h.filterList.filters[0], original);
     assert.equal(h.filterList.saveAttempts, 0);
   });
+});
+
+describe("Move/Copy filter writes resolve canonical destinations", () => {
+  const conditions = [{ attrib: "subject", op: "contains", value: "invoice" }];
+  const requested = "imap://user@example.invalid/Project Work";
+  const canonicalURI = "imap://user%40example.invalid/Project%20Work";
+
+  for (const type of ["moveToFolder", "copyToFolder"]) {
+    for (const operation of ["create", "update"]) {
+      it(`stores the canonical ${type} URI on ${operation}`, () => {
+        const lookups = [];
+        const h = makeFilterHarness({
+          getAccessibleFolder(uri) {
+            lookups.push(uri);
+            assert.ok(uri === requested || uri === canonicalURI);
+            return { folder: { URI: canonicalURI } };
+          },
+        });
+        if (operation === "update") h.seed();
+        const actions = [{ type, value: requested }];
+        const result = operation === "create"
+          ? h.api.createFilter("account", "New", true, undefined, conditions, actions)
+          : h.api.updateFilter("account", 0, "Renamed", undefined, undefined, undefined, actions);
+        assert.equal(result.success, true, result.error);
+        assert.equal(lookups[0], requested);
+        assert.equal(h.filterList.filters[0].getActionAt(0).targetFolderUri, canonicalURI);
+        assert.equal(h.api.listFilters("account")[0].filters[0].actions[0].value, canonicalURI);
+        assert.equal(h.filterList.saveAttempts, 1);
+      });
+
+      it(`leaves the list unchanged when ${operation} cannot resolve its ${type} target`, () => {
+        for (const failure of ["restricted", "missing", "invalid-uri", "lookup-error"]) {
+          const h = makeFilterHarness({
+            getAccessibleFolder() {
+              if (failure === "lookup-error") throw new Error("Folder lookup failed");
+              if (failure === "invalid-uri") return { folder: {} };
+              return { error: failure === "restricted" ? "Account not accessible" : "Folder not found" };
+            },
+          });
+          const original = h.seed();
+          const before = h.snapshot();
+          const actions = [{ type, value: requested }];
+          const result = operation === "create"
+            ? h.api.createFilter("account", "New", true, undefined, conditions, actions)
+            : h.api.updateFilter("account", 0, "Renamed", false, undefined, undefined, actions);
+          assert.match(result.error, /Filter target folder not accessible|Folder lookup failed/);
+          assert.equal(h.snapshot(), before);
+          assert.equal(h.filterList.filters[0], original);
+          assert.equal(h.filterList.saveAttempts, 0);
+          assert.deepEqual(h.filterList.mutations, []);
+        }
+      });
+    }
+  }
 });
 
 describe("retained Move/Copy actions respect current destination access", () => {

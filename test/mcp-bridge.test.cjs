@@ -16,7 +16,7 @@ const {
   isSensitiveFilePath,
   isValidAuthToken,
   readConnectionInfo,
-} = require('../mcp-bridge.cjs');
+} = require('./helpers/bridge.cjs');
 
 function makeTempRoot() {
   // Windows' default temp directory is inside denied AppData. Keep allowed

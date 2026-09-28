@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
-const { isSensitiveFilePath } = require('../mcp-bridge.cjs');
+const { isSensitiveFilePath } = require('./helpers/bridge.cjs');
 
 const BRIDGE_PATH = path.resolve(__dirname, '..', 'mcp-bridge.cjs');
 let CONN_DIR;

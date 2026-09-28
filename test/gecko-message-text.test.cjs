@@ -320,6 +320,57 @@ test("real Gecko Experiment globals and message text conversion", {
     }
   });
 
+  await t.test("joined MIME fragments use real Gecko text and safe Markdown conversion", async () => {
+    const result = await evaluate(`
+      const mime = { contentType: "multipart/mixed", allUserAttachments: [{ partName: "1.2" }], parts: [
+        { contentType: "text/html", partName: "1.1", body: '<p>Before &amp; readable</p><div hidden>hidden secret</div>' },
+        { contentType: "text/plain", partName: "1.2", body: "attached secret" },
+        { contentType: "text/html", partName: "1.3", body: '<p>After <a href="javascript:alert(1)">unsafe link</a><img src="https://tracker.test/pixel" alt="image description"></p>' },
+      ] };
+      return [extractFormattedBody(mime, "text"), extractFormattedBody(mime, "markdown")];
+    `);
+    for (const output of result) {
+      assert.match(output.body, /Before & readable/);
+      assert.match(output.body, /After unsafe link/);
+      assert.doesNotMatch(output.body, /secret|javascript:|https:|!\[/);
+      assert.equal(output.bodyIsHtml, false);
+    }
+    assert.match(result[1].body, /image description/);
+  });
+
+  await t.test("mixed MIME footers cannot displace the primary body in either direction", async () => {
+    const result = await evaluate(`
+      return [true, false].flatMap(mainIsHtml => {
+        const mime = { contentType: "multipart/mixed", parts: [
+          { contentType: mainIsHtml ? "text/html" : "text/plain", body: mainIsHtml ? "<p>Main discussion</p>" : "Main discussion" },
+          { contentType: mainIsHtml ? "text/plain" : "text/html", body: mainIsHtml ? "Unsubscribe footer" : "<p>Unsubscribe footer</p>" },
+        ] };
+        return ["text", "markdown", "html"].map(format => extractFormattedBody(mime, format));
+      });
+    `);
+    assert.deepEqual(result, [
+      { body: "Main discussion", bodyIsHtml: false },
+      { body: "Main discussion", bodyIsHtml: false },
+      { body: "<p>Main discussion</p>", bodyIsHtml: true },
+      { body: "Main discussion", bodyIsHtml: false },
+      { body: "Main discussion", bodyIsHtml: false },
+      { body: "Main discussion", bodyIsHtml: false },
+    ]);
+  });
+
+  await t.test("joined HTML armor is classified for HTML and Markdown output", async () => {
+    const result = await evaluate(`
+      const mime = { contentType: "multipart/mixed", parts: [
+        { contentType: "text/html", body: "<pre>-----BEGIN PGP " },
+        { contentType: "application/pdf" },
+        { contentType: "text/html", body: "MESSAGE-----</pre><p>ciphertext</p>" },
+      ] };
+      return ["text", "markdown", "html"].map(format =>
+        hasInlinePgpBodyArmor(mime, extractFormattedBody(mime, format).body, format !== "text"));
+    `);
+    assert.deepEqual(result, [true, true, true]);
+  });
+
   await t.test("hidden html and body roots do not expose detached subtrees", async () => {
     const result = await evaluate(`
       return ['<html hidden><body>root-secret</body></html>', '<html><body hidden>root-secret</body></html>',

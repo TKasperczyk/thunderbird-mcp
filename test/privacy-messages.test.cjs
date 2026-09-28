@@ -414,6 +414,120 @@ describe("Standalone inline PGP armor", () => {
   }
 });
 
+describe("Mixed MIME primary bodies in reads and direct quoting", () => {
+  for (const mainIsHtml of [false, true]) {
+    it(`keeps the primary body ahead of an opposite-format footer, HTML main=${mainIsHtml}`, async () => {
+      const mainType = mainIsHtml ? "text/html" : "text/plain";
+      const html = "<p>Main discussion</p><p>Continued discussion</p>";
+      const mime = { contentType: "multipart/mixed", parts: [
+        { contentType: mainType, body: mainIsHtml ? "<p>Main discussion</p>" : "Main discussion\n" },
+        { contentType: mainIsHtml ? "text/plain" : "text/html", body: mainIsHtml ? "Unsubscribe footer" : "<p>Unsubscribe footer</p>" },
+        { contentType: mainType, body: mainIsHtml ? "<p>Continued discussion</p>" : "Continued discussion" },
+      ] };
+      const { api, calls } = mainIsHtml
+        ? loadHtmlFixture(html, () => documentTree([
+          elementNode("p", [textNode("Main discussion")]), elementNode("p", [textNode("Continued discussion")]),
+        ]), { mime })
+        : loadMessageTools({ mime });
+
+      for (const format of ["text", "markdown", "html"]) {
+        const result = await api.getMessage("message-1", "folder", false, format);
+        assert.match(result.body, /Main discussion/);
+        assert.match(result.body, /Continued discussion/);
+        assert.doesNotMatch(result.body, /Unsubscribe footer/);
+        assert.equal(result.bodyIsHtml, mainIsHtml && format === "html");
+      }
+      const reply = await api.replyToMessage("message-1", "folder", "intro", false, false,
+        undefined, undefined, undefined, undefined, undefined, true);
+      const forward = await api.forwardMessage("message-1", "folder", "to@example.test", "intro", false,
+        undefined, undefined, undefined, undefined, true);
+      assert.equal(reply.success, true);
+      assert.equal(forward.success, true);
+      assert.equal(calls.sends.length, 2);
+      for (const fields of calls.sends) {
+        assert.match(fields.body, /Main discussion/);
+        assert.match(fields.body, /Continued discussion/);
+        assert.doesNotMatch(fields.body, /Unsubscribe footer|<p>/);
+      }
+      assert.equal(calls.streams, 0);
+    });
+  }
+});
+
+describe("Encryption classification of joined MIME bodies", () => {
+  const armor = "-----BEGIN PGP MESSAGE-----";
+  const text = `${armor}\nciphertext`;
+  const html = `<p>${armor}</p><p>ciphertext</p>`;
+
+  for (const isHtml of [false, true]) {
+    for (const allowed of [false, true]) {
+      it(`classifies armor split around an attachment, HTML=${isHtml}, opt-in=${allowed}`, async () => {
+        const mime = { contentType: "multipart/mixed", parts: [
+          { contentType: isHtml ? "text/html" : "text/plain", partName: "1.1", body: `${isHtml ? "<p>" : ""}-----BEGIN PGP ` },
+          { contentType: "application/pdf", partName: "1.2" },
+          { contentType: isHtml ? "text/html" : "text/plain", partName: "1.3", body: `MESSAGE-----${isHtml ? "</p><p>ciphertext</p>" : "\nciphertext"}` },
+        ], allUserAttachments: [{ partName: "1.2", name: "report.pdf" }] };
+        const { api, calls } = isHtml
+          ? loadHtmlFixture(html, () => documentTree([
+            elementNode("p", [textNode(armor)]), elementNode("p", [textNode("ciphertext")]),
+          ]), { mime, allowed })
+          : loadMessageTools({ mime, allowed });
+        assert.equal(api.isEncryptedMimeMessage(mime), false, "individual fragments have no complete armor marker");
+        for (const format of ["text", "markdown", "html"]) {
+          const result = await api.getMessage("message-1", "folder", false, format);
+          assert.equal(result.encryptedContentWithheld === true, !allowed);
+          if (allowed) assert.match(result.body, /-----BEGIN PGP MESSAGE-----/);
+          else {
+            assert.equal(result.subject, "[Encrypted message]");
+            assert.equal(result.attachments.length, 0);
+            assert.doesNotMatch(JSON.stringify(result), /ciphertext|protected subject/);
+          }
+        }
+        const results = [
+          await api.replyToMessage("message-1", "folder", "intro", false, false, undefined, undefined, undefined, undefined, undefined, true),
+          await api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true),
+        ];
+        for (const result of results) {
+          if (allowed) assert.equal(result.success, true);
+          else assert.match(result.error, /encrypted messages is blocked/);
+        }
+        assert.equal(calls.sends.length, allowed ? 2 : 0);
+        assert.equal(calls.streams, 0);
+        if (!isHtml && allowed) assert.ok(calls.sends[1].body.includes(text));
+      });
+    }
+  }
+
+  it("classifies the full joined HTML when only the total exceeds the presentation cap", async () => {
+    const cap = 2 * 1024 * 1024;
+    const first = "<p>" + " ".repeat(cap - 20) + "-----BEGIN PGP ";
+    const second = "MESSAGE-----</p><p>ciphertext</p>";
+    const joined = first + second;
+    const mime = { contentType: "multipart/mixed", parts: [
+      { contentType: "text/html", body: first },
+      { contentType: "text/html", body: second },
+    ] };
+    assert.ok(first.length < cap && second.length < cap && joined.length > cap);
+    const { api, calls } = loadHtmlFixture(joined.slice(0, cap), () => documentTree([elementNode("p", [textNode("prefix")])]), { mime });
+    assert.equal(api.isEncryptedMimeMessage(mime), false);
+    for (const format of ["text", "markdown", "html"]) {
+      assert.equal((await api.getMessage("message-1", "folder", false, format)).encryptedContentWithheld, true);
+    }
+    assert.equal(calls.streams, 0);
+  });
+
+  it("withholds joined raw HTML if its visible text cannot be classified", async () => {
+    const { api, calls } = loadMessageTools({ mime: {
+      contentType: "multipart/mixed", parts: [
+        { contentType: "text/html", body: "<p>-----BEGIN PGP " },
+        { contentType: "text/html", body: "MESSAGE-----</p><p>ciphertext</p>" },
+      ],
+    }, DOMParser: class { parseFromString() { throw Error("parser failed"); } } });
+    assert.equal((await api.getMessage("message-1", "folder", false, "html")).encryptedContentWithheld, true);
+    assert.equal(calls.streams, 0);
+  });
+});
+
 describe("Oversized HTML encryption classification", () => {
   const cap = 2 * 1024 * 1024;
   const header = "-----BEGIN PGP MESSAGE-----";
