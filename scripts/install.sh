@@ -25,12 +25,6 @@ profile_size() {
     du -sh "$profile_dir" 2>/dev/null | awk '{print $1}'
 }
 
-profile_name() {
-    local profile_dir="$1"
-
-    basename "$profile_dir"
-}
-
 platform_profile_roots() {
     case "$(uname -s)" in
     Darwin)
@@ -284,7 +278,7 @@ select_profile() {
     for index in "${!profiles[@]}"; do
         printf '  %d) %s  size=%s  modified=%s\n' \
             "$((index + 1))" \
-            "$(profile_name "${profiles[$index]}")" \
+            "${profiles[$index]}" \
             "$(profile_size "${profiles[$index]}")" \
             "$(format_mtime "${profiles[$index]}")" >&2
     done

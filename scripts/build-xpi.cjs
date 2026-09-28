@@ -156,5 +156,6 @@ try {
 fs.mkdirSync(DIST_DIR, { recursive: true });
 const zip = new ZipWriter();
 addDir(zip, EXT_DIR, '');
+zip.addFile('LICENSE', fs.readFileSync(path.join(PROJECT_DIR, 'LICENSE')));
 fs.writeFileSync(OUT_FILE, zip.toBuffer());
 console.log(`Built: ${OUT_FILE} (${(fs.statSync(OUT_FILE).size / 1024).toFixed(0)} KB)`);

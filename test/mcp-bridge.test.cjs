@@ -814,6 +814,7 @@ describe('Bridge discovery', () => {
     assert.equal(readConnectionInfo(options), null);
     assert.match(buildConnectionDiscoveryErrorMessage(), /THUNDERBIRD_MCP_CONNECTION_FILE/);
     assert.match(buildConnectionDiscoveryErrorMessage(), /file not found/);
+    assert.match(buildConnectionDiscoveryErrorMessage(), /\nThe add-on may be disabled in Thunderbird; see README: https:\/\/github\.com\/TKasperczyk\/thunderbird-mcp#release-channel-and-experiment-api-add-ons$/);
   });
 
   it('discoverConnectionInfo collects every valid candidate, not just the winner', () => {

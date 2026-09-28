@@ -289,9 +289,17 @@ UNC/network and device paths, dotfiles and dot-directories, application-data dir
 | `searchBody` returns no results | IMAP accounts need offline sync enabled for Gloda to index message bodies |
 | `rawSource` fails on IMAP | Requires local/offline message copy. Enable offline sync or click the message first to cache it. |
 
+### Release channel and Experiment API add-ons
+
+This add-on uses Thunderbird's Experiment APIs. The add-on team has [announced plans to disable them on the Release channel](https://thunderbird.topicbox.com/groups/addons/T5426c1d2b0ba520c); Thunderbird has since [reported a postponement](https://blog.thunderbird.net/2026/06/thunderbird-monthly-development-digest-june-2026/), so do not assume every Release version blocks them.
+
+If Thunderbird disables the add-on for this reason, use [Thunderbird ESR](https://www.thunderbird.net/thunderbird/all/) (Extended Support Release), which this add-on supports. It has been verified working on **140.16.0esr** and **153.3.1esr**. Check **Tools > Add-ons and Themes** to confirm the add-on is enabled, then open its Options page for the server status and any startup error.
+
 ---
 
 ## Development
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build, isolated test, and pull request instructions.
 
 ```bash
 # Build the extension
@@ -351,4 +359,4 @@ thunderbird-mcp/
 
 ## License
 
-MIT. The bundled `httpd.sys.mjs` is from Mozilla and licensed under MPL-2.0.
+This project uses the [MIT license](LICENSE). The bundled `extension/httpd.sys.mjs` is derived from Mozilla's HTTP server and remains under [MPL-2.0](https://mozilla.org/MPL/2.0/); its license notice is retained in the file.

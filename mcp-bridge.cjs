@@ -1024,12 +1024,15 @@ function formatDiscoveryAttempts(attempts = lastDiscoveryAttempts) {
     .join('; ');
 }
 
+const ADDON_DISABLED_HINT = 'The add-on may be disabled in Thunderbird; see README: https://github.com/TKasperczyk/thunderbird-mcp#release-channel-and-experiment-api-add-ons';
+
 function buildConnectionDiscoveryErrorMessage() {
   return (
     'Connection discovery failed. ' +
     'Tried: ' + formatDiscoveryAttempts() + '. ' +
     'Is Thunderbird running with the MCP extension? ' +
-    'The extension must be started first to create the connection file.'
+    'The extension must be started first to create the connection file.\n' +
+    ADDON_DISABLED_HINT
   );
 }
 
@@ -1324,12 +1327,13 @@ async function forwardToThunderbird(message) {
         clearConnectionCache();
         connInfo = readConnectionInfo();
         if (!connInfo) {
-          throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`, { cause: err });
+          throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?\n${ADDON_DISABLED_HINT}`, { cause: err });
         }
         continue;
       }
 
-      throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?`, { cause: err });
+      const hint = err.code === 'ECONNREFUSED' ? '\n' + ADDON_DISABLED_HINT : '';
+      throw new Error(`Connection failed: ${err.message}. Is Thunderbird running with the MCP extension?${hint}`, { cause: err });
     }
   }
 }

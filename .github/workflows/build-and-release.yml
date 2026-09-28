@@ -30,10 +30,20 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify release commit is on main
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} is not contained in origin/main; refusing to release. Merge the commit into main before tagging."
+            exit 1
+          fi
+
       - name: Setup Node.js
         uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: '20'
+          node-version: '22'
           # Never restore a dependency cache in the job that can write the release and the update channel.
           package-manager-cache: false
 
@@ -59,7 +69,9 @@ jobs:
           fi
 
       - name: Build extension
-        run: bash scripts/build.sh
+        # Rebuilds of the same tag must produce the same bytes for immutable releases.
+        run: |
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" TZ=UTC bash scripts/build.sh
 
       - name: Verify built manifest version matches the tag
         run: |
@@ -82,9 +94,23 @@ jobs:
         run: |
           set -euo pipefail
           XPI="dist/thunderbird-mcp-${TAG}.xpi"
+          ASSET="${XPI##*/}"
           test -f "$XPI" || { echo "::error::$XPI not found"; exit 1; }
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$XPI" --repo "$GITHUB_REPOSITORY" --clobber
+          if ASSETS="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"; then
+            if grep -Fxq -- "$ASSET" <<< "$ASSETS"; then
+              TMP_ASSET_DIR="$(mktemp -d)"
+              trap 'rm -rf "$TMP_ASSET_DIR"' EXIT
+              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir "$TMP_ASSET_DIR"
+              HASH="$(sha256sum "$XPI" | cut -d' ' -f1)"
+              RELEASE_HASH="$(sha256sum "$TMP_ASSET_DIR/$ASSET" | cut -d' ' -f1)"
+              if [ "$HASH" != "$RELEASE_HASH" ]; then
+                echo "::error::Release asset ${ASSET} already exists with sha256 ${RELEASE_HASH}, but this build has ${HASH}; refusing to replace it."
+                exit 1
+              fi
+              echo "Release asset ${ASSET} already has sha256 ${HASH}; skipping upload."
+            else
+              gh release upload "$TAG" "$XPI" --repo "$GITHUB_REPOSITORY"
+            fi
           else
             gh release create "$TAG" "$XPI" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$TAG" --notes ""
           fi

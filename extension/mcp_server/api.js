@@ -10749,7 +10749,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           let result;
           try {
             result = await startPromise;
+            if (globalThis.__tbMcpStartPromise === startPromise) {
+              globalThis.__tbMcpLastStartError = result.success ? null : result.error;
+            }
             return result;
+          } catch (e) {
+            if (globalThis.__tbMcpStartPromise === startPromise) {
+              globalThis.__tbMcpLastStartError = String(e);
+            }
+            throw e;
           } finally {
             // The IIFE can fail synchronously before the assignment above.
             // Evict failures/rejections after settlement without clearing a
@@ -10804,6 +10812,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
           return {
             running: !!globalThis.__tbMcpServer,
+            lastError: globalThis.__tbMcpLastStartError || null,
             port,
             connectionFile,
             buildVersion,
