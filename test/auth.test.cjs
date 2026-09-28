@@ -160,6 +160,22 @@ describe('Auth: connection info file', () => {
     assert.equal(response.id, 2);
     assert.ok(response.error, 'should return an error when connection file is missing');
     assert.match(response.error.message, /Connection file not found|Bridge error/);
+    assert.match(response.error.message, /The add-on may be disabled in Thunderbird/);
+    assert.match(response.error.message, /#release-channel-and-experiment-api-add-ons/);
+  });
+
+  it('includes the add-on hint when a discovered endpoint refuses the connection', async () => {
+    const server = http.createServer();
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    await new Promise(resolve => server.close(resolve));
+    writeTestConnectionInfo(port, 'a'.repeat(64));
+
+    const response = await sendToBridge({ jsonrpc: '2.0', id: 3, method: 'tools/list' });
+    assert.equal(response.id, 3);
+    assert.match(response.error.message, /ECONNREFUSED/);
+    assert.match(response.error.message, /\nThe add-on may be disabled in Thunderbird/);
+    assert.match(response.error.message, /#release-channel-and-experiment-api-add-ons/);
   });
 });
 
@@ -233,6 +249,7 @@ describe('Auth: token verification', () => {
     assert.equal(response.id, 11);
     assert.ok(response.error);
     assert.match(response.error.message, /authentication failed/i);
+    assert.doesNotMatch(response.error.message, /The add-on may be disabled/);
   });
 });
 

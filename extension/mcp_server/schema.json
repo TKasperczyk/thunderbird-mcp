@@ -14,7 +14,7 @@
         "name": "getServerInfo",
         "type": "function",
         "async": true,
-        "description": "Get current server status, port, and connection file path",
+        "description": "Get current server status, port, connection file path, build information, and lastError (the last startup error message, or null before a failure or after a successful start). Available only to the extension, not over MCP.",
         "parameters": []
       },
       {

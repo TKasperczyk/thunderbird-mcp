@@ -63,9 +63,13 @@ function validateGetMessagesLimitInput() {
 }
 // END OPTIONS ACCESS STATE
 
+// BEGIN OPTIONS SERVER STATUS
+const retryServerBtn = document.getElementById("retryServerBtn");
+
 async function loadServerInfo() {
   try {
     const info = await browser.mcpServer.getServerInfo();
+    retryServerBtn.hidden = info.running || !info.lastError;
     if (info.running) {
       statusDot.className = "status-dot running";
       statusText.textContent = "Running";
@@ -73,7 +77,7 @@ async function loadServerInfo() {
       connFile.textContent = info.connectionFile || "--";
     } else {
       statusDot.className = "status-dot stopped";
-      statusText.textContent = "Not running";
+      statusText.textContent = info.lastError ? "Failed to start: " + info.lastError : "Not running";
       serverPort.textContent = "--";
       connFile.textContent = "--";
     }
@@ -102,8 +106,26 @@ async function loadServerInfo() {
   } catch (e) {
     statusDot.className = "status-dot stopped";
     statusText.textContent = "Error: " + e.message;
+    serverPort.textContent = "--";
+    connFile.textContent = "--";
   }
 }
+
+retryServerBtn.addEventListener("click", async () => {
+  retryServerBtn.disabled = true;
+  statusText.textContent = "Starting...";
+  try {
+    const result = await browser.mcpServer.start();
+    await loadServerInfo();
+    if (result.success) await loadAuthenticationConfig();
+  } catch (e) {
+    statusDot.className = "status-dot stopped";
+    statusText.textContent = "Failed to start: " + e.message;
+  } finally {
+    retryServerBtn.disabled = false;
+  }
+});
+// END OPTIONS SERVER STATUS
 
 function updateStableAuthTokenControls() {
   stableAuthTokenControls.hidden = !useStableAuthTokenCheckbox.checked;
@@ -679,6 +701,7 @@ listenAllCheckbox.addEventListener("change", () => {
   listenAllWarning.style.display = listenAllCheckbox.checked ? "block" : "none";
 });
 
+// BEGIN OPTIONS LISTEN ALL SAVE
 saveListenAllBtn.addEventListener("click", async () => {
   saveListenAllBtn.disabled = true;
   saveListenAllStatus.textContent = "Saving...";
@@ -690,13 +713,14 @@ saveListenAllBtn.addEventListener("click", async () => {
       saveListenAllStatus.className = "save-status error";
     } else {
       saveListenAllStatus.textContent = "Saved.";
-      await loadServerInfo();
     }
   } catch (e) {
     saveListenAllStatus.textContent = "Error: " + e.message;
     saveListenAllStatus.className = "save-status error";
   }
+  await loadServerInfo();
   saveListenAllBtn.disabled = false;
 });
+// END OPTIONS LISTEN ALL SAVE
 
 loadListenAllPref();

@@ -32,6 +32,7 @@
       margin-bottom: 8px;
     }
     .status-dot {
+      flex-shrink: 0;
       width: 10px;
       height: 10px;
       border-radius: 50%;
@@ -39,6 +40,7 @@
     }
     .status-dot.running { background: #30e60b; }
     .status-dot.stopped { background: #ff0039; }
+    #statusText { overflow-wrap: anywhere; }
     .info-label {
       color: #5b5b66;
       min-width: 110px;
@@ -190,7 +192,8 @@
   <h2>Server Status</h2>
   <div class="status-row">
     <span id="statusDot" class="status-dot stopped"></span>
-    <span id="statusText">Checking...</span>
+    <span id="statusText" role="status">Checking...</span>
+    <button id="retryServerBtn" type="button" hidden>Retry</button>
   </div>
   <div>
     <span class="info-label">Port:</span>

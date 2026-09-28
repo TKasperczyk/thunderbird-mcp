@@ -150,16 +150,134 @@ function loadServerLifecycle(overrides = {}) {
   return { api: sandbox.api, sandbox, state };
 }
 
+// Reuse the production lifecycle above for the options page's browser API.
+// The other options test loader covers account/privacy controls, not status.
+function loadServerStatus(api) {
+  const source = fs.readFileSync(path.resolve(__dirname, "../extension/options.js"), "utf8");
+  const start = source.indexOf("// BEGIN OPTIONS SERVER STATUS");
+  const end = source.indexOf("// END OPTIONS SERVER STATUS", start);
+  assert.ok(start >= 0 && end > start, "options server status markers missing");
+  const saveStart = source.indexOf("// BEGIN OPTIONS LISTEN ALL SAVE");
+  const saveEnd = source.indexOf("// END OPTIONS LISTEN ALL SAVE", saveStart);
+  assert.ok(saveStart >= 0 && saveEnd > saveStart, "options listen-all save markers missing");
+  const elements = Object.fromEntries([
+    "statusDot", "statusText", "serverPort", "connFile", "buildInfo", "retryServerBtn",
+    "listenAllCheckbox", "saveListenAllBtn", "saveListenAllStatus",
+  ].map(id => [id, {
+    textContent: "", className: "", hidden: true, disabled: false,
+    addEventListener(event, listener) {
+      assert.equal(event, "click");
+      this.click = listener;
+    },
+  }]));
+  const ui = {
+    ...elements,
+    authRefreshes: 0,
+    loadAuthenticationConfig: async () => { ui.authRefreshes++; },
+    document: { getElementById: id => elements[id] },
+    browser: { mcpServer: api },
+  };
+  vm.runInNewContext(source.slice(start, end) + "\n" + source.slice(saveStart, saveEnd) +
+    "\nthis.loadServerInfo = loadServerInfo;", ui);
+  return ui;
+}
+
+describe("options server status", () => {
+  it("shows stopped without a startup error before any attempt", async () => {
+    const { api } = loadServerLifecycle();
+    const ui = loadServerStatus(api);
+    await ui.loadServerInfo();
+    assert.equal(ui.statusText.textContent, "Not running");
+    assert.equal(ui.retryServerBtn.hidden, true);
+  });
+
+  it("shows the stored error on reopening options and refreshes status after Retry", async () => {
+    const { api, state } = loadServerLifecycle({ importError: new Error("Cannot load <httpd>") });
+    const failed = await api.start();
+    const ui = loadServerStatus(api);
+    await ui.loadServerInfo();
+    assert.equal(ui.statusText.textContent, "Failed to start: " + failed.error);
+    assert.equal(ui.statusDot.className, "status-dot stopped");
+    assert.equal(ui.retryServerBtn.hidden, false);
+    assert.equal(ui.serverPort.textContent, "--");
+    assert.equal(ui.connFile.textContent, "--");
+
+    state.importError = null;
+    const retry = ui.retryServerBtn.click();
+    assert.equal(ui.retryServerBtn.disabled, true);
+    assert.equal(ui.statusText.textContent, "Starting...");
+    await retry;
+    assert.equal(state.attempts, 2);
+    assert.equal(ui.retryServerBtn.disabled, false);
+    assert.equal(ui.retryServerBtn.hidden, true);
+    assert.equal(ui.statusText.textContent, "Running");
+    assert.equal(ui.statusDot.className, "status-dot running");
+    assert.equal(ui.serverPort.textContent, 8765);
+    assert.equal(ui.connFile.textContent, "/mock-tmp/thunderbird-mcp/connection.json");
+    assert.equal((await api.getServerInfo()).lastError, null);
+    assert.equal(ui.authRefreshes, 1);
+  });
+
+  it("replaces an earlier failure with the latest retry error and keeps Retry available", async () => {
+    const { api, state } = loadServerLifecycle({ importError: new Error("first failure") });
+    await api.start();
+    const ui = loadServerStatus(api);
+    await ui.loadServerInfo();
+    state.importError = null;
+    state.writeError = new Error("connection file is not writable");
+    await ui.retryServerBtn.click();
+    assert.equal((await api.getServerInfo()).lastError, "Error: connection file is not writable");
+    assert.equal(ui.statusText.textContent, "Failed to start: Error: connection file is not writable");
+    assert.equal(ui.retryServerBtn.hidden, false);
+    assert.equal(ui.retryServerBtn.disabled, false);
+    assert.equal(ui.statusDot.className, "status-dot stopped");
+    assert.equal(ui.authRefreshes, 0);
+  });
+
+  it("refreshes a previously running status when a listen-all restart fails", async () => {
+    let info = { running: true, port: 8765, lastError: null };
+    const ui = loadServerStatus({
+      getServerInfo: async () => info,
+      setListenAll: async () => {
+        info = { running: false, lastError: "Cannot bind to port" };
+        return { error: info.lastError };
+      },
+    });
+    await ui.loadServerInfo();
+    assert.equal(ui.statusText.textContent, "Running");
+    assert.equal(ui.retryServerBtn.hidden, true);
+    await ui.saveListenAllBtn.click();
+    assert.equal(ui.statusText.textContent, "Failed to start: Cannot bind to port");
+    assert.equal(ui.retryServerBtn.hidden, false);
+    assert.equal(ui.saveListenAllStatus.textContent, "Cannot bind to port");
+    assert.equal(ui.saveListenAllBtn.disabled, false);
+  });
+
+  it("reenables Retry if the experiment API rejects the call", async () => {
+    const ui = loadServerStatus({
+      getServerInfo: async () => ({ running: false, lastError: "Previous failure" }),
+      start: async () => { throw new Error("API unavailable"); },
+    });
+    await ui.loadServerInfo();
+    await ui.retryServerBtn.click();
+    assert.equal(ui.statusText.textContent, "Failed to start: API unavailable");
+    assert.equal(ui.retryServerBtn.hidden, false);
+    assert.equal(ui.retryServerBtn.disabled, false);
+  });
+});
+
 describe("server startup lifecycle", () => {
   it("evicts a synchronous failure and allows a successful retry", async () => {
     const { api, sandbox, state } = loadServerLifecycle({ importError: new Error("import failed") });
     assert.equal((await api.getServerInfo()).running, false);
+    assert.equal((await api.getServerInfo()).lastError, null);
 
     const result = await api.start();
     assert.equal(result.success, false);
     assert.match(result.error, /import failed/);
     assert.equal(sandbox.__tbMcpStartPromise, null);
     assert.equal((await api.getServerInfo()).running, false);
+    assert.equal((await api.getServerInfo()).lastError, result.error);
     assert.equal(state.servers.length, 0);
 
     state.importError = null;
@@ -167,6 +285,7 @@ describe("server startup lifecycle", () => {
     assert.equal(state.attempts, 2);
     assert.equal((await api.getServerInfo()).running, true);
     assert.equal((await api.getServerInfo()).port, 8765);
+    assert.equal((await api.getServerInfo()).lastError, null);
   });
 
   it("coalesces concurrent starts and memoizes a successful start", async () => {
@@ -261,12 +380,14 @@ describe("server startup lifecycle", () => {
     });
     await assert.rejects(api.start(), error => error === rejection);
     assert.equal(sandbox.__tbMcpStartPromise, null);
+    assert.equal((await api.getServerInfo()).lastError, String(rejection));
     assert.equal(state.servers[0].listening, false);
     assert.equal(state.connection, null);
     assert.equal((await api.getServerInfo()).running, false);
 
     state.writeError = null;
     assert.equal((await api.start()).success, true);
+    assert.equal((await api.getServerInfo()).lastError, null);
   });
 
   for (const rejects of [false, true]) {
@@ -355,12 +476,14 @@ describe("server startup lifecycle", () => {
       const newer = Promise.resolve({ success: true, port: 8770 });
       const newerConnection = { port: 8770, token: "new", pid: 4242 };
       sandbox.__tbMcpStartPromise = newer;
+      sandbox.__tbMcpLastStartError = null;
       state.connection = newerConnection;
       state.pendingStops.shift()();
 
       if (rejects) await assert.rejects(oldStart, error => error === rejection);
       else assert.equal((await oldStart).success, false);
       assert.strictEqual(sandbox.__tbMcpStartPromise, newer);
+      assert.equal((await api.getServerInfo()).lastError, null);
       assert.strictEqual(state.connection, newerConnection);
     });
   }

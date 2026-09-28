@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a reproducible problem with Thunderbird MCP.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security issues, use [private vulnerability reporting](https://github.com/TKasperczyk/thunderbird-mcp/security/advisories/new).
+        Remove auth tokens, email contents, addresses, and other private data from anything you share here.
+  - type: input
+    id: addon-version
+    attributes:
+      label: Add-on version
+      description: Include the build shown in Thunderbird MCP Options, if available.
+    validations:
+      required: true
+  - type: input
+    id: thunderbird-version
+    attributes:
+      label: Thunderbird version and channel
+      description: Copy the full version from About Thunderbird and state ESR, Release, Beta, or Daily.
+      placeholder: 153.3.1esr (ESR)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Include the OS version and installation type (native, Snap, Flatpak, etc.).
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client and version
+    validations:
+      required: true
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Connection method
+      options:
+        - Node.js bridge (stdio)
+        - Direct HTTP
+        - Both
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps, expected behavior, and actual behavior
+      description: Include the smallest example that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste redacted MCP client/bridge logs and Thunderbird Error Console messages (Tools > Developer Tools > Error Console). For bridge diagnostics, set THUNDERBIRD_MCP_DEBUG=1 in the client configuration. Say if no logs are available.
+      render: text
+    validations:
+      required: true

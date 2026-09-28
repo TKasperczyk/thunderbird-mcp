@@ -40,7 +40,7 @@ jobs:
           node-version: '22.x'
       # No package-lock.json is committed, so install (not ci) for the devDeps.
       - name: Install dev dependencies
-        run: npm install --no-package-lock
+        run: npm install --no-package-lock --ignore-scripts
       - name: Lint
         run: npm run lint
 

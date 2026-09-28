@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the Thunderbird MCP extension
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -51,7 +51,13 @@ fi
 if ! git -C "$PROJECT_DIR" diff --quiet 2>/dev/null || ! git -C "$PROJECT_DIR" diff --cached --quiet 2>/dev/null; then
   VERSION="${VERSION}+dirty"
 fi
-BUILT_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+  # The Ubuntu release job supplies the commit time so reruns produce the same XPI.
+  export TZ=UTC
+  BUILT_AT=$(date -u -d "@$SOURCE_DATE_EPOCH" +"%Y-%m-%dT%H:%M:%SZ")
+else
+  BUILT_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+fi
 echo "{\"version\":\"$VERSION\",\"builtAt\":\"$BUILT_AT\"}" > "$EXTENSION_DIR/buildinfo.json"
 echo "Build version: $VERSION"
 
@@ -72,6 +78,14 @@ echo "Manifest version: $PACKAGE_VERSION"
 
 # Package extension
 cd "$EXTENSION_DIR"
-zip -r "$DIST_DIR/thunderbird-mcp.xpi" . -x "*.DS_Store" -x "*.git*"
+if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+  find . -exec touch -d "@$SOURCE_DATE_EPOCH" {} +
+  touch -d "@$SOURCE_DATE_EPOCH" "$PROJECT_DIR/LICENSE"
+  find . -type f ! -name '*.DS_Store' ! -path '*.git*' | LC_ALL=C sort |
+    zip -X "$DIST_DIR/thunderbird-mcp.xpi" -@
+else
+  zip -r "$DIST_DIR/thunderbird-mcp.xpi" . -x "*.DS_Store" -x "*.git*"
+fi
+zip -X -j "$DIST_DIR/thunderbird-mcp.xpi" "$PROJECT_DIR/LICENSE"
 
 echo "Built: $DIST_DIR/thunderbird-mcp.xpi"
