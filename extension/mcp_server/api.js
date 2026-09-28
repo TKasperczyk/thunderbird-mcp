@@ -1234,7 +1234,6 @@ function parseFilterType(raw) {
 }
 
 const LOCAL_DAY_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
-const ISO_DATE_TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
 const pad2 = (n) => String(n).padStart(2, "0");
 const formatLocalDay = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 
@@ -1267,7 +1266,7 @@ const VALUE_CODECS = {
     format: (stored) => String(stored),
   },
   date: {
-    hint: "YYYY-MM-DD (a local calendar day) or an ISO-8601 date-time",
+    hint: "YYYY-MM-DD (a local calendar day); date-times are not accepted",
     parse: (raw, label) => {
       const text = String(raw ?? "").trim();
       let ms = NaN;
@@ -1283,11 +1282,6 @@ const VALUE_CODECS = {
           && local.getMonth() === month - 1
           && local.getDate() === dayOfMonth;
         if (valid) ms = local.getTime();
-      } else if (ISO_DATE_TIME_RE.test(text)) {
-        // A date-time is unambiguous: with a zone it means that instant, without
-        // one it is local time. Bare numbers are deliberately not accepted:
-        // "2026" used to be taken as epoch milliseconds and saved as 01-Jan-1970.
-        ms = Date.parse(text);
       }
       if (!Number.isFinite(ms)) {
         throw new Error(`${label} must be ${VALUE_CODECS.date.hint}, got: ${JSON.stringify(raw)}`);
@@ -1588,7 +1582,7 @@ function buildTerms(filter, conditions) {
   }
 }
 
-// checkTargetFolder(uri) may return { error } to refuse a move/copy target.
+// checkTargetFolder(uri) resolves an accessible folder, or returns { error }.
 function buildActions(filter, actions, { checkTargetFolder } = {}) {
   if (!FILTER_ACTIONS_AVAILABLE) {
     throw new Error("Cannot build filter actions -- this Thunderbird did not expose nsMsgFilterAction");
@@ -1622,12 +1616,15 @@ function buildActions(filter, actions, { checkTargetFolder } = {}) {
       if (!(spec.member in action)) {
         throw new Error(`This Thunderbird's nsIMsgRuleAction has no "${spec.member}" member`);
       }
-      const parsed = VALUE_CODECS[spec.codec].parse(raw, `Action value for "${act.type}"`, spec);
+      let parsed = VALUE_CODECS[spec.codec].parse(raw, `Action value for "${act.type}"`, spec);
       if (spec.codec === "folder" && checkTargetFolder) {
         const targetCheck = checkTargetFolder(parsed);
-        if (targetCheck && targetCheck.error) {
+        const canonicalURI = targetCheck?.folder?.URI;
+        if (targetCheck?.error || typeof canonicalURI !== "string" || !canonicalURI.trim()) {
           throw new Error(`Filter target folder not accessible: ${parsed}`);
         }
+        // Folder lookup accepts spellings the native action setter rejects.
+        parsed = canonicalURI;
       }
       action[spec.member] = parsed;
     }
@@ -1638,6 +1635,8 @@ function buildActions(filter, actions, { checkTargetFolder } = {}) {
 // ── Reading filters back ──
 
 function serializeSearchTerm(term) {
+  // An ALL term has no attribute, operator or search value to serialize.
+  if (term.matchAll) return { matchAll: true, booleanAnd: term.booleanAnd };
   const t = {
     attrib: attribName(term.attrib),
     op: OP_NAMES[term.op] || String(term.op),
@@ -4360,7 +4359,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // Safety timeout -- if neither listener callback nor error fires
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                 timer.initWithCallback({
-                  notify() { settle({ error: "Send timed out after " + (SEND_TIMEOUT_MS / 1000) + "s" }); }
+                  notify() {
+                    settle({ error: mode === Ci.nsIMsgCompDeliverMode.Now
+                      ? "Send timed out after 120s. The outcome is unknown; check Sent and the Outbox before retrying."
+                      : "Save timed out after 120s. The outcome is unknown; check Drafts and the Outbox before retrying." });
+                  }
                 }, SEND_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
 
                 try {
@@ -4432,6 +4435,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     onStartCopy() {},
                     setMessageKey() {},
                     onStopCopy(status) {
+                      // A Sent-folder copy says nothing about SMTP delivery and
+                      // must not cancel the delivery timeout, even on failure.
+                      if (mode === Ci.nsIMsgCompDeliverMode.Now) return;
                       timer.cancel();
                       if (Components.isSuccessCode(status)) {
                         settle({ success: true, message: "Saved" });
@@ -4483,15 +4489,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
                   }
                   // Modern TB (128+) returns a Promise from createAndSendMessage.
-                  // Handle both fulfillment and rejection -- belt-and-suspenders
-                  // with the listener (settle is idempotent). For SaveAsDraft on
-                  // older TB without the copy listener, the Promise fulfillment
-                  // can be the only completion signal we get.
+                  // For immediate sends this fulfills when delivery starts, so
+                  // only onStopSending may report success. Saves/queued mail
+                  // still support promise completion as well as onStopCopy.
                   if (sendResult && typeof sendResult.then === "function") {
                     sendResult.then(
                       () => {
-                        timer.cancel();
-                        settle({ success: true });
+                        if (mode !== Ci.nsIMsgCompDeliverMode.Now) {
+                          timer.cancel();
+                          settle({ success: true });
+                        }
                       },
                       e => {
                         timer.cancel();
@@ -4563,7 +4570,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return { doc, truncated: input.truncated };
             }
 
-            function stripHtml(html) {
+            function stripHtml(html, failOnParseError = false) {
               if (!html) return "";
               let text;
               let truncated;
@@ -4586,7 +4593,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // DOM text nodes are already entity-decoded. Serializing markup and
                 // stripping tags would expose comments and inert template contents.
                 text = doc.body ? walk(doc.body) : "";
-              } catch {
+              } catch (e) {
+                if (failOnParseError) throw e;
                 return "[HTML content withheld: safe HTML parser unavailable.]";
               }
 
@@ -4726,12 +4734,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Does NOT use coerceBodyToPlaintext -- callers that want
              * the raw HTML (for markdown/html output) need this.
              * multipart/alternative selects the requested representation;
-             * other multipart containers preserve message order.
+             * other containers keep the first body's representation and join
+             * later fragments of that type, including after inline attachments.
              */
             function extractBodyContent(aMimeMsg, preferHtml = false) {
               if (!aMimeMsg) return { text: "", isHtml: false };
               try {
+                // Reuse Gloda's attachment classification and stable MIME part
+                // names so attached text files cannot become body fragments.
+                const attachedParts = new Set();
+                try {
+                  for (const attachment of aMimeMsg.allUserAttachments || []) {
+                    if (attachment?.partName) attachedParts.add(attachment.partName);
+                  }
+                } catch {
+                  // An unavailable or partially readable attachment list must
+                  // not prevent body extraction or leave a partial exclusion.
+                  attachedParts.clear();
+                }
                 function findBody(part, isRoot = false) {
+                  if (!part || attachedParts.has(part.partName)) return null;
                   const ct = ((part.contentType || "").split(";")[0] || "").trim().toLowerCase();
                   if (ct === "message/rfc822" && !isRoot) return null;
                   if (ct !== "message/rfc822") {
@@ -4749,9 +4771,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                       return fallback;
                     }
+                    const fragments = [];
                     for (const sub of part.parts) {
                       const candidate = findBody(sub);
-                      if (candidate) return candidate;
+                      if (candidate) fragments.push(candidate);
+                    }
+                    if (fragments.length) {
+                      // A different-format footer is not an alternative to the
+                      // primary body. Keep the first body and its continuation.
+                      const selected = fragments.filter(fragment => fragment.isHtml === fragments[0].isHtml);
+                      return { text: selected.map(fragment => fragment.text).join(""), isHtml: selected[0].isHtml };
                     }
                   }
                   return null;
@@ -7506,7 +7535,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function hasInlinePgpBodyArmor(aMimeMsg, body, preferHtml = false) {
               const { text, isHtml } = extractBodyContent(aMimeMsg, preferHtml);
-              return hasInlinePgpArmor(body, isHtml ? text : null);
+              if (!isHtml) return hasInlinePgpArmor(body) || hasInlinePgpArmor(stripInvisibleCharacters(text));
+              // Classify the joined visible content, even when the caller wants
+              // raw HTML or Markdown formatting obscures a standalone armor line.
+              // Keep the full HTML for the existing truncation-aware check.
+              try {
+                return hasInlinePgpArmor(body, text) || hasInlinePgpArmor(stripHtml(text, true), text);
+              } catch {
+                return true; // No reliable HTML classification: withhold content.
+              }
             }
 
             function classifyMimeContentType(value) {
@@ -9780,13 +9817,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function serializeFilter(filter, index) {
               const terms = [];
+              let matchAll;
               try {
                 for (const term of filter.searchTerms) {
                   terms.push(serializeSearchTerm(term));
                 }
+                // Only a lone ALL is the native unconditional rule. Empty
+                // filters match nothing; compound rules retain their terms.
+                matchAll = terms.length === 1 && terms[0].matchAll === true;
               } catch {
-                // searchTerms iteration may fail on some TB versions
-                // Try indexed access via termAsString as fallback
+                // A partially read ALL must not make the whole rule unconditional.
+                matchAll = false;
               }
 
               const actions = [];
@@ -9804,7 +9845,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 enabled: filter.enabled,
                 type: filter.filterType,
                 temporary: filter.temporary,
-                terms,
+                ...(matchAll ? { matchAll: true } : {}),
+                terms: matchAll ? [] : terms,
                 actions,
               };
             }
@@ -9972,7 +10014,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   return { error: "Cannot update: failed to read existing filter conditions" };
                 }
                 if (actions !== undefined) {
-                  buildActions(candidate, actions);
+                  buildActions(candidate, actions, { checkTargetFolder: getAccessibleFolder });
                   changes.push("actions");
                 } else {
                   copyActions(filter, candidate);

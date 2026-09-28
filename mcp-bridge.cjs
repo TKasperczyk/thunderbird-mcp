@@ -12,7 +12,6 @@ const path = require('path');
 const os = require('os');
 
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
-const REQUEST_TIMEOUT = 30000;
 const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
 const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
@@ -1119,8 +1118,54 @@ async function handleMessage(line) {
   return forwardToThunderbird(message);
 }
 
-function tryRequest(hostname, postData, port, token) {
+// BEGIN BRIDGE HTTP REQUEST HELPERS
+const REQUEST_TIMEOUT = 30000;
+const MAIL_OPERATION_TIMEOUT = 150000;
+
+function getThunderbirdRequestPolicy(message) {
+  let checkFolders = null;
+  if (message?.method === 'tools/call') {
+    const name = message.params?.name;
+    const args = message.params?.arguments;
+    // Match coerceToolArgs in the extension: only the exact string "true"
+    // becomes true before validation and dispatch.
+    const saveAsDraft = args?.saveAsDraft === true || args?.saveAsDraft === 'true';
+    const skipReview = args?.skipReview === true || args?.skipReview === 'true';
+    if (name === 'saveDraft' || (name === 'replyToMessage' && saveAsDraft)) {
+      checkFolders = 'Drafts';
+    } else if (['sendMail', 'replyToMessage', 'forwardMessage'].includes(name) && skipReview) {
+      checkFolders = 'the Sent folder and the Outbox';
+    }
+  }
+  return {
+    timeoutMs: checkFolders ? MAIL_OPERATION_TIMEOUT : REQUEST_TIMEOUT,
+    checkFolders,
+  };
+}
+
+function tryRequest(hostname, postData, port, token, policy) {
   return new Promise((resolve, reject) => {
+    let connected = false;
+    let requestStarted = false;
+    let settled = false;
+    const settle = (error, response) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(response);
+    };
+    const connectionFailed = (error) => {
+      // Writes are queued before connecting. A refused connection cannot have
+      // dispatched the operation, but a lost connected socket may have done so
+      // even when the entire request has not finished flushing yet.
+      if (policy.checkFolders && connected && requestStarted) {
+        error = new Error(
+          `${error.message}. The outcome is unknown. Check ${policy.checkFolders} in Thunderbird before retrying.`,
+          { cause: error }
+        );
+      }
+      settle(error);
+    };
     const headers = {
       'Content-Type': 'application/json',
       'Content-Length': Buffer.byteLength(postData)
@@ -1135,35 +1180,47 @@ function tryRequest(hostname, postData, port, token) {
       method: 'POST',
       headers
     }, (res) => {
+      connected = true;
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
+      res.on('error', connectionFailed);
+      res.on('aborted', () => connectionFailed(new Error('Response from Thunderbird was interrupted')));
+      res.on('close', () => {
+        if (!res.complete) connectionFailed(new Error('Response from Thunderbird closed before completion'));
+      });
       res.on('end', () => {
         if (res.statusCode === 403) {
           const err = new Error('Authentication failed (403). Token may be stale.');
           err.statusCode = 403;
-          reject(err);
+          settle(err);
           return;
         }
         const data = Buffer.concat(chunks).toString('utf8');
         try {
-          resolve(JSON.parse(data));
+          settle(null, JSON.parse(data));
         } catch {
           try {
-            resolve(JSON.parse(sanitizeJson(data)));
+            settle(null, JSON.parse(sanitizeJson(data)));
           } catch (e) {
-            reject(new Error(`Invalid JSON from Thunderbird: ${e.message}`));
+            settle(new Error(`Invalid JSON from Thunderbird: ${e.message}`));
           }
         }
       });
     });
 
-    req.on('error', reject);
+    req.on('socket', (socket) => {
+      if (socket.connecting) socket.once('connect', () => { connected = true; });
+      else connected = true;
+    });
+    req.on('error', connectionFailed);
+    req.on('close', () => connectionFailed(new Error('Connection to Thunderbird closed before a complete response')));
 
-    req.setTimeout(REQUEST_TIMEOUT, () => {
+    req.setTimeout(policy.timeoutMs, () => {
+      connectionFailed(new Error(`Request to Thunderbird timed out after ${policy.timeoutMs / 1000} seconds`));
       req.destroy();
-      reject(new Error('Request to Thunderbird timed out'));
     });
 
+    requestStarted = true;
     req.write(postData);
     req.end();
   });
@@ -1177,9 +1234,9 @@ function isRetryableConnectionError(err) {
       || err.code === 'EAFNOSUPPORT');
 }
 
-function tryAllHosts(hosts, postData, port, token) {
+function tryAllHosts(hosts, postData, port, token, policy) {
   const tryNext = ([hostname, ...rest]) => {
-    return tryRequest(hostname, postData, port, token).catch((err) => {
+    return tryRequest(hostname, postData, port, token, policy).catch((err) => {
       if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
         return tryNext(rest);
       }
@@ -1188,6 +1245,7 @@ function tryAllHosts(hosts, postData, port, token) {
   };
   return tryNext(hosts);
 }
+// END BRIDGE HTTP REQUEST HELPERS
 
 function compactToolResultJsonText(response) {
   const content = response?.result?.content;
@@ -1219,8 +1277,10 @@ function compactToolResultJsonText(response) {
   return { ...response, result: { ...response.result, content: compactedContent } };
 }
 
+// BEGIN BRIDGE FORWARDING
 async function forwardToThunderbird(message) {
   const postData = JSON.stringify(message);
+  const policy = getThunderbirdRequestPolicy(message);
 
   // Read connection info (port + auth token) from the file written by the extension.
   // Fail-closed: if no connection file exists, retry a few times (Thunderbird may
@@ -1247,7 +1307,7 @@ async function forwardToThunderbird(message) {
 
   while (connInfo) {
     try {
-      return await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token);
+      return await tryAllHosts(THUNDERBIRD_HOSTS, postData, connInfo.port, connInfo.token, policy);
     } catch (err) {
       if (!isRetryableConnectionError(err)) {
         throw err;
@@ -1273,6 +1333,7 @@ async function forwardToThunderbird(message) {
     }
   }
 }
+// END BRIDGE FORWARDING
 
 function startBridge() {
   let pendingRequests = 0;
@@ -1367,9 +1428,14 @@ function startBridge() {
   process.on('SIGTERM', () => process.exit(0));
 }
 
-if (require.main === module) {
+// BEGIN BRIDGE STARTUP
+// Desktop clients may load this program with require() from a Node bootstrap,
+// so require.main does not reliably identify a CLI invocation. Test/library
+// consumers must opt out explicitly before requiring the module.
+if (process.env.THUNDERBIRD_MCP_NO_AUTOSTART !== '1') {
   startBridge();
 }
+// END BRIDGE STARTUP
 
 module.exports = {
   advanceToNextCandidate,

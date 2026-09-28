@@ -1519,7 +1519,7 @@ describe('isValidBase64: canonical RFC 4648 semantics and large inputs', () => {
 });
 
 describe('Attachment policy parity', () => {
-  const bridge = require('../mcp-bridge.cjs');
+  const bridge = require('./helpers/bridge.cjs');
   it('keeps the duplicated pattern lists and helpers identical', () => {
     const bridgeSource = fs.readFileSync(path.resolve(__dirname, '../mcp-bridge.cjs'), 'utf8');
     const patternList = /const SENSITIVE_ATTACHMENT_PATTERNS = \[[\s\S]*?\n\];/;
