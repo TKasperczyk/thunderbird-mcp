@@ -894,8 +894,6 @@ async function readAttachmentFromPath(fileInfo, context) {
         throw new Error(`Attachment export path is redirected: ${filePath}`);
       }
     }
-    // Other platforms retain a parent-directory swap window after realpath;
-    // inode checks alone cannot detect a file moved into a denied directory.
     const buffer = await readFileHandleExactly(handle, filePath, openedStat.size);
     return {
       name: path.basename(filePath),
