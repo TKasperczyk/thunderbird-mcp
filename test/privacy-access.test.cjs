@@ -184,6 +184,20 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
   };
 }
 
+describe("Folder and message options in production schemas and dispatch", () => {
+  it("exposes favoritesOnly and copyTo and forwards both to their handlers", async () => {
+    const runtime = loadPrivacyRuntime();
+    const folders = runtime.tools.find(tool => tool.name === "listFolders");
+    const update = runtime.tools.find(tool => tool.name === "updateMessage");
+    assert.equal(folders.inputSchema.properties.favoritesOnly.type, "boolean");
+    assert.equal(update.inputSchema.properties.copyTo.type, "string");
+    await runtime.callTool("listFolders", { favoritesOnly: true });
+    assert.equal(runtime.calls[0].args[3], true);
+    await runtime.callTool("updateMessage", { copyTo: "imap://account/Project" });
+    assert.equal(runtime.calls[1].args[9], "imap://account/Project");
+  });
+});
+
 describe("Access preferences use the same production parser in options and server", () => {
   for (const raw of ["{", "null", "{}", "true", '"account1"', "[1]", '["account1",false]', "[{}]", true, false, 0, 1, -1]) {
     it(`blocks invalid account and tool configuration (${typeof raw}): ${JSON.stringify(raw)}`, async () => {

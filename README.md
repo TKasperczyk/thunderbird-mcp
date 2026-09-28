@@ -43,13 +43,13 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | Tool | Description |
 |------|-------------|
 | `listAccounts` | List all email accounts and their identities |
-| `listFolders` | Browse folder tree with message counts -- filter by account or subtree |
+| `listFolders` | Browse folder tree with message counts and `isFavorite` in object or table format. Filter by account, subtree, or `favoritesOnly: true`; favorites nested under ordinary folders are included. |
 | `searchMessages` | Search by subject, sender, recipient, body preview, date range, or tags. Multi-word queries are AND-of-tokens (every word must appear somewhere). Prefix with `from:`, `subject:`, `to:`, or `cc:` to restrict to one field. Set `searchBody: true` for full-text body search via Thunderbird's Gloda index. Supports `includeSubfolders`, `countOnly`, and offset-based pagination. Results include `threadId` and `preview` snippet. By default, `dedupByMessageId` collapses the same RFC Message-ID found in multiple folders/labels into one row and reports the other folder paths in `dupLocations`; set `dedupByMessageId: false` to return every location. |
 | `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Set `rawSource: true` for the complete RFC 2822 source (all headers + MIME parts). Optional attachment saving. Set `includeInlineImages: true` to append supported inline CID images as MCP image blocks (PNG, JPEG, GIF, or WebP; max 1 MiB base64 per image and 4 MiB total). Skipped images are reported in attachment metadata. |
 | `getMessages` | Read full email content for up to the configured batch limit in one call (default 10, max 20). Uses the same `bodyFormat`, `rawSource`, and attachment options as `getMessage`; each item supplies `messageId` and `folderPath`. |
 | `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
 | `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
-| `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move between folders, or trash -- supports bulk via `messageIds` |
+| `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move or copy between folders, or trash -- supports bulk via `messageIds`. `copyTo` preserves the source and can add a Gmail label. |
 | `deleteMessages` | Delete messages -- drafts are safely moved to Trash |
 | `createFolder` | Create new subfolders to organize your mail |
 | `renameFolder` | Rename an existing mail folder |
@@ -57,6 +57,16 @@ The Thunderbird extension embeds a local HTTP server with session-scoped auth to
 | `moveFolder` | Move a folder to a new parent within the same account |
 | `emptyTrash` | Permanently delete all messages in Trash (including subfolders) |
 | `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
+
+`searchMessages` scans cooperatively with a best-effort 20-second budget. Header searches count and sort collected matches before pagination, including those beyond 10,000; only the returned page loads full result fields. Counts and totals are best-effort when folders change during a long search, even if no truncation is reported. Unscoped searches still request an IMAP refresh for each visited folder, but results use the locally available cache. Opening a native database and taking its key snapshot are synchronous and cannot be interrupted by this budget.
+
+Message results remain a plain array when `offset` is omitted or null, including incomplete searches and `searchBody: true`. To receive completeness information, provide `offset: 0` (or another offset) for a paginated object. Only object responses can include `truncated: true` and a `message` explaining why; `countOnly` retains its existing object response and can also include these fields. Partial counts and `totalMatches` cover only observed matches, and date ordering covers only that subset. `hasMore` describes additional pages within the collected results and becomes false at their end, even if `truncated` is true; an empty returned page also sets it false. To improve coverage, narrow the folder, date range, or query (or set `includeSubfolders: false`).
+
+For `searchBody: true`, object responses are conservatively marked `truncated: true`: Gloda returns candidates ranked by relevance and exposes no reliable completeness indicator. It applies its limit before removing stale index rows, so even a short result can omit other matches. Plain-array responses carry no completeness information. Narrowing the text query improves coverage; use header search when header/preview matching is sufficient.
+
+`updateMessage` takes tag **keys**, not display labels: for example, `addTags: ["my=20project"]` uses a key generated for a label with a space. Keys must be non-empty printable ASCII without spaces, parentheses, brackets, braces, `%`, `*`, double quotes, backslashes, `<`, `>`, or `;`. This follows [Thunderbird's keyword handling](https://searchfox.org/comm-central/source/mailnews/imap/public/nsIImapService.idl), including its extra restrictions beyond [RFC 3501 atoms](https://www.rfc-editor.org/rfc/rfc3501#section-9). `=` and legacy modified UTF-7 keys containing `&` are accepted. Invalid entries in either `addTags` or `removeTags` fail the entire call with an error naming those entries before any messages are changed.
+
+Use `copyTo: "<destination folder URI>"` to copy without removing the original. On Gmail, copying from Sent Mail to a project folder adds that label while preserving Sent Mail and existing labels. `copyTo`, `moveTo`, and `trash: true` are mutually exclusive. Both source and destination must be accessible. Copies and moves within or across accounts use the same Thunderbird native copy service call. On IMAP, completion is asynchronous and later failures are not reported back; success means only that the operation was submitted, so verify the destination. Tags applied together with a copy or move may not transfer on IMAP; verify the destination tags as well.
 
 ### Compose
 
