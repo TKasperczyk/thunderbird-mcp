@@ -1447,3 +1447,54 @@ describe('isSensitiveFilePath: case insensitivity and slash normalization', () =
     assert.equal(isSensitiveFilePath('C:\\Users\\x\\.ssh\\id_rsa'), true);
   });
 });
+
+// Regression: the previous STRICT_BASE64_PATTERN used a group quantifier
+// ((?:[...]{4})*) that pushed a backtrack frame per base64 quartet. On
+// SpiderMonkey (Thunderbird's engine) this threw "InternalError: too much
+// recursion" for inputs beyond a few hundred KB, so every real-world inline
+// attachment failed validation. The validator must stay character-class-only
+// (linear, no per-iteration backtrack frames) while keeping the exact
+// canonical RFC 4648 semantics. The recursion itself is engine-specific and
+// not reproducible on V8, so these tests pin the semantics and exercise a
+// multi-megabyte input through the exact production code path.
+describe('isValidBase64: canonical RFC 4648 semantics and large inputs', () => {
+  const { isValidBase64 } = productionAttachmentValidation;
+
+  it('accepts canonical base64 with and without padding', () => {
+    assert.equal(isValidBase64('AAAA'), true);
+    assert.equal(isValidBase64('ABCD'), true);
+    assert.equal(isValidBase64('AB=='), true);
+    assert.equal(isValidBase64('ABC='), true);
+    assert.equal(isValidBase64('ABCDAB=='), true);
+    assert.equal(isValidBase64('+/+/'), true);
+  });
+
+  it('rejects non-canonical shapes', () => {
+    assert.equal(isValidBase64(''), false);
+    assert.equal(isValidBase64('A'), false);
+    assert.equal(isValidBase64('AB'), false);
+    assert.equal(isValidBase64('ABC'), false);
+    assert.equal(isValidBase64('A==='), false);
+    assert.equal(isValidBase64('===='), false);
+    assert.equal(isValidBase64('AB=C'), false);
+    assert.equal(isValidBase64('=ABC'), false);
+    assert.equal(isValidBase64('ABCD=BCD'), false);
+    assert.equal(isValidBase64('AAA!'), false);
+    assert.equal(isValidBase64('AA A'), false);
+    assert.equal(isValidBase64('AAAA\n'), false);
+  });
+
+  it('rejects non-string values', () => {
+    assert.equal(isValidBase64(null), false);
+    assert.equal(isValidBase64(undefined), false);
+    assert.equal(isValidBase64(123), false);
+    assert.equal(isValidBase64({}), false);
+  });
+
+  it('validates a multi-megabyte attachment payload', () => {
+    const bytes = Buffer.alloc(5 * 1024 * 1024, 0x42);
+    const encoded = bytes.toString('base64');
+    assert.equal(isValidBase64(encoded), true);
+    assert.equal(isValidBase64(encoded.slice(0, -1) + '!'), false);
+  });
+});

@@ -44,6 +44,7 @@ function isListenAllEnabled() {
   try { return Services.prefs.getBoolPref(PREF_LISTEN_ALL, false); } catch { return false; }
 }
 
+// BEGIN CONNECTION INFO REFRESH HELPERS
 function stopConnectionInfoRefreshTimer() {
   if (globalThis.__tbMcpConnectionInfoRefreshTimer) {
     try {
@@ -55,7 +56,6 @@ function stopConnectionInfoRefreshTimer() {
   }
 }
 
-// BEGIN CONNECTION INFO REFRESH HELPERS
 function ensureFreshConnectionInfo({
   port,
   token,
@@ -725,9 +725,16 @@ const _claimedComposeWindows = new WeakSet();
 // BEGIN INLINE ATTACHMENT BASE64 HELPERS
 // Require canonical RFC 4648 base64: complete quartets with padding only in
 // the final quartet. In particular, do not silently discard invalid bytes.
-const STRICT_BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+// Character-class-only pattern: a group quantifier like (?:[...]{4})* pushes a
+// backtrack frame per quartet, and SpiderMonkey throws "InternalError: too
+// much recursion" once the input exceeds a few hundred KB — which any real
+// attachment does. Quartet alignment is enforced by the length % 4 check.
+const STRICT_BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 function isValidBase64(value) {
-  return typeof value === "string" && value.length > 0 && STRICT_BASE64_PATTERN.test(value);
+  return typeof value === "string"
+    && value.length > 0
+    && value.length % 4 === 0
+    && STRICT_BASE64_PATTERN.test(value);
 }
 // END INLINE ATTACHMENT BASE64 HELPERS
 // BEGIN OUTBOUND ATTACHMENT LIMITS
@@ -1978,12 +1985,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
     return {
       mcpServer: {
+        // BEGIN SERVER LIFECYCLE
         start: async function() {
           // Guard against double-start on extension reload (port conflict)
           if (globalThis.__tbMcpStartPromise) {
             return await globalThis.__tbMcpStartPromise;
           }
           const startPromise = (async () => {
+          let startedServer = null;
           try {
             // Stop any previously running server (e.g. extension reload)
             if (globalThis.__tbMcpServer) {
@@ -2141,6 +2150,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return deduped;
             }
 
+            // BEGIN CONNECTION INFO WRITER
             /**
              * Write connection info (port + auth token) to a well-known file
              * so the bridge can discover how to connect.
@@ -2153,14 +2163,17 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 tmpDir.create(Ci.nsIFile.DIRECTORY_TYPE, 0o700);
               } else if (tmpDir.isSymlink()) {
                 throw new Error("thunderbird-mcp tmp directory is a symlink — refusing to write connection info");
-              } else {
+              } else if (Services.appinfo.OS !== "WINNT") {
                 // POSIX hardening: on a shared /tmp another local user could
                 // pre-create the directory with group/world bits set, then race
                 // the connection file. The O_EXCL on the file itself blocks a
                 // straight overwrite, but a permissive directory still lets the
                 // attacker read or rename our file. Force perms back to 0o700.
-                // permissions is 0 on platforms that don't expose POSIX modes
-                // (Windows ACLs), so the chmod is a no-op there.
+                //
+                // Skipped on Windows: nsIFile.permissions synthesises group/
+                // other bits (0o666/0o777 have been observed) that assigning
+                // 0o700 cannot clear. Access is governed by inherited ACLs;
+                // these mode bits neither describe nor enforce ACL privacy.
                 try {
                   const mode = tmpDir.permissions;
                   if (mode && (mode & 0o077) !== 0) {
@@ -2194,6 +2207,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               converter.close();
               return connFile.path;
             }
+            // END CONNECTION INFO WRITER
 
             function ensureConnectionInfo(port, token) {
               return ensureFreshConnectionInfo({
@@ -2211,6 +2225,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function startConnectionInfoRefresh(port, token) {
               stopConnectionInfoRefreshTimer();
               const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+              // Track it before initialization so failed startup can cancel it.
+              globalThis.__tbMcpConnectionInfoRefreshTimer = timer;
               timer.initWithCallback(() => {
                 try {
                   ensureConnectionInfo(port, token);
@@ -2218,7 +2234,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   console.warn("thunderbird-mcp: failed to refresh connection info:", e);
                 }
               }, CONNECTION_FILE_REFRESH_MS, Ci.nsITimer.TYPE_REPEATING_SLACK);
-              globalThis.__tbMcpConnectionInfoRefreshTimer = timer;
             }
 
             const authToken = getStableAuthTokenPref() || generateAuthToken();
@@ -3489,8 +3504,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Returns { text, isHtml } without any format conversion.
              * Does NOT use coerceBodyToPlaintext -- callers that want
              * the raw HTML (for markdown/html output) need this.
+             * multipart/alternative selects the requested representation;
+             * other multipart containers preserve message order.
              */
-            function extractBodyContent(aMimeMsg) {
+            function extractBodyContent(aMimeMsg, preferHtml = false) {
               if (!aMimeMsg) return { text: "", isHtml: false };
               try {
                 function findBody(part, isRoot = false) {
@@ -3501,13 +3518,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     if (ct === "text/html" && part.body) return { text: part.body, isHtml: true };
                   }
                   if (part.parts) {
-                    let htmlFallback = null;
-                    for (const sub of part.parts) {
-                      const r = findBody(sub);
-                      if (r && !r.isHtml) return r;
-                      if (r && r.isHtml && !htmlFallback) htmlFallback = r;
+                    if (ct === "multipart/alternative") {
+                      let fallback = null;
+                      for (const sub of part.parts) {
+                        const candidate = findBody(sub);
+                        if (!candidate) continue;
+                        if (candidate.isHtml === preferHtml) return candidate;
+                        if (!fallback) fallback = candidate;
+                      }
+                      return fallback;
                     }
-                    if (htmlFallback) return htmlFallback;
+                    for (const sub of part.parts) {
+                      const candidate = findBody(sub);
+                      if (candidate) return candidate;
+                    }
                   }
                   return null;
                 }
@@ -3542,7 +3566,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { body: extractPlainTextBody(aMimeMsg), bodyIsHtml: false };
               }
               // For markdown/html: need raw MIME content, not coerced text
-              const { text, isHtml } = extractBodyContent(aMimeMsg);
+              const { text, isHtml } = extractBodyContent(aMimeMsg, true);
               if (!text) {
                 // MIME tree empty -- try coerce as last resort
                 const fallback = extractPlainTextBody(aMimeMsg);
@@ -5642,6 +5666,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return Math.abs(actualSize - declaredSize) > Math.max(8, declaredSize * 0.05);
             }
 
+            const MESSAGE_STREAM_READ_CHUNK_BYTES = 64 * 1024;
+
             // Reads a message stream fully, looping on stream.available() to handle
             // mbox-stored messages where msgHdr.offlineMessageSize/messageSize can
             // underreport (observed at ~56% of true size for locally-injected mbox
@@ -5649,15 +5675,33 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // close the stream.
             function readMessageStreamFully(stream, maxBytes) {
               let raw = "";
-              for (let safety = 0; safety < 1024; safety++) {
-                const available = stream.available();
-                if (available <= 0) break;
-                if (typeof maxBytes === "number" && raw.length + available > maxBytes) {
-                  throw new Error(`message too large (> ${maxBytes} bytes)`);
+              const hasByteLimit = typeof maxBytes === "number" && Number.isFinite(maxBytes);
+              while (true) {
+                let available;
+                try {
+                  available = stream.available();
+                } catch (e) {
+                  if (e === Cr.NS_BASE_STREAM_CLOSED || e?.result === Cr.NS_BASE_STREAM_CLOSED) break;
+                  throw e;
                 }
-                const chunk = NetUtil.readInputStreamToString(stream, available);
-                if (!chunk || chunk.length === 0) break;
+                if (available <= 0) break;
+
+                let bytesToRead = Math.min(available, MESSAGE_STREAM_READ_CHUNK_BYTES);
+                if (hasByteLimit) {
+                  // Reading one byte beyond the remaining budget proves overflow
+                  // from returned data, rather than from the available byte count.
+                  bytesToRead = Math.min(bytesToRead, Math.max(1, maxBytes - raw.length + 1));
+                }
+                const chunk = NetUtil.readInputStreamToString(stream, bytesToRead);
+                if (!chunk || chunk.length === 0) {
+                  throw new Error("message stream read made no progress");
+                }
                 raw += chunk;
+                if (hasByteLimit && raw.length > maxBytes) {
+                  const error = new Error(`message too large (> ${maxBytes} bytes)`);
+                  error.isStreamSizeLimit = true;
+                  throw error;
+                }
               }
               return raw;
             }
@@ -5749,7 +5793,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                        rawSource: raw,
 	                      });
 	                    } catch (e) {
-	                      resolve({ error: `Failed to read raw source: ${e}` });
+	                      console.error("thunderbird-mcp: raw source read failed:", e);
+	                      resolve({ error: "Failed to read raw source" });
 	                    } finally {
 	                      if (stream) try { stream.close(); } catch { /* ignore */ }
 	                    }
@@ -5828,7 +5873,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           }
                         }
                       } catch (e) {
-                        bodyNote = String(e?.message || e).startsWith("message too large")
+                        bodyNote = e?.isStreamSizeLimit === true
                           ? "raw MIME body extraction hit 50 MiB size cap"
                           : "raw MIME body extraction failed";
                         console.error(`${fallbackContext}: failed`, e);
@@ -6090,7 +6135,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             uri: source.url,
                             loadUsingSystemPrincipal: true,
                           });
-                          NetUtil.asyncFetch(channel, (inputStream, status, request) => {
+                          NetUtil.asyncFetch(channel, (inputStream, status) => {
                             try {
                               if (status && status !== 0) {
                                 resolve({ error: `Inline image fetch failed: ${status}` });
@@ -6100,37 +6145,36 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                 resolve({ error: "Inline image fetch returned no data" });
                                 return;
                               }
-                              const requestLength = request && typeof request.contentLength === "number"
-                                ? request.contentLength
-                                : -1;
-                              if (requestLength > 0 &&
-                                  getBase64EncodedSize(requestLength) > MAX_INLINE_IMAGE_BASE64_BYTES) {
-                                resolve({
-                                  error: `Image exceeds per-image base64 limit (${getBase64EncodedSize(requestLength)} bytes > ${MAX_INLINE_IMAGE_BASE64_BYTES} bytes)`,
-                                });
-                                return;
-                              }
+                              // Message-part channels can report the parent message's
+                              // contentLength, so enforce the limit on bytes read below.
                               // Largest decoded payload whose base64 representation fits
                               // exactly inside the per-image encoded budget.
                               const maxRawBytes = Math.floor(MAX_INLINE_IMAGE_BASE64_BYTES / 4) * 3;
                               let byteString;
                               try {
                                 byteString = readMessageStreamFully(inputStream, maxRawBytes);
-                              } catch {
-                                resolve({
-                                  error: `Image exceeds per-image base64 limit (${MAX_INLINE_IMAGE_BASE64_BYTES} bytes)`,
-                                });
+                              } catch (e) {
+                                if (e?.isStreamSizeLimit === true) {
+                                  resolve({
+                                    error: `Image exceeds per-image base64 limit (${MAX_INLINE_IMAGE_BASE64_BYTES} bytes)`,
+                                  });
+                                } else {
+                                  console.error("thunderbird-mcp: inline image stream read failed:", e);
+                                  resolve({ error: "Inline image read failed" });
+                                }
                                 return;
                               }
                               resolve({ data: encodeByteStringToBase64(byteString) });
                             } catch (e) {
-                              resolve({ error: `Inline image fetch failed: ${e}` });
+                              console.error("thunderbird-mcp: inline image fetch callback failed:", e);
+                              resolve({ error: "Inline image fetch failed" });
                             } finally {
                               try { inputStream?.close(); } catch {}
                             }
                           });
                         } catch (e) {
-                          resolve({ error: `Inline image fetch failed: ${e}` });
+                          console.error("thunderbird-mcp: inline image fetch setup failed:", e);
+                          resolve({ error: "Inline image fetch failed" });
                         }
                       });
                     }
@@ -6210,10 +6254,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       appendInlineImageContent()
                         .then(() => resolve(baseResponse))
                         .catch((e) => {
+                          console.error("thunderbird-mcp: inline image content assembly failed:", e);
                           baseResponse.inlineImageContent = {
                             included: 0,
                             skipped: inlineImageSources.length,
-                            error: `Failed to include inline images: ${e}`,
+                            error: "Failed to include inline images",
                             limits: {
                               perImageBase64Bytes: MAX_INLINE_IMAGE_BASE64_BYTES,
                               totalBase64Bytes: MAX_INLINE_IMAGES_TOTAL_BASE64_BYTES,
@@ -6418,7 +6463,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             loadUsingSystemPrincipal: true
                           });
 
-                          NetUtil.asyncFetch(channel, (inputStream, status, request) => {
+                          NetUtil.asyncFetch(channel, (inputStream, status) => {
                             try {
                               if (status && status !== 0) {
                                 try { inputStream?.close(); } catch {}
@@ -6434,19 +6479,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                                 return;
                               }
 
-                              try {
-                                const reqLen = request && typeof request.contentLength === "number" ? request.contentLength : -1;
-                                if (reqLen >= 0 && reqLen > MAX_ATTACHMENT_BYTES) {
-                                  try { inputStream.close(); } catch {}
-                                  info.error = `Attachment too large (${reqLen} bytes, limit ${MAX_ATTACHMENT_BYTES})`;
-                                  try { file.remove(false); } catch {}
-                                  done();
-                                  return;
-                                }
-                              } catch {
-                                // ignore contentLength failures
-                              }
-
+                              // Message-part contentLength can describe the parent
+                              // message. Enforce the limit on the copied file below.
                               const ostream = Cc["@mozilla.org/network/file-output-stream;1"]
                                 .createInstance(Ci.nsIFileOutputStream);
                               ostream.init(file, -1, -1, 0);
@@ -6519,7 +6553,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }, true, { examineEncryptedParts: true });
 
 	                } catch (e) {
-	                  resolve({ error: e.toString() });
+	                  console.error("thunderbird-mcp: getMessage failed:", e);
+	                  resolve({ error: "Failed to get message" });
 	                }
 	              });
 	            }
@@ -6854,6 +6889,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                            result.message = msg;
 	                          }
 	                          resolve(result);
+	                        }).catch(e => {
+	                          // The promise helpers above resolve rather than reject today, but
+	                          // nothing in their signature guarantees it and this promise has no
+	                          // timeout of its own -- an unhandled rejection would hang the request
+	                          // forever instead of failing it.
+	                          resolve({ error: e.toString() });
 	                        });
 	                      } catch (e) {
 	                        resolve({ error: e.toString() });
@@ -6880,6 +6921,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                      result.message = msg;
 	                    }
 	                    resolve(result);
+	                  }).catch(e => {
+	                    // The promise helpers above resolve rather than reject today, but
+	                    // nothing in their signature guarantees it and this promise has no
+	                    // timeout of its own -- an unhandled rejection would hang the request
+	                    // forever instead of failing it.
+	                    resolve({ error: e.toString() });
 	                  });
 
 	                } catch (e) {
@@ -7026,6 +7073,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             result.message = msg;
                           }
                           resolve(result);
+                        }).catch(e => {
+                          // The promise helpers above resolve rather than reject today, but
+                          // nothing in their signature guarantees it and this promise has no
+                          // timeout of its own -- an unhandled rejection would hang the request
+                          // forever instead of failing it.
+                          resolve({ error: e.toString() });
                         });
                       } catch (e) {
                         resolve({ error: e.toString() });
@@ -7057,6 +7110,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       result.message = msg;
                     }
                     resolve(result);
+                  }).catch(e => {
+                    // The promise helpers above resolve rather than reject today, but
+                    // nothing in their signature guarantees it and this promise has no
+                    // timeout of its own -- an unhandled rejection would hang the request
+                    // forever instead of failing it.
+                    resolve({ error: e.toString() });
                   });
                 } catch (e) {
                   resolve({ error: e.toString() });
@@ -7138,6 +7197,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       subject: msgHdr.mime2DecodedSubject || msgHdr.subject,
                       author: msgHdr.mime2DecodedAuthor || msgHdr.author,
                       recipients: msgHdr.mime2DecodedRecipients || msgHdr.recipients,
+                      ccList: msgHdr.ccList,
                       date: msgHdr.date ? new Date(msgHdr.date / 1000).toISOString() : null,
                       folder: folder.prettyName,
                       folderPath: folder.URI,
@@ -8675,45 +8735,49 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
-            globalThis.__tbMcpServer = server;
-            let connFilePath;
-            try {
-              // Write the connection file fresh on initial start so the secure
-              // create path (0600 perms, directory checks) always runs. The
-              // refresh timer self-heals it afterward via ensureConnectionInfo
-              // if the OS deletes it while the server keeps running.
-              connFilePath = writeConnectionInfo(boundPort, authToken);
-              startConnectionInfoRefresh(boundPort, authToken);
-            } catch (writeErr) {
-              // Connection file write failed -- stop the orphaned server
-              try { server.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
-              globalThis.__tbMcpServer = null;
-              stopConnectionInfoRefreshTimer();
-              throw writeErr;
-            }
+            startedServer = server;
+            // Write the connection file fresh on initial start so the secure
+            // create path (0600 perms, directory checks) always runs. The
+            // refresh timer self-heals it afterward via ensureConnectionInfo
+            // if the OS deletes it while the server keeps running.
+            const connFilePath = writeConnectionInfo(boundPort, authToken);
+            startConnectionInfoRefresh(boundPort, authToken);
             console.log(`Thunderbird MCP server listening on port ${boundPort}`);
             console.log(`Connection info written to ${connFilePath}`);
             if (listenAll) {
               console.error(`thunderbird-mcp: WARNING - server is listening on all interfaces (0.0.0.0/[::]). This exposes the MCP server to your local network. Only enable on trusted networks.`);
             }
+            // Publish running state only after startup has fully succeeded.
+            globalThis.__tbMcpServer = server;
             return { success: true, port: boundPort };
           } catch (e) {
             console.error("Failed to start MCP server:", e);
-            // Stop server if it was started but something else failed
-            if (globalThis.__tbMcpServer) {
-              try { globalThis.__tbMcpServer.stop(() => {}); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
-              globalThis.__tbMcpServer = null;
-            }
             stopConnectionInfoRefreshTimer();
-            // Clear cached promise so a retry can attempt to bind again
-            globalThis.__tbMcpStartPromise = null;
+            // Clean up before yielding: a reload may install a new connection
+            // file while this listener is still draining.
             removeConnectionInfo();
+            // Keep this attempt cached until the listener has finished stopping,
+            // so concurrent starts cannot rebind during failure cleanup.
+            if (startedServer) {
+              try { await startedServer.stop(); } catch (e) { console.error("thunderbird-mcp: server.stop failed:", e); }
+            }
             return { success: false, error: e.toString() };
           }
           })();
           // Set sentinel BEFORE awaiting to prevent race with concurrent start() calls
           globalThis.__tbMcpStartPromise = startPromise;
-          return await startPromise;
+          let result;
+          try {
+            result = await startPromise;
+            return result;
+          } finally {
+            // The IIFE can fail synchronously before the assignment above.
+            // Evict failures/rejections after settlement without clearing a
+            // newer attempt installed by a restart or extension reload.
+            if (!result?.success && globalThis.__tbMcpStartPromise === startPromise) {
+              globalThis.__tbMcpStartPromise = null;
+            }
+          }
         },
 
         getServerInfo: async function() {
@@ -8759,13 +8823,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           }
 
           return {
-            running: !!globalThis.__tbMcpStartPromise,
+            running: !!globalThis.__tbMcpServer,
             port,
             connectionFile,
             buildVersion,
             buildDate,
           };
         },
+
+        // END SERVER LIFECYCLE
 
         getCurrentAuthToken: async function() {
           let authToken = "";
@@ -8994,45 +9060,65 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           return { listenAll };
         },
 
+        // BEGIN LISTEN ALL SETTER
         setListenAll: async function(listenAll) {
           if (typeof listenAll !== "boolean") {
             return { error: "listenAll must be a boolean" };
           }
-          console.log(`[MCP] setListenAll called with: ${listenAll}`);
-          if (listenAll) {
-            Services.prefs.setBoolPref(PREF_LISTEN_ALL, true);
-          } else {
-            try { Services.prefs.clearUserPref(PREF_LISTEN_ALL); } catch { /* ignore */ }
-          }
+          // Serialize settings changes through the entire restart, including
+          // failure cleanup, so another setter cannot bypass a pending stop.
+          const previousRestart = globalThis.__tbMcpRestartPromise;
+          const restartPromise = (async () => {
+            try { await previousRestart; } catch { /* previous restart failed */ }
+            console.log(`[MCP] setListenAll called with: ${listenAll}`);
+            // A failed start may still be stopping its listener. Follow any
+            // newer attempt another caller installs while we are waiting.
+            let startPromise;
+            do {
+              startPromise = globalThis.__tbMcpStartPromise;
+              if (startPromise) {
+                try { await startPromise; } catch { /* startup failed */ }
+              }
+            } while (globalThis.__tbMcpStartPromise &&
+                     globalThis.__tbMcpStartPromise !== startPromise);
+            if (listenAll) {
+              Services.prefs.setBoolPref(PREF_LISTEN_ALL, true);
+            } else {
+              try { Services.prefs.clearUserPref(PREF_LISTEN_ALL); } catch { /* ignore */ }
+            }
 
-          // Stop existing server
-          if (globalThis.__tbMcpServer) {
-            const stopServer = globalThis.__tbMcpServer;
-            globalThis.__tbMcpServer = null;
-            stopConnectionInfoRefreshTimer();
-            // Wait for the socket close callback before rebinding the port.
-            try {
-              await new Promise((resolve) => {
-                try { stopServer.stop(resolve); } catch { resolve(); }
-              });
-            } catch { /* ignore */ }
-          }
-          // Clear sentinels so start() can reinitialize
-          globalThis.__tbMcpStartPromise = null;
+            // Remove stale info before yielding so this stop cannot remove a
+            // newer attempt's connection file.
+            removeConnectionInfo();
+            if (globalThis.__tbMcpServer) {
+              const stopServer = globalThis.__tbMcpServer;
+              globalThis.__tbMcpServer = null;
+              stopConnectionInfoRefreshTimer();
+              // Wait for the socket close callback before rebinding the port.
+              try {
+                await new Promise((resolve) => {
+                  try { stopServer.stop(resolve); } catch { resolve(); }
+                });
+              } catch { /* ignore */ }
+            }
+            // Only release the startup attempt this operation waited for.
+            if (globalThis.__tbMcpStartPromise === startPromise) {
+              globalThis.__tbMcpStartPromise = null;
+            }
 
-          // Remove stale connection file
+            console.log(`[MCP] Restarting server...`);
+            return await this.start();
+          })();
+          globalThis.__tbMcpRestartPromise = restartPromise;
           try {
-            const tmpDir = Services.dirsvc.get("TmpD", Ci.nsIFile);
-            tmpDir.append("thunderbird-mcp");
-            const connFile = tmpDir.clone();
-            connFile.append("connection.json");
-            if (connFile.exists()) connFile.remove(false);
-          } catch { /* best-effort cleanup */ }
-
-          // Restart server with new binding
-          console.log(`[MCP] Restarting server...`);
-          return await this.start();
+            return await restartPromise;
+          } finally {
+            if (globalThis.__tbMcpRestartPromise === restartPromise) {
+              globalThis.__tbMcpRestartPromise = null;
+            }
+          }
         },
+        // END LISTEN ALL SETTER
       }
     };
   }
