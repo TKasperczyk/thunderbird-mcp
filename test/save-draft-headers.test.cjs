@@ -37,7 +37,7 @@ try {
 
 function normalizeHeaders(value) {
   assert.ifError(normalizerLoadError);
-  return normalizeDraftHeaders(value);
+  return JSON.parse(JSON.stringify(normalizeDraftHeaders(value)));
 }
 
 function getSaveDraftToolDefinition() {
@@ -49,7 +49,8 @@ function getSaveDraftToolDefinition() {
 
   const sandbox = { MAX_ATTACHMENTS_PER_MESSAGE: 10 };
   vm.createContext(sandbox);
-  vm.runInContext(`this.saveDraftTool = ${apiSource.slice(start, nextTool)};`, sandbox);
+  const definition = apiSource.slice(start, nextTool).trim().replace(/,$/, '');
+  vm.runInContext(`this.saveDraftTool = ${definition};`, sandbox);
   return sandbox.saveDraftTool;
 }
 
