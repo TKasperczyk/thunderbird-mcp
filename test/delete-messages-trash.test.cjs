@@ -19,6 +19,22 @@ const Ci = {
   },
 };
 
+function extractFunction(source, name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  assert.ok(start >= 0, `${name} missing`);
+  const brace = source.indexOf("{", start);
+  let depth = 0;
+  for (let i = brace; i < source.length; i++) {
+    if (source[i] === "{") depth++;
+    else if (source[i] === "}") {
+      depth--;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  assert.fail(`unterminated ${name}`);
+}
+
 function loadDeleteMessages(dependencies) {
   const apiPath = path.resolve(__dirname, "../extension/mcp_server/api.js");
   const source = fs.readFileSync(apiPath, "utf8");
@@ -30,6 +46,11 @@ function loadDeleteMessages(dependencies) {
   assert.ok(end > start, "deleteMessages end marker missing");
 
   const snippet = source.slice(start, end);
+  const helpers = [
+    "normalizeRfcMessageId",
+    "messageIdForHeaderLookup",
+    "lookupHeaderInDatabase",
+  ].map(name => extractFunction(source, name)).join("\n");
   const sandbox = {
     openFolder: dependencies.openFolder,
     findTrashFolder: dependencies.findTrashFolder,
@@ -38,7 +59,8 @@ function loadDeleteMessages(dependencies) {
   };
   vm.createContext(sandbox);
   vm.runInContext(
-    `${snippet}
+    `${helpers}
+${snippet}
 this.deleteMessages = deleteMessages;`,
     sandbox
   );

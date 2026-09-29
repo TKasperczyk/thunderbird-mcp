@@ -15,6 +15,22 @@ function snippet(startMarker, endMarker) {
   return source.slice(start, end);
 }
 
+function extractFunction(name) {
+  const marker = `function ${name}(`;
+  const start = source.indexOf(marker);
+  assert.ok(start >= 0, `${name} missing`);
+  const brace = source.indexOf("{", start);
+  let depth = 0;
+  for (let i = brace; i < source.length; i++) {
+    if (source[i] === "{") depth++;
+    else if (source[i] === "}") {
+      depth--;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  assert.fail(`unterminated ${name}`);
+}
+
 // Load real folder access, handlers, dispatch and sanitization; mock only the
 // account preference and native Thunderbird services they call.
 function loadFolderTools({ accounts, folders, isAccountAllowed = () => true, copyMessages = () => {}, copyFolder = () => {} }) {
@@ -33,6 +49,9 @@ function loadFolderTools({ accounts, folders, isAccountAllowed = () => true, cop
     },
   });
   vm.runInContext([
+    extractFunction("normalizeRfcMessageId"),
+    extractFunction("messageIdForHeaderLookup"),
+    extractFunction("lookupHeaderInDatabase"),
     snippet("// BEGIN OUTBOX DESTINATION GUARD", "// END OUTBOX DESTINATION GUARD"),
     snippet("function isFolderAccessible(", "function toColumnarTable("),
     snippet("function toColumnarTable(", "function listAccounts("),
