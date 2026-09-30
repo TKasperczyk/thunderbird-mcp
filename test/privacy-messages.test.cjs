@@ -49,6 +49,8 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     readMessageStreamFully: () => raw,
     isSkipReviewBlocked: () => false,
     filePathsToAttachDescs: () => ({ descs: [], failed: [] }),
+    resolveOutboundInlineImages: () => ({ embedded: [] }),
+    inlineImagesAsDataUrls: (body) => body,
     Cc: {
       "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
       "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({ setHeader() {} }) },
