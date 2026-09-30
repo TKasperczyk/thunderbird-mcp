@@ -3,9 +3,9 @@
     "thunderbird-mcp@tkasperczyk.dev": {
       "updates": [
         {
-          "version": "0.7.6",
-          "update_link": "https://github.com/TKasperczyk/thunderbird-mcp/releases/download/v0.7.6/thunderbird-mcp-v0.7.6.xpi",
-          "update_hash": "sha256:bcf0e5a76ac144c7227fea3b3b910438937bc9e7646a52bb6d6aa62241a35fd4",
+          "version": "0.8.0",
+          "update_link": "https://github.com/TKasperczyk/thunderbird-mcp/releases/download/v0.8.0/thunderbird-mcp-v0.8.0.xpi",
+          "update_hash": "sha256:514597cba66e42d5f5a229d07ca89f6fb91145eee5b758d0f29d717399724607",
           "applications": {
             "gecko": {
               "strict_min_version": "102.0",
