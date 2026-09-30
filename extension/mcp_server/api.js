@@ -2086,6 +2086,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            headers: {
+              description: "Extra RFC 5322 headers to set on the draft, as {name: value} or a JSON string of that object (some MCP clients flatten nested objects). For example, add-ons such as Send Later read X-Send-Later-At and X-Send-Later-Uuid from messages in Drafts.",
+              oneOf: [
+                { type: "object", additionalProperties: { type: "string" } },
+                { type: "string", description: "JSON object as a string" },
+              ],
+            },
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
@@ -2734,6 +2741,42 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
       ];
     }
     // END TOOL SCHEMA BUILDER
+
+    // BEGIN SAVE DRAFT HEADERS NORMALIZER
+    function normalizeDraftHeaders(headers) {
+      if (headers === undefined || headers === null) {
+        return { headers: [] };
+      }
+
+      if (typeof headers === "string") {
+        if (!headers.trim()) {
+          return { headers: [] };
+        }
+        try {
+          headers = JSON.parse(headers);
+        } catch (e) {
+          return { error: `headers is a string but not valid JSON: ${e}` };
+        }
+      }
+
+      if (typeof headers !== "object" || headers === null || Array.isArray(headers)) {
+        return { error: "headers must be an object of {name: value}" };
+      }
+
+      const normalizedHeaders = [];
+      for (const [name, value] of Object.entries(headers)) {
+        if (!/^[A-Za-z0-9-]+$/.test(name)) {
+          return { error: `Invalid header name: ${name}` };
+        }
+        if (typeof value !== "string" || /[\r\n]/.test(value)) {
+          return { error: `Invalid header value for ${name} (must be a string without CR/LF)` };
+        }
+        normalizedHeaders.push([name, value]);
+      }
+
+      return { headers: normalizedHeaders };
+    }
+    // END SAVE DRAFT HEADERS NORMALIZER
 
     const tools = buildTools();
 
@@ -7682,7 +7725,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * sending or opening a compose window. The destination folder is
              * resolved by Thunderbird from the identity's draft-folder pref.
              */
-            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments) {
+            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, headers) {
+              const normalizedHeaders = normalizeDraftHeaders(headers);
+              if (normalizedHeaders.error) return normalizedHeaders;
+
               try {
                 const msgComposeParams = Cc["@mozilla.org/messengercompose/composeparams;1"]
                   .createInstance(Ci.nsIMsgComposeParams);
@@ -7694,6 +7740,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 composeFields.cc = cc || "";
                 composeFields.bcc = bcc || "";
                 composeFields.subject = subject || "";
+                for (const [name, value] of normalizedHeaders.headers) {
+                  composeFields.setHeader(name, value);
+                }
 
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
@@ -9383,7 +9432,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "sendMail":
                   return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
                 case "saveDraft":
-                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments);
+                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.headers);
                 case "replyToMessage":
                   return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
                 case "forwardMessage":
