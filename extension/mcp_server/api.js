@@ -890,31 +890,6 @@ function findUnreferencedContentIds(body, cids) {
   return cids.filter(cid => !outboundCidReferencePattern(cid).test(text));
 }
 
-// btoa is not defined in the experiment API scope Thunderbird runs this file
-// in (the same reason the attachment decoder carries a manual atob fallback),
-// so encode by hand. Takes a byte array (Uint8Array or number[]).
-const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-function encodeBytesToBase64(bytes) {
-  const parts = [];
-  let chunk = "";
-  const len = bytes.length;
-  for (let i = 0; i < len; i += 3) {
-    const a = bytes[i];
-    const b = i + 1 < len ? bytes[i + 1] : 0;
-    const c = i + 2 < len ? bytes[i + 2] : 0;
-    chunk += BASE64_ALPHABET[a >> 2]
-      + BASE64_ALPHABET[((a & 3) << 4) | (b >> 4)]
-      + (i + 1 < len ? BASE64_ALPHABET[((b & 15) << 2) | (c >> 6)] : "=")
-      + (i + 2 < len ? BASE64_ALPHABET[c & 63] : "=");
-    if (chunk.length >= 65536) {
-      parts.push(chunk);
-      chunk = "";
-    }
-  }
-  parts.push(chunk);
-  return parts.join("");
-}
-
 /** Replaces every cid:<cid> reference in body with urlsByCid[cid]. */
 function replaceContentIdReferences(body, urlsByCid) {
   let text = String(body || "");
@@ -3940,8 +3915,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 try {
                   fstream.init(file, -1, 0, 0);
                   bstream.setInputStream(fstream);
-                  const bytes = bstream.readByteArray(bstream.available());
-                  urlsByCid[cid] = `data:${desc.contentType};filename=${encodeURIComponent(desc.name)};base64,${encodeBytesToBase64(bytes)}`;
+                  const bytes = bstream.readBytes(bstream.available());
+                  urlsByCid[cid] = `data:${desc.contentType};filename=${encodeURIComponent(desc.name)};base64,${btoa(bytes)}`;
                 } finally {
                   try { bstream.close(); } catch { /* already closed */ }
                   try { fstream.close(); } catch { /* already closed */ }

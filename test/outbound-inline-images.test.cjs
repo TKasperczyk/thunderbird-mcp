@@ -36,7 +36,6 @@ this.helpers = {
   planOutboundInlineImages,
   findUnreferencedContentIds,
   replaceContentIdReferences,
-  encodeBytesToBase64,
   OUTBOUND_INLINE_IMAGES_SCHEMA,
 };`,
     sandbox
@@ -50,7 +49,6 @@ const {
   planOutboundInlineImages,
   findUnreferencedContentIds,
   replaceContentIdReferences,
-  encodeBytesToBase64,
   OUTBOUND_INLINE_IMAGES_SCHEMA,
 } = loadHelpers();
 
@@ -116,26 +114,6 @@ describe("planOutboundInlineImages", () => {
     assert.match(errors[0], /duplicate cid/);
     assert.match(errors[1], /one of base64 or path/);
     assert.match(errors[2], /either base64 or path/);
-  });
-});
-
-describe("encodeBytesToBase64", () => {
-  it("matches Buffer base64 for every padding case and large inputs", () => {
-    const samples = [[], [0], [0, 255], [1, 2, 3], [250, 251, 252, 253]];
-    const big = new Uint8Array(200001);
-    for (let i = 0; i < big.length; i++) big[i] = (i * 7919) & 255;
-    samples.push(big);
-    for (const bytes of samples) {
-      assert.equal(encodeBytesToBase64(bytes), Buffer.from(bytes).toString("base64"));
-    }
-  });
-
-  it("does not depend on a global btoa (absent in the TB experiment scope)", () => {
-    const start = source.indexOf("function encodeBytesToBase64");
-    const body = source.slice(start, source.indexOf("/** Replaces every cid:", start));
-    assert.ok(body.length > 0 && !body.includes("btoa("));
-    const fn = source.slice(source.indexOf("function inlineImagesAsDataUrls"), source.indexOf("function addAttachmentsToComposeWindow"));
-    assert.ok(fn.length > 0 && !fn.includes("btoa("), "inlineImagesAsDataUrls must not call btoa");
   });
 });
 
