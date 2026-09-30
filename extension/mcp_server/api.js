@@ -2782,7 +2782,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Converts attachment descriptors to nsIMsgAttachment objects.
              * Shared by the new-compose path (composeFields.addAttachment),
              * the reply/forward observer path (addAttachmentsToComposeWindow),
-             * and sendMessageDirectly (headless send).
+             * and sendThroughCompose (windowless send).
              */
             function descsToMsgAttachments(attachDescs) {
               const result = [];
@@ -3153,195 +3153,118 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               });
             }
 
-            function markMessageDispositionState(msgHdr, dispositionState) {
-              try {
-                const folder = msgHdr?.folder;
-                if (!folder || dispositionState == null) return false;
-                if (typeof folder.addMessageDispositionState === "function") {
-                  folder.addMessageDispositionState(msgHdr, dispositionState);
-                  return true;
-                }
-                if (typeof folder.AddMessageDispositionState === "function") {
-                  folder.AddMessageDispositionState(msgHdr, dispositionState);
-                  return true;
-                }
-              } catch {}
-              return false;
-            }
-
             /**
-             * Sends a message directly via nsIMsgSend without opening a compose window.
-             * Used by composeMail, replyToMessage, forwardMessage when skipReview=true.
+             * Sends a message without opening a compose window, through the same
+             * nsIMsgCompose lifecycle the compose window uses. Used by composeMail,
+             * replyToMessage and forwardMessage when skipReview=true, and by
+             * saveDraft.
              *
-             * Handles two createAndSendMessage signatures:
-             * - TB 102-127 (C++): 18 args, includes aAttachments + aPreloadedAttachments
-             * - TB 128+   (JS):  16 args, attachments via composeFields only
-             * Attachments are always added to composeFields (works in both).
-             * We try the modern 16-arg call first; if TB throws
-             * NS_ERROR_XPC_NOT_ENOUGH_ARGS, fall back to the legacy 18-arg call.
+             * Going through nsIMsgCompose rather than a bare nsIMsgSend matters
+             * for accounts whose provider replaces the sender: Owl (Exchange)
+             * observes "mail-set-sender" from nsMsgCompose::SendMsgToServer. It
+             * also applies the identity's From, Organization, Reply-To and auto
+             * Cc/Bcc, and marks the original replied/forwarded on success.
+             *
+             * sendMsg dropped its nsIMsgWindow argument after TB 140. Passing
+             * null for both trailing arguments fits the old five-argument and
+             * the new four-argument signature.
              */
-            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType, deliverMode, bodyType) {
+            function sendThroughCompose(msgComposeParams, attachDescs, deliverMode) {
+              const identity = msgComposeParams.identity;
               if (!identity) {
                 return Promise.resolve({ error: "No identity available for direct send" });
               }
 
-              const mode = deliverMode ?? Ci.nsIMsgCompDeliverMode.Now;
-              const bodyMimeType = bodyType || "text/html";
               const SEND_TIMEOUT_MS = 120000; // 2 min safety timeout
 
               return new Promise((resolve) => {
+                let msgCompose = null;
+                let stateListener = null;
                 let settled = false;
                 const settle = (result) => {
-                  if (!settled) {
-                    settled = true;
-                    resolve(result);
+                  if (settled) return;
+                  settled = true;
+                  timer.cancel();
+                  if (msgCompose && stateListener) {
+                    try { msgCompose.UnregisterStateListener(stateListener); } catch {}
                   }
+                  resolve(result);
                 };
 
-                // Safety timeout -- if neither listener callback nor error fires
+                // Safety timeout -- if neither listener nor an error fires. The
+                // outcome is unknown at that point, so the message steers the
+                // caller away from a blind retry that could deliver it twice.
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                 timer.initWithCallback({
-                  notify() { settle({ error: "Send timed out after " + (SEND_TIMEOUT_MS / 1000) + "s" }); }
+                  notify() {
+                    const seconds = SEND_TIMEOUT_MS / 1000;
+                    settle({
+                      error: deliverMode === Ci.nsIMsgCompDeliverMode.SaveAsDraft
+                        ? `Saving the draft timed out after ${seconds}s. It may still have been saved, so check the Drafts folder before saving it again.`
+                        : `Sending timed out after ${seconds}s. The message may still have been delivered, so check the Sent folder or ask the user before sending it again.`,
+                    });
+                  }
                 }, SEND_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
 
                 try {
-                  const msgSend = Cc["@mozilla.org/messengercompose/send;1"]
-                    .createInstance(Ci.nsIMsgSend);
-
-                  // Populate sender fields from identity (normally done by compose window)
-                  if (identity.email) {
-                    const name = identity.fullName || "";
-                    composeFields.from = name
-                      ? `"${name}" <${identity.email}>`
-                      : identity.email;
-                  }
-                  if (identity.organization) {
-                    composeFields.organization = identity.organization;
-                  }
-
-                  // Add attachments to composeFields (works in all TB versions)
                   for (const att of descsToMsgAttachments(attachDescs)) {
-                    composeFields.addAttachment(att);
+                    msgComposeParams.composeFields.addAttachment(att);
                   }
 
-                  // Extract body -- createAndSendMessage takes it as a separate param
-                  const body = composeFields.body || "";
+                  const accountKey = MailServices.accounts.accounts.find(account =>
+                    account.identities.some(id => id.key === identity.key)
+                  )?.key || "";
 
-                  // Resolve account key from identity
-                  let accountKey = "";
-                  try {
-                    for (const account of MailServices.accounts.accounts) {
-                      for (let i = 0; i < account.identities.length; i++) {
-                        if (account.identities[i].key === identity.key) {
-                          accountKey = account.key;
-                          break;
-                        }
-                      }
-                      if (accountKey) break;
-                    }
-                  } catch {}
+                  msgCompose = Cc["@mozilla.org/messengercompose/compose;1"]
+                    .createInstance(Ci.nsIMsgCompose);
+                  msgCompose.initialize(msgComposeParams, null, null);
 
-                  // SaveAsDraft mode routes through _mimeDoFcc() which does not
-                  // call onStopSending. Completion is signaled via the copy
-                  // service's onStopCopy after the message lands in the Drafts
-                  // folder, so the listener also QIs nsIMsgCopyServiceListener.
-                  const listener = {
-                    QueryInterface: ChromeUtils.generateQI(["nsIMsgSendListener", "nsIMsgCopyServiceListener"]),
-                    // nsIMsgSendListener -- fires for SMTP send paths
+                  // A send is done once the message is delivered. The Sent copy
+                  // runs afterwards and can stall on a recovery prompt or fail,
+                  // and reporting that as a failed send would invite a retry
+                  // that delivers the message twice.
+                  msgCompose.addMsgSendListener({
+                    QueryInterface: ChromeUtils.generateQI(["nsIMsgSendListener"]),
                     onStartSending() {},
-                    onProgress() {},
                     onSendProgress() {},
                     onStatus() {},
+                    onGetDraftFolderURI() {},
+                    onSendNotPerformed() {},
                     onStopSending(msgID, status) {
-                      timer.cancel();
-                      if (Components.isSuccessCode(status)) {
-                        settle({ success: true, message: "Message sent" });
-                      } else {
-                        settle({ error: `Send failed (status: 0x${status.toString(16)})` });
+                      if (deliverMode === Ci.nsIMsgCompDeliverMode.Now && Components.isSuccessCode(status)) {
+                        settle({ success: true });
                       }
                     },
-                    onGetDraftFolderURI() {},
-                    onSendNotPerformed(msgID, status) {
-                      timer.cancel();
-                      settle({ error: "Send was not performed" });
-                    },
                     onTransportSecurityError(msgID, status, secInfo, location) {
-                      timer.cancel();
                       settle({ error: `Transport security error${location ? ": " + location : ""}` });
                     },
-                    // nsIMsgCopyServiceListener -- fires for SaveAsDraft / Sent-folder copy
-                    onStartCopy() {},
-                    setMessageKey() {},
-                    onStopCopy(status) {
-                      timer.cancel();
-                      if (Components.isSuccessCode(status)) {
-                        settle({ success: true, message: "Saved" });
+                  });
+
+                  // ComposeProcessDone is the final notification for every
+                  // deliver mode, success or failure: after the Sent/Drafts copy
+                  // when there is one, otherwise after sending. It settles
+                  // failures and draft saves.
+                  stateListener = {
+                    QueryInterface: ChromeUtils.generateQI(["nsIMsgComposeStateListener"]),
+                    NotifyComposeFieldsReady() {},
+                    NotifyComposeBodyReady() {},
+                    SaveInFolderDone() {},
+                    ComposeProcessDone(result) {
+                      if (Components.isSuccessCode(result)) {
+                        settle({ success: true });
                       } else {
-                        settle({ error: `Save failed (status: 0x${status.toString(16)})` });
+                        const action = deliverMode === Ci.nsIMsgCompDeliverMode.SaveAsDraft ? "Save" : "Send";
+                        settle({ error: `${action} failed (status: 0x${(result >>> 0).toString(16)})` });
                       }
                     },
                   };
+                  msgCompose.RegisterStateListener(stateListener);
 
-                  // Common args shared by both signatures (positions 1-10)
-                  const commonArgs = [
-                    null,                           // editor
-                    identity,                       // identity
-                    accountKey,                     // account key
-                    composeFields,                  // fields
-                    false,                          // isDigest
-                    false,                          // dontDeliver
-                    mode,                           // deliver mode
-                    null,                           // msgToReplace
-                    bodyMimeType,                   // body type
-                    body,                           // body
-                  ];
-
-                  // Tail args shared by both (parentWindow..compType)
-                  const tailArgs = [
-                    null,                           // parent window
-                    null,                           // progress
-                    listener,                       // listener
-                    "",                             // password
-                    originalMsgURI || "",           // original msg URI
-                    compType,                       // compose type
-                  ];
-
-                  // Try modern 16-arg signature first (TB 128+).
-                  // On TB 102-127, XPCOM throws NS_ERROR_XPC_NOT_ENOUGH_ARGS
-                  // (0x80570001), so we fall back to legacy 18-arg with null
-                  // attachment params (attachments already on composeFields).
-                  // Modern TB may return a Promise -- catch async rejections.
-                  let sendResult;
-                  try {
-                    sendResult = msgSend.createAndSendMessage(...commonArgs, ...tailArgs);
-                  } catch (e) {
-                    const isArgError = (e && e.result === 0x80570001) ||
-                      String(e).includes("Not enough arguments");
-                    if (isArgError) {
-                      sendResult = msgSend.createAndSendMessage(...commonArgs, null, null, ...tailArgs);
-                    } else {
-                      throw e;
-                    }
-                  }
-                  // Modern TB (128+) returns a Promise from createAndSendMessage.
-                  // Handle both fulfillment and rejection -- belt-and-suspenders
-                  // with the listener (settle is idempotent). For SaveAsDraft on
-                  // older TB without the copy listener, the Promise fulfillment
-                  // can be the only completion signal we get.
-                  if (sendResult && typeof sendResult.then === "function") {
-                    sendResult.then(
-                      () => {
-                        timer.cancel();
-                        settle({ success: true });
-                      },
-                      e => {
-                        timer.cancel();
-                        settle({ error: e.toString() });
-                      }
-                    );
+                  const sendPromise = msgCompose.sendMsg(deliverMode, identity, accountKey, null, null);
+                  if (sendPromise && typeof sendPromise.then === "function") {
+                    sendPromise.catch(e => settle({ error: e.toString() }));
                   }
                 } catch (e) {
-                  timer.cancel();
                   settle({ error: e.toString() });
                 }
               });
@@ -6518,7 +6441,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
                 if (skipReview) {
-                  return sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, null, Ci.nsIMsgCompType.New, Ci.nsIMsgCompDeliverMode.Now, useHtml ? "text/html" : "text/plain").then(result => {
+                  return sendThroughCompose(msgComposeParams, fileDescs, Ci.nsIMsgCompDeliverMode.Now).then(result => {
                     if (result.success) {
                       let msg = "Message sent";
                       if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
@@ -6535,7 +6458,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 // sendMail call -- or the user simply clicking an older compose
                 // window while this one opens -- would steal or drop the
                 // attachments. composeFields binds them to this exact message,
-                // exactly like the direct-send path (sendMessageDirectly).
+                // exactly like the direct-send path (sendThroughCompose).
                 for (const att of descsToMsgAttachments(fileDescs)) {
                   composeFields.addAttachment(att);
                 }
@@ -6589,15 +6512,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const { descs: fileDescs, failed: failedPaths } = filePathsToAttachDescs(attachments);
 
-                return sendMessageDirectly(
-                  composeFields,
-                  msgComposeParams.identity,
-                  fileDescs,
-                  null,
-                  Ci.nsIMsgCompType.New,
-                  Ci.nsIMsgCompDeliverMode.SaveAsDraft,
-                  useHtml ? "text/html" : "text/plain"
-                ).then(result => {
+                return sendThroughCompose(msgComposeParams, fileDescs, Ci.nsIMsgCompDeliverMode.SaveAsDraft).then(result => {
                   if (result.success) {
                     let msg = "Draft saved";
                     if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
@@ -6617,8 +6532,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Review path uses Thunderbird's native reply compose flow so it can
              * build the quoted original, place the identity signature according
              * to user preferences, and set threading headers/disposition flags.
-             * skipReview still uses direct send, so it keeps a manual quoted body
-             * and manually marks the original as replied after a successful send.
+             * skipReview sends through a windowless nsIMsgCompose, so it keeps a
+             * manual quoted body. Thunderbird marks the original as replied.
              */
 	            function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview) {
 	              return new Promise((resolve) => {
@@ -6696,17 +6611,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
 	                        composeFields.bcc = bcc || "";
 
-	                        const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-	                        composeFields.subject = /^re:/i.test(origSubject) ? origSubject : `Re: ${origSubject}`;
+	                        // nsIMsgCompose.initialize sets the "Re:" subject from msgHdr.
 	                        composeFields.references = `<${messageId}>`;
 	                        composeFields.setHeader("In-Reply-To", `<${messageId}>`);
 
 	                        const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
 	                        const author = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
 
-	                        // Direct send goes through nsIMsgSend, not nsIMsgCompose, so
-	                        // it still uses a hand-built quoted body and cannot place the
-	                        // identity signature according to reply preferences. The shape
+	                        // Quoting and signature placement run in the compose window's
+	                        // editor, so direct send uses a hand-built quoted body. The shape
 	                        // matches the resolved compose mode -- shipping an HTML envelope
 	                        // for a plain-format send would otherwise render as literal
 	                        // markup in the recipient's mail client.
@@ -6724,14 +6637,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                          composeFields.body = `${body || ""}\n\nOn ${dateStr}, ${author} wrote:\n${quotedLines}`;
 	                        }
 
-	                        sendMessageDirectly(composeFields, msgComposeParams.identity, fileDescs, msgURI, compType, Ci.nsIMsgCompDeliverMode.Now, replyUseHtml ? "text/html" : "text/plain").then(result => {
+	                        sendThroughCompose(msgComposeParams, fileDescs, Ci.nsIMsgCompDeliverMode.Now).then(result => {
 	                          if (result.success) {
-	                            let repliedDisposition = null;
-	                            try {
-	                              repliedDisposition = Ci.nsIMsgFolder.nsMsgDispositionState_Replied;
-	                            } catch {}
-	                            markMessageDispositionState(msgHdr, repliedDisposition);
-
 	                            let msg = "Reply sent";
 	                            if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
 	                            result.message = msg;
@@ -6794,9 +6701,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * intro body is injected via NotifyComposeBodyReady, mirroring how
              * replyToMessage handles intro injection.
              *
-             * skipReview still uses direct send, so it keeps a manual forward
-             * block + auto-attaches originals from MsgHdrToMimeMessage + manually
-             * marks the original as forwarded after a successful send.
+             * skipReview sends through a windowless nsIMsgCompose, so it keeps a
+             * manual forward block and attaches originals from MsgHdrToMimeMessage.
+             * Thunderbird sets the subject, References and $Forwarded disposition.
              */
             function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
               return new Promise((resolve) => {
@@ -6858,15 +6765,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         composeFields.cc = cc || "";
                         composeFields.bcc = bcc || "";
 
+                        // nsIMsgCompose.initialize sets the "Fwd:" subject from msgHdr.
                         const origSubject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
-                        composeFields.subject = /^fwd:/i.test(origSubject) ? origSubject : `Fwd: ${origSubject}`;
 
                         const dateStr = msgHdr.date ? new Date(msgHdr.date / 1000).toLocaleString() : "";
                         const fwdAuthor = msgHdr.mime2DecodedAuthor || msgHdr.author || "";
                         const fwdRecipients = msgHdr.mime2DecodedRecipients || msgHdr.recipients || "";
 
-                        // Direct send goes through nsIMsgSend, not nsIMsgCompose,
-                        // so we hand-build the forward block. The shape matches the
+                        // Forward body population runs in the compose window, so
+                        // direct send hand-builds the forward block. The shape matches the
                         // resolved compose mode -- shipping an HTML envelope for a
                         // plain-format send would render as literal markup in the
                         // recipient's mail client.
@@ -6908,14 +6815,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         }
                         const allDescs = [...origDescs, ...fileDescs];
 
-                        sendMessageDirectly(composeFields, msgComposeParams.identity, allDescs, msgURI, compType, Ci.nsIMsgCompDeliverMode.Now, fwdUseHtml ? "text/html" : "text/plain").then(result => {
+                        sendThroughCompose(msgComposeParams, allDescs, Ci.nsIMsgCompDeliverMode.Now).then(result => {
                           if (result.success) {
-                            let forwardedDisposition = null;
-                            try {
-                              forwardedDisposition = Ci.nsIMsgFolder.nsMsgDispositionState_Forwarded;
-                            } catch {}
-                            markMessageDispositionState(msgHdr, forwardedDisposition);
-
                             let msg = `Forward sent with ${allDescs.length} attachment(s)`;
                             if (failedPaths.length > 0) msg += ` (failed to attach: ${failedPaths.join(", ")})`;
                             result.message = msg;
