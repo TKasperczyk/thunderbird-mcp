@@ -3191,10 +3191,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   resolve(result);
                 };
 
-                // Safety timeout -- if neither the state listener nor an error fires
+                // Safety timeout -- if neither listener nor an error fires. The
+                // outcome is unknown at that point, so the message steers the
+                // caller away from a blind retry that could deliver it twice.
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                 timer.initWithCallback({
-                  notify() { settle({ error: "Send timed out after " + (SEND_TIMEOUT_MS / 1000) + "s" }); }
+                  notify() {
+                    const seconds = SEND_TIMEOUT_MS / 1000;
+                    settle({
+                      error: deliverMode === Ci.nsIMsgCompDeliverMode.SaveAsDraft
+                        ? `Saving the draft timed out after ${seconds}s. It may still have been saved, so check the Drafts folder before saving it again.`
+                        : `Sending timed out after ${seconds}s. The message may still have been delivered, so check the Sent folder or ask the user before sending it again.`,
+                    });
+                  }
                 }, SEND_TIMEOUT_MS, Ci.nsITimer.TYPE_ONE_SHOT);
 
                 try {
