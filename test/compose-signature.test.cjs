@@ -205,6 +205,16 @@ describe("Direct compose identity signatures", () => {
     }
   });
 
+  it("useSignature takes precedence and accepts 0 as an explicit opt-out", async () => {
+    const { api, calls } = loadComposeTools();
+    const result = await api.dispatchTool("sendMail", {
+      to: "to@example.test", subject: "Subject", body: "Hello", isHtml: false,
+      skipReview: true, includeSignature: true, useSignature: 0,
+    });
+    assert.equal(result.success, true);
+    assert.equal(calls.sends[0].fields.body, "Hello");
+  });
+
   it("leaves signature insertion to Thunderbird on the review path", async () => {
     const { api, calls } = loadComposeTools();
     api.buildBodyWithSignature = () => assert.fail("review must not append a second signature");
@@ -222,6 +232,36 @@ describe("Direct compose identity signatures", () => {
     const result = await api.dispatchTool("sendMail", { to: "to@example.test", subject: "Subject", body: "Hello", skipReview: true });
     assert.match(result.error, /blocks skipReview/);
     assert.equal(calls.sends.length, 0);
+  });
+
+  it("reads the signature through the identity-facing tool without exposing its file path", () => {
+    const { api } = loadSignatureHelpers();
+    const identity = {
+      key: "id1",
+      email: "rafaelfelixremy@gmail.com",
+      fullName: "Rafael Remy",
+      htmlSigText: "Rafael Remy",
+      htmlSigFormat: false,
+    };
+    api.setComposeIdentity = (params, identityId) => {
+      assert.equal(identityId, "id1");
+      params.identity = identity;
+      return "";
+    };
+    api.getAccessibleAccounts = () => [{ identities: [identity], defaultIdentity: identity }];
+
+    assert.deepEqual(JSON.parse(JSON.stringify(api.getSignature("id1"))), {
+      identity: {
+        id: "id1",
+        email: "rafaelfelixremy@gmail.com",
+        name: "Rafael Remy",
+        isDefault: true,
+      },
+      configured: true,
+      source: "inline",
+      format: "text",
+      content: "Rafael Remy",
+    });
   });
 });
 
