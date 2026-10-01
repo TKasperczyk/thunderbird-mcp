@@ -2,11 +2,16 @@ const { it } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
+const previousNoAutostart = process.env.THUNDERBIRD_MCP_NO_AUTOSTART;
+process.env.THUNDERBIRD_MCP_NO_AUTOSTART = '1';
+const bridge = require('../mcp-bridge.cjs');
+if (previousNoAutostart === undefined) delete process.env.THUNDERBIRD_MCP_NO_AUTOSTART;
+else process.env.THUNDERBIRD_MCP_NO_AUTOSTART = previousNoAutostart;
 const {
   describeBase64Attachments,
   inlineOnlyAttachmentsEnabled,
   validateBase64Attachments,
-} = require('../mcp-bridge.cjs');
+} = bridge;
 
 it('requires explicit opt-in for remote attachment mode', () => {
   assert.equal(inlineOnlyAttachmentsEnabled({}), false);
