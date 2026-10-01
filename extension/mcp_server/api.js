@@ -8842,14 +8842,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Numeric 0/1 are accepted as a convenient MCP-client alias for
              * false/true after schema validation.
              */
-            function resolveSignaturePreference(useSignature, includeSignature, defaultValue = true) {
-              const value = useSignature !== undefined ? useSignature : includeSignature;
-              if (value === undefined || value === null) return defaultValue;
-              if (value === true || value === 1 || value === "true" || value === "1") return true;
-              if (value === false || value === 0 || value === "false" || value === "0") return false;
-              return defaultValue;
-            }
-
             function composeMail(to, subject, body, cc, bcc, isHtml, from, attachments, skipReview, includeSignature = true, useSignature) {
               try {
                 if (skipReview && isSkipReviewBlocked()) {
@@ -8956,6 +8948,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             // BEGIN DRAFT HELPERS
+            function resolveSignaturePreference(useSignature, includeSignature, defaultValue = true) {
+              const value = useSignature !== undefined ? useSignature : includeSignature;
+              if (value === undefined || value === null) return defaultValue;
+              if (value === true || value === 1 || value === "true" || value === "1") return true;
+              if (value === false || value === 0 || value === "false" || value === "0") return false;
+              return defaultValue;
+            }
+
             function getIdentityDraftFolderURI(identity) {
               // ESR 128 uses draftFolder; newer Thunderbird uses draftsFolderURI.
               for (const prop of ["draftsFolderURI", "draftFolder"]) {
