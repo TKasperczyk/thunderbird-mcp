@@ -249,10 +249,10 @@
     Thunderbird may still decrypt S/MIME messages locally. Enabling encrypted message access exposes
     decrypted content to MCP clients and their AI providers, and allows direct replies and forwards
     when <code>skipReview</code> is permitted.
-    Search, recent-message, and display tools still return cached headers and previews where available;
-    cached subjects may already contain decrypted protected headers. This setting does not exclude
-    encrypted mail from body-search matches. Thunderbird provides no reliable encryption marker for
-    all message headers.
+    While it is off, search and recent-message tools show the outer subject without a preview for
+    messages Thunderbird has recorded as OpenPGP-encrypted, searches do not match them, and
+    displayMessage refuses encrypted messages. Thunderbird provides no reliable encryption marker for
+    all message headers, so some cached subjects may still contain decrypted protected headers.
   </p>
   <ul class="account-list">
     <li>
