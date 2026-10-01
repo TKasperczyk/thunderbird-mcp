@@ -123,6 +123,7 @@ function loadGetMessage({ stream, log, findMessageError }) {
     PREF_ALLOW_ENCRYPTED_MESSAGES: "allowEncryptedMessages",
     isPrivacyOptInEnabled: () => false,
     isEncryptedMimeMessage: () => false,
+    withSignedContent: (_fetch, _hdr, _allowEncrypted, callback) => callback,
     ChromeUtils: {
       importESModule: () => ({
         MsgHdrToMimeMessage: (hdr, _listener, callback) => callback(hdr, { parts: [] }),

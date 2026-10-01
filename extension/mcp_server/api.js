@@ -7674,8 +7674,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 ? "encrypted" : "clear";
             }
 
-            function isEncryptedMimeMessage(part) {
-              if (!part) return false;
+            function getMimePartContentTypes(part) {
               // Gloda's contentType omits parameters; prefer the full original header
               // for that type, while still inspecting a different structural type.
               const contentTypes = [].concat(part.headers?.["content-type"] || []);
@@ -7683,9 +7682,57 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   parseRawMimeHeaderValue(part.contentType).value)) {
                 contentTypes.push(part.contentType || "");
               }
+              return contentTypes;
+            }
+
+            const DETACHED_SIGNATURE_PROTOCOLS = ["application/pgp-signature", "application/pkcs7-signature", "application/x-pkcs7-signature"];
+
+            // RFC 1847 multipart/signed keeps its content in the clear next to a
+            // detached signature. Thunderbird can still route the container through
+            // its OpenPGP handler, whose libmime class marks it as encrypted, so
+            // Gloda's isEncrypted flag alone does not mean ciphertext here. The
+            // children are classified on their own.
+            function isFlaggedSignedContainer(part) {
+              if (!part.isEncrypted) return false;
+              const contentTypes = getMimePartContentTypes(part);
+              return contentTypes.every(value => {
+                const parsed = parseRawMimeHeaderValue(value);
+                return parsed.value === "multipart/signed" &&
+                  DETACHED_SIGNATURE_PROTOCOLS.includes(String(parsed.params.protocol || "").toLowerCase()) &&
+                  splitRawMimeHeaderParameters(value).slice(1).filter(param => /^protocol\s*=/i.test(param)).length === 1;
+              });
+            }
+
+            function hasFlaggedSignedContainer(part) {
+              if (!part) return false;
+              if (isFlaggedSignedContainer(part)) return true;
+              return Array.isArray(part.parts) && part.parts.some(hasFlaggedSignedContainer);
+            }
+
+            // Without examineEncryptedParts Gloda empties every container it flags
+            // as encrypted, which hides the cleartext of a flagged multipart/signed.
+            // Fetch such a message again in full; callers still classify the tree
+            // they receive, so encrypted content inside it stays withheld.
+            function withSignedContent(MsgHdrToMimeMessage, msgHdr, allowEncrypted, callback) {
+              return (aMsgHdr, aMimeMsg) => {
+                if (!allowEncrypted && aMimeMsg && !isEncryptedMimeMessage(aMimeMsg) && hasFlaggedSignedContainer(aMimeMsg)) {
+                  try {
+                    MsgHdrToMimeMessage(msgHdr, null, callback, true, { examineEncryptedParts: true });
+                    return;
+                  } catch (e) {
+                    console.error("thunderbird-mcp: signed content fetch failed:", e);
+                  }
+                }
+                callback(aMsgHdr, aMimeMsg);
+              };
+            }
+
+            function isEncryptedMimeMessage(part) {
+              if (!part) return false;
+              const contentTypes = getMimePartContentTypes(part);
               const states = contentTypes.map(classifyMimeContentType);
               if (states.some(state => state === "encrypted" || state === "unknown")) return true;
-              if (part.isEncrypted) return true;
+              if (part.isEncrypted && !isFlaggedSignedContainer(part)) return true;
               const isHtml = contentTypes.some(value => parseRawMimeHeaderValue(value).value === "text/html");
               if (hasInlinePgpArmor(part.body, isHtml ? part.body : null)) return true;
               return Array.isArray(part.parts) && part.parts.some(isEncryptedMimeMessage);
@@ -7857,7 +7904,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  );
 
                   const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
-                  MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
+                  MsgHdrToMimeMessage(msgHdr, null, withSignedContent(MsgHdrToMimeMessage, msgHdr, allowEncrypted, (aMsgHdr, aMimeMsg) => {
                     if (!aMimeMsg) {
                       resolve({ error: "Could not parse message" });
                       return;
@@ -8658,7 +8705,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                       resolveBaseResponse();
                     })();
-                  }, true, { examineEncryptedParts: allowEncrypted });
+                  }), true, { examineEncryptedParts: allowEncrypted });
 
 	                } catch (e) {
 	                  console.error("thunderbird-mcp: getMessage failed:", e);
@@ -9051,7 +9098,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                      "resource:///modules/gloda/MimeMessage.sys.mjs"
                       );
 
-	                    MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
+	                    MsgHdrToMimeMessage(msgHdr, null, withSignedContent(MsgHdrToMimeMessage, msgHdr, allowEncrypted, (aMsgHdr, aMimeMsg) => {
 	                      try {
 	                        const originalBody = extractPlainTextBody(aMimeMsg);
 	                        if (!allowEncrypted && (!aMimeMsg || isEncryptedMimeMessage(aMimeMsg) || hasInlinePgpBodyArmor(aMimeMsg, originalBody))) {
@@ -9129,7 +9176,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                      } catch (e) {
 	                        resolve({ error: e.toString() });
 	                      }
-	                    }, true, { examineEncryptedParts: allowEncrypted });
+	                    }), true, { examineEncryptedParts: allowEncrypted });
 	                    return;
 	                  }
 
@@ -9241,7 +9288,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       "resource:///modules/gloda/MimeMessage.sys.mjs"
                     );
 
-                    MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
+                    MsgHdrToMimeMessage(msgHdr, null, withSignedContent(MsgHdrToMimeMessage, msgHdr, allowEncrypted, (aMsgHdr, aMimeMsg) => {
                       try {
                         const originalBody = extractPlainTextBody(aMimeMsg);
                         if (!allowEncrypted && (!aMimeMsg || isEncryptedMimeMessage(aMimeMsg) || hasInlinePgpBodyArmor(aMimeMsg, originalBody))) {
@@ -9325,7 +9372,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       } catch (e) {
                         resolve({ error: e.toString() });
                       }
-                    }, true, { examineEncryptedParts: allowEncrypted });
+                    }), true, { examineEncryptedParts: allowEncrypted });
                     return;
                   }
 

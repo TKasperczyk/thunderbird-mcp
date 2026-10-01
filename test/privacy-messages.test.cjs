@@ -15,7 +15,7 @@ function snippet(name) {
   return source.slice(start, end);
 }
 
-function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "raw MIME", DOMParser: Parser = null, streamError, mimeError } = {}) {
+function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, fullMime = mime, allowed = false, unreadable = false, raw = "raw MIME", DOMParser: Parser = null, streamError, mimeError } = {}) {
   const calls = { options: [], streams: 0, sends: [], reviews: 0, logs: [] };
   const folder = {
     server: {},
@@ -41,7 +41,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
       MsgHdrToMimeMessage(msgHdr, _listener, callback, _download, options) {
         calls.options.push(options);
         if (mimeError) throw mimeError;
-        callback(msgHdr, mime);
+        callback(msgHdr, options?.examineEncryptedParts ? fullMime : mime);
       },
     }) },
     findMessage: () => ({ msgHdr: hdr, folder }),
@@ -146,6 +146,112 @@ describe("Encrypted message privacy", () => {
     const result = await api.getMessage("message-1", "folder", false, "markdown");
     assert.equal(result.body, "signed text");
     assert.equal(calls.options[0].examineEncryptedParts, false);
+  });
+
+  // Thunderbird 153 routes multipart/signed through its OpenPGP handler, so
+  // Gloda flags the container as encrypted and, without examineEncryptedParts,
+  // hands it back empty. Later versions leave it unflagged with both parts.
+  const signedHeader = protocol => ({ "content-type": [`multipart/signed; micalg=pgp-sha256; protocol="${protocol}"; boundary="b"`] });
+  const signedContainer = (parts, { protocol = "application/pgp-signature", isEncrypted = true } = {}) => ({
+    contentType: "message/rfc822", headers: signedHeader(protocol),
+    parts: [{ contentType: "multipart/signed", headers: signedHeader(protocol), isEncrypted, parts }],
+  });
+  const signedContent = { contentType: "multipart/mixed", parts: [{ contentType: "text/plain", body: "signed text" }] };
+  const signaturePart = { contentType: "application/pgp-signature", body: "-----BEGIN PGP SIGNATURE-----\n\nwsB5\n-----END PGP SIGNATURE-----" };
+
+  for (const protocol of ["application/pgp-signature", "application/pkcs7-signature", "application/x-pkcs7-signature"]) {
+    it(`reads clear-signed mail that Gloda flags as encrypted without opting in, protocol=${protocol}`, async () => {
+      const { api, calls } = loadMessageTools({
+        mime: signedContainer([], { protocol }),
+        fullMime: signedContainer([signedContent], { protocol }),
+      });
+      const result = await api.getMessage("message-1", "folder", false, "markdown");
+      assert.equal(result.body, "signed text");
+      assert.equal(result.subject, "protected subject");
+      assert.notEqual(result.encryptedContentWithheld, true);
+      assert.deepEqual(calls.options.map(options => options.examineEncryptedParts), [false, true]);
+    });
+  }
+
+  it("reads clear-signed mail that Gloda leaves unflagged in a single pass", async () => {
+    const { api, calls } = loadMessageTools({ mime: signedContainer([signedContent, signaturePart], { isEncrypted: false }) });
+    const result = await api.getMessage("message-1", "folder", false, "markdown");
+    assert.equal(result.body, "signed text");
+    assert.notEqual(result.encryptedContentWithheld, true);
+    assert.deepEqual(calls.options.map(options => options.examineEncryptedParts), [false]);
+  });
+
+  it("does not fetch flagged clear-signed mail twice once the opt-in is on", async () => {
+    const full = signedContainer([signedContent]);
+    const { api, calls } = loadMessageTools({ allowed: true, mime: full });
+    assert.equal((await api.getMessage("message-1", "folder", false, "markdown")).body, "signed text");
+    assert.deepEqual(calls.options.map(options => options.examineEncryptedParts), [true]);
+  });
+
+  it("returns the raw source of flagged clear-signed mail without opting in", async () => {
+    const raw = [
+      'Content-Type: multipart/signed; micalg=pgp-sha256; protocol="application/pgp-signature"; boundary="b"',
+      "", "--b", "Content-Type: text/plain", "", "signed text",
+      "--b", "Content-Type: application/pgp-signature", "", signaturePart.body, "--b--", "",
+    ].join("\r\n");
+    const { api } = loadMessageTools({ mime: signedContainer([]), fullMime: signedContainer([signedContent]), raw });
+    assert.equal((await api.getMessage("message-1", "folder", false, "markdown", true)).rawSource, raw);
+  });
+
+  it("replies to and forwards flagged clear-signed mail directly without opting in", async () => {
+    const { api, calls } = loadMessageTools({ mime: signedContainer([]), fullMime: signedContainer([signedContent]) });
+    const results = [
+      await api.replyToMessage("message-1", "folder", "intro", false, false, undefined, undefined, undefined, undefined, undefined, true),
+      await api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true),
+    ];
+    for (const result of results) assert.equal(result.success, true);
+    assert.equal(calls.sends.length, 2);
+    for (const sent of calls.sends) assert.match(sent.body, /signed text/);
+  });
+
+  const withheldSignedTrees = [
+    { label: "an encrypted part inside the signature", full: signedContainer([{ contentType: "multipart/encrypted", isEncrypted: true, parts: [{ contentType: "text/plain", body: "decrypted body" }] }]) },
+    { label: "a flagged part inside the signature", full: signedContainer([{ contentType: "multipart/mixed", isEncrypted: true, parts: [{ contentType: "text/plain", body: "decrypted body" }] }]) },
+    { label: "inline OpenPGP inside the signature", full: signedContainer([{ contentType: "text/plain", body: "-----BEGIN PGP MESSAGE-----\ndecrypted body" }]) },
+    { label: "an unknown signature protocol", full: signedContainer([{ contentType: "text/plain", body: "decrypted body" }], { protocol: "application/x-custom" }) },
+    { label: "a duplicated protocol parameter", full: { contentType: "message/rfc822", parts: [{
+      contentType: "multipart/signed", isEncrypted: true, parts: [{ contentType: "text/plain", body: "decrypted body" }],
+      headers: { "content-type": ['multipart/signed; protocol="application/x-custom"; protocol="application/pgp-signature"; boundary="b"'] },
+    }] } },
+    { label: "a conflicting content type", full: { contentType: "message/rfc822", parts: [{
+      contentType: "multipart/mixed", isEncrypted: true, parts: [{ contentType: "text/plain", body: "decrypted body" }],
+      headers: signedHeader("application/pgp-signature"),
+    }] } },
+  ];
+  for (const { label, full } of withheldSignedTrees) {
+    it(`still withholds flagged multipart/signed with ${label}`, async () => {
+      const stripped = structuredClone(full);
+      stripped.parts[0].parts = [];
+      for (const mime of [stripped, full]) {
+        const { api, calls } = loadMessageTools({ mime, fullMime: full });
+        const result = await api.getMessage("message-1", "folder", true, "html", false, true);
+        assert.equal(result.encryptedContentWithheld, true);
+        assert.equal(calls.streams, 0);
+        assert.doesNotMatch(JSON.stringify(result), /decrypted body|protected subject/);
+        const reply = await api.replyToMessage("message-1", "folder", "intro", false, false, undefined, undefined, undefined, undefined, undefined, true);
+        assert.match(reply.error, /encrypted messages is blocked/);
+        assert.equal(calls.sends.length, 0);
+      }
+    });
+  }
+
+  it("falls back to the first tree when the second fetch of signed content throws", async () => {
+    const { api, calls } = loadMessageTools({ mime: signedContainer([]), fullMime: signedContainer([signedContent]) });
+    const { MsgHdrToMimeMessage } = api.ChromeUtils.importESModule();
+    api.ChromeUtils.importESModule = () => ({
+      MsgHdrToMimeMessage(msgHdr, listener, callback, download, options) {
+        if (options.examineEncryptedParts) throw new Error("stream failed");
+        MsgHdrToMimeMessage(msgHdr, listener, callback, download, options);
+      },
+    });
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.notEqual(result.body, "signed text");
+    assert.equal(calls.logs.some(args => /signed content fetch failed/.test(args[0])), true);
   });
 
   for (const contentType of ["application/pkcs7-mime", "application/x-pkcs7-mime"]) {

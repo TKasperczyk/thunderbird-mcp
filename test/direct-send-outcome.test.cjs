@@ -77,6 +77,7 @@ function loadSend(options = {}) {
     isPrivacyOptInEnabled: () => false,
     extractPlainTextBody: () => "Original body",
     isEncryptedMimeMessage: () => false,
+    withSignedContent: (_fetch, _hdr, _allowEncrypted, callback) => callback,
     hasInlinePgpBodyArmor: () => false,
   };
   const dispositionStart = source.indexOf("function markMessageDispositionState(");
