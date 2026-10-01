@@ -17,9 +17,8 @@ const assert = require('node:assert/strict');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const { spawn } = require('child_process');
-const { isSensitiveFilePath } = require('./helpers/bridge.cjs');
+const { makeAllowedTempDir } = require('./helpers/fixture-dir.cjs');
 
 const BRIDGE_PATH = path.resolve(__dirname, '..', 'mcp-bridge.cjs');
 let CONN_DIR;
@@ -27,10 +26,9 @@ let CONN_FILE;
 let BRIDGE_ENV;
 
 beforeEach(() => {
-  // Windows temp normally lives in denied AppData; outgoing attachment
-  // fixtures need a benign path. Every directory is unique and removed below.
-  const base = isSensitiveFilePath(os.tmpdir()) ? path.resolve(__dirname, '..') : os.tmpdir();
-  CONN_DIR = fs.mkdtempSync(path.join(base, 'tb-mcp-auth-'));
+  // Outgoing attachment fixtures need a path the policy allows. Every
+  // directory is unique and removed below.
+  CONN_DIR = makeAllowedTempDir('tb-mcp-auth-');
   CONN_FILE = path.join(CONN_DIR, 'connection.json');
   // A missing/invalid pin must never fall through to a running instance.
   BRIDGE_ENV = { ...process.env, THUNDERBIRD_MCP_CONNECTION_FILE: CONN_FILE };
