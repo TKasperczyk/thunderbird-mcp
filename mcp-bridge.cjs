@@ -32,6 +32,8 @@ const FLATPAK_APP_IDS = new Set([
   'eu.betterbird.Betterbird',
 ]);
 const AUTH_TOKEN_PATTERN = /^[0-9a-f]{64}$/;
+// Executable basenames a discovered connection file's owning process may have.
+const THUNDERBIRD_EXECUTABLE_NAMES = new Set(['thunderbird', 'thunderbird-bin', 'betterbird', 'betterbird-bin']);
 
 // MCP protocol versions the bridge knows how to speak. Per lifecycle spec the
 // server MUST respond with the requested version if it supports it, otherwise
@@ -91,6 +93,12 @@ function normalizeFsError(err) {
     return 'permission denied';
   }
   return err.message || String(err);
+}
+
+// The native resolver also expands Windows short (8.3) names to long names.
+function realpathNative(fsImpl, filePath) {
+  const realpath = fsImpl.realpathSync;
+  return (typeof realpath.native === 'function' ? realpath.native : realpath)(filePath);
 }
 
 function getCurrentUid(processImpl = process) {
@@ -448,29 +456,141 @@ function buildCandidateGroups(options = {}) {
     return groups;
   }
 
+  // Discovered files must be confined and, outside Flatpak's own PID
+  // namespace, belong to a live Thunderbird process.
+  const discovered = { stopOnFailure: false, discovered: true, checkProcess: true, context };
   groups.push({
     notes: [],
     candidates: [makeCandidate('native tmp', getDefaultConnectionFile(context))],
-    stopOnFailure: false,
-    context,
+    ...discovered,
   });
 
   if (context.platform === 'darwin') {
-    groups.push({ ...findMacOsConnectionCandidates(context), stopOnFailure: false, context });
+    groups.push({ ...findMacOsConnectionCandidates(context), ...discovered });
   }
 
   if (context.platform === 'linux') {
-    groups.push({ ...findSnapConnectionCandidates(context), stopOnFailure: false, context });
-    groups.push({ ...findFlatpakConnectionCandidates(context), stopOnFailure: false, context });
+    groups.push({ ...findSnapConnectionCandidates(context), ...discovered });
+    groups.push({ ...findFlatpakConnectionCandidates(context), ...discovered, checkProcess: false });
   }
 
   return groups;
 }
 
-function tryReadConnectionCandidate(candidate, context) {
+// Component-wise, case-insensitive containment for Windows paths.
+function isWindowsPathWithin(rootPath, filePath, pathImpl) {
+  const split = value => pathImpl.resolve(value).replace(/\\/g, '/').toLowerCase().split('/').filter(Boolean);
+  const rootParts = split(rootPath);
+  const parts = split(filePath);
+  return parts.length > rootParts.length && rootParts.every((part, index) => part === parts[index]);
+}
+
+// Windows has no owner/mode bits to check, so a discovered connection file
+// must resolve inside the current user's own temp directory.
+function resolveConfinedWindowsConnectionFile(filePath, context) {
+  const { fsImpl, osImpl, pathImpl } = context;
+  const tempRoot = realpathNative(fsImpl, osImpl.tmpdir());
+  const realPath = realpathNative(fsImpl, filePath);
+  if (!isWindowsPathWithin(tempRoot, realPath, pathImpl)) {
+    throw new Error('connection file is outside the current user\'s temp directory');
+  }
+  return realPath;
+}
+
+function validateConnectionDirectory(filePath, context) {
+  const { fsImpl, pathImpl, uid } = context;
+  const stat = fsImpl.lstatSync(pathImpl.dirname(filePath));
+  if (!stat.isDirectory()) throw new Error('connection directory is not a real directory');
+  if (!Number.isInteger(uid) || stat.uid !== uid) {
+    throw new Error('connection directory is not owned by the current user');
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error('connection directory permissions must be owner-only (0700)');
+  }
+}
+
+function isThunderbirdExecutable(executable, pathImpl) {
+  // A running binary replaced by a package update is reported as "(deleted)".
+  return THUNDERBIRD_EXECUTABLE_NAMES.has(pathImpl.basename(executable.replace(/ \(deleted\)$/, '')));
+}
+
+// A sandbox with its own PID namespace (e.g. Firejail) records Thunderbird's
+// namespace-local pid. Accept it only when one of the current user's
+// Thunderbird processes is namespaced and has that pid in its own namespace.
+function hasNamespacedThunderbirdProcess(pid, context) {
+  const { fsImpl, pathImpl, procRoot, uid } = context;
+  if (!Number.isInteger(uid)) return false;
+  let entries;
+  try {
+    entries = fsImpl.readdirSync(procRoot).filter(entry => /^\d+$/.test(entry));
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    try {
+      const status = fsImpl.readFileSync(pathImpl.join(procRoot, entry, 'status'), 'utf8');
+      const uids = /^Uid:\s+(.+)$/m.exec(status)?.[1].trim().split(/\s+/) || [];
+      if (!uids.length || uids.some(value => Number(value) !== uid)) continue;
+      const nsPids = /^NSpid:\s+(.+)$/m.exec(status)?.[1].trim().split(/\s+/) || [];
+      if (nsPids.length < 2 || nsPids[nsPids.length - 1] !== String(pid)) continue;
+      if (isThunderbirdExecutable(fsImpl.readlinkSync(pathImpl.join(procRoot, entry, 'exe')), pathImpl)) return true;
+    } catch {
+      // Processes can exit or deny access while /proc is scanned.
+    }
+  }
+  return false;
+}
+
+// Refuse connection files left behind by an exited Thunderbird or written for
+// a process that is not the current user's Thunderbird.
+function validateConnectionProcess(data, context) {
+  const pid = data.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    throw new Error('connection file has no valid Thunderbird process id');
+  }
+  try {
+    validateHostConnectionProcess(pid, context);
+  } catch (err) {
+    if (context.platform !== 'linux' || !hasNamespacedThunderbirdProcess(pid, context)) throw err;
+  }
+}
+
+function validateHostConnectionProcess(pid, context) {
+  const { fsImpl, pathImpl, processImpl, procRoot, platform, uid } = context;
+  try {
+    processImpl.kill(pid, 0);
+  } catch (err) {
+    throw new Error(err?.code === 'EPERM'
+      ? 'connection file process belongs to another user'
+      : 'connection file process is not running', { cause: err });
+  }
+  if (platform !== 'linux') return;
+  const procDir = pathImpl.join(procRoot, String(pid));
+  let procStat;
+  try {
+    procStat = fsImpl.statSync(procDir);
+  } catch {
+    return; // Process details are unavailable; the liveness check above still applies.
+  }
+  if (procStat.uid !== uid) throw new Error('connection file process belongs to another user');
+  let executable;
+  try {
+    executable = fsImpl.readlinkSync(pathImpl.join(procDir, 'exe'));
+  } catch {
+    throw new Error('connection file process executable cannot be verified');
+  }
+  if (!isThunderbirdExecutable(executable, pathImpl)) {
+    throw new Error('connection file process is not Thunderbird');
+  }
+}
+
+function tryReadConnectionCandidate(candidate, context, { discovered = false, checkProcess = false } = {}) {
   const { fsImpl, platform, uid } = context;
+  const confineWindows = discovered && platform === 'win32';
   let fd;
   try {
+    if (confineWindows) resolveConfinedWindowsConnectionFile(candidate.path, context);
+    else if (discovered) validateConnectionDirectory(candidate.path, context);
     const constants = fsImpl.constants || fs.constants;
     if (platform !== 'win32' && (!constants.O_NOFOLLOW || !constants.O_NONBLOCK)) {
       throw new Error('secure connection file open flags unavailable');
@@ -491,6 +611,13 @@ function tryReadConnectionCandidate(candidate, context) {
     }
     if (!Number.isSafeInteger(stat.size) || stat.size < 0 || stat.size > MAX_CONNECTION_FILE_BYTES) {
       throw new Error(`connection file exceeds ${MAX_CONNECTION_FILE_BYTES} bytes or has an invalid size`);
+    }
+    if (confineWindows) {
+      // The opened file must still be the confined one, not a redirected path.
+      const realPath = resolveConfinedWindowsConnectionFile(candidate.path, context);
+      if (!sameFile(fsImpl.statSync(realPath), stat)) {
+        throw new Error('connection file changed while being opened');
+      }
     }
     // Bound the read as well as fstat: the file may grow after it was checked.
     const buffer = Buffer.alloc(MAX_CONNECTION_FILE_BYTES + 1);
@@ -518,6 +645,7 @@ function tryReadConnectionCandidate(candidate, context) {
     if (!isValidAuthToken(data.token)) {
       throw new Error('Invalid connection file: token must be 64 lowercase hex characters');
     }
+    if (checkProcess) validateConnectionProcess(data, context);
     return {
       ok: true,
       data,
@@ -542,7 +670,7 @@ function discoverConnectionInfo(options = {}) {
     attempts.push(...group.notes);
 
     for (const candidate of group.candidates) {
-      const result = tryReadConnectionCandidate(candidate, group.context);
+      const result = tryReadConnectionCandidate(candidate, group.context, group);
       attempts.push(result.attempt);
       if (result.ok) {
         candidates.push({ data: result.data, path: candidate.path });
@@ -645,14 +773,45 @@ function getAttachmentExportPathInfo(attachmentPath, exportRoots = [], windows =
   return root ? { root, parts: [match[2], match[3]] } : null;
 }
 
+// Windows opens a device for these names in any directory and with any extension.
+const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)$/;
+// Windows short (8.3) aliases can name a protected location without its long name:
+// a base of at most 8 characters ending in ~digits, and an extension of at most 3.
+const WINDOWS_SHORT_NAME = /^(?=[^.]{1,8}(?:\.|$))[^.~]+~[0-9]+(?:\.[^.]{0,3})?$/;
+
+function isWindowsReservedName(part) {
+  return WINDOWS_RESERVED_NAME.test(part.split('.')[0].replace(/[ .]+$/, ''));
+}
+
+// Number of leading components that are the trusted temp directory, which
+// Windows may report in short form. Export roots are <temp>/thunderbird-mcp.
+function getWindowsTempPrefixLength(parts, exportRoots) {
+  const roots = typeof exportRoots === 'function' ? exportRoots() : exportRoots;
+  let prefixLength = 0;
+  for (const root of roots) {
+    const rootParts = root.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '').split('/');
+    if (rootParts.pop() !== 'thunderbird-mcp') continue;
+    if (rootParts.length > prefixLength && rootParts.length <= parts.length &&
+        rootParts.every((part, index) => part === parts[index])) prefixLength = rootParts.length;
+  }
+  return prefixLength;
+}
+
 function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [] } = {}) {
   if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
   const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
+  const parts = normalized.split('/');
   if (windows && (normalized.replace(/^[a-z]:/, '').includes(':') ||
-      normalized.split('/').some(part => /[. ]$/.test(part)))) return true;
+      parts.some(part => /[. ]$/.test(part) || isWindowsReservedName(part)))) return true;
   // Traversal must never gain the export-directory exemption.
-  if (normalized.split('/').some(part => part === '.' || part === '..')) return true;
+  if (parts.some(part => part === '.' || part === '..')) return true;
   if (SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized))) return true;
+  // Refuse short names outside the trusted temp prefix. Roots are resolved only
+  // after the network-namespace patterns above have passed.
+  if (windows && parts.some(part => WINDOWS_SHORT_NAME.test(part))) {
+    const tempPrefixLength = getWindowsTempPrefixLength(parts, exportRoots);
+    if (parts.some((part, index) => index >= tempPrefixLength && WINDOWS_SHORT_NAME.test(part))) return true;
+  }
   // Only inherited dot-directory/AppData restrictions may be waived for exports.
   if (/(^|\/)(\.[^/]*|appdata)(\/|$)/.test(normalized)) {
     return !getAttachmentExportPathInfo(attachmentPath, exportRoots, windows);
@@ -738,6 +897,9 @@ function validateAttachmentStat(filePath, stat) {
   if (!stat.isFile()) {
     throw new Error(`Attachment is not a regular file: ${filePath}`);
   }
+  if (!Number.isSafeInteger(stat.nlink) || stat.nlink > 1) {
+    throw new Error(`Attachment has multiple hard links and is not allowed: ${filePath}`);
+  }
   if (!Number.isSafeInteger(stat.size) || stat.size < 0) {
     throw new Error(`Attachment has an invalid file size: ${filePath}`);
   }
@@ -766,7 +928,7 @@ function getAttachmentExportRoots(context) {
   // thunderbird-mcp directory itself) must not become a trusted export root.
   const canonicalRoots = roots.flatMap(root => {
     try {
-      return [pathImpl.join(context.fsImpl.realpathSync(pathImpl.dirname(root)), THUNDERBIRD_MCP_SUBDIR)];
+      return [pathImpl.join(realpathNative(context.fsImpl, pathImpl.dirname(root)), THUNDERBIRD_MCP_SUBDIR)];
     } catch {
       return []; // An unavailable temp layout cannot provide an exemption.
     }
@@ -793,7 +955,7 @@ async function inspectAttachmentPath(filePath, context) {
   validateAttachmentStat(filePath, stat);
   let realPath;
   try {
-    realPath = fsImpl.realpathSync(filePath);
+    realPath = realpathNative(fsImpl, filePath);
   } catch (e) {
     throw attachmentError('realpath', filePath, e);
   }
@@ -805,7 +967,7 @@ async function inspectAttachmentPath(filePath, context) {
   if (exportInfo || resolvedExportInfo) {
     let expectedPath = pathImpl.resolve(filePath);
     if (exportInfo) {
-      const canonicalTempRoot = fsImpl.realpathSync(pathImpl.dirname(exportInfo.root));
+      const canonicalTempRoot = realpathNative(fsImpl, pathImpl.dirname(exportInfo.root));
       expectedPath = pathImpl.join(canonicalTempRoot, THUNDERBIRD_MCP_SUBDIR, ...exportInfo.parts);
     }
     if (pathImpl.relative(expectedPath, realPath) !== '') {
@@ -1031,7 +1193,8 @@ function buildConnectionDiscoveryErrorMessage() {
     'Connection discovery failed. ' +
     'Tried: ' + formatDiscoveryAttempts() + '. ' +
     'Is Thunderbird running with the MCP extension? ' +
-    'The extension must be started first to create the connection file.\n' +
+    'The extension must be started first to create the connection file. ' +
+    'If Thunderbird runs in a sandbox, set THUNDERBIRD_MCP_CONNECTION_FILE to its connection.json path.\n' +
     ADDON_DISABLED_HINT
   );
 }

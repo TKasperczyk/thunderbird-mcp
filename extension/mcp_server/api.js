@@ -1015,14 +1015,45 @@ function getAttachmentExportPathInfo(attachmentPath, exportRoots = [], windows =
   return root ? { root, parts: [match[2], match[3]] } : null;
 }
 
+// Windows opens a device for these names in any directory and with any extension.
+const WINDOWS_RESERVED_NAME = /^(?:con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)$/;
+// Windows short (8.3) aliases can name a protected location without its long name:
+// a base of at most 8 characters ending in ~digits, and an extension of at most 3.
+const WINDOWS_SHORT_NAME = /^(?=[^.]{1,8}(?:\.|$))[^.~]+~[0-9]+(?:\.[^.]{0,3})?$/;
+
+function isWindowsReservedName(part) {
+  return WINDOWS_RESERVED_NAME.test(part.split('.')[0].replace(/[ .]+$/, ''));
+}
+
+// Number of leading components that are the trusted temp directory, which
+// Windows may report in short form. Export roots are <temp>/thunderbird-mcp.
+function getWindowsTempPrefixLength(parts, exportRoots) {
+  const roots = typeof exportRoots === 'function' ? exportRoots() : exportRoots;
+  let prefixLength = 0;
+  for (const root of roots) {
+    const rootParts = root.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '').split('/');
+    if (rootParts.pop() !== 'thunderbird-mcp') continue;
+    if (rootParts.length > prefixLength && rootParts.length <= parts.length &&
+        rootParts.every((part, index) => part === parts[index])) prefixLength = rootParts.length;
+  }
+  return prefixLength;
+}
+
 function isSensitiveFilePath(attachmentPath, { windows = false, exportRoots = [] } = {}) {
   if (typeof attachmentPath !== 'string' || !attachmentPath) return false;
   const normalized = attachmentPath.replace(/\\/g, '/').toLowerCase();
+  const parts = normalized.split('/');
   if (windows && (normalized.replace(/^[a-z]:/, '').includes(':') ||
-      normalized.split('/').some(part => /[. ]$/.test(part)))) return true;
+      parts.some(part => /[. ]$/.test(part) || isWindowsReservedName(part)))) return true;
   // Traversal must never gain the export-directory exemption.
-  if (normalized.split('/').some(part => part === '.' || part === '..')) return true;
+  if (parts.some(part => part === '.' || part === '..')) return true;
   if (SENSITIVE_ATTACHMENT_PATTERNS.some(re => re.test(normalized))) return true;
+  // Refuse short names outside the trusted temp prefix. Roots are resolved only
+  // after the network-namespace patterns above have passed.
+  if (windows && parts.some(part => WINDOWS_SHORT_NAME.test(part))) {
+    const tempPrefixLength = getWindowsTempPrefixLength(parts, exportRoots);
+    if (parts.some((part, index) => index >= tempPrefixLength && WINDOWS_SHORT_NAME.test(part))) return true;
+  }
   // Only inherited dot-directory/AppData restrictions may be waived for exports.
   if (/(^|\/)(\.[^/]*|appdata)(\/|$)/.test(normalized)) {
     return !getAttachmentExportPathInfo(attachmentPath, exportRoots, windows);

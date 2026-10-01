@@ -30,7 +30,8 @@ function cleanupTempRoot(root) {
 }
 
 function writeConnectionFile(filePath, { port, token, pid = process.pid }) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  // Thunderbird creates the connection directory owner-only.
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   fs.writeFileSync(filePath, JSON.stringify({ port, token, pid }), { encoding: 'utf8', mode: 0o600 });
 }
 
@@ -55,13 +56,37 @@ function makeTestOptions(root, overrides = {}) {
     pathImpl: overrides.pathImpl || path,
     platform: overrides.platform || 'linux',
     procRoot: overrides.procRoot || path.join(root, 'proc'),
-    processImpl: overrides.processImpl || { env: overrides.env || {}, platform: overrides.platform || 'linux' },
+    processImpl: overrides.processImpl || {
+      env: overrides.env || {},
+      platform: overrides.platform || 'linux',
+      kill: (pid, signal) => process.kill(pid, signal),
+    },
     runtimeDir: Object.prototype.hasOwnProperty.call(overrides, 'runtimeDir')
       ? overrides.runtimeDir
       : runtimeDir,
     uid: Object.prototype.hasOwnProperty.call(overrides, 'uid') ? overrides.uid : uid,
     darwinFoldersRoot: overrides.darwinFoldersRoot || path.join(root, 'var', 'folders'),
   };
+}
+
+// Connection file path for a discovery layout; 'pin' also sets the override.
+function prepareConnectionLayout(layout, options, root) {
+  switch (layout) {
+    case 'native': return path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json');
+    case 'pin': {
+      const file = path.join(root, 'pinned.json');
+      options.env.THUNDERBIRD_MCP_CONNECTION_FILE = file;
+      return file;
+    }
+    case 'snap':
+      fs.mkdirSync(options.procRoot, { recursive: true });
+      fs.mkdirSync(path.join(options.homeDir, 'snap', 'thunderbird'), { recursive: true });
+      return path.join(options.homeDir, 'Downloads', 'thunderbird.tmp', 'thunderbird-mcp', 'connection.json');
+    case 'flatpak-runtime': return path.join(options.runtimeDir, 'app', 'org.mozilla.thunderbird', 'thunderbird-mcp', 'connection.json');
+    case 'flatpak-cache': return path.join(options.homeDir, '.var', 'app', 'net.thunderbird.Thunderbird', 'cache', 'tmp', 'thunderbird-mcp', 'connection.json');
+    case 'macOS': return path.join(options.darwinFoldersRoot, 'aa', 'bb', 'T', 'thunderbird-mcp', 'connection.json');
+  }
+  throw new Error(`unknown layout: ${layout}`);
 }
 
 function makeFsWithStatOverrides(overrides) {
@@ -90,12 +115,12 @@ function makeFsWithStatOverrides(overrides) {
           return target.closeSync(fd);
         };
       }
-      if (prop === 'statSync' || prop === 'fstatSync') {
+      if (prop === 'statSync' || prop === 'fstatSync' || prop === 'lstatSync') {
         return (fileOrFd, ...args) => {
           const stat = target[prop](fileOrFd, ...args);
           const filePath = prop === 'fstatSync' ? openedPaths.get(fileOrFd) : fileOrFd;
           const override = {
-            ...(process.platform === 'win32' ? { mode: 0o600 } : {}),
+            ...(process.platform === 'win32' ? { mode: stat.isDirectory() ? 0o700 : 0o600 } : {}),
             ...overrides.get(filePath),
           };
           return new Proxy(stat, {
@@ -561,6 +586,121 @@ describe('Bridge attachment path policy', () => {
       inline,
     ]);
   });
+
+  it('refuses hard-linked files at check time', async (t) => {
+    const file = path.join(root, 'report.txt');
+    const alias = path.join(root, 'alias.txt');
+    fs.writeFileSync(file, 'linked attachment');
+    try {
+      fs.linkSync(file, alias);
+    } catch (error) {
+      if (['EPERM', 'EACCES', 'ENOTSUP', 'EXDEV'].includes(error.code)) return t.skip(`hard links unavailable: ${error.code}`);
+      throw error;
+    }
+    for (const entry of [file, alias]) {
+      await assert.rejects(inlineAttachmentPaths({ attachments: [entry] }), /Attachment has multiple hard links/);
+    }
+  });
+
+  it('refuses hard-linked files on the opened descriptor', async (t) => {
+    const file = path.join(root, 'report.txt');
+    const alias = path.join(root, 'alias.txt');
+    fs.writeFileSync(file, 'linked after the check');
+    let reads = 0;
+    let closed = false;
+    const options = makeTestOptions(root);
+    options.fsImpl = {
+      ...fs,
+      promises: {
+        ...fs.promises,
+        async open(filePath, flags) {
+          try {
+            fs.linkSync(filePath, alias);
+          } catch (error) {
+            if (['EPERM', 'EACCES', 'ENOTSUP', 'EXDEV'].includes(error.code)) t.skip(`hard links unavailable: ${error.code}`);
+            throw error;
+          }
+          const handle = await fs.promises.open(filePath, flags);
+          return {
+            fd: handle.fd,
+            stat: () => handle.stat(),
+            read() { reads++; assert.fail('a hard-linked descriptor must not be read'); },
+            async close() { await handle.close(); closed = true; },
+          };
+        },
+      },
+    };
+    await assert.rejects(inlineAttachmentPaths({ attachments: [file] }, options), /Attachment has multiple hard links/);
+    assert.equal(reads, 0);
+    assert.equal(closed, true);
+  });
+
+  it('refuses Windows reserved device names before any filesystem access', async () => {
+    const touched = [];
+    const fsImpl = new Proxy({}, { get(_target, method) { touched.push(method); throw new Error('unexpected filesystem access'); } });
+    for (const file of ['C:\\Docs\\CON', 'C:\\Docs\\nul.txt', 'C:\\Docs\\COM1.log', 'C:\\Docs\\LPT\u00b9', 'C:\\Docs\\CONOUT$', 'C:\\AUX\\report.pdf']) {
+      await assert.rejects(inlineAttachmentPaths({ attachments: [file] }, { platform: 'win32', pathImpl: path.win32, fsImpl }), /Sensitive attachment path blocked/);
+    }
+    assert.deepEqual(touched, []);
+  });
+
+  describe('Windows short names', () => {
+    const shortTemp = 'C:\\Users\\ALICE~1\\AppData\\Local\\Temp';
+    const expandShortNames = filePath => filePath.replace(/^C:\\Users\\ALICE~1(?=\\|$)/i, 'C:\\Users\\alice');
+    const content = Buffer.from('exported attachment');
+    const fileStat = { isSymbolicLink: () => false, isFile: () => true, size: content.length, nlink: 1, dev: 1, ino: 9 };
+
+    // In-memory win32 filesystem whose native resolver expands short names.
+    function makeWindowsAttachmentOptions(resolve, touched = []) {
+      const realpathSync = () => assert.fail('the native resolver must be used');
+      realpathSync.native = filePath => { touched.push(filePath); return resolve(filePath); };
+      return {
+        platform: 'win32',
+        pathImpl: path.win32,
+        osImpl: { tmpdir: () => shortTemp, homedir: () => 'C:\\Users\\alice' },
+        fsImpl: {
+          constants: fs.constants,
+          realpathSync,
+          promises: {
+            async lstat(filePath) { touched.push(filePath); return fileStat; },
+            async open(filePath) {
+              touched.push(filePath);
+              return {
+                fd: 3,
+                stat: async () => fileStat,
+                read: async (buffer, offset, length, position) => ({ bytesRead: content.copy(buffer, offset, position, position + length) }),
+                close: async () => {},
+              };
+            },
+          },
+        },
+      };
+    }
+
+    it('refuses short-name components outside the temp directory before touching them', async () => {
+      const touched = [];
+      const options = makeWindowsAttachmentOptions(expandShortNames, touched);
+      for (const file of ['C:\\PROGRA~1\\report.pdf', 'C:\\Users\\ALICE~1\\Documents\\report.pdf', 'C:\\Users\\alice\\Documents\\REPORT~1.PDF']) {
+        await assert.rejects(inlineAttachmentPaths({ attachments: [file] }, options), /Sensitive attachment path blocked/);
+      }
+      // Only the trusted temp directory itself may be resolved for the exemption.
+      assert.deepEqual([...new Set(touched)], [shortTemp]);
+    });
+
+    it('checks the native resolved path against the deny policy', async () => {
+      const options = makeWindowsAttachmentOptions(() => 'C:\\Users\\alice\\AppData\\Roaming\\Thunderbird\\Profiles\\abc\\key4.db');
+      await assert.rejects(inlineAttachmentPaths({ attachments: ['D:\\Docs\\report.pdf'] }, options), /Sensitive attachment path blocked/);
+    });
+
+    it('accepts exports below a short-form temp directory', async () => {
+      const options = makeWindowsAttachmentOptions(expandShortNames);
+      const exportDir = shortTemp + '\\thunderbird-mcp\\message_1';
+      const args = { attachments: [exportDir + '\\report.pdf'] };
+      await inlineAttachmentPaths(args, options);
+      assert.equal(args.attachments[0].base64, content.toString('base64'));
+      await assert.rejects(inlineAttachmentPaths({ attachments: [exportDir + '\\REPORT~1.PDF'] }, options), /Sensitive attachment path blocked/);
+    });
+  });
 });
 
 describe('Bridge discovery', () => {
@@ -770,6 +910,8 @@ describe('Bridge discovery', () => {
     // what the host's real fs.statSync returns.
     statOverrides.set(ownedConnFile, { uid: currentUid });
     statOverrides.set(foreignConnFile, { uid: currentUid + 1 });
+    statOverrides.set(path.dirname(ownedConnFile), { uid: currentUid });
+    statOverrides.set(path.dirname(foreignConnFile), { uid: currentUid });
 
     const connInfo = readConnectionInfo({
       ...options,
@@ -901,24 +1043,12 @@ describe('Bridge discovery', () => {
     ]) {
       it(`${layout} validates ${name} on the opened descriptor`, () => {
         const options = makeTestOptions(root, { platform: layout === 'macOS' ? 'darwin' : 'linux', uid: 1234 });
-        let file;
-        switch (layout) {
-          case 'native': file = path.join(root, 'tmp', 'thunderbird-mcp', 'connection.json'); break;
-          case 'pin':
-            file = path.join(root, 'pinned.json');
-            options.env.THUNDERBIRD_MCP_CONNECTION_FILE = file;
-            break;
-          case 'snap':
-            fs.mkdirSync(options.procRoot, { recursive: true });
-            fs.mkdirSync(path.join(options.homeDir, 'snap', 'thunderbird'), { recursive: true });
-            file = path.join(options.homeDir, 'Downloads', 'thunderbird.tmp', 'thunderbird-mcp', 'connection.json');
-            break;
-          case 'flatpak-runtime': file = path.join(options.runtimeDir, 'app', 'org.mozilla.thunderbird', 'thunderbird-mcp', 'connection.json'); break;
-          case 'flatpak-cache': file = path.join(options.homeDir, '.var', 'app', 'net.thunderbird.Thunderbird', 'cache', 'tmp', 'thunderbird-mcp', 'connection.json'); break;
-          case 'macOS': file = path.join(options.darwinFoldersRoot, 'aa', 'bb', 'T', 'thunderbird-mcp', 'connection.json'); break;
-        }
+        const file = prepareConnectionLayout(layout, options, root);
         writeConnectionFile(file, { port: 21000, token: 'a'.repeat(64) });
-        options.fsImpl = makeFsWithStatOverrides(new Map([[file, { uid: 1234, mode: 0o600, ...override }]]));
+        options.fsImpl = makeFsWithStatOverrides(new Map([
+          [file, { uid: 1234, mode: 0o600, ...override }],
+          [path.dirname(file), { uid: 1234 }],
+        ]));
         const before = fs.readFileSync(file);
         const result = discoverConnectionInfo(options);
         assert.equal(result.candidates.length, name === 'valid owner-only' ? 1 : 0);
@@ -1059,4 +1189,255 @@ describe('Bridge discovery', () => {
     }
   });
 
+  const killWith = code => () => { throw Object.assign(new Error(code), { code }); };
+
+  for (const layout of ['native', 'snap', 'macOS', 'pin', 'flatpak-runtime', 'flatpak-cache']) {
+    const checked = ['native', 'snap', 'macOS'].includes(layout);
+    it(`${layout} ${checked ? 'skips' : 'keeps'} a connection file whose process has exited`, () => {
+      const options = makeTestOptions(root, { platform: layout === 'macOS' ? 'darwin' : 'linux' });
+      const file = prepareConnectionLayout(layout, options, root);
+      writeConnectionFile(file, { port: 21000, token: 'a'.repeat(64), pid: 4242 });
+      options.processImpl.kill = killWith('ESRCH');
+      const result = discoverConnectionInfo(options);
+      assert.equal(result.candidates.length, checked ? 0 : 1);
+      if (checked) assert.match(result.attempts.find(attempt => attempt.path === file).reason, /process is not running/);
+    });
+  }
+
+  it('skips a discovered connection file whose process belongs to another user', () => {
+    const options = makeTestOptions(root);
+    const file = prepareConnectionLayout('native', options, root);
+    writeConnectionFile(file, { port: 21000, token: 'a'.repeat(64), pid: 4242 });
+    options.processImpl.kill = killWith('EPERM');
+    const result = discoverConnectionInfo(options);
+    assert.equal(result.candidates.length, 0);
+    assert.match(result.attempts.find(attempt => attempt.path === file).reason, /belongs to another user/);
+  });
+
+  it('skips a discovered connection file without a valid process id', () => {
+    const options = makeTestOptions(root);
+    const file = prepareConnectionLayout('native', options, root);
+    writeConnectionFile(file, { port: 21000, token: 'a'.repeat(64) });
+    for (const pid of ['missing', null, '4242', 0, -1, 1.5, 2 ** 53]) {
+      const data = { port: 21000, token: 'a'.repeat(64), ...(pid === 'missing' ? {} : { pid }) };
+      fs.writeFileSync(file, JSON.stringify(data), { mode: 0o600 });
+      const result = discoverConnectionInfo(options);
+      assert.equal(result.candidates.length, 0, String(pid));
+      assert.match(result.attempts.find(attempt => attempt.path === file).reason, /no valid Thunderbird process id/);
+    }
+  });
+
+  for (const [name, executable, procUid, reason] of [
+    ['Thunderbird', '/usr/lib/thunderbird/thunderbird', 1234, null],
+    ['thunderbird-bin', '/opt/thunderbird/thunderbird-bin', 1234, null],
+    ['Betterbird', '/opt/betterbird/betterbird', 1234, null],
+    ['betterbird-bin', '/opt/betterbird/betterbird-bin', 1234, null],
+    ['an updated Thunderbird binary', '/usr/lib/thunderbird/thunderbird (deleted)', 1234, null],
+    ['Snap Thunderbird', '/snap/thunderbird/123/usr/lib/thunderbird/thunderbird', 1234, null],
+    ['another program', '/usr/bin/python3', 1234, /process is not Thunderbird/],
+    ['a lookalike name', '/usr/bin/thunderbird-helper', 1234, /process is not Thunderbird/],
+    ['another user', '/usr/lib/thunderbird/thunderbird', 1235, /belongs to another user/],
+    ['an unverifiable executable', null, 1234, /executable cannot be verified/],
+  ]) {
+    it(`Linux process details ${reason ? 'skip' : 'accept'} ${name}`, () => {
+      const options = makeTestOptions(root, { uid: 1234 });
+      const file = prepareConnectionLayout('native', options, root);
+      writeConnectionFile(file, { port: 21000, token: 'a'.repeat(64), pid: 4242 });
+      const procDir = path.join(options.procRoot, '4242');
+      fs.mkdirSync(procDir, { recursive: true });
+      const statFs = makeFsWithStatOverrides(new Map([
+        [file, { uid: 1234 }], [path.dirname(file), { uid: 1234 }], [procDir, { uid: procUid }],
+      ]));
+      options.processImpl.kill = () => true;
+      options.fsImpl = { ...statFs, readlinkSync(linkPath) {
+        assert.equal(linkPath, path.join(procDir, 'exe'));
+        if (!executable) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+        return executable;
+      } };
+      const result = discoverConnectionInfo(options);
+      assert.equal(result.candidates.length, reason ? 0 : 1);
+      if (reason) assert.match(result.attempts.find(attempt => attempt.path === file).reason, reason);
+    });
+  }
+
+  for (const [name, reason] of [
+    ['symlinked', /not a real directory/],
+    ['group-accessible', /owner-only \(0700\)/],
+    ['foreign-owned', /not owned by the current user/],
+  ]) {
+    it(`skips a discovered connection file in a ${name} directory but keeps the pin`, { skip: process.platform === 'win32' }, () => {
+      const options = makeTestOptions(root, { uid: 1234 });
+      const file = prepareConnectionLayout('native', options, root);
+      const dir = path.dirname(file);
+      const overrides = new Map([[file, { uid: 1234 }], [dir, { uid: name === 'foreign-owned' ? 1235 : 1234 }]]);
+      if (name === 'symlinked') {
+        const elsewhere = path.join(root, 'elsewhere');
+        writeConnectionFile(path.join(elsewhere, 'connection.json'), { port: 21000, token: 'a'.repeat(64) });
+        fs.symlinkSync(elsewhere, dir, 'dir');
+        overrides.set(path.join(elsewhere, 'connection.json'), { uid: 1234 });
+      } else {
+        writeConnectionFile(file, { port: 21000, token: 'a'.repeat(64) });
+        if (name === 'group-accessible') fs.chmodSync(dir, 0o750);
+      }
+      options.fsImpl = makeFsWithStatOverrides(overrides);
+      const result = discoverConnectionInfo(options);
+      assert.equal(result.candidates.length, 0);
+      assert.match(result.attempts.find(attempt => attempt.path === file).reason, reason);
+      options.env.THUNDERBIRD_MCP_CONNECTION_FILE = file;
+      assert.equal(discoverConnectionInfo(options).candidates.length, 1);
+    });
+  }
+
+  describe('PID-namespaced Thunderbird (e.g. Firejail)', () => {
+    const hostPid = '5151';
+    const thunderbird = '/usr/lib/thunderbird/thunderbird';
+
+    // The file records pid 2 (the sandbox-internal pid); the host pid differs.
+    function runNamespaced({ nsPid = `${hostPid}\t2`, uidLine = '1234\t1234\t1234\t1234', executable = thunderbird } = {}) {
+      const options = makeTestOptions(root, { uid: 1234 });
+      const file = prepareConnectionLayout('native', options, root);
+      writeConnectionFile(file, { port: 21000, token: 'a'.repeat(64), pid: 2 });
+      const procDir = path.join(options.procRoot, hostPid);
+      fs.mkdirSync(procDir, { recursive: true });
+      fs.writeFileSync(path.join(procDir, 'status'), `Name:\tthunderbird\nUid:\t${uidLine}\nNSpid:\t${nsPid}\n`);
+      const statFs = makeFsWithStatOverrides(new Map([[file, { uid: 1234 }], [path.dirname(file), { uid: 1234 }]]));
+      options.processImpl.kill = killWith('ESRCH');
+      options.fsImpl = { ...statFs, readlinkSync(linkPath) {
+        assert.equal(linkPath, path.join(procDir, 'exe'));
+        return executable;
+      } };
+      const result = discoverConnectionInfo(options);
+      return { result, file };
+    }
+
+    it('accepts a file whose pid belongs to a namespaced Thunderbird of the current user', () => {
+      for (const executable of [thunderbird, thunderbird + ' (deleted)']) {
+        assert.equal(runNamespaced({ executable }).result.candidates.length, 1, executable);
+      }
+      assert.equal(runNamespaced({ nsPid: `${hostPid}\t77\t2` }).result.candidates.length, 1);
+    });
+
+    for (const [name, override] of [
+      ['another user', { uidLine: '1235\t1235\t1235\t1235' }],
+      ['a mixed-uid process', { uidLine: '1234\t0\t1234\t1234' }],
+      ['another program', { executable: '/usr/bin/python3' }],
+      ['a process that is not namespaced', { nsPid: '2' }],
+      ['a different namespaced pid', { nsPid: `${hostPid}\t3` }],
+    ]) {
+      it(`keeps skipping a stale file when the namespaced match is ${name}`, () => {
+        const { result, file } = runNamespaced(override);
+        assert.equal(result.candidates.length, 0);
+        assert.match(result.attempts.find(attempt => attempt.path === file).reason, /process is not running/);
+      });
+    }
+
+    it('points sandboxed users at the explicit connection file override', () => {
+      runNamespaced({ executable: '/usr/bin/python3' });
+      readConnectionInfo(makeTestOptions(root, { env: { THUNDERBIRD_MCP_CONNECTION_FILE: path.join(root, 'missing.json') } }));
+      assert.match(buildConnectionDiscoveryErrorMessage(), /sandbox, set THUNDERBIRD_MCP_CONNECTION_FILE/);
+    });
+  });
+
+  describe('Windows connection file confinement', () => {
+    const shortTemp = 'C:\\Users\\ALICE~1\\AppData\\Local\\Temp';
+    const candidate = shortTemp + '\\thunderbird-mcp\\connection.json';
+    const expandShortNames = filePath => filePath.replace(/^C:\\Users\\ALICE~1(?=\\|$)/i, 'C:\\Users\\alice');
+    const content = Buffer.from(JSON.stringify({ port: 21000, token: 'a'.repeat(64), pid: 4242 }));
+
+    // In-memory win32 filesystem; `resolve` stands in for the native resolver.
+    function makeWindowsDiscoveryOptions(resolve, { statIno = 7, env = {} } = {}) {
+      const opened = [];
+      let position = 0;
+      const realpathSync = () => assert.fail('the native resolver must be used');
+      realpathSync.native = resolve;
+      const fileStat = ino => ({ isFile: () => true, size: content.length, dev: 1, ino, uid: 0, mode: 0o666 });
+      const options = makeTestOptions(root, {
+        platform: 'win32',
+        uid: null,
+        env,
+        pathImpl: path.win32,
+        osImpl: { tmpdir: () => shortTemp, homedir: () => 'C:\\Users\\alice' },
+        processImpl: { env, platform: 'win32', kill: () => true },
+        fsImpl: {
+          constants: fs.constants,
+          realpathSync,
+          openSync(filePath) { opened.push(filePath); position = 0; return 3; },
+          fstatSync: () => fileStat(7),
+          statSync: () => fileStat(statIno),
+          readSync(fd, buffer, offset) {
+            const count = content.copy(buffer, offset, position);
+            position += count;
+            return count;
+          },
+          closeSync() {},
+        },
+      });
+      return { options, opened };
+    }
+
+    function reasonFor(result) {
+      return result.attempts.find(attempt => attempt.path === candidate).reason;
+    }
+
+    it('accepts a file inside the real temp directory, comparing case-insensitively', () => {
+      for (const resolve of [expandShortNames, filePath => expandShortNames(filePath).toUpperCase()]) {
+        const { options, opened } = makeWindowsDiscoveryOptions(resolve);
+        assert.equal(discoverConnectionInfo(options).candidates.length, 1);
+        assert.deepEqual(opened, [candidate]);
+      }
+    });
+
+    for (const outside of [
+      'C:\\Users\\Public\\thunderbird-mcp\\connection.json',
+      'C:\\Users\\alice\\AppData\\Local\\Temp2\\thunderbird-mcp\\connection.json',
+      'C:\\Users\\alice\\AppData\\Local\\Temp',
+    ]) {
+      it(`refuses a candidate resolving to ${outside} before opening it`, () => {
+        const { options, opened } = makeWindowsDiscoveryOptions(
+          filePath => filePath === candidate ? outside : expandShortNames(filePath));
+        const result = discoverConnectionInfo(options);
+        assert.equal(result.candidates.length, 0);
+        assert.match(reasonFor(result), /outside the current user's temp directory/);
+        assert.deepEqual(opened, []);
+      });
+    }
+
+    it('refuses a file that resolves elsewhere once opened', () => {
+      let candidateResolutions = 0;
+      const { options, opened } = makeWindowsDiscoveryOptions(filePath => {
+        if (filePath !== candidate) return expandShortNames(filePath);
+        return ++candidateResolutions === 1 ? expandShortNames(filePath) : 'D:\\elsewhere\\connection.json';
+      });
+      const result = discoverConnectionInfo(options);
+      assert.equal(result.candidates.length, 0);
+      assert.match(reasonFor(result), /outside the current user's temp directory/);
+      assert.equal(opened.length, 1);
+    });
+
+    it('refuses an opened file that is not the confined file', () => {
+      const { options } = makeWindowsDiscoveryOptions(expandShortNames, { statIno: 8 });
+      const result = discoverConnectionInfo(options);
+      assert.equal(result.candidates.length, 0);
+      assert.match(reasonFor(result), /changed while being opened/);
+    });
+
+    for (const [code, reason] of [['ESRCH', /process is not running/], ['EPERM', /belongs to another user/]]) {
+      it(`skips a confined file whose process check fails with ${code}`, () => {
+        const { options } = makeWindowsDiscoveryOptions(expandShortNames);
+        options.processImpl.kill = killWith(code);
+        const result = discoverConnectionInfo(options);
+        assert.equal(result.candidates.length, 0);
+        assert.match(reasonFor(result), reason);
+      });
+    }
+
+    it('keeps honoring an explicit connection file override outside the temp directory', () => {
+      const pinned = 'D:\\config\\connection.json';
+      const { options, opened } = makeWindowsDiscoveryOptions(
+        () => assert.fail('an explicit override is not confined'),
+        { env: { THUNDERBIRD_MCP_CONNECTION_FILE: pinned } });
+      assert.equal(discoverConnectionInfo(options).candidates.length, 1);
+      assert.deepEqual(opened, [pinned]);
+    });
+  });
 });

@@ -1518,6 +1518,21 @@ describe('isValidBase64: canonical RFC 4648 semantics and large inputs', () => {
   });
 });
 
+// Windows device names in any component, with or without an extension.
+const WINDOWS_RESERVED_NAME_PATHS = [
+  'C:\\Docs\\CON', 'C:\\Docs\\nul.txt', 'C:\\Docs\\Aux.tar.gz', 'C:\\Docs\\prn', 'C:\\Docs\\COM0',
+  'C:\\Docs\\com9.log', 'C:\\Docs\\LPT1', 'C:\\Docs\\lpt0.txt', 'C:\\Docs\\COM\u00b9', 'C:\\Docs\\com\u00b2.txt',
+  'C:\\Docs\\LPT\u00b3', 'C:\\Docs\\CONIN$', 'C:\\Docs\\conout$.txt', 'C:\\Docs\\con .txt', 'C:/aux/report.pdf',
+];
+// Windows short (8.3) name components outside the trusted temp prefix.
+const WINDOWS_SHORT_NAME_PATHS = [
+  'C:\\PROGRA~1\\report.pdf', 'C:\\Users\\ALICE~1\\Documents\\report.pdf',
+  'C:/Users/alice/Documents/REPORT~1.PDF', 'C:/Users/alice/Documents/REPOR~12',
+  'C:\\Users\\APPDAT~1\\report.pdf', 'C:\\Users\\alice\\SSH~1\\id', 'C:\\Users\\alice\\THUNDE~1\\report.pdf',
+  'C:\\Temp\\CONNEC~1.JSO', 'C:\\Docs\\ABCDE~12.TXT',
+];
+const WINDOWS_SHORT_TEMP = 'C:\\Users\\ALICE~1\\AppData\\Local\\Temp';
+
 describe('Attachment policy parity', () => {
   const bridge = require('./helpers/bridge.cjs');
   it('keeps the duplicated pattern lists and helpers identical', () => {
@@ -1540,12 +1555,44 @@ describe('Attachment policy parity', () => {
     '/tmp/login.keychain-db', '/tmp/key4.db', '/tmp/logins.json', '/tmp/Web Data', '/tmp/Local State',
     '/tmp/Login Data', '/tmp/signons.sqlite', '/tmp/prefs.js',
     '\\\\server\\share\\file.txt', '//server/share/file.txt', '\\\\?\\C:\\file.txt', '\\\\.\\C:\\file.txt', '//?/C:/file.txt', '//./C:/file.txt',
+    ...WINDOWS_RESERVED_NAME_PATHS, ...WINDOWS_SHORT_NAME_PATHS,
   ]) {
     it(`denies ${file} in both runtimes`, () => {
       assert.equal(isSensitiveFilePath(file, { windows: true }), true);
       assert.equal(bridge.isSensitiveFilePath(file, { windows: true }), true);
     });
   }
+  it('allows names that only resemble Windows device or short names in both runtimes', () => {
+    for (const file of ['C:\\Docs\\console.txt', 'C:\\Docs\\com10.txt', 'C:\\Docs\\auxiliary.pdf', 'C:\\Docs\\lpt.txt',
+      'C:\\Docs\\conin.txt', 'C:\\Docs\\notes~draft.txt', 'C:\\Docs\\~1.txt', 'C:\\Docs\\v1~2.final.pdf',
+      'C:\\Docs\\Invoice~2024.pdf', 'C:\\Docs\\scan~001.jpeg', 'C:\\Docs\\IMG~12345678.heic', 'C:\\Docs\\ABCDEF~12.TXT']) {
+      assert.equal(isSensitiveFilePath(file, { windows: true }), false, file);
+      assert.equal(bridge.isSensitiveFilePath(file, { windows: true }), false, file);
+    }
+    // These are ordinary file names outside Windows.
+    for (const file of ['/home/user/Documents/con', '/home/user/Documents/nul.txt', '/home/user/Documents/REPORT~1.PDF']) {
+      assert.equal(isSensitiveFilePath(file), false, file);
+      assert.equal(bridge.isSensitiveFilePath(file), false, file);
+    }
+  });
+
+  it('accepts a short-form temp directory prefix but no short names below it in both runtimes', () => {
+    const policy = { windows: true, exportRoots: [WINDOWS_SHORT_TEMP + '\\thunderbird-mcp'] };
+    const exported = WINDOWS_SHORT_TEMP + '\\thunderbird-mcp\\message_1\\report.pdf';
+    for (const check of [isSensitiveFilePath, bridge.isSensitiveFilePath]) {
+      assert.equal(check(exported, policy), false);
+      assert.equal(check(exported.toLowerCase().replace(/\\/g, '/'), policy), false);
+      for (const file of [
+        WINDOWS_SHORT_TEMP + '\\thunderbird-mcp\\message_1\\REPORT~1.PDF',
+        WINDOWS_SHORT_TEMP + '\\THUNDE~1\\message_1\\report.pdf',
+        'C:\\Users\\ALICE~1\\Documents\\report.pdf',
+        'C:\\Users\\ALICE~1\\AppData\\Local\\Temp2\\report.pdf',
+      ]) {
+        assert.equal(check(file, policy), true, file);
+      }
+    }
+  });
+
   it('allows ordinary Documents paths in both runtimes', () => {
     for (const file of ['/home/user/Documents/report.pdf', '/Users/user/Documents/report.pdf', 'C:\\Users\\user\\Documents\\report.pdf',
       '/home/user/Documents/Library/book.pdf', '/Users/user/Documents/Library/book.pdf', 'D:\\Scans\\library\\scan.pdf']) {
@@ -1835,6 +1882,21 @@ describe('Outbound attachment failures are atomic', () => {
       });
     }
   }
+
+  it('refuses Windows device and short-name components before touching nsIFile', () => {
+    const { runtime, state } = makeOutboundMailRuntime({ os: 'WINNT' });
+    for (const file of [...WINDOWS_RESERVED_NAME_PATHS, ...WINDOWS_SHORT_NAME_PATHS]) {
+      assert.throws(() => runtime.filePathsToAttachDescs([file]), /sensitive path blocked/, file);
+    }
+    assert.equal(state.fileCalls, 0);
+  });
+
+  it('accepts Windows exports below a short-form TmpD', () => {
+    const tmpDir = WINDOWS_SHORT_TEMP.replace(/\\/g, '/');
+    const { runtime } = makeOutboundMailRuntime({ os: 'WINNT', tmpDir });
+    assert.equal(runtime.filePathsToAttachDescs([tmpDir + '/thunderbird-mcp/message_1/report.pdf']).descs.length, 1);
+    assert.throws(() => runtime.filePathsToAttachDescs([tmpDir + '/thunderbird-mcp/message_1/REPORT~1.PDF']), /sensitive path blocked/);
+  });
 
   it('allows Windows exports through ordinary AppData ancestors but refuses redirected ones', () => {
     const tmpDir = 'C:/Users/user/AppData/Local/Temp';
