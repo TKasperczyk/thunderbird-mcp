@@ -1,7 +1,6 @@
 const { describe, it, beforeEach, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
@@ -17,12 +16,10 @@ const {
   isValidAuthToken,
   readConnectionInfo,
 } = require('./helpers/bridge.cjs');
+const { makeAllowedTempDir } = require('./helpers/fixture-dir.cjs');
 
 function makeTempRoot() {
-  // Windows' default temp directory is inside denied AppData. Keep allowed
-  // attachment fixtures in a unique local workspace directory in that case.
-  const base = isSensitiveFilePath(os.tmpdir()) ? path.resolve(__dirname, '..') : os.tmpdir();
-  return fs.mkdtempSync(path.join(base, 'tb-mcp-bridge-'));
+  return makeAllowedTempDir('tb-mcp-bridge-');
 }
 
 function cleanupTempRoot(root) {
