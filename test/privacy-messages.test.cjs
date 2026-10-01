@@ -1323,12 +1323,15 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
     assertNoDecryption(calls);
   });
 
-  it("keeps the comm-central unflagged shape in a single structured pass", async () => {
-    const { api, calls } = loadMessageTools({ mime: signedContainer([{ contentType: "text/plain", body: SIGNED_TEXT }], { isEncrypted: false }) });
+  it("keeps the comm-central unflagged shape in a single structured pass plus one raw check", async () => {
+    const { api, calls } = loadMessageTools({
+      mime: signedContainer([{ contentType: "text/plain", body: SIGNED_TEXT }], { isEncrypted: false }), raw: signedRaw(plainPart),
+    });
     const result = await api.getMessage("message-1", "folder", false, "markdown");
     assert.equal(result.body, SIGNED_TEXT);
     assert.equal(calls.options.length, 1);
-    assert.equal(calls.streams, 0);
+    // The signed-message raw checks run on every Thunderbird version.
+    assert.equal(calls.streams, 1);
     assertNoDecryption(calls);
   });
 
@@ -2023,6 +2026,63 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
     const result = await api.getMessage("message-1", "folder", false, "text");
     assert.notEqual(result.encryptedContentWithheld, true);
     assert.match(result.body, /signed text/);
+  });
+
+  // Thunderbird 156 (comm-central) shows a signed container unflagged with its
+  // children, so the message never takes the "raw" path. The signed-message
+  // checks must still apply.
+  const UNTYPED_INNER_LEAF = [
+    "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="x.p7m"', "",
+    "From: x@example.invalid", "Subject: inner", "Content-Transfer-Encoding: base64", "",
+    "MIAGCSqGSIb3DQEHA6CAMIACAQAxggEwMIIBLAIBADCBlDCBjjELMAkGA1UEBhMC",
+  ];
+  const commCentralTree = () => signedContainer([{ contentType: "multipart/mixed", parts: [
+    { contentType: "text/plain", body: SIGNED_TEXT },
+    { contentType: "message/rfc822", parts: [{ contentType: "text/plain", body: "inner" }] },
+  ] }], { isEncrypted: false });
+
+  it("withholds the untyped-inner input in the comm-central shape on every output", async () => {
+    const { api, calls } = loadMessageTools({ mime: commCentralTree(), raw: signedRaw(mixedWith(UNTYPED_INNER_LEAF)) });
+    for (const [saveAttachments, rawSource] of [[false, false], [true, false], [false, true]]) {
+      const result = await api.getMessage("message-1", "folder", saveAttachments, "text", rawSource, true);
+      assert.equal(result.encryptedContentWithheld, true);
+      assert.equal(result.rawSource, undefined);
+      assert.equal(result.attachments.length, 0);
+      assert.doesNotMatch(JSON.stringify(result), /signed text|MIAGCS|protected subject/);
+    }
+    for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+    assert.equal(calls.sends.length, 0);
+    assertNoDecryption(calls);
+  });
+
+  it("applies the signed-message checks to rawSource and the body fallback from the raw headers alone", async () => {
+    // No Gloda headers: only the stored message says it is multipart/signed.
+    const { api } = loadMessageTools({ mime: { contentType: "message/rfc822", parts: [] }, raw: signedRaw(mixedWith(UNTYPED_INNER_LEAF)) });
+    for (const rawSource of [false, true]) {
+      const result = await api.getMessage("message-1", "folder", false, "text", rawSource);
+      assert.equal(result.encryptedContentWithheld, true);
+      assert.equal(result.rawSource, undefined);
+    }
+  });
+
+  it("reads realistic clear-signed mail in the comm-central shape", async () => {
+    const thunderbird = realisticSigned[0];
+    const raw = thunderbird.lines.join("\r\n");
+    const { api, calls } = loadHtmlFixture("<p>signed text</p>\r\n", () => documentTree([elementNode("p", [textNode(SIGNED_TEXT)])]), {
+      mime: signedContainer([{ contentType: "text/plain", body: SIGNED_TEXT }], { isEncrypted: false, headerValue: thunderbird.header }), raw,
+    });
+    assert.equal((await api.getMessage("message-1", "folder", false, "text", true)).rawSource, raw);
+    assert.equal((await api.getMessage("message-1", "folder", false, "text")).body, SIGNED_TEXT);
+    assert.equal((await reply(api)).success, true);
+    assertNoDecryption(calls);
+  });
+
+  it("keeps 0.9.1 behaviour for the untyped-inner input in unsigned mail", async () => {
+    const raw = [...mixedWith(UNTYPED_INNER_LEAF), ""].join("\r\n");
+    const { api, calls } = loadMessageTools({ mime: { contentType: "message/rfc822", parts: [] }, raw });
+    assert.equal((await api.getMessage("message-1", "folder", false, "text", true)).rawSource, raw);
+    assert.equal((await api.getMessage("message-1", "folder", false, "text")).body, SIGNED_TEXT);
+    assert.equal(calls.streams, 2);
   });
 
   it("keeps 0.9.1 classification for unsigned mail outside the clear-signed raw path", async () => {

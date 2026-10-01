@@ -8279,6 +8279,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // Top-level multipart/signed, from the stored message's own headers.
+            // Thunderbird versions differ in how Gloda presents such a message
+            // (an empty flagged container, or an unflagged one with children),
+            // so the signed-message checks key off the raw headers instead.
+            function isRawTopLevelMultipartSigned(rawBytes) {
+              const split = findRawMimeHeaderBodySplit(rawMimeToByteString(rawBytes));
+              if (!split) return false;
+              return (parseRawMimeHeaders(split.header)["content-type"] || [])
+                .some(value => parseRawMimeHeaderValue(value).value === "multipart/signed");
+            }
+
+            // The same signal from Gloda's root headers, before any raw read.
+            function isMimeTopLevelMultipartSigned(aMimeMsg) {
+              return [].concat(aMimeMsg?.headers?.["content-type"] || [])
+                .some(value => parseRawMimeHeaderValue(value).value === "multipart/signed");
+            }
+
+            // Reads the stored message of a top-level signed message and applies
+            // the signed-message checks. Returns { raw } when it is "clear",
+            // otherwise { state } ("encrypted" or "unknown"; read failures are
+            // "unknown").
+            function checkSignedRawMessage(msgHdr) {
+              let raw;
+              try {
+                raw = readBoundedRawMessage(msgHdr);
+              } catch (e) {
+                console.error("thunderbird-mcp: signed message raw read failed:", e);
+                return { state: "unknown" };
+              }
+              const state = classifyRawMessageEncryption(raw, 0, { signedRaw: true });
+              return state === "clear" ? { raw } : { state };
+            }
+
             // Plain-text body for direct reply/forward quoting while the encrypted
             // message preference applies. Returns null when the message must be
             // withheld, otherwise { body } plus { raw } when the body came from the
@@ -8289,17 +8322,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const state = classifyMimeMessageEncryption(aMimeMsg);
               if (state === "encrypted") return null;
               if (state === "clear") {
+                // A signed message Gloda shows with its children still gets the
+                // same raw checks as one Gloda withholds.
+                if (isMimeTopLevelMultipartSigned(aMimeMsg) && !checkSignedRawMessage(msgHdr).raw) return null;
                 const body = extractPlainTextBody(aMimeMsg);
                 return hasInlinePgpBodyArmor(aMimeMsg, body) ? null : { body };
               }
-              let raw;
-              try {
-                raw = readBoundedRawMessage(msgHdr);
-              } catch (e) {
-                console.error("thunderbird-mcp: signed message raw read failed:", e);
-                return null;
-              }
-              if (classifyRawMessageEncryption(raw, 0, { signedRaw: true }) !== "clear") return null;
+              const { raw } = checkSignedRawMessage(msgHdr);
+              if (!raw) return null;
               const part = extractBodyPartFromRawMime(raw, "text");
               const body = !part ? "" : part.isHtml ? stripHtml(part.text) : stripInvisibleCharacters(part.text);
               return hasInlinePgpArmor(body) ? null : { body, raw };
@@ -8434,6 +8464,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // classifyRawMessageEncryption returns "clear" for it (the raw
                     // source mode and the body fallback below both check that).
                     const useRawContent = encryptionState === "raw";
+                    // Thunderbird versions that show a signed container with its
+                    // children skip the "raw" path; apply the same raw checks.
+                    if (!allowEncrypted && !useRawContent && !rawSource && isMimeTopLevelMultipartSigned(aMimeMsg)) {
+                      const checked = checkSignedRawMessage(msgHdr);
+                      if (!checked.raw) {
+                        resolve(encryptedMessagePlaceholder(msgHdr, checked.state === "unknown"));
+                        return;
+                      }
+                    }
 
                     // Raw source mode: return full RFC 2822 message
                     if (rawSource) {
@@ -8444,7 +8483,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         // Latin-1 default preserves raw bytes; UTF-8 corrupts 8-bit content.
                         const raw = readMessageStreamFully(stream);
                         if (!allowEncrypted) {
-                          const state = classifyRawMessageEncryption(raw, 0, { signedRaw: useRawContent });
+                          const state = classifyRawMessageEncryption(raw, 0, {
+                            signedRaw: useRawContent || isRawTopLevelMultipartSigned(raw),
+                          });
                           if (state !== "clear") {
                             resolve(encryptedMessagePlaceholder(msgHdr, state === "unknown"));
                             return;
@@ -8500,7 +8541,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         // Latin-1 default preserves raw bytes for transfer decoding.
                         rawMimeContent = readMessageStreamFully(rawStream, MAX_ATTACHMENT_BYTES);
                         if (!allowEncrypted) {
-                          const state = classifyRawMessageEncryption(rawMimeContent, 0, { signedRaw: useRawContent });
+                          const state = classifyRawMessageEncryption(rawMimeContent, 0, {
+                            signedRaw: useRawContent || isRawTopLevelMultipartSigned(rawMimeContent),
+                          });
                           if (state !== "clear") {
                             resolve(encryptedMessagePlaceholder(msgHdr, state === "unknown"));
                             return;
