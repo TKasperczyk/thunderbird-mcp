@@ -535,7 +535,7 @@ test("real Gecko Experiment globals and message text conversion", {
         return {
           presentationArmor: hasInlinePgpArmor(presentation),
           originalArmor: hasInlinePgpBodyArmor(mime, presentation),
-          encrypted: isEncryptedMimeMessage(mime),
+          encrypted: classifyMimeMessageEncryption(mime) !== 'clear',
         };
       });
     `);

@@ -7253,12 +7253,200 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return headers[name]?.[0] || "";
             }
 
-            function getRawMimeFilename(contentDisposition, contentType) {
-              return contentDisposition.params["filename*"] ||
-                contentDisposition.params.filename ||
-                contentType.params["name*"] ||
-                contentType.params.name ||
-                "";
+            // Decodes bytes with a declared charset, or returns null when the
+            // charset is unknown or the bytes are not valid in it.
+            function decodeRawMimeNameBytes(bytes, charset) {
+              try {
+                return new TextDecoder(charset, { fatal: true }).decode(new Uint8Array(bytes));
+              } catch {
+                return null;
+              }
+            }
+
+            // RFC 2231 %xx decoding that rejects anything it cannot read exactly.
+            function decodeRawMimeStrictPercent(value, bytes) {
+              for (let i = 0; i < value.length; i++) {
+                const code = value.charCodeAt(i);
+                if (value[i] === "%") {
+                  const hex = value.slice(i + 1, i + 3);
+                  if (!/^[0-9A-Fa-f]{2}$/.test(hex)) return false;
+                  bytes.push(parseInt(hex, 16));
+                  i += 2;
+                } else if (code > 0x7e || code < 0x21) {
+                  return false;
+                } else {
+                  bytes.push(code);
+                }
+              }
+              return true;
+            }
+
+            // RFC 2047 encoded words. Returns null when an encoded word, or
+            // something that looks like one, cannot be decoded with certainty.
+            function decodeRawMimeEncodedWords(value) {
+              if (!value.includes("=?")) return value;
+              const wordRe = /=\?([^?\s]+)\?([BbQq])\?([^?\s]*)\?=/g;
+              let failed = false;
+              const decoded = value
+                .replace(/(\?=)\s+(?==\?[^?\s]+\?[BbQq]\?)/g, "$1")
+                .replace(wordRe, (_match, charsetSpec, encoding, text) => {
+                  const charset = charsetSpec.split("*")[0];
+                  let bytes = [];
+                  if (encoding.toUpperCase() === "B") {
+                    const padded = text + "=".repeat((4 - (text.length % 4)) % 4);
+                    if (text.length % 4 === 1 || !isValidBase64(padded)) {
+                      failed = true;
+                      return "";
+                    }
+                    bytes = Array.from(decodeRawMimeBase64ToBytes(padded, true));
+                  } else {
+                    for (let i = 0; i < text.length; i++) {
+                      if (text[i] === "_") {
+                        bytes.push(0x20);
+                      } else if (text[i] === "=") {
+                        const hex = text.slice(i + 1, i + 3);
+                        if (!/^[0-9A-Fa-f]{2}$/.test(hex)) {
+                          failed = true;
+                          return "";
+                        }
+                        bytes.push(parseInt(hex, 16));
+                        i += 2;
+                      } else {
+                        bytes.push(text.charCodeAt(i) & 0xFF);
+                      }
+                    }
+                  }
+                  const result = decodeRawMimeNameBytes(bytes, charset);
+                  if (result === null) failed = true;
+                  return result ?? "";
+                });
+              return failed || decoded.includes("=?") ? null : decoded;
+            }
+
+            // Name values of one parameter (RFC 2231 continuation or extended
+            // form, then the plain form) from a single header value.
+            function collectRawMimeParameterNames(headerValue, base, out) {
+              const segments = new Map();
+              let single = null;
+              let plain = null;
+              let invalid = false;
+              const keyRe = new RegExp(`^${base}(?:\\*(\\d+))?(\\*)?$`);
+              for (const piece of splitRawMimeHeaderParameters(String(headerValue || "")).slice(1)) {
+                const eqIdx = piece.indexOf("=");
+                if (eqIdx < 0) continue;
+                const match = keyRe.exec(piece.slice(0, eqIdx).trim().toLowerCase());
+                if (!match) continue;
+                const value = piece.slice(eqIdx + 1).trim();
+                if (match[1] !== undefined) {
+                  // Continuation segment: base*N or base*N*.
+                  const index = Number(match[1]);
+                  if (segments.has(index) || /^0\d/.test(match[1])) invalid = true;
+                  segments.set(index, { value, extended: !!match[2] });
+                } else if (match[2]) {
+                  if (single !== null) invalid = true;
+                  single = { value, extended: true }; // base* without an index
+                } else {
+                  if (plain !== null) invalid = true;
+                  plain = value;
+                }
+              }
+              if (single !== null) {
+                if (segments.size) invalid = true;
+                segments.set(0, single);
+              }
+              if (invalid) {
+                out.undecodable = true;
+                return;
+              }
+              if (segments.size) {
+                const bytes = [];
+                let charset = null;
+                for (let i = 0; i < segments.size; i++) {
+                  const segment = segments.get(i);
+                  if (!segment) {
+                    out.undecodable = true;
+                    return;
+                  }
+                  let value = segment.value;
+                  if (segment.extended) {
+                    if (i === 0) {
+                      const match = /^([^']*)'[^']*'(.*)$/.exec(value);
+                      if (!match) {
+                        out.undecodable = true;
+                        return;
+                      }
+                      charset = match[1] || "us-ascii";
+                      value = match[2];
+                    } else if (charset === null) {
+                      out.undecodable = true;
+                      return;
+                    }
+                    if (!decodeRawMimeStrictPercent(value, bytes)) {
+                      out.undecodable = true;
+                      return;
+                    }
+                  } else {
+                    for (const ch of unquoteRawMimeParameter(value)) bytes.push(ch.charCodeAt(0) & 0xFF);
+                  }
+                }
+                const name = decodeRawMimeNameBytes(bytes, charset || "utf-8");
+                if (name === null) out.undecodable = true;
+                else out.names.push(name);
+              }
+              if (plain !== null) out.names.push(unquoteRawMimeParameter(plain));
+            }
+
+            // Name header syntax that Mozilla's parameter parser reads differently
+            // from ours: backslashes (dropped before any character), NUL, text
+            // after a closing quote, an unterminated quote, and for
+            // parameterized headers a comma or '=' before the first ';'.
+            function isAmbiguousRawMimeNameHeader(value, parameterized) {
+              if (/[\\\0]/.test(value)) return true;
+              const pieces = splitRawMimeHeaderParameters(value);
+              if (parameterized && /[,=]/.test(pieces[0])) return true;
+              const values = parameterized
+                ? pieces.slice(1).map(piece => piece.slice(piece.indexOf("=") + 1))
+                : [value];
+              return values.some(raw => {
+                const trimmed = raw.trim();
+                if (!trimmed.startsWith("\"")) return false;
+                const close = trimmed.indexOf("\"", 1);
+                return close < 0 || trimmed.slice(close + 1).trim() !== "";
+              });
+            }
+
+            // Every name a part carries, in libmime's MimeHeaders_get_name order:
+            // Content-Disposition filename, Content-Type name, Content-Name,
+            // X-Sun-Data-Name, each RFC 2047-decoded. undecodable is true when a
+            // name is present but cannot be decoded with certainty.
+            function getRawMimeNames(headers) {
+              const out = { names: [], undecodable: false };
+              const single = (name, parameterized = false) => {
+                const values = headers[name] || [];
+                if (values.length > 1 ||
+                    (values.length && isAmbiguousRawMimeNameHeader(values[0], parameterized))) {
+                  out.undecodable = true;
+                }
+                return values[0];
+              };
+              const disposition = single("content-disposition", true);
+              if (disposition !== undefined) collectRawMimeParameterNames(disposition, "filename", out);
+              const contentType = single("content-type", true);
+              if (contentType !== undefined) collectRawMimeParameterNames(contentType, "name", out);
+              for (const header of ["content-name", "x-sun-data-name"]) {
+                const value = single(header);
+                if (value !== undefined && value !== "") out.names.push(unquoteRawMimeParameter(value));
+              }
+              out.names = out.names.map(name => {
+                const decoded = decodeRawMimeEncodedWords(name);
+                if (decoded === null) out.undecodable = true;
+                return decoded;
+              }).filter(name => name);
+              return out;
+            }
+
+            function getRawMimeFilename(headers) {
+              return getRawMimeNames(headers).names[0] || "";
             }
 
             function normalizeRawMimeContentId(value) {
@@ -7371,18 +7559,39 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return parts;
             }
 
+            // libmime renders all of these with its message class, so their
+            // content is a whole embedded message.
+            const RAW_MIME_EMBEDDED_MESSAGE_TYPES = new Set(["message/rfc822", "message/news", "message/global"]);
+
+            // RFC 2046 / mimemdig.cpp: digest children default to message/rfc822.
+            function getRawMimeDefaultChildType(parentType) {
+              return parentType === "multipart/digest" ? "message/rfc822" : "text/plain";
+            }
+
+            function isRawMimeEmbeddedMessage(entity) {
+              return RAW_MIME_EMBEDDED_MESSAGE_TYPES.has(entity.contentType.value);
+            }
+
+            // libmime picks the class of an untyped or generic part from its file
+            // name, which can make it an embedded message or opaque S/MIME data.
+            const RAW_MIME_NAME_TYPED_CONTENT_TYPES = new Set(["", "application/octet-stream", "application/x-unknown-content-type"]);
+            const RAW_MIME_PROTECTED_NAME_RE = /\.(?:eml|mail|art|nws|mht|mhtml|msg|p7m|p7c|p7z|pgp|gpg|asc)\s*$/i;
+            // A message part is already rendered as a message, so only names of
+            // encrypted or signed data matter on it (fwd.eml is the normal case).
+            const RAW_MIME_PROTECTED_DATA_NAME_RE = /\.(?:p7m|p7c|p7z|pgp|gpg|asc)\s*$/i;
+
             function parseRawMimeEntity(rawBytes, options = {}) {
               const maxDepth = Number.isInteger(options.maxDepth) && options.maxDepth >= 0
                 ? options.maxDepth
                 : 32;
               const raw = rawMimeToByteString(rawBytes);
 
-              function parseEntity(partRaw, depth, partName) {
+              function parseEntity(partRaw, depth, partName, defaultType = "text/plain") {
                 const split = findRawMimeHeaderBodySplit(partRaw);
                 if (!split) return null;
                 const headers = parseRawMimeHeaders(split.header);
                 const contentType = parseRawMimeHeaderValue(
-                  getRawMimeHeader(headers, "content-type") || "text/plain"
+                  getRawMimeHeader(headers, "content-type") || defaultType
                 );
                 const contentDisposition = parseRawMimeHeaderValue(
                   getRawMimeHeader(headers, "content-disposition") || ""
@@ -7408,7 +7617,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     contentType.params.boundary || ""
                   );
                   for (let index = 0; index < children.length; index++) {
-                    const child = parseEntity(children[index], depth + 1, `${partName}.${index + 1}`);
+                    const child = parseEntity(
+                      children[index],
+                      depth + 1,
+                      `${partName}.${index + 1}`,
+                      getRawMimeDefaultChildType(contentType.value)
+                    );
                     if (child) entity.parts.push(child);
                   }
                 }
@@ -7470,7 +7684,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               function findBody(entity, isRoot = false) {
                 const contentType = entity.contentType.value || "text/plain";
                 // Attached messages are intentionally out of scope for this fallback.
-                if (contentType === "message/rfc822") return null;
+                if (isRawMimeEmbeddedMessage(entity)) return null;
                 if (!isRoot && entity.contentDisposition.value === "attachment") return null;
 
                 if (contentType.startsWith("multipart/")) {
@@ -7545,6 +7759,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             const MESSAGE_STREAM_READ_CHUNK_BYTES = 64 * 1024;
+            // Ceiling for synchronous raw-MIME work on a whole stored message.
+            const RAW_MESSAGE_MAX_BYTES = 50 * 1024 * 1024;
 
             // Reads a message stream fully, looping on stream.available() to handle
             // mbox-stored messages where msgHdr.offlineMessageSize/messageSize can
@@ -7584,8 +7800,60 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return raw;
             }
 
+            // Reads the stored message within RAW_MESSAGE_MAX_BYTES. Throws on
+            // read failure or overflow.
+            function readBoundedRawMessage(msgHdr) {
+              let stream = null;
+              try {
+                stream = msgHdr.folder.getMsgInputStream(msgHdr, {});
+                return readMessageStreamFully(stream, RAW_MESSAGE_MAX_BYTES);
+              } finally {
+                if (stream) try { stream.close(); } catch { /* ignore */ }
+              }
+            }
+
+            // True when a direct forward built from the raw message would drop
+            // content: an attached message, or any leaf other than the first body
+            // candidate that has an attachment disposition, a filename, or a
+            // Content-ID. Detached signatures do not count. Unparseable input
+            // counts, so the caller refuses instead of guessing.
+            function rawMessageHasForwardableParts(rawBytes) {
+              const root = parseRawMimeEntity(rawBytes, { maxDepth: 33 });
+              if (!root) return true;
+              const leaves = [];
+              let incomplete = false;
+              (function walk(entity) {
+                const ct = entity.contentType.value || "text/plain";
+                if (ct.startsWith("multipart/")) {
+                  if (entity.depthLimitReached) incomplete = true;
+                  const children = ct === "multipart/signed" ? entity.parts.slice(0, 1) : entity.parts;
+                  for (const child of children) walk(child);
+                  return;
+                }
+                leaves.push(entity);
+              })(root);
+              if (incomplete) return true;
+              return leaves.some((leaf, index) => {
+                if (isRawMimeEmbeddedMessage(leaf)) return true;
+                const names = getRawMimeNames(leaf.headers);
+                const hasAttachmentMarker = leaf.contentDisposition.value === "attachment" ||
+                  names.undecodable || names.names.length > 0;
+                if (index === 0) return hasAttachmentMarker;
+                return hasAttachmentMarker || !!normalizeRawMimeContentId(getRawMimeHeader(leaf.headers, "content-id"));
+              });
+            }
+
             function parseAttachmentPartsFromRawMime(rawBytes, options = {}) {
               const includeInlineImages = options.includeInlineImages === true;
+              // RFC 1847: the second part of multipart/signed is the detached
+              // signature, which libmime never exposes as a user attachment.
+              const skipDetachedSignatures = options.skipDetachedSignatures === true;
+              // Lists attached messages as whole entries, as Gloda's
+              // allUserAttachments does, without descending into them.
+              const includeAttachedMessages = options.includeAttachedMessages === true;
+              // Also lists images inside multipart/related, the rule the Gloda
+              // path uses for isInline entries when inline images are not requested.
+              const includeRelatedImages = options.includeRelatedImages === true;
               // Keep the attachment walk's historical depth allowance. Body
               // extraction uses the stricter main-thread cap in its own consumer.
               const top = parseRawMimeEntity(rawBytes, { maxDepth: 33 });
@@ -7597,14 +7865,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const contentDisposition = entity.contentDisposition;
                 const ct = contentType.value || "text/plain";
                 const disposition = contentDisposition.value || "";
-                if (ct === "message/rfc822") return;
+                const isEmbeddedMessage = isRawMimeEmbeddedMessage(entity);
+                if (isEmbeddedMessage && !includeAttachedMessages) return;
                 if (ct.startsWith("multipart/")) {
                   const childInsideRelated = insideRelated || ct === "multipart/related";
-                  for (const child of entity.parts) walkPart(child, childInsideRelated);
+                  const children = skipDetachedSignatures && ct === "multipart/signed"
+                    ? entity.parts.slice(0, 1)
+                    : entity.parts;
+                  for (const child of children) walkPart(child, childInsideRelated);
                   return;
                 }
 
-                const filename = getRawMimeFilename(contentDisposition, contentType);
+                const filename = getRawMimeFilename(entity.headers);
                 const contentId = normalizeRawMimeContentId(
                   getRawMimeHeader(entity.headers, "content-id")
                 );
@@ -7613,8 +7885,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const hasNonTextFilename = !!filename && !ct.startsWith("text/");
                 const isInlineImage = ct.startsWith("image/") && disposition !== "attachment" &&
                   (insideRelated || disposition === "inline" || !!contentId);
-                if (!hasAttachmentDisposition && !hasInlineFilename && !hasNonTextFilename &&
-                    !(includeInlineImages && isInlineImage)) return;
+                // Attached messages qualify like other attachments: by an
+                // attachment disposition or a name, never as inline parts.
+                const isAttachment = hasAttachmentDisposition || hasInlineFilename || hasNonTextFilename;
+                if (!isAttachment && !(includeInlineImages && isInlineImage) &&
+                    !(includeRelatedImages && ct.startsWith("image/") && insideRelated)) return;
 
                 let bytes;
                 try {
@@ -7633,12 +7908,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   disposition,
                   partName: entity.partName,
                   isInline: isInlineImage,
+                  isAttachment,
+                  insideRelated,
                   bytes,
                 });
               }
 
-              const insideRelated = top.contentType.value === "multipart/related";
-              for (const child of top.parts) walkPart(child, insideRelated);
+              walkPart(top, false);
               return results;
             }
             // END RAW MIME ATTACHMENT HELPERS
@@ -7650,7 +7926,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (typeof rawHtml === "string" && truncateHtmlForParsing(rawHtml).truncated) {
                 return rawHtml.includes("-----BEGIN PGP MESSAGE-----");
               }
-              return typeof text === "string" && /(?:^|\r?\n)[^\S\r\n]*-----BEGIN PGP MESSAGE-----[^\S\r\n]*(?:\r?\n|$)/.test(text);
+              return typeof text === "string" && /(?:^|\r\n|\n|\r)[^\S\r\n]*-----BEGIN PGP MESSAGE-----[^\S\r\n]*(?:\r\n|\n|\r|$)/.test(text);
             }
 
             function hasInlinePgpBodyArmor(aMimeMsg, body, preferHtml = false) {
@@ -7674,8 +7950,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 ? "encrypted" : "clear";
             }
 
-            function isEncryptedMimeMessage(part) {
-              if (!part) return false;
+            function getMimePartContentTypes(part) {
               // Gloda's contentType omits parameters; prefer the full original header
               // for that type, while still inspecting a different structural type.
               const contentTypes = [].concat(part.headers?.["content-type"] || []);
@@ -7683,30 +7958,265 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   parseRawMimeHeaderValue(part.contentType).value)) {
                 contentTypes.push(part.contentType || "");
               }
-              const states = contentTypes.map(classifyMimeContentType);
-              if (states.some(state => state === "encrypted" || state === "unknown")) return true;
-              if (part.isEncrypted) return true;
-              const isHtml = contentTypes.some(value => parseRawMimeHeaderValue(value).value === "text/html");
-              if (hasInlinePgpArmor(part.body, isHtml ? part.body : null)) return true;
-              return Array.isArray(part.parts) && part.parts.some(isEncryptedMimeMessage);
+              return contentTypes;
             }
 
-            function classifyRawMessageEncryption(rawBytes, depth = 0) {
+            const DETACHED_SIGNATURE_PROTOCOLS = ["application/pgp-signature", "application/pkcs7-signature", "application/x-pkcs7-signature"];
+
+            // Some Thunderbird versions route RFC 1847 multipart/signed through the
+            // OpenPGP handler, whose libmime class derives from MimeEncrypted, so
+            // Gloda flags the container as encrypted and, without
+            // examineEncryptedParts, returns it with no children. That exact shape
+            // only means "unknown until the raw message is checked". Any other
+            // flagged part, including a flagged signed container that does have
+            // children (possibly decrypted leaves), stays encrypted. Protocol
+            // matching follows the approach proposed by @the78mole in #235.
+            function isEmptyFlaggedSignedContainer(part, contentTypes) {
+              if (!part.isEncrypted || !Array.isArray(part.parts) || part.parts.length !== 0) return false;
+              return contentTypes.every(value => {
+                const parsed = parseRawMimeHeaderValue(value);
+                return parsed.value === "multipart/signed" &&
+                  DETACHED_SIGNATURE_PROTOCOLS.includes(String(parsed.params.protocol || "").toLowerCase()) &&
+                  splitRawMimeHeaderParameters(value).slice(1).filter(param => /^protocol\s*=/i.test(param)).length === 1;
+              });
+            }
+
+            // Returns "encrypted", "clear", or "raw". "raw" means the tree holds
+            // nothing encrypted except empty flagged signed containers, so the
+            // caller must withhold unless classifyRawMessageEncryption on the
+            // stored message returns "clear". Callers must never refetch with
+            // examineEncryptedParts to fill such a container: that decrypts nested
+            // encrypted content.
+            function classifyMimeMessageEncryption(part) {
+              if (!part) return "clear";
+              const contentTypes = getMimePartContentTypes(part);
+              const states = contentTypes.map(classifyMimeContentType);
+              if (states.some(state => state === "encrypted" || state === "unknown")) return "encrypted";
+              const needsRaw = isEmptyFlaggedSignedContainer(part, contentTypes);
+              if (part.isEncrypted && !needsRaw) return "encrypted";
+              const isHtml = contentTypes.some(value => parseRawMimeHeaderValue(value).value === "text/html");
+              if (hasInlinePgpArmor(part.body, isHtml ? part.body : null)) return "encrypted";
+              let result = needsRaw ? "raw" : "clear";
+              for (const child of Array.isArray(part.parts) ? part.parts : []) {
+                const state = classifyMimeMessageEncryption(child);
+                if (state === "encrypted") return "encrypted";
+                if (state === "raw") result = "raw";
+              }
+              return result;
+            }
+
+            // BEGIN STRICT RAW MIME GATE
+            // The signed raw path only classifies MIME that every parser reads
+            // the same way. Each round of review found another construct that
+            // libmime reads differently from our parser (parameter quoting,
+            // RFC 2231 forms, boundary separators), so any deviation from this
+            // strict grammar withholds the message instead.
+            const STRICT_MIME_TOKEN = "[!#$%&'*+.0-9A-Z^_`a-z{|}~-]+";
+            const STRICT_MIME_TYPE_HEAD_RE = new RegExp(`^[ \\t]*${STRICT_MIME_TOKEN}/${STRICT_MIME_TOKEN}`);
+            const STRICT_MIME_DISPOSITION_HEAD_RE = new RegExp(`^[ \\t]*${STRICT_MIME_TOKEN}`);
+            const STRICT_MIME_PARAMETER_RE = new RegExp(
+              `[ \\t]*;[ \\t]*(${STRICT_MIME_TOKEN})[ \\t]*=[ \\t]*(${STRICT_MIME_TOKEN}|"[^"\\\\\\0\\r\\n]*")`, "y"
+            );
+            const STRICT_MIME_TAIL_RE = /[ \t]*;?[ \t]*$/y;
+            // RFC 2231 forms are accepted only for name and filename.
+            const STRICT_MIME_RFC2231_KEY_RE = /^(?:name|filename)\*(?:\d+\*?)?$/;
+            // Narrower than RFC 2046 bchars: no quotes (mimeVerify strips matching
+            // quotes from the boundary), no spaces (folding is normalised
+            // differently by each parser) and no other punctuation. Thunderbird,
+            // Outlook, Apple Mail, Gmail, K-9/FairEmail, Evolution and KMail
+            // boundaries all fit.
+            const STRICT_MIME_BOUNDARY_RE = /^[A-Za-z0-9_.=+-]{1,70}$/;
+            const STRICT_MIME_LINE_RE = /([^\r\n]*)(\r\n|\n|\r|$)/y;
+            const STRICT_MIME_SINGLE_HEADERS = ["content-type", "content-disposition", "content-transfer-encoding", "content-name", "x-sun-data-name"];
+
+            function isStrictRawMimeStructuredValue(value, headRe) {
+              const head = headRe.exec(value);
+              if (!head) return false;
+              let index = head[0].length;
+              const seen = new Set();
+              for (;;) {
+                STRICT_MIME_PARAMETER_RE.lastIndex = index;
+                const match = STRICT_MIME_PARAMETER_RE.exec(value);
+                if (!match) break;
+                const key = match[1].toLowerCase();
+                if (seen.has(key) || (key.includes("*") && !STRICT_MIME_RFC2231_KEY_RE.test(key))) return false;
+                seen.add(key);
+                index = STRICT_MIME_PARAMETER_RE.lastIndex;
+              }
+              STRICT_MIME_TAIL_RE.lastIndex = index;
+              if (!STRICT_MIME_TAIL_RE.test(value)) return false;
+              // Continuations must be complete and decodable, and a plain form
+              // next to them must name the same file.
+              for (const base of ["name", "filename"]) {
+                const out = { names: [], undecodable: false };
+                collectRawMimeParameterNames(value, base, out);
+                if (out.undecodable || new Set(out.names).size > 1) return false;
+              }
+              return true;
+            }
+
+            function isStrictlyWellFormedRawMime(rawBytes, depth = 0, defaultType = "text/plain") {
+              if (depth > 10) return false;
+              const raw = rawMimeToByteString(rawBytes);
+              // Header lines end with CRLF or LF; the block ends at the first
+              // empty line.
+              const headerLines = [];
+              let pos = 0;
+              let bodyStart = -1;
+              while (bodyStart < 0) {
+                STRICT_MIME_LINE_RE.lastIndex = pos;
+                const match = STRICT_MIME_LINE_RE.exec(raw);
+                if (match[2] === "\r") return false;
+                if (match[1] === "") {
+                  bodyStart = STRICT_MIME_LINE_RE.lastIndex;
+                } else {
+                  if (match[2] === "") return false; // no empty line ends the headers
+                  headerLines.push(match[1]);
+                  pos = STRICT_MIME_LINE_RE.lastIndex;
+                }
+              }
+              const headers = Object.create(null);
+              let current = null;
+              for (const line of headerLines) {
+                // No C0 control other than HT, and no DEL, in any header: libmime
+                // may decode escape sequences (e.g. ISO-2022-JP) into a name.
+                if (/[\x00-\x08\x0A-\x1F\x7F]/.test(line)) return false;
+                if (/^[ \t]/.test(line)) {
+                  if (!current) return false;
+                  current.value += line;
+                  continue;
+                }
+                // RFC 5322 field name: printable US-ASCII except ':'.
+                const match = /^([!-9;-~]+):(.*)$/.exec(line);
+                if (!match) return false;
+                current = { value: match[2] };
+                const name = match[1].toLowerCase();
+                (headers[name] ||= []).push(current);
+              }
+              const value = name => headers[name]?.[0]?.value;
+              if (STRICT_MIME_SINGLE_HEADERS.some(name => (headers[name] || []).length > 1)) return false;
+              const contentTypeValue = value("content-type");
+              const dispositionValue = value("content-disposition");
+              // The classifier and extractors read these headers through
+              // parseRawMimeHeaders, which normalises folding differently; both
+              // readings must give the same type and parameters.
+              const collapsedHeaders = parseRawMimeHeaders(raw.slice(0, bodyStart));
+              for (const [name, own] of [["content-type", contentTypeValue], ["content-disposition", dispositionValue]]) {
+                if (own === undefined) continue;
+                const mine = parseRawMimeHeaderValue(own);
+                const theirs = parseRawMimeHeaderValue(getRawMimeHeader(collapsedHeaders, name));
+                const keys = Object.keys(mine.params);
+                if (mine.value !== theirs.value || keys.length !== Object.keys(theirs.params).length ||
+                    keys.some(key => mine.params[key] !== theirs.params[key])) return false;
+              }
+              const encoding = (value("content-transfer-encoding") ?? "7bit").trim().toLowerCase();
+              if (contentTypeValue !== undefined &&
+                  !isStrictRawMimeStructuredValue(contentTypeValue, STRICT_MIME_TYPE_HEAD_RE)) return false;
+              if (dispositionValue !== undefined &&
+                  !isStrictRawMimeStructuredValue(dispositionValue, STRICT_MIME_DISPOSITION_HEAD_RE)) return false;
+              if (!/^(?:7bit|8bit|binary|base64|quoted-printable)$/.test(encoding)) return false;
+              if (["content-name", "x-sun-data-name"].some(name => /[\\"\0]/.test(value(name) ?? ""))) return false;
+
+              const contentType = parseRawMimeHeaderValue(contentTypeValue ?? defaultType);
+              const body = raw.slice(bodyStart);
+              if (contentType.value.startsWith("multipart/")) {
+                const boundary = contentType.params.boundary;
+                if (!/^(?:7bit|8bit|binary)$/.test(encoding) || !boundary || !STRICT_MIME_BOUNDARY_RE.test(boundary)) return false;
+                // Thunderbird's mimeVerify.sys.mjs splits multipart/signed itself
+                // with indexOf. So every occurrence of the delimiter anywhere in
+                // the body (preamble, parts and epilogue, which include all
+                // descendants) must start a line and end at the line break, or
+                // be the one closing delimiter. No padding and no lone CR.
+                if (/\r(?!\n)/.test(body)) return false;
+                const delimiter = `--${boundary}`;
+                let closed = false;
+                for (let index = body.indexOf(delimiter); index >= 0;
+                  index = body.indexOf(delimiter, index + delimiter.length)) {
+                  if (closed || (index > 0 && body[index - 1] !== "\n")) return false;
+                  const after = body.slice(index + delimiter.length, index + delimiter.length + 4);
+                  if (/^--(?:\r\n|\n|$)/.test(after)) closed = true;
+                  else if (!/^(?:\r\n|\n)/.test(after)) return false;
+                }
+                if (!closed) return false;
+                const parts = splitRawMimeMultipartBody(body, boundary);
+                const childType = getRawMimeDefaultChildType(contentType.value);
+                return parts.length > 0 && parts.every(part => isStrictlyWellFormedRawMime(part, depth + 1, childType));
+              }
+              if (RAW_MIME_EMBEDDED_MESSAGE_TYPES.has(contentType.value)) {
+                // RFC 2046 forbids encoding these, and older Thunderbird does not
+                // decode them, so an encoded one parses differently in libmime.
+                if (!/^(?:7bit|8bit|binary)$/.test(encoding)) return false;
+                return isStrictlyWellFormedRawMime(body, depth + 1);
+              }
+              return true;
+            }
+            // END STRICT RAW MIME GATE
+
+            // A line libmime's untyped-text class decodes into an attachment whose
+            // name could make it an embedded message or encrypted data. BinHex
+            // hides the name inside the encoded data, so any BinHex block counts.
+            function hasRawMimeEncodedProtectedFile(text) {
+              return String(text || "").split(/\r\n|\n|\r/).some(line => {
+                if (line.startsWith("(This file must be converted with BinHex")) return true;
+                const name = /^begin [0-7]{3,4} (.+)$/.exec(line)?.[1] ?? /^=ybegin .*\bname=(.*)$/.exec(line)?.[1];
+                return name !== undefined && RAW_MIME_PROTECTED_NAME_RE.test(name.trim());
+              });
+            }
+
+            // options.defaultType: type of a part without Content-Type.
+            // options.embeddedRoot: rawBytes is the whole of an embedded message.
+            // options.insideEmbedded: rawBytes is in an embedded message.
+            // options.signedRaw: the message is read raw because Gloda withheld a
+            // clear-signed container. Only then do the libmime-differential
+            // rules below apply (names, embedded roots, encoded files, header
+            // syntax); every other caller keeps the 0.9.1 classification.
+            function classifyRawMessageEncryption(rawBytes, depth = 0, options = {}) {
+              const defaultType = options.defaultType || "text/plain";
+              const insideEmbedded = options.insideEmbedded === true;
+              const signedRaw = options.signedRaw === true;
               try {
                 if (depth > 10) return "unknown";
                 const raw = rawMimeToByteString(rawBytes);
+                if (signedRaw && depth === 0 && !isStrictlyWellFormedRawMime(raw)) return "unknown";
                 if (hasInlinePgpArmor(raw)) return "encrypted";
                 const split = findRawMimeHeaderBodySplit(raw);
                 if (!split) return "unknown";
                 const headers = parseRawMimeHeaders(split.header);
                 const lines = split.header.replace(/(?:\r\n|\r|\n)[ \t]+/g, " ").split(/\r\n|\r|\n/);
+                // libmime ends headers at the first empty line under any line
+                // terminator, so an empty line inside the block is ambiguous.
+                if (signedRaw && split.header !== "" && lines.some(line => !line)) return "unknown";
                 if (lines.some(line => line && !/^[!-9;-~]+:/.test(line)) ||
                     (headers["content-type"] || []).length > 1 ||
                     (headers["content-transfer-encoding"] || []).length > 1) return "unknown";
                 if (headers["content-type"] && !headers["content-type"][0]) return "unknown";
-                const contentTypeValue = getRawMimeHeader(headers, "content-type") || "text/plain";
+                const contentTypeValue = getRawMimeHeader(headers, "content-type") || defaultType;
                 const state = classifyMimeContentType(contentTypeValue);
                 if (state === "encrypted" || state === "unknown") return state;
+                // libmime gives a part with no or a generic type the class its
+                // name suggests, and creates an embedded message root without
+                // MIME-Version or Content-Type with no type at all. Withhold
+                // whenever such a name could select a message or S/MIME class.
+                const untyped = !headers["content-type"];
+                const names = getRawMimeNames(headers);
+                const hasNameHint = names.undecodable || names.names.length > 0;
+                if (signedRaw && options.embeddedRoot && untyped && !headers["mime-version"]) {
+                  // A pre-MIME embedded message must be plain text; a transfer
+                  // encoding there could carry opaque data libmime classes by name.
+                  const rootEncoding = getRawMimeHeader(headers, "content-transfer-encoding").trim().toLowerCase();
+                  if (hasNameHint || !/^(?:7bit|8bit|binary)?$/.test(rootEncoding)) return "unknown";
+                }
+                const typeValue = parseRawMimeHeaderValue(contentTypeValue).value;
+                if (signedRaw && (untyped || RAW_MIME_NAME_TYPED_CONTENT_TYPES.has(typeValue)) &&
+                    (names.undecodable || names.names.some(name => RAW_MIME_PROTECTED_NAME_RE.test(name)))) {
+                  return "unknown";
+                }
+                // An embedded message part's own name also withholds when it
+                // stands for S/MIME or PGP data, or cannot be decoded.
+                if (signedRaw && RAW_MIME_EMBEDDED_MESSAGE_TYPES.has(typeValue) &&
+                    (names.undecodable || names.names.some(name => RAW_MIME_PROTECTED_DATA_NAME_RE.test(name)))) {
+                  return "unknown";
+                }
                 const contentType = parseRawMimeHeaderValue(contentTypeValue);
                 const encoding = getRawMimeHeader(headers, "content-transfer-encoding").trim().toLowerCase();
                 if (!/^(?:7bit|8bit|binary|base64|quoted-printable)?$/.test(encoding)) return "unknown";
@@ -7719,7 +8229,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                   const parts = splitRawMimeMultipartBody(split.body, boundary);
                   if (!parts.length) return "unknown";
-                  const states = parts.map(part => classifyRawMessageEncryption(part, depth + 1));
+                  const childType = getRawMimeDefaultChildType(contentType.value);
+                  const states = parts.map(part => classifyRawMessageEncryption(part, depth + 1, {
+                    defaultType: childType,
+                    insideEmbedded,
+                    signedRaw,
+                  }));
                   return states.includes("encrypted") ? "encrypted" : states.includes("unknown") ? "unknown" : "clear";
                 }
                 if (encoding === "base64" && split.body.trim() && !isValidBase64(split.body.replace(/\s/g, ""))) return "unknown";
@@ -7728,7 +8243,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!bytes) return "unknown";
                 const decoded = rawMimeToByteString(bytes);
                 if (hasInlinePgpArmor(decoded)) return "encrypted";
-                if (contentType.value === "message/rfc822") return classifyRawMessageEncryption(decoded, depth + 1);
+                // Embedded messages are classified as whole messages, as libmime
+                // renders them.
+                if (RAW_MIME_EMBEDDED_MESSAGE_TYPES.has(contentType.value)) {
+                  // Same rule as the strict gate on the signed raw path.
+                  if (signedRaw && !/^(?:7bit|8bit|binary)?$/.test(encoding)) return "unknown";
+                  return classifyRawMessageEncryption(decoded, depth + 1, { embeddedRoot: true, insideEmbedded: true, signedRaw });
+                }
                 if (contentType.value.startsWith("text/")) {
                   const charsetParams = splitRawMimeHeaderParameters(contentTypeValue).slice(1)
                     .filter(param => /^charset(?:\*[^=\s]*)?\s*=/i.test(param));
@@ -7736,12 +8257,52 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       (!/^charset\s*=/i.test(charsetParams[0]) || !contentType.params.charset))) return "unknown";
                   const text = decodeRawMimeTextPart({ headers, body: split.body, contentType: { value: "text/plain" } });
                   if (!text || text.charsetFallback) return "unknown";
-                  if (hasInlinePgpArmor(text.text, contentType.value === "text/html" ? text.text : null)) return "encrypted";
+                  if (signedRaw && (untyped || insideEmbedded) && hasRawMimeEncodedProtectedFile(text.text)) return "unknown";
+                  const isHtml = contentType.value === "text/html";
+                  if (hasInlinePgpArmor(text.text, isHtml ? text.text : null)) return "encrypted";
+                  // Match the structured-body check: invisible characters and HTML
+                  // markup must not hide a standalone armor line.
+                  if (hasInlinePgpArmor(stripInvisibleCharacters(text.text))) return "encrypted";
+                  if (isHtml) {
+                    let visible;
+                    try {
+                      visible = stripHtml(text.text, true);
+                    } catch {
+                      return "unknown"; // No reliable HTML classification.
+                    }
+                    if (hasInlinePgpArmor(visible, text.text)) return "encrypted";
+                  }
                 }
                 return contentType.value ? "clear" : "unknown";
               } catch {
                 return "unknown";
               }
+            }
+
+            // Plain-text body for direct reply/forward quoting while the encrypted
+            // message preference applies. Returns null when the message must be
+            // withheld, otherwise { body } plus { raw } when the body came from the
+            // stored message because Gloda withheld a clear-signed container.
+            function getDirectQuoteContent(msgHdr, aMimeMsg, allowEncrypted) {
+              if (allowEncrypted) return { body: extractPlainTextBody(aMimeMsg) };
+              if (!aMimeMsg) return null;
+              const state = classifyMimeMessageEncryption(aMimeMsg);
+              if (state === "encrypted") return null;
+              if (state === "clear") {
+                const body = extractPlainTextBody(aMimeMsg);
+                return hasInlinePgpBodyArmor(aMimeMsg, body) ? null : { body };
+              }
+              let raw;
+              try {
+                raw = readBoundedRawMessage(msgHdr);
+              } catch (e) {
+                console.error("thunderbird-mcp: signed message raw read failed:", e);
+                return null;
+              }
+              if (classifyRawMessageEncryption(raw, 0, { signedRaw: true }) !== "clear") return null;
+              const part = extractBodyPartFromRawMime(raw, "text");
+              const body = !part ? "" : part.isHtml ? stripHtml(part.text) : stripInvisibleCharacters(part.text);
+              return hasInlinePgpArmor(body) ? null : { body, raw };
             }
 
             // BEGIN PROTECTED SUBJECT HELPERS
@@ -7863,10 +8424,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return;
                     }
 
-                    if (!allowEncrypted && isEncryptedMimeMessage(aMimeMsg)) {
+                    const encryptionState = allowEncrypted ? "clear" : classifyMimeMessageEncryption(aMimeMsg);
+                    if (encryptionState === "encrypted") {
                       resolve(encryptedMessagePlaceholder(msgHdr));
                       return;
                     }
+                    // Gloda withheld a clear-signed container's children. Content
+                    // then comes only from the stored message, after
+                    // classifyRawMessageEncryption returns "clear" for it (the raw
+                    // source mode and the body fallback below both check that).
+                    const useRawContent = encryptionState === "raw";
 
                     // Raw source mode: return full RFC 2822 message
                     if (rawSource) {
@@ -7877,7 +8444,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         // Latin-1 default preserves raw bytes; UTF-8 corrupts 8-bit content.
                         const raw = readMessageStreamFully(stream);
                         if (!allowEncrypted) {
-                          const state = classifyRawMessageEncryption(raw);
+                          const state = classifyRawMessageEncryption(raw, 0, { signedRaw: useRawContent });
                           if (state !== "clear") {
                             resolve(encryptedMessagePlaceholder(msgHdr, state === "unknown"));
                             return;
@@ -7902,7 +8469,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
 
                     const requestedBodyFormat = bodyFormat || "markdown";
-                    const fmt = extractFormattedBody(aMimeMsg, requestedBodyFormat);
+                    const fmt = useRawContent
+                      ? { body: "", bodyIsHtml: false }
+                      : extractFormattedBody(aMimeMsg, requestedBodyFormat);
                     let body = fmt.body;
                     let bodyIsHtml = fmt.bodyIsHtml;
                     let bodyNote = "";
@@ -7913,7 +8482,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     // Bound all synchronous raw-MIME work with the existing
                     // attachment-recovery ceiling.
-                    const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+                    const MAX_ATTACHMENT_BYTES = RAW_MESSAGE_MAX_BYTES;
                     let rawMimeContent = null;
                     let rawMimeAttachmentParts = null;
                     let rawMimePartsWithInlineImages = null;
@@ -7921,6 +8490,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     // If structured MIME extraction failed, try the raw stream for
                     // local mbox folders where MsgHdrToMimeMessage returns empty parts.
+                    // A withheld clear-signed container always takes this path.
                     if (!body) {
                       const fallbackContext = `thunderbird-mcp: raw MIME body fallback (${msgHdr.messageId})`;
                       let rawStream = null;
@@ -7930,7 +8500,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         // Latin-1 default preserves raw bytes for transfer decoding.
                         rawMimeContent = readMessageStreamFully(rawStream, MAX_ATTACHMENT_BYTES);
                         if (!allowEncrypted) {
-                          const state = classifyRawMessageEncryption(rawMimeContent);
+                          const state = classifyRawMessageEncryption(rawMimeContent, 0, { signedRaw: useRawContent });
                           if (state !== "clear") {
                             resolve(encryptedMessagePlaceholder(msgHdr, state === "unknown"));
                             return;
@@ -7950,6 +8520,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             bodyNote = bodyDiagnostic.bodyNote ||
                               "raw MIME body extraction found no suitable text part";
                             console.error(`${fallbackContext}: ${bodyNote}`);
+                          } else if (!allowEncrypted && hasInlinePgpBodyArmor(
+                            { contentType: extracted.isHtml ? "text/html" : "text/plain", body: extracted.text },
+                            extracted.text,
+                            requestedBodyFormat !== "text"
+                          )) {
+                            // The raw classifier and the structured-body check must
+                            // agree before fallback content is returned.
+                            resolve(encryptedMessagePlaceholder(msgHdr));
+                            return;
                           } else {
                             if (extracted.charsetFallback) {
                               console.error(
@@ -8031,7 +8610,48 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return String(rawContentId).trim().replace(/^<+|>+$/g, "").trim();
                     }
 
-                    if (aMimeMsg && aMimeMsg.allUserAttachments) {
+                    if (useRawContent) {
+                      // Gloda saw none of the signed content, so list attachments
+                      // from the stored message, which already classified "clear".
+                      // Bytes come from that message; no message-part URL is
+                      // fetched through libmime.
+                      let rawParts = [];
+                      try {
+                        rawParts = parseAttachmentPartsFromRawMime(rawMimeContent, {
+                          includeInlineImages,
+                          skipDetachedSignatures: true,
+                          includeAttachedMessages: true,
+                          includeRelatedImages: !includeInlineImages,
+                        });
+                      } catch (e) {
+                        console.error("thunderbird-mcp: signed message attachment parse failed:", e);
+                        bodyNote = bodyNote || "attachments could not be parsed from the signed message";
+                      }
+                      for (const part of rawParts) {
+                        // Without the opt-in, the Gloda path marks images inside
+                        // multipart/related as inline; keep that rule here.
+                        const isInline = includeInlineImages
+                          ? part.isInline
+                          : part.contentType.startsWith("image/") && part.insideRelated;
+                        const info = {
+                          name: part.filename || (isInline ? `inline_${part.partName}` : ""),
+                          contentType: part.contentType,
+                          size: part.bytes.length,
+                          isInline,
+                        };
+                        if (isInline) info.partName = part.partName;
+                        if (isInline && includeInlineImages) info.contentId = part.contentId || null;
+                        attachments.push(info);
+                        attachmentSources.push({ info, url: "", size: info.size, bytes: part.bytes });
+                        if (isInline && includeInlineImages) {
+                          inlineImageSources.push({
+                            info, url: "", size: info.size, partName: part.partName, bytes: part.bytes,
+                          });
+                        }
+                      }
+                    }
+
+                    if (!useRawContent && aMimeMsg && aMimeMsg.allUserAttachments) {
                       for (const att of aMimeMsg.allUserAttachments) {
                         const info = {
                           name: att?.name || "",
@@ -8064,7 +8684,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // an explicit attachment disposition never does. URLs are resolved
                     // through the message service because imap-message:// is not
                     // directly fetchable by NetUtil.
-                    if (aMimeMsg) {
+                    if (!useRawContent && aMimeMsg) {
                       // For the opt-in path this set only deduplicates the MIME-tree
                       // walk. allUserAttachments is reconciled after collection so a
                       // named inline image remains eligible for an image block.
@@ -8184,7 +8804,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     // Recover Content-ID from the raw MIME tree for attribution. This
                     // only runs for the opt-in path; default getMessage output and I/O
                     // remain unchanged.
-                    if (includeInlineImages && inlineImageSources.length > 0) {
+                    if (!useRawContent && includeInlineImages && inlineImageSources.length > 0) {
                       const parsed = getRawMimeAttachmentParts(true);
                       if (!parsed.error) {
                         const rawInlineParts = (parsed.parts || []).filter(part => part.isInline);
@@ -8231,6 +8851,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     function fetchInlineImageBase64(source) {
                       return new Promise((resolve) => {
+                        // Largest decoded payload whose base64 representation fits
+                        // exactly inside the per-image encoded budget.
+                        const maxRawBytes = Math.floor(MAX_INLINE_IMAGE_BASE64_BYTES / 4) * 3;
+                        if (source.bytes) {
+                          resolve(source.bytes.length > maxRawBytes
+                            ? { error: `Image exceeds per-image base64 limit (${MAX_INLINE_IMAGE_BASE64_BYTES} bytes)` }
+                            : { data: encodeByteStringToBase64(rawMimeToByteString(source.bytes)) });
+                          return;
+                        }
                         if (!source.url) {
                           resolve({ error: "Inline image has no fetchable message-part URL" });
                           return;
@@ -8252,9 +8881,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                               }
                               // Message-part channels can report the parent message's
                               // contentLength, so enforce the limit on bytes read below.
-                              // Largest decoded payload whose base64 representation fits
-                              // exactly inside the per-image encoded budget.
-                              const maxRawBytes = Math.floor(MAX_INLINE_IMAGE_BASE64_BYTES / 4) * 3;
                               let byteString;
                               try {
                                 byteString = readMessageStreamFully(inputStream, maxRawBytes);
@@ -8534,10 +9160,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return { size: recoveredSize };
                     }
 
-                                        const saveOne = ({ info, url, size }, index) =>
+                                        const saveOne = ({ info, url, size, bytes }, index) =>
                                           new Promise((done) => {
                         try {
-                          if (!url) {
+                          if (!url && !bytes) {
                             info.error = "Missing attachment URL";
                             done();
                             return;
@@ -8562,6 +9188,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                             file.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, 0o600);
                           } catch (e) {
                             info.error = `Failed to create file: ${e}`;
+                            done();
+                            return;
+                          }
+
+                          if (bytes) {
+                            // Already decoded from the classified raw message.
+                            try {
+                              writeBytesToFile(file, bytes);
+                              info.filePath = file.path;
+                            } catch (e) {
+                              info.error = `Write failed: ${e}`;
+                              try { file.remove(false); } catch {}
+                            }
                             done();
                             return;
                           }
@@ -9053,11 +9692,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
 	                    MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
 	                      try {
-	                        const originalBody = extractPlainTextBody(aMimeMsg);
-	                        if (!allowEncrypted && (!aMimeMsg || isEncryptedMimeMessage(aMimeMsg) || hasInlinePgpBodyArmor(aMimeMsg, originalBody))) {
+	                        const quoted = getDirectQuoteContent(msgHdr, aMimeMsg, allowEncrypted);
+	                        if (!quoted) {
 	                          resolve({ error: "Direct reply or automatic drafting of encrypted messages is blocked. Use skipReview: false and saveAsDraft: false to review in Thunderbird, or enable \"Allow MCP clients to read encrypted messages\" in the extension options." });
 	                          return;
 	                        }
+	                        const originalBody = quoted.body;
 
 	                        if (saveAsDraft) {
 	                          openReplyWindow();
@@ -9243,11 +9883,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                     MsgHdrToMimeMessage(msgHdr, null, (aMsgHdr, aMimeMsg) => {
                       try {
-                        const originalBody = extractPlainTextBody(aMimeMsg);
-                        if (!allowEncrypted && (!aMimeMsg || isEncryptedMimeMessage(aMimeMsg) || hasInlinePgpBodyArmor(aMimeMsg, originalBody))) {
+                        const quoted = getDirectQuoteContent(msgHdr, aMimeMsg, allowEncrypted);
+                        if (!quoted) {
                           resolve({ error: "Direct reply/forward of encrypted messages is blocked. Use skipReview: false to review in Thunderbird, or enable \"Allow MCP clients to read encrypted messages\" in the extension options." });
                           return;
                         }
+                        // Gloda withheld this clear-signed message's parts, so its
+                        // attachments have no message-part URLs to forward safely.
+                        if (quoted.raw && rawMessageHasForwardableParts(quoted.raw)) {
+                          resolve({ error: "Direct forward of this signed message cannot include its attachments while encrypted message access is off. Use skipReview: false to review in Thunderbird." });
+                          return;
+                        }
+                        const originalBody = quoted.body;
 
                         composeFields.to = to;
                         composeFields.cc = cc || "";

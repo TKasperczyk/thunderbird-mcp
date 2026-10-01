@@ -75,9 +75,7 @@ function loadSend(options = {}) {
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
     PREF_ALLOW_ENCRYPTED_MESSAGES: "encrypted",
     isPrivacyOptInEnabled: () => false,
-    extractPlainTextBody: () => "Original body",
-    isEncryptedMimeMessage: () => false,
-    hasInlinePgpBodyArmor: () => false,
+    getDirectQuoteContent: () => ({ body: "Original body" }),
   };
   const dispositionStart = source.indexOf("function markMessageDispositionState(");
   const dispositionEnd = source.indexOf("// BEGIN DIRECT SEND HELPER", dispositionStart);

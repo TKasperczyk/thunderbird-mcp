@@ -36,6 +36,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     TextDecoder,
     Uint8Array,
     atob,
+    btoa,
     Services: { prefs: { getBoolPref() { if (unreadable) throw Error("unreadable"); return allowed; } } },
     ChromeUtils: { importESModule: () => ({
       MsgHdrToMimeMessage(msgHdr, _listener, callback, _download, options) {
@@ -70,9 +71,12 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     source.match(/^const PREF_\w+ = .+;$/gm).join("\n"),
     snippet("PRIVACY PREFERENCE HELPERS"), snippet("MCP TEXT SANITIZATION"),
     snippet("MESSAGE TEXT CONVERSION"), snippet("RAW MIME PARSING HELPERS"),
+    snippet("RAW MIME ATTACHMENT HELPERS"), snippet("INLINE IMAGE CONTENT HELPERS"),
     snippet("INLINE ATTACHMENT BASE64 HELPERS"), snippet("ENCRYPTED MESSAGE GUARD"),
     snippet("MESSAGE READ TOOLS"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
+  // The production stream reader is loaded with its helper block; serve the fixture instead.
+  sandbox.readMessageStreamFully = () => raw;
   return { api: sandbox, calls };
 }
 
@@ -472,7 +476,7 @@ describe("Encryption classification of joined MIME bodies", () => {
             elementNode("p", [textNode(armor)]), elementNode("p", [textNode("ciphertext")]),
           ]), { mime, allowed })
           : loadMessageTools({ mime, allowed });
-        assert.equal(api.isEncryptedMimeMessage(mime), false, "individual fragments have no complete armor marker");
+        assert.equal(api.classifyMimeMessageEncryption(mime), "clear", "individual fragments have no complete armor marker");
         for (const format of ["text", "markdown", "html"]) {
           const result = await api.getMessage("message-1", "folder", false, format);
           assert.equal(result.encryptedContentWithheld === true, !allowed);
@@ -509,7 +513,7 @@ describe("Encryption classification of joined MIME bodies", () => {
     ] };
     assert.ok(first.length < cap && second.length < cap && joined.length > cap);
     const { api, calls } = loadHtmlFixture(joined.slice(0, cap), () => documentTree([elementNode("p", [textNode("prefix")])]), { mime });
-    assert.equal(api.isEncryptedMimeMessage(mime), false);
+    assert.equal(api.classifyMimeMessageEncryption(mime), "clear");
     for (const format of ["text", "markdown", "html"]) {
       assert.equal((await api.getMessage("message-1", "folder", false, format)).encryptedContentWithheld, true);
     }
@@ -626,7 +630,7 @@ describe("Oversized HTML encryption classification", () => {
     const html = `<p>${"é".repeat(cap / 2)}the delimiter is ${header}</p>`;
     assert.ok(html.length < cap);
     const { api } = loadMessageTools({ mime: { contentType: "text/html", body: html } });
-    assert.equal(api.isEncryptedMimeMessage({ contentType: "text/html", body: html }), true);
+    assert.equal(api.classifyMimeMessageEncryption({ contentType: "text/html", body: html }), "encrypted");
     const allowed = loadMessageTools({ allowed: true, mime: { contentType: "text/html", body: html } }).api;
     const result = await allowed.getMessage("message-1", "folder", false, "html");
     assert.notEqual(result.encryptedContentWithheld, true);
@@ -700,7 +704,8 @@ describe("Encryption classification before raw output or body fallback", () => {
               `Content-Type: multipart/${subtype}; boundary=b`, "", "--b", child,
               "--b", "Content-Type: text/html", "", "<p>Hello</p>", "--b--", "",
             ].join(newline);
-            const { api } = loadMessageTools({ raw, mime: { parts: [] } });
+            // The raw classifier also checks the HTML part's visible text.
+            const { api } = loadHtmlFixture("<p>Hello</p>", () => documentTree([elementNode("p", [textNode("Hello")])]), { raw, mime: { parts: [] } });
             const result = await api.getMessage("message-1", "folder", false, "text", rawSource);
             assert.equal(result.error, undefined);
             assert.notEqual(result.encryptedContentWithheld, true);
@@ -1238,5 +1243,844 @@ describe("Message text conversion", () => {
     const { api } = loadHtmlFixture(html, () => documentTree([textNode("a\u200db\u200cc")]));
     assert.equal(api.stripHtml(html), "a\u200db\u200cc");
     assert.equal(api.extractFormattedBody({ contentType: "text/plain", body: "👩\u200d💻 ا\u200cب" }, "markdown").body, "👩\u200d💻 ا\u200cب");
+  });
+});
+
+// Thunderbird 147/153 route multipart/signed through the OpenPGP handler, so
+// Gloda flags the container as encrypted and, without examineEncryptedParts,
+// returns it with no children. comm-central leaves it unflagged with children.
+describe("Clear-signed mail with the encrypted-message preference off", () => {
+  const PGP_SIGNATURE = "application/pgp-signature";
+  const PKCS7_SIGNATURE = "application/pkcs7-signature";
+  const SIGNED_TEXT = "signed text";
+  const SECRET = "decrypted body";
+  const WITHHELD_SEND = /encrypted messages is blocked/;
+  const signedHeaderValue = protocol => `multipart/signed; micalg=sha-256; protocol="${protocol}"; boundary="sig"`;
+  const signedContainer = (parts, { protocol = PGP_SIGNATURE, isEncrypted = true, headerValue = signedHeaderValue(protocol) } = {}) => ({
+    contentType: "message/rfc822", headers: { "content-type": [headerValue] },
+    parts: [{ contentType: "multipart/signed", headers: { "content-type": [headerValue] }, isEncrypted, parts }],
+  });
+  const signatureLeaf = protocol => protocol === PGP_SIGNATURE
+    ? [`Content-Type: ${PGP_SIGNATURE}; name="OpenPGP_signature.asc"`, 'Content-Disposition: attachment; filename="OpenPGP_signature.asc"', "",
+      "-----BEGIN PGP SIGNATURE-----", "", "wsB5", "-----END PGP SIGNATURE-----"]
+    : [`Content-Type: ${protocol}; name="smime.p7s"`, 'Content-Disposition: attachment; filename="smime.p7s"', "Content-Transfer-Encoding: base64", "", "MIIB"];
+  const signedRaw = (signedPart, protocol = PGP_SIGNATURE) => [
+    `Content-Type: ${signedHeaderValue(protocol)}`, "",
+    "--sig", ...signedPart, "--sig", ...signatureLeaf(protocol), "--sig--", "",
+  ].join("\r\n");
+  const plainPart = ["Content-Type: text/plain; charset=utf-8", "", SIGNED_TEXT];
+  const mixedPart = [
+    'Content-Type: multipart/mixed; boundary="mix"', "",
+    "--mix", ...plainPart,
+    "--mix", 'Content-Type: application/pdf; name="report.pdf"', 'Content-Disposition: attachment; filename="report.pdf"',
+    "Content-Transfer-Encoding: base64", "", "JVBERi0=",
+    "--mix--",
+  ];
+  const nestedEncryptedRaws = [
+    { label: "multipart/encrypted", part: [
+      'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="enc"', "",
+      "--enc", "Content-Type: application/pgp-encrypted", "", "Version: 1",
+      "--enc", "Content-Type: application/octet-stream", "", "ciphertext", "--enc--",
+    ] },
+    { label: "pkcs7-mime enveloped data", part: [
+      'Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"', "Content-Transfer-Encoding: base64", "", "MIIB",
+    ] },
+    { label: "a standalone inline PGP MESSAGE line", part: [
+      "Content-Type: text/plain; charset=utf-8", "", "intro", "-----BEGIN PGP MESSAGE-----", "", "hQEM", "-----END PGP MESSAGE-----",
+    ] },
+  ];
+  const reply = api => api.replyToMessage("message-1", "folder", "intro", false, false, undefined, undefined, undefined, undefined, undefined, true);
+  const forward = api => api.forwardMessage("message-1", "folder", "to@example.test", "intro", false, undefined, undefined, undefined, undefined, true);
+  const assertNoDecryption = calls => {
+    assert.ok(calls.options.length > 0);
+    for (const options of calls.options) assert.equal(options.examineEncryptedParts, false);
+  };
+
+  for (const protocol of [PGP_SIGNATURE, PKCS7_SIGNATURE, "application/x-pkcs7-signature"]) {
+    it(`reads a flagged empty clear-signed container from the raw message, protocol=${protocol}`, async () => {
+      const { api, calls } = loadMessageTools({ mime: signedContainer([], { protocol }), raw: signedRaw(mixedPart, protocol) });
+      const result = await api.getMessage("message-1", "folder", false, "markdown");
+      assert.equal(result.body, SIGNED_TEXT);
+      assert.equal(result.subject, "protected subject");
+      assert.notEqual(result.encryptedContentWithheld, true);
+      // Attachment metadata comes from the raw message, without the detached signature.
+      assert.deepEqual(JSON.parse(JSON.stringify(result.attachments)), [
+        { name: "report.pdf", contentType: "application/pdf", size: 5, isInline: false },
+      ]);
+      assert.equal(calls.options.length, 1);
+      assert.equal(calls.streams, 1);
+      assertNoDecryption(calls);
+    });
+  }
+
+  it("returns the raw source of flagged clear-signed mail with a single read", async () => {
+    const raw = signedRaw(plainPart);
+    const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw });
+    const result = await api.getMessage("message-1", "folder", false, "markdown", true);
+    assert.equal(result.rawSource, raw);
+    assert.equal(calls.streams, 1);
+    assert.equal(calls.options.length, 1);
+    assertNoDecryption(calls);
+  });
+
+  it("keeps the comm-central unflagged shape in a single structured pass", async () => {
+    const { api, calls } = loadMessageTools({ mime: signedContainer([{ contentType: "text/plain", body: SIGNED_TEXT }], { isEncrypted: false }) });
+    const result = await api.getMessage("message-1", "folder", false, "markdown");
+    assert.equal(result.body, SIGNED_TEXT);
+    assert.equal(calls.options.length, 1);
+    assert.equal(calls.streams, 0);
+    assertNoDecryption(calls);
+  });
+
+  it("replies to and forwards flagged clear-signed mail directly", async () => {
+    const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(plainPart) });
+    for (const result of [await reply(api), await forward(api)]) assert.equal(result.success, true);
+    assert.equal(calls.sends.length, 2);
+    for (const sent of calls.sends) assert.match(sent.body, /signed text/);
+    assert.doesNotMatch(calls.sends[1].body, /PGP SIGNATURE/);
+    assertNoDecryption(calls);
+  });
+
+  it("refuses a direct forward that would drop the signed message's attachments", async () => {
+    const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(mixedPart) });
+    assert.match((await forward(api)).error, /cannot include its attachments/);
+    assert.equal(calls.sends.length, 0);
+  });
+
+  for (const { label, part } of nestedEncryptedRaws) {
+    it(`withholds a signed wrapper whose raw message contains ${label}`, async () => {
+      const raw = signedRaw(part);
+      const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw });
+      for (const rawSource of [false, true]) {
+        const result = await api.getMessage("message-1", "folder", false, "text", rawSource, true);
+        assert.equal(result.encryptedContentWithheld, true);
+        assert.equal(result.rawSource, undefined);
+        assert.equal(result.attachments.length, 0);
+        assert.doesNotMatch(JSON.stringify(result), /signed text|intro|ciphertext|hQEM|protected subject/);
+      }
+      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      assert.equal(calls.sends.length, 0);
+      assertNoDecryption(calls);
+    });
+  }
+
+  const flaggedTrees = [
+    { label: "a flagged signed container that has parts", mime: signedContainer([{ contentType: "text/plain", body: SECRET }]) },
+    { label: "decrypted leaves under fake containers", mime: signedContainer([{
+      contentType: "multipart/fake-container", parts: [{ contentType: "multipart/fake-container", parts: [{ contentType: "text/plain", body: SECRET }] }],
+    }]) },
+    { label: "an unknown signature protocol", mime: signedContainer([], { protocol: "application/x-custom" }) },
+    { label: "a duplicated protocol parameter", mime: signedContainer([], {
+      headerValue: `multipart/signed; protocol="application/x-custom"; protocol="${PGP_SIGNATURE}"; boundary="sig"`,
+    }) },
+    { label: "no protocol parameter", mime: { contentType: "message/rfc822", parts: [{ contentType: "multipart/signed", isEncrypted: true, parts: [] }] } },
+    { label: "a flagged non-signed container", mime: { contentType: "message/rfc822", parts: [{
+      contentType: "multipart/mixed", headers: { "content-type": [signedHeaderValue(PGP_SIGNATURE)] }, isEncrypted: true, parts: [],
+    }] } },
+    { label: "opaque-signed S/MIME", mime: { contentType: "message/rfc822", headers: { "content-type": ["application/pkcs7-mime; smime-type=signed-data"] }, parts: [{
+      contentType: "application/pkcs7-mime", headers: { "content-type": ["application/pkcs7-mime; smime-type=signed-data"] }, isEncrypted: true, parts: [],
+    }] } },
+  ];
+  for (const { label, mime } of flaggedTrees) {
+    it(`withholds ${label} without reading the raw message`, async () => {
+      // The raw source is clear; only the structural classification may decide here.
+      const { api, calls } = loadMessageTools({ mime, raw: signedRaw(plainPart) });
+      for (const rawSource of [false, true]) {
+        const result = await api.getMessage("message-1", "folder", true, "html", rawSource, true);
+        assert.equal(result.encryptedContentWithheld, true);
+        assert.doesNotMatch(JSON.stringify(result), /decrypted body|signed text|protected subject/);
+      }
+      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      assert.equal(calls.streams, 0);
+      assert.equal(calls.sends.length, 0);
+      assertNoDecryption(calls);
+    });
+  }
+
+  it("withholds the raw path when the raw message cannot be read", async () => {
+    const { api, calls } = loadMessageTools({ mime: signedContainer([]), streamError: new Error("stream failed") });
+    assert.equal((await api.getMessage("message-1", "folder", false, "text")).encryptedContentWithheld, true);
+    assert.match((await reply(api)).error, WITHHELD_SEND);
+    assert.equal(calls.sends.length, 0);
+  });
+
+  const ZWSP_ARMOR_PART = ["Content-Type: text/plain; charset=utf-8", "", "intro", "\xE2\x80\x8B-----BEGIN PGP MESSAGE-----", "", "hQEM", "-----END PGP MESSAGE-----"];
+  const ARMOR_HTML = "<p>-----BEGIN PGP MESSAGE-----</p><p>hQEM</p>";
+  const armorHtmlTree = () => documentTree([elementNode("p", [textNode("-----BEGIN PGP MESSAGE-----")]), elementNode("p", [textNode("hQEM")])]);
+  const HTML_ARMOR_PART = ["Content-Type: text/html; charset=utf-8", "", ARMOR_HTML];
+  const hiddenArmorCases = [
+    { label: "a zero-width space before the armor line", load: options => loadMessageTools({ ...options, raw: signedRaw(ZWSP_ARMOR_PART) }) },
+    { label: "armor split into HTML paragraphs", load: options => loadHtmlFixture(ARMOR_HTML, armorHtmlTree, { ...options, raw: signedRaw(HTML_ARMOR_PART) }) },
+  ];
+  for (const { label, load } of hiddenArmorCases) {
+    it(`withholds signed mail with ${label} in every format and direct send`, async () => {
+      const { api, calls } = load({ mime: signedContainer([]) });
+      for (const format of ["text", "markdown", "html"]) {
+        const result = await api.getMessage("message-1", "folder", false, format);
+        assert.equal(result.encryptedContentWithheld, true, format);
+        assert.doesNotMatch(JSON.stringify(result), /hQEM|intro/);
+      }
+      // Raw source output depends on the raw classifier alone.
+      const rawResult = await api.getMessage("message-1", "folder", false, "text", true);
+      assert.equal(rawResult.encryptedContentWithheld, true);
+      assert.equal(rawResult.rawSource, undefined);
+      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      assert.equal(calls.sends.length, 0);
+      assertNoDecryption(calls);
+    });
+    it(`re-checks the extracted fallback body for ${label} even if raw classification passed`, async () => {
+      const { api } = load({ mime: signedContainer([]) });
+      api.classifyRawMessageEncryption = () => "clear";
+      for (const format of ["text", "markdown", "html"]) {
+        const result = await api.getMessage("message-1", "folder", false, format);
+        assert.equal(result.encryptedContentWithheld, true, format);
+        assert.doesNotMatch(JSON.stringify(result), /hQEM/);
+      }
+    });
+  }
+
+  it("treats bare CR line breaks around armor as encrypted on both paths", async () => {
+    const armored = "intro\r-----BEGIN PGP MESSAGE-----\rhQEM\r-----END PGP MESSAGE-----";
+    const { api } = loadMessageTools({ mime: { contentType: "text/plain", body: armored } });
+    assert.equal(api.classifyRawMessageEncryption(`Content-Type: text/plain\r\n\r\n${armored}`), "encrypted");
+    assert.equal(api.classifyRawMessageEncryption(signedRaw(["Content-Type: text/plain", "", armored])), "encrypted");
+    assert.equal(api.classifyMimeMessageEncryption({ contentType: "text/plain", body: armored }), "encrypted");
+    assert.equal((await api.getMessage("message-1", "folder", false, "text")).encryptedContentWithheld, true);
+    assert.equal(api.hasInlinePgpBodyArmor({ contentType: "text/plain", body: "" }, armored), true);
+  });
+
+  const attachedMessagePart = [
+    'Content-Type: multipart/mixed; boundary="mix"', "",
+    "--mix", ...plainPart,
+    "--mix", "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="earlier.eml"', "",
+    "Subject: earlier", "", "earlier body",
+    "--mix--",
+  ];
+  const PNG_BASE64 = "iVBORw0KGgo=";
+  const relatedPart = (imageBase64 = PNG_BASE64) => [
+    'Content-Type: multipart/related; boundary="rel"', "",
+    "--rel", ...plainPart,
+    "--rel", "Content-Type: image/png", "Content-ID: <img1>", "Content-Transfer-Encoding: base64", "", imageBase64,
+    "--rel--",
+  ];
+
+  it("lists attached messages from the raw message like Gloda does", async () => {
+    const { api } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(attachedMessagePart) });
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.equal(result.body, SIGNED_TEXT);
+    assert.deepEqual(JSON.parse(JSON.stringify(result.attachments)), [
+      { name: "earlier.eml", contentType: "message/rfc822", size: "Subject: earlier\r\n\r\nearlier body".length, isInline: false },
+    ]);
+  });
+
+  for (const { label, part } of [
+    { label: "an attached message without a disposition", part: attachedMessagePart.map(line => line.startsWith("Content-Disposition") ? "X-Note: none" : line) },
+    { label: "a Content-ID image without a filename", part: relatedPart() },
+  ]) {
+    it(`refuses a direct forward that would drop ${label}`, async () => {
+      const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(part) });
+      assert.match((await forward(api)).error, /cannot include its attachments/);
+      assert.equal(calls.sends.length, 0);
+      assert.equal((await reply(api)).success, true);
+    });
+  }
+
+  it("lists raw inline images only when the caller asks for them", async () => {
+    const { api } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(relatedPart()) });
+    const plain = await api.getMessage("message-1", "folder", false, "text");
+    assert.equal(plain.body, SIGNED_TEXT);
+    // Same rule as the Gloda path without the opt-in: related images are inline entries.
+    assert.deepEqual(JSON.parse(JSON.stringify(plain.attachments)), [
+      { name: "inline_1.1.2", contentType: "image/png", size: 8, isInline: true, partName: "1.1.2" },
+    ]);
+    assert.equal(plain.inlineImageContent, undefined);
+
+    const withImages = await api.getMessage("message-1", "folder", false, "text", false, true);
+    const [image] = withImages.attachments;
+    assert.equal(image.contentType, "image/png");
+    assert.equal(image.contentId, "img1");
+    assert.equal(image.partName, "1.1.2");
+    assert.equal(image.mcpImage.status, "included");
+    assert.equal(withImages.inlineImageContent.included, 1);
+    const blocks = withImages[Object.getOwnPropertySymbols(withImages)[0]];
+    assert.deepEqual(JSON.parse(JSON.stringify(blocks)), [{ type: "image", data: PNG_BASE64, mimeType: "image/png" }]);
+  });
+
+  it("applies the per-image base64 limit to raw inline images", async () => {
+    const big = Buffer.alloc(800 * 1024, 1).toString("base64").match(/.{1,76}/g).join("\r\n");
+    const { api } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(relatedPart(big)) });
+    const result = await api.getMessage("message-1", "folder", false, "text", false, true);
+    assert.equal(result.attachments[0].mcpImage.status, "skipped");
+    assert.match(result.attachments[0].mcpImage.reason, /limit/);
+    assert.equal(result.inlineImageContent.included, 0);
+  });
+
+  it("saves raw-path attachments from the decoded bytes without a part fetch", async () => {
+    const { api } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(mixedPart) });
+    const written = [];
+    const makeFile = filePath => ({
+      path: filePath,
+      append(name) { this.path += `/${name}`; },
+      clone() { return makeFile(this.path); },
+      create() {}, createUnique() {}, remove() {},
+      exists: () => true, isDirectory: () => true,
+    });
+    api.Services.dirsvc = { get: () => makeFile("/tmp") };
+    api.Ci.nsIFile = { DIRECTORY_TYPE: 1, NORMAL_FILE_TYPE: 0 };
+    api.NetUtil = { newChannel: () => assert.fail("raw-path attachments must not be fetched") };
+    api.Cc["@mozilla.org/network/file-output-stream;1"] = { createInstance: () => ({ init(file) { this.file = file; }, close() {} }) };
+    api.Cc["@mozilla.org/binaryoutputstream;1"] = { createInstance: () => ({
+      setOutputStream(stream) { this.stream = stream; },
+      writeByteArray(bytes, length) { written.push({ path: this.stream.file.path, data: Buffer.from(bytes.slice(0, length)).toString("latin1") }); },
+      close() {},
+    }) };
+    const result = await api.getMessage("message-1", "folder", true, "text");
+    assert.equal(result.attachments[0].error, undefined);
+    assert.equal(result.attachments[0].filePath, "/tmp/thunderbird-mcp/message_1/report.pdf");
+    assert.deepEqual(written, [{ path: "/tmp/thunderbird-mcp/message_1/report.pdf", data: "%PDF-" }]);
+  });
+
+  it("withholds signed mail whose raw message exceeds the read cap", async () => {
+    const { api, calls } = loadMessageTools({ mime: signedContainer([]) });
+    const limits = [];
+    api.readMessageStreamFully = (_stream, maxBytes) => {
+      limits.push(maxBytes);
+      throw Object.assign(new Error("message too large"), { isStreamSizeLimit: true });
+    };
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.equal(result.encryptedContentWithheld, true);
+    assert.match(result.body, /could not be determined/);
+    assert.match((await reply(api)).error, WITHHELD_SEND);
+    assert.deepEqual(limits, [50 * 1024 * 1024, 50 * 1024 * 1024]);
+    assert.equal(calls.sends.length, 0);
+  });
+
+  // libmime renders message/news, non-base64 *.eml attachments and untyped
+  // multipart/digest children as embedded messages and looks inside them.
+  const ENCRYPTED_INNER_MESSAGES = [
+    { label: "pkcs7-mime enveloped data", lines: [
+      "Subject: inner", "Content-Type: application/pkcs7-mime; smime-type=enveloped-data", "Content-Transfer-Encoding: base64", "", "MIIB",
+    ] },
+    { label: "multipart/encrypted with base64 armor", lines: [
+      "Subject: inner", 'Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"; boundary="enc"', "",
+      "--enc", "Content-Type: application/pgp-encrypted", "", "Version: 1",
+      "--enc", "Content-Type: application/octet-stream", "Content-Transfer-Encoding: base64", "",
+      Buffer.from("-----BEGIN PGP MESSAGE-----\n\nhQEM\n-----END PGP MESSAGE-----\n").toString("base64"),
+      "--enc--",
+    ] },
+  ];
+  const CLEAR_INNER_MESSAGE = ["Subject: inner", "Content-Type: text/plain", "", "embedded text"];
+  const embeddedWrappers = [
+    { label: "message/news", wrap: inner => [
+      'Content-Type: multipart/mixed; boundary="mix"', "",
+      "--mix", ...plainPart,
+      "--mix", "Content-Type: message/news", 'Content-Disposition: attachment; filename="post.eml"', "", ...inner,
+      "--mix--",
+    ], listed: inner => [{ name: "post.eml", contentType: "message/news", size: inner.join("\r\n").length, isInline: false }] },
+    { label: "a non-base64 octet-stream named .eml", wrap: inner => [
+      'Content-Type: multipart/mixed; boundary="mix"', "",
+      "--mix", ...plainPart,
+      "--mix", 'Content-Type: application/octet-stream; name="fwd.eml"', "Content-Transfer-Encoding: 7bit", "", ...inner,
+      "--mix--",
+    ], nameTyped: true },
+    { label: "an untyped multipart/digest child", wrap: inner => [
+      'Content-Type: multipart/mixed; boundary="mix"', "",
+      "--mix", ...plainPart,
+      "--mix", 'Content-Type: multipart/digest; boundary="dig"', "",
+      "--dig", "", ...inner,
+      "--dig--",
+      "--mix--",
+    ], listed: () => [] },
+  ];
+  for (const wrapper of embeddedWrappers) {
+    for (const inner of ENCRYPTED_INNER_MESSAGES) {
+      it(`withholds ${inner.label} inside ${wrapper.label} on every raw-path output`, async () => {
+        const raw = signedRaw(wrapper.wrap(inner.lines));
+        const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw });
+        // A name-typed part is withheld as "unknown" before its content is read.
+        assert.equal(api.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), wrapper.nameTyped ? "unknown" : "encrypted");
+        for (const [saveAttachments, rawSource] of [[false, false], [true, false], [false, true]]) {
+          const result = await api.getMessage("message-1", "folder", saveAttachments, "text", rawSource, true);
+          assert.equal(result.encryptedContentWithheld, true);
+          assert.equal(result.rawSource, undefined);
+          assert.equal(result.attachments.length, 0);
+          assert.doesNotMatch(JSON.stringify(result), /signed text|MIIB|hQEM|LS0t/);
+        }
+        for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+        assert.equal(calls.sends.length, 0);
+        assertNoDecryption(calls);
+      });
+    }
+    if (wrapper.nameTyped) continue;
+    it(`keeps a clear embedded message in ${wrapper.label} readable`, async () => {
+      const raw = signedRaw(wrapper.wrap(CLEAR_INNER_MESSAGE));
+      const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw });
+      const result = await api.getMessage("message-1", "folder", false, "text");
+      assert.equal(result.body, SIGNED_TEXT);
+      assert.deepEqual(JSON.parse(JSON.stringify(result.attachments)), wrapper.listed(CLEAR_INNER_MESSAGE));
+      assert.equal((await api.getMessage("message-1", "folder", false, "text", true)).rawSource, raw);
+      assert.equal((await reply(api)).success, true);
+      // A direct forward cannot carry the embedded message, so it is refused.
+      assert.match((await forward(api)).error, /cannot include its attachments/);
+      assert.equal(calls.sends.length, 1);
+    });
+  }
+
+  it("does not take an untyped digest child as the body", async () => {
+    const digestOnly = ['Content-Type: multipart/digest; boundary="dig"', "", "--dig", "", ...CLEAR_INNER_MESSAGE, "--dig--"];
+    const { api } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(digestOnly) });
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.notEqual(result.encryptedContentWithheld, true);
+    assert.doesNotMatch(result.body, /embedded text|Subject/);
+  });
+
+  it("does not list an inline attached message without a name", async () => {
+    const part = [
+      'Content-Type: multipart/mixed; boundary="mix"', "",
+      "--mix", ...plainPart, "--mix", "Content-Type: message/rfc822", "", ...CLEAR_INNER_MESSAGE, "--mix--",
+    ];
+    const { api } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(part) });
+    assert.deepEqual((await api.getMessage("message-1", "folder", false, "text")).attachments.length, 0);
+  });
+
+  // libmime chooses a class from the file name for untyped or generic parts
+  // (MimeHeaders_get_name order, RFC 2231 and RFC 2047 decoded), so any name that
+  // could select a message or S/MIME class withholds the whole message.
+  const SMIME_INNER = ["Subject: inner", "MIME-Version: 1.0", "Content-Type: application/pkcs7-mime; smime-type=enveloped-data", "Content-Transfer-Encoding: base64", "", "MIIB"];
+  const mixedWith = leaf => ['Content-Type: multipart/mixed; boundary="mix"', "", "--mix", ...plainPart, "--mix", ...leaf, "--mix--"];
+  const OCTET = "Content-Type: application/octet-stream";
+  const nameTypedLeaves = [
+    { label: "an octet-stream named .p7m with base64 CMS", leaf: [`${OCTET}; name="secret.p7m"`, "Content-Transfer-Encoding: base64", "", "MIIB"] },
+    { label: "an octet-stream named .mail wrapping S/MIME", leaf: [`${OCTET}; name="fwd.mail"`, "Content-Transfer-Encoding: 7bit", "", ...SMIME_INNER] },
+    { label: "an octet-stream named .art wrapping S/MIME", leaf: [`${OCTET}; name="fwd.art"`, "", ...SMIME_INNER] },
+    { label: "an RFC 2231 continued .eml filename", leaf: [OCTET, 'Content-Disposition: attachment; filename*0="fwd."; filename*1="eml"', "", ...SMIME_INNER] },
+    { label: "an RFC 2047 encoded .eml name", leaf: [`${OCTET}; name="=?utf-8?Q?fwd.eml?="`, "", ...SMIME_INNER] },
+    { label: "a Content-Name .eml", leaf: [OCTET, "Content-Name: fwd.eml", "", ...SMIME_INNER] },
+    { label: "an X-Sun-Data-Name .eml", leaf: [OCTET, "X-Sun-Data-Name: fwd.eml", "", ...SMIME_INNER] },
+    { label: "an untyped part named .pgp", leaf: ['Content-Disposition: attachment; filename="a.pgp"', "", "binary"] },
+    { label: "an x-unknown-content-type part named .gpg", leaf: ['Content-Type: application/x-unknown-content-type; name="a.GPG"', "", "binary"] },
+    { label: "an untyped embedded message root with a .p7m filename", leaf: [
+      "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="earlier.eml"', "",
+      "Subject: inner", 'Content-Disposition: attachment; filename="x.p7m"', "Content-Transfer-Encoding: base64", "", "MIIB",
+    ] },
+    { label: "an untyped embedded message root with any name", leaf: [
+      "Content-Type: message/rfc822", "", "Subject: inner", "Content-Name: notes.txt", "", "embedded text",
+    ] },
+    { label: "a message/rfc822 part named .p7m over an untyped base64 root", leaf: [
+      "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="x.p7m"', "",
+      "From: x@example.invalid", "Subject: inner", "Content-Transfer-Encoding: base64", "",
+      "MIAGCSqGSIb3DQEHA6CAMIACAQAxggEwMIIBLAIBADCBlDCBjjELMAkGA1UEBhMC",
+    ] },
+    { label: "a message/rfc822 part with a protected name over a typed root", leaf: [
+      "Content-Type: message/rfc822; name=\"x.pgp\"", "", "Subject: inner", "MIME-Version: 1.0", "Content-Type: text/plain", "", "embedded text",
+    ] },
+    { label: "an untyped embedded root with a base64 transfer encoding", leaf: [
+      "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="earlier.eml"', "",
+      "From: x@example.invalid", "Subject: inner", "Content-Transfer-Encoding: base64", "", "ZW1iZWRkZWQ=",
+    ] },
+    { label: "an untyped embedded root with a quoted-printable transfer encoding", leaf: [
+      "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="earlier.eml"', "",
+      "Subject: inner", "Content-Transfer-Encoding: quoted-printable", "", "embedded text",
+    ] },
+    // Mozilla's parameter parser reads these as x.p7m; ours would not.
+    { label: "a backslash inside a quoted name", leaf: [`${OCTET}; name="x.p7\\m"`, "", "data"] },
+    { label: "a backslash inside a quoted filename", leaf: [OCTET, 'Content-Disposition: attachment; filename="x.\\p7m"', "", "data"] },
+    { label: "text after a closing quote", leaf: [OCTET, 'Content-Disposition: attachment; filename="x.p7m"junk', "", "data"] },
+    { label: "a comma before the first parameter", leaf: [OCTET, "Content-Disposition: attachment, filename=x.p7m", "", "data"] },
+    { label: "a disposition without a token", leaf: [OCTET, "Content-Disposition: filename=x.p7m", "", "data"] },
+    { label: "a NUL inside a filename", leaf: [OCTET, "Content-Disposition: attachment; filename=x.p7m\0.bin", "", "data"] },
+    { label: "a backslash in Content-Name", leaf: [OCTET, "Content-Name: x.p7\\m", "", "data"] },
+    { label: "a message part with a backslash in its filename", leaf: [
+      "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="x.\\p7m"', "",
+      "Subject: inner", "MIME-Version: 1.0", "Content-Type: text/plain", "", "embedded text",
+    ] },
+    // libmime ends headers at the first empty line under CR, LF or CRLF.
+    { label: "headers ended by LF then CRLF", leaf: ["X-Note: 1\n", "Content-Type: text/plain", "", "data"] },
+    { label: "headers ended by CRLF then CR", leaf: ["X-Note: 1", "\rContent-Type: text/plain", "", "data"] },
+    { label: "an unknown filename charset", leaf: [OCTET, "Content-Disposition: attachment; filename*=x-no-such-charset''report.pdf", "", "data"] },
+    { label: "a gap in RFC 2231 continuations", leaf: [OCTET, 'Content-Disposition: attachment; filename*0="report"; filename*2=".pdf"', "", "data"] },
+    { label: "a malformed RFC 2231 percent escape", leaf: [OCTET, "Content-Disposition: attachment; filename*=utf-8''report%G1.pdf", "", "data"] },
+    { label: "a malformed RFC 2047 encoded word", leaf: [`${OCTET}; name="=?utf-8?B?***?="`, "", "data"] },
+    { label: "a uuencoded .p7m in an untyped embedded body", leaf: [
+      "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="earlier.eml"', "",
+      "Subject: inner", "", "intro", "begin 644 x.p7m", "M04)#", "end",
+    ] },
+    { label: "a BinHex block in an untyped embedded body", leaf: [
+      "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="earlier.eml"', "",
+      "Subject: inner", "", "(This file must be converted with BinHex 4.0)", ":data:",
+    ] },
+    { label: "a yEnc .pgp in an embedded text body", leaf: [
+      "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="earlier.eml"', "",
+      "Subject: inner", "Content-Type: text/plain", "", "=ybegin line=128 size=4 name=x.pgp", "data", "=yend size=4",
+    ] },
+  ];
+  for (const { label, leaf } of nameTypedLeaves) {
+    it(`withholds signed mail with ${label} on every raw-path output`, async () => {
+      const raw = signedRaw(mixedWith(leaf));
+      const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw });
+      assert.equal(api.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), "unknown");
+      for (const [saveAttachments, rawSource] of [[false, false], [true, false], [false, true]]) {
+        const result = await api.getMessage("message-1", "folder", saveAttachments, "text", rawSource, true);
+        assert.equal(result.encryptedContentWithheld, true);
+        assert.equal(result.rawSource, undefined);
+        assert.equal(result.attachments.length, 0);
+        assert.doesNotMatch(JSON.stringify(result), /signed text|MIIB|protected subject/);
+      }
+      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      assert.equal(calls.sends.length, 0);
+      assertNoDecryption(calls);
+    });
+  }
+
+  it("lists RFC 2231 and RFC 2047 attachment names decoded and keeps the message readable", async () => {
+    const encoded = Buffer.from("été.pdf").toString("base64");
+    const part = [
+      'Content-Type: multipart/mixed; boundary="mix"', "",
+      "--mix", ...plainPart,
+      "--mix", "Content-Type: application/pdf",
+      "Content-Disposition: attachment; filename*0*=utf-8''r%C3%A9; filename*1*=sum%C3%A9; filename*2=\".pdf\"",
+      "Content-Transfer-Encoding: base64", "", "JVBERi0=",
+      "--mix", `Content-Type: application/pdf; name="=?utf-8?B?${encoded}?="`, "Content-Disposition: attachment",
+      "Content-Transfer-Encoding: base64", "", "JVBERi0=",
+      "--mix--",
+    ];
+    const raw = signedRaw(part);
+    const { api } = loadMessageTools({ mime: signedContainer([]), raw });
+    assert.equal(api.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), "clear");
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.equal(result.body, SIGNED_TEXT);
+    assert.deepEqual(Array.from(result.attachments, attachment => attachment.name), ["résumé.pdf", "été.pdf"]);
+    assert.equal((await reply(api)).success, true);
+  });
+
+  // Strict well-formedness gate on the signed raw path: any construct a MIME
+  // parser could read differently withholds the message.
+  const PKCS7_LEAF = ['Content-Type: application/pkcs7-mime; smime-type=enveloped-data; name="smime.p7m"', "Content-Transfer-Encoding: base64", "", "MIIB"];
+  const TEXT_LEAF = ["Content-Type: text/plain", "", "visible"];
+  // Our parser follows boundary "A"; libmime follows "B" or treats the
+  // separator differently and so sees the PKCS7 part.
+  const hiddenPartBody = (seen, hidden) => ["", `--${hidden}`, ...PKCS7_LEAF, `--${hidden}--`, `--${seen}`, ...TEXT_LEAF, `--${seen}--`];
+  const malformedLeaves = [
+    { label: "boundary plus an RFC 2231 extended boundary", leaf: ["Content-Type: multipart/mixed; boundary=\"A\"; boundary*=''B", ...hiddenPartBody("A", "B")] },
+    { label: "boundary plus a continued boundary", leaf: ['Content-Type: multipart/mixed; boundary="A"; boundary*0="B"', ...hiddenPartBody("A", "B")] },
+    { label: "a backslash inside the boundary", leaf: ['Content-Type: multipart/mixed; boundary="A\\B"', ...hiddenPartBody("A\\B", "AB")] },
+    { label: "text after the quoted boundary", leaf: ['Content-Type: multipart/mixed; boundary="AB"junk', ...hiddenPartBody("AB", "ABjunk")] },
+    { label: "a form-feed separator", leaf: ['Content-Type: multipart/mixed; boundary="A"', "", "--A", ...TEXT_LEAF, "--A\f", ...PKCS7_LEAF, "--A--"] },
+    { label: "a vertical-tab separator", leaf: ['Content-Type: multipart/mixed; boundary="A"', "", "--A", ...TEXT_LEAF, "--A\v", ...PKCS7_LEAF, "--A--"] },
+    { label: "a duplicate parameter", leaf: ["Content-Type: text/plain; charset=utf-8; charset=us-ascii", "", "visible"] },
+    { label: "an RFC 2231 charset", leaf: ["Content-Type: text/plain; charset*=utf-8''utf-8", "", "visible"] },
+    { label: "a backslash in a quoted charset", leaf: ['Content-Type: text/plain; charset="utf\\-8"', "", "visible"] },
+    { label: "text after a quoted disposition parameter", leaf: ['Content-Type: application/pdf', 'Content-Disposition: attachment; filename="a.pdf" x', "", "data"] },
+    { label: "an unknown transfer encoding", leaf: ["Content-Type: text/plain", "Content-Transfer-Encoding: x-uuencode", "", "visible"] },
+    { label: "a duplicate transfer encoding", leaf: ["Content-Type: text/plain", "Content-Transfer-Encoding: 7bit", "Content-Transfer-Encoding: base64", "", "dmlzaWJsZQ=="] },
+    { label: "a line prefixed with an enclosing boundary", leaf: ["Content-Type: text/plain", "", "visible", "--sig-not-a-separator"] },
+    { label: "a header name with invalid characters", leaf: ["X Bad: 1", "Content-Type: text/plain", "", "visible"] },
+    { label: "a NUL in a header", leaf: ["X-Note: a\0b", "Content-Type: text/plain", "", "visible"] },
+    { label: "a bare CR inside a header line", leaf: ["X-Note: a\rContent-Type: application/pkcs7-mime", "Content-Type: text/plain", "", "visible"] },
+    { label: "a nested multipart without a closing delimiter", leaf: ['Content-Type: multipart/mixed; boundary="A"', "", "--A", ...TEXT_LEAF] },
+    { label: "a boundary longer than 70 characters", leaf: [`Content-Type: multipart/mixed; boundary="${"b".repeat(71)}"`, "", `--${"b".repeat(71)}`, ...TEXT_LEAF, `--${"b".repeat(71)}--`] },
+    { label: "a plain filename that disagrees with its continuation", leaf: ["Content-Type: application/pdf", 'Content-Disposition: attachment; filename="a.pdf"; filename*0="x.p7"; filename*1="m"', "", "data"] },
+    // Thunderbird before about 152 does not decode encoded embedded messages,
+    // so a quoted-printable soft break makes the header blocks differ.
+    { label: "a quoted-printable embedded message hiding pkcs7-mime", leaf: [
+      "Content-Type: message/rfc822", "Content-Transfer-Encoding: quoted-printable", "",
+      "From: a@example.test", "Subject: fwd", "MIME-Version: 1.0",
+      "X-Foo: a=", "Content-Type: application/pkcs7-mime", "X-Bar: b=", "Content-Transfer-Encoding: base64", "", "MIAGCSqGSIb3DQEHA6CAMIACAQAx",
+    ] },
+    { label: "a quoted-printable embedded message hiding multipart/encrypted", leaf: [
+      "Content-Type: message/rfc822", "Content-Transfer-Encoding: quoted-printable", "",
+      "From: a@example.test", "Subject: fwd", "MIME-Version: 1.0",
+      "X-Foo: a=", "Content-Type: multipart/encrypted", "X-Bar: b=", "Content-Transfer-Encoding: 7bit", "", "MIAGCSqGSIb3DQEHA6CAMIACAQAx",
+    ] },
+    { label: "a base64 embedded message", leaf: [
+      "Content-Type: message/rfc822", "Content-Transfer-Encoding: base64", "",
+      Buffer.from("Subject: inner\r\nContent-Type: text/plain\r\n\r\nembedded text").toString("base64"),
+    ] },
+    { label: "a multipart with a base64 transfer encoding", leaf: ['Content-Type: multipart/mixed; boundary="A"', "Content-Transfer-Encoding: base64", "", "--A", ...TEXT_LEAF, "--A--"] },
+  ];
+  for (const { label, leaf } of malformedLeaves) {
+    it(`withholds signed mail with ${label} through the well-formedness gate`, async () => {
+      const raw = signedRaw(mixedWith(leaf));
+      const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw });
+      assert.equal(api.isStrictlyWellFormedRawMime(raw), false);
+      assert.equal(api.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), "unknown");
+      for (const [saveAttachments, rawSource] of [[false, false], [true, false], [false, true]]) {
+        const result = await api.getMessage("message-1", "folder", saveAttachments, "text", rawSource, true);
+        assert.equal(result.encryptedContentWithheld, true);
+        assert.equal(result.rawSource, undefined);
+        assert.equal(result.attachments.length, 0);
+        assert.doesNotMatch(JSON.stringify(result), /signed text|visible|MIIB|protected subject/);
+      }
+      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      assert.equal(calls.sends.length, 0);
+      assertNoDecryption(calls);
+    });
+  }
+
+  const realisticSigned = [
+    { label: "Thunderbird PGP/MIME with protected headers, alternative body and an RFC 2231 attachment name",
+      header: 'multipart/signed; micalg=pgp-sha256; protocol="application/pgp-signature"; boundary="------------JWnu0yhmPHsQ5Ue2FfXcrbJq"',
+      attachments: ["résumé.pdf"],
+      html: "<p>signed text</p>\r\n",
+      lines: [
+        "Content-Type: multipart/signed; micalg=pgp-sha256;",
+        ' protocol="application/pgp-signature";',
+        ' boundary="------------JWnu0yhmPHsQ5Ue2FfXcrbJq"',
+        "", "This is an OpenPGP/MIME signed message (RFC 4880 and 3156)",
+        "--------------JWnu0yhmPHsQ5Ue2FfXcrbJq",
+        'Content-Type: multipart/mixed; boundary="------------0LmkWlLRnn3AQsF9ZpWKFn7f";',
+        ' protected-headers="v1"',
+        "From: Tom <tom@example.invalid>", "To: reader@example.invalid", "Message-ID: <a@example.invalid>", "Subject: Hello",
+        "", "--------------0LmkWlLRnn3AQsF9ZpWKFn7f",
+        "Content-Type: multipart/alternative;", ' boundary="------------q3sJ6Ijb2QGgM5HfK0Ip4pXz"',
+        "", "--------------q3sJ6Ijb2QGgM5HfK0Ip4pXz",
+        "Content-Type: text/plain; charset=UTF-8; format=flowed", "Content-Transfer-Encoding: base64",
+        "", Buffer.from("signed text\r\n").toString("base64"), "",
+        "--------------q3sJ6Ijb2QGgM5HfK0Ip4pXz",
+        "Content-Type: text/html; charset=UTF-8", "Content-Transfer-Encoding: 7bit",
+        "", "<p>signed text</p>", "",
+        "--------------q3sJ6Ijb2QGgM5HfK0Ip4pXz--", "",
+        "--------------0LmkWlLRnn3AQsF9ZpWKFn7f",
+        `Content-Type: application/pdf; name="=?UTF-8?B?${Buffer.from("résumé.pdf").toString("base64")}?="`,
+        "Content-Disposition: attachment; filename*0*=UTF-8''r%C3%A9sum%C3%A9;", " filename*1*=.pdf",
+        "Content-Transfer-Encoding: base64", "", "JVBERi0=", "",
+        "--------------0LmkWlLRnn3AQsF9ZpWKFn7f--", "",
+        "--------------JWnu0yhmPHsQ5Ue2FfXcrbJq",
+        'Content-Type: application/pgp-signature; name="OpenPGP_signature.asc"',
+        "Content-Description: OpenPGP digital signature",
+        'Content-Disposition: attachment; filename="OpenPGP_signature.asc"',
+        "", "-----BEGIN PGP SIGNATURE-----", "", "wsB5BAABCAAjFiEE", "-----END PGP SIGNATURE-----", "",
+        "--------------JWnu0yhmPHsQ5Ue2FfXcrbJq--", "",
+      ] },
+    { label: "Outlook S/MIME with folded parameters",
+      header: 'multipart/signed; protocol="application/x-pkcs7-signature"; micalg=SHA1; boundary="----=_NextPart_000_0007_01DA1234.56789ABC"',
+      attachments: [],
+      lines: [
+        "Content-Type: multipart/signed;", '\tprotocol="application/x-pkcs7-signature";', "\tmicalg=SHA1;",
+        '\tboundary="----=_NextPart_000_0007_01DA1234.56789ABC"', "MIME-Version: 1.0",
+        "", "This is a multi-part message in MIME format.", "",
+        "------=_NextPart_000_0007_01DA1234.56789ABC",
+        "Content-Type: multipart/alternative;", '\tboundary="----=_NextPart_001_0008_01DA1234.56789ABC"',
+        "", "", "------=_NextPart_001_0008_01DA1234.56789ABC",
+        "Content-Type: text/plain;", '\tcharset="us-ascii"', "Content-Transfer-Encoding: 7bit",
+        "", "signed text", "",
+        "------=_NextPart_001_0008_01DA1234.56789ABC",
+        "Content-Type: text/html;", '\tcharset="us-ascii"', "Content-Transfer-Encoding: quoted-printable",
+        "", "<p>signed text</p>",
+        "------=_NextPart_001_0008_01DA1234.56789ABC--", "",
+        "------=_NextPart_000_0007_01DA1234.56789ABC",
+        "Content-Type: application/x-pkcs7-signature;", '\tname="smime.p7s"', "Content-Transfer-Encoding: base64",
+        "Content-Disposition: attachment;", '\tfilename="smime.p7s"',
+        "", "MIIB", "", "------=_NextPart_000_0007_01DA1234.56789ABC--", "",
+      ] },
+    { label: "Apple Mail PGP/MIME",
+      header: 'multipart/signed; boundary="Apple-Mail=_5A1B2C3D-0000-4000-8000-ABCDEFABCDEF"; protocol="application/pgp-signature"; micalg=pgp-sha512',
+      attachments: [],
+      lines: [
+        "Content-Type: multipart/signed;", '\tboundary="Apple-Mail=_5A1B2C3D-0000-4000-8000-ABCDEFABCDEF";',
+        '\tprotocol="application/pgp-signature";', "\tmicalg=pgp-sha512",
+        "Mime-Version: 1.0 (Mac OS X Mail 16.0 \\(3731.500.231\\))",
+        "", "", "--Apple-Mail=_5A1B2C3D-0000-4000-8000-ABCDEFABCDEF",
+        "Content-Transfer-Encoding: 7bit", "Content-Type: text/plain;", "\tcharset=us-ascii",
+        "", "signed text", "",
+        "--Apple-Mail=_5A1B2C3D-0000-4000-8000-ABCDEFABCDEF",
+        "Content-Transfer-Encoding: 7bit", "Content-Disposition: attachment;", "\tfilename=signature.asc",
+        "Content-Type: application/pgp-signature;", "\tname=signature.asc", "Content-Description: Message signed with OpenPGP",
+        "", "-----BEGIN PGP SIGNATURE-----", "", "iQEz", "-----END PGP SIGNATURE-----", "",
+        "--Apple-Mail=_5A1B2C3D-0000-4000-8000-ABCDEFABCDEF--", "",
+      ] },
+  ];
+  for (const { label, header, attachments, lines, html = "<p>signed text</p>" } of realisticSigned) {
+    it(`passes the gate and reads realistic ${label}`, async () => {
+      const raw = lines.join("\r\n");
+      const { api, calls } = loadHtmlFixture(html, () => documentTree([elementNode("p", [textNode(SIGNED_TEXT)])]), {
+        mime: signedContainer([], { headerValue: header }), raw,
+      });
+      assert.equal(api.isStrictlyWellFormedRawMime(raw), true);
+      assert.equal(api.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), "clear");
+      const result = await api.getMessage("message-1", "folder", false, "text");
+      assert.notEqual(result.encryptedContentWithheld, true);
+      assert.match(result.body, /signed text/);
+      assert.deepEqual(Array.from(result.attachments, attachment => attachment.name), attachments);
+      assert.equal((await api.getMessage("message-1", "folder", false, "text", true)).rawSource, raw);
+      assert.equal((await reply(api)).success, true);
+      assert.match(calls.sends[0].body, /signed text/);
+      assertNoDecryption(calls);
+    });
+  }
+
+  // Every occurrence of a delimiter must be an exact line, as Thunderbird's own
+  // multipart/signed splitter finds them with indexOf.
+  const delimiterCases = [
+    { label: "a padded opening delimiter", raw: () => signedRaw(plainPart).replace("\r\n\r\n--sig\r\n", "\r\n\r\n--sig \r\n") },
+    { label: "a padded separator", raw: () => signedRaw(plainPart).replace("\r\n--sig\r\nContent-Type: application/pgp-signature", "\r\n--sig\t\r\nContent-Type: application/pgp-signature") },
+    { label: "a delimiter at the end of an LF preamble line", raw: () => [
+      `Content-Type: ${signedHeaderValue(PGP_SIGNATURE)}`, "", "junk--sig", "--sig", ...plainPart, "--sig", ...signatureLeaf(PGP_SIGNATURE), "--sig--", "",
+    ].join("\n") },
+    { label: "a delimiter in the middle of a line in part 1", raw: () => signedRaw(["Content-Type: text/plain", "", "signed text --sig", "more"]) },
+    { label: "a closing delimiter in the middle of a line", raw: () => signedRaw(["Content-Type: text/plain", "", "signed text --sig--", "more"]) },
+    { label: "a lone CR in a body", raw: () => signedRaw(["Content-Type: text/plain", "", "signed\rtext"]) },
+  ];
+  // Boundary derivation: mimeVerify strips matching quotes, and parsers
+  // normalise folded whitespace differently, so only a plain boundary is accepted.
+  const SIG_LEAF_LINES = [`Content-Type: ${PGP_SIGNATURE}; name="OpenPGP_signature.asc"`, "", "-----BEGIN PGP SIGNATURE-----", "", "wsB5", "-----END PGP SIGNATURE-----"];
+  const quotedBoundaryRaw = boundaryParam => [
+    `Content-Type: multipart/signed; micalg=pgp-sha256; protocol="${PGP_SIGNATURE}"; boundary=${boundaryParam}`, "MIME-Version: 1.0", "",
+    "--'sig'", "Content-Type: text/plain; charset=utf-8", "", "visible",
+    "--sig", ...PKCS7_LEAF, "--sig", "Content-Type: application/pgp-signature", "", "x", "--sig--", "",
+    "--'sig'", ...SIG_LEAF_LINES, "--'sig'--", "",
+  ].join("\r\n");
+  const FOLDED_BOUNDARY = "abc   def";
+  delimiterCases.push(
+    { label: `a double-quoted boundary "'sig'"`, raw: () => quotedBoundaryRaw(`"'sig'"`) },
+    { label: "a single-quoted boundary 'sig'", raw: () => quotedBoundaryRaw("'sig'") },
+    { label: "an empty quoted boundary ''", raw: () => quotedBoundaryRaw("''").replace(/--'sig'/g, "--''") },
+    { label: "a folded quoted boundary with repeated spaces", raw: () => [
+      `Content-Type: multipart/signed; micalg=pgp-sha256; protocol="${PGP_SIGNATURE}"; boundary="abc`, '   def"', "MIME-Version: 1.0", "",
+      "--abc def", "Content-Type: text/plain; charset=utf-8", "", "visible",
+      `--${FOLDED_BOUNDARY}`, ...PKCS7_LEAF,
+      `--${FOLDED_BOUNDARY}`, ...SIG_LEAF_LINES, `--${FOLDED_BOUNDARY}--`, "--abc def--", "",
+    ].join("\r\n") },
+  );
+  // Thunderbird decodes an ESC sequence in a name with the message charset
+  // (ISO-2022-JP), turning "smime.p7<ESC>(Bm" into "smime.p7m".
+  const ESC = "\x1B";
+  const iso2022Raw = ({ topParams = "", sunCharset = false, leafHeaders }) => [
+    `Content-Type: ${signedHeaderValue(PGP_SIGNATURE)}${topParams}`, ...(sunCharset ? ["X-Sun-Charset: ISO-2022-JP"] : []), "MIME-Version: 1.0", "",
+    "--sig", 'Content-Type: multipart/mixed; boundary="mix"', "",
+    "--mix", "Content-Type: text/plain; charset=utf-8", "", "visible",
+    "--mix", ...leafHeaders, "Content-Transfer-Encoding: base64", "", "MIAGCSqGSIb3DQEHA6CAMIACAQAx",
+    "--mix--", "",
+    "--sig", ...SIG_LEAF_LINES, "--sig--", "",
+  ].join("\r\n");
+  delimiterCases.push(
+    { label: "an ISO-2022-JP escape in a Content-Type name", raw: () => iso2022Raw({
+      topParams: "; charset=ISO-2022-JP", leafHeaders: [`Content-Type: application/octet-stream; name="smime.p7${ESC}(Bm"`],
+    }) },
+    { label: "an ISO-2022-JP escape in a Content-Disposition filename", raw: () => iso2022Raw({
+      topParams: "; charset=ISO-2022-JP", leafHeaders: ["Content-Type: application/octet-stream", `Content-Disposition: attachment; filename="smime.p7${ESC}(Bm"`],
+    }) },
+    { label: "an escape in a name with an X-Sun-Charset header", raw: () => iso2022Raw({
+      sunCharset: true, leafHeaders: [`Content-Type: application/octet-stream; name="smime.p7${ESC}(Bm"`],
+    }) },
+    { label: "a DEL in an unrelated header", raw: () => signedRaw(["X-Note: a\x7Fb", ...plainPart]) },
+  );
+  for (const { label, raw: build } of delimiterCases) {
+    it(`withholds signed mail with ${label} through the well-formedness gate`, async () => {
+      const raw = build();
+      const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw });
+      assert.equal(api.isStrictlyWellFormedRawMime(raw), false);
+      assert.equal(api.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), "unknown");
+      for (const [saveAttachments, rawSource] of [[false, false], [true, false], [false, true]]) {
+        const result = await api.getMessage("message-1", "folder", saveAttachments, "text", rawSource, true);
+        assert.equal(result.encryptedContentWithheld, true);
+        assert.equal(result.rawSource, undefined);
+        assert.equal(result.attachments.length, 0);
+        assert.doesNotMatch(JSON.stringify(result), /signed|visible|MIIB|protected subject/);
+      }
+      for (const result of [await reply(api), await forward(api)]) assert.match(result.error, WITHHELD_SEND);
+      assert.equal(calls.sends.length, 0);
+      assertNoDecryption(calls);
+    });
+  }
+
+  for (const newline of ["\r\n", "\n"]) {
+    it(`reads realistic Thunderbird signed mail with its preamble, newline=${JSON.stringify(newline)}`, async () => {
+      const thunderbird = realisticSigned[0];
+      const raw = thunderbird.lines.join(newline);
+      const { api } = loadHtmlFixture(`<p>signed text</p>${newline}`, () => documentTree([elementNode("p", [textNode(SIGNED_TEXT)])]), {
+        mime: signedContainer([], { headerValue: thunderbird.header }), raw,
+      });
+      assert.match(raw, /This is an OpenPGP\/MIME signed message/);
+      assert.equal(api.isStrictlyWellFormedRawMime(raw), true);
+      const result = await api.getMessage("message-1", "folder", false, "text");
+      assert.notEqual(result.encryptedContentWithheld, true);
+      assert.match(result.body, /signed text/);
+      assert.equal((await api.getMessage("message-1", "folder", false, "text", true)).rawSource, raw);
+    });
+  }
+
+  for (const boundary of [
+    "------------0LmkWlLRnn3AQsF9ZpWKFn7f", "_000_DB9PR01MB1234ABCDEF_", "Apple-Mail=_5A1B2C3D-0000-4000-8000-ABCDEFABCDEF",
+    "Apple-Mail-2--123456789", "000000000000a1b2c3d4e5f6a7b8", "----K-9.FairEmail+0123", "=-AbCdEf0123456789==", "nextPart1234567.abcdEFGH",
+  ]) {
+    it(`accepts the real-world boundary style ${boundary}`, async () => {
+      const header = `multipart/signed; micalg=pgp-sha256; protocol="${PGP_SIGNATURE}"; boundary="${boundary}"`;
+      const raw = [`Content-Type: ${header}`, "", `--${boundary}`, ...plainPart, `--${boundary}`, ...signatureLeaf(PGP_SIGNATURE), `--${boundary}--`, ""].join("\r\n");
+      const { api } = loadMessageTools({ mime: signedContainer([], { headerValue: header }), raw });
+      assert.equal(api.isStrictlyWellFormedRawMime(raw), true);
+      const result = await api.getMessage("message-1", "folder", false, "text");
+      assert.equal(result.body, SIGNED_TEXT);
+      assert.equal((await api.getMessage("message-1", "folder", false, "text", true)).rawSource, raw);
+    });
+  }
+
+  it("accepts RFC 5322 header names such as server-added X-Spam_score", async () => {
+    const apple = realisticSigned.find(fixture => fixture.label.startsWith("Apple"));
+    const raw = [apple.lines[0], ...apple.lines.slice(1, 4), "X-Spam_score: -0.1", "X-Spam_bar: /", ...apple.lines.slice(4)].join("\r\n");
+    const { api } = loadMessageTools({ mime: signedContainer([], { headerValue: apple.header }), raw });
+    assert.equal(api.isStrictlyWellFormedRawMime(raw), true);
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.notEqual(result.encryptedContentWithheld, true);
+    assert.match(result.body, /signed text/);
+  });
+
+  it("keeps 0.9.1 classification for unsigned mail outside the clear-signed raw path", async () => {
+    for (const name of ["OpenPGP_0x1234.asc", "Meeting.msg", "notes.mht"]) {
+      const raw = [
+        'Content-Type: multipart/mixed; boundary="mix"', "",
+        "--mix", ...plainPart,
+        "--mix", `${OCTET}; name="${name}"`, `Content-Disposition: attachment; filename="${name}"`, "", "data",
+        "--mix", "Content-Type: message/rfc822", "", "Subject: inner", "Content-Transfer-Encoding: base64", "", "ZW1iZWRkZWQ=",
+        "--mix--", "",
+      ].join("\r\n");
+      const { api } = loadMessageTools({ raw, mime: { parts: [] } });
+      assert.equal(api.classifyRawMessageEncryption(raw), "clear", name);
+      assert.equal(api.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), "unknown", name);
+      assert.equal((await api.getMessage("message-1", "folder", false, "text", true)).rawSource, raw, name);
+      assert.equal((await api.getMessage("message-1", "folder", false, "text")).body, SIGNED_TEXT, name);
+    }
+  });
+
+  it("keeps a classic pre-MIME embedded message readable", async () => {
+    const leaf = [
+      "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="earlier.eml"', "",
+      "From: x@example.invalid", "Subject: inner", "", "plain pre-MIME text",
+    ];
+    const raw = signedRaw(mixedWith(leaf));
+    const { api } = loadMessageTools({ mime: signedContainer([]), raw });
+    assert.equal(api.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), "clear");
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.equal(result.body, SIGNED_TEXT);
+    assert.deepEqual(Array.from(result.attachments, attachment => attachment.name), ["earlier.eml"]);
+    assert.equal((await api.getMessage("message-1", "folder", false, "text", true)).rawSource, raw);
+    assert.equal((await reply(api)).success, true);
+  });
+
+  it("keeps untyped embedded bodies readable when encoded files have ordinary names", async () => {
+    const leaf = [
+      "Content-Type: message/rfc822", 'Content-Disposition: attachment; filename="earlier.eml"', "",
+      "Subject: inner", "", "begin 644 photo.jpg", "M04)#", "end",
+    ];
+    const { api } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(mixedWith(leaf)) });
+    const result = await api.getMessage("message-1", "folder", false, "text");
+    assert.equal(result.body, SIGNED_TEXT);
+    assert.deepEqual(Array.from(result.attachments, attachment => attachment.name), ["earlier.eml"]);
+  });
+
+  for (const header of ["Content-Name", "X-Sun-Data-Name"]) {
+    it(`refuses a direct forward that would drop a part named only by ${header}`, async () => {
+      const leaf = ["Content-Type: application/pdf", `${header}: report.pdf`, "Content-Transfer-Encoding: base64", "", "JVBERi0="];
+      const { api, calls } = loadMessageTools({ mime: signedContainer([]), raw: signedRaw(mixedWith(leaf)) });
+      assert.deepEqual(Array.from((await api.getMessage("message-1", "folder", false, "text")).attachments, attachment => attachment.name), ["report.pdf"]);
+      assert.match((await forward(api)).error, /cannot include its attachments/);
+      assert.equal(calls.sends.length, 0);
+    });
+  }
+
+  it("never requests decryption from Gloda while the preference is off", () => {
+    const values = [...source.matchAll(/examineEncryptedParts\s*:\s*([^\s},]+)/g)].map(match => match[1]);
+    assert.equal(values.length, 3);
+    for (const value of values) assert.equal(value, "allowEncrypted");
   });
 });
