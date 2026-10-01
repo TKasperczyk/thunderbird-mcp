@@ -151,6 +151,7 @@ function loadPrivacyRuntime({ initial = {}, unreadable = [], legacyAddonManager 
     "this.isAccountAllowed = isAccountAllowed;",
     "this.isToolEnabled = isToolEnabled;",
     "this.isPrivacyOptInEnabled = isPrivacyOptInEnabled;",
+    "this.isAddressBookAccessRestricted = isAddressBookAccessRestricted;",
     "this.callTool = callTool;",
     "this.stripInvisibleCharacters = stripInvisibleCharacters;",
     "this.sanitizeToolResultText = sanitizeToolResultText;",
@@ -369,6 +370,23 @@ describe("Calendar and address-book access at the production tool dispatcher", (
       assert.equal(runtime.calls.length, 0);
     }
   });
+});
+
+describe("filter address book checks share the contact tool decision", () => {
+  const cases = [
+    [{}, []], [{ PREF_ALLOWED_ACCOUNTS: "[]" }, []], [{ PREF_ALLOWED_ACCOUNTS: '["account1"]' }, []],
+    [{ PREF_ALLOWED_ACCOUNTS: "{" }, []], [{ PREF_ALLOWED_ACCOUNTS: '["account1"]', PREF_ALLOW_ALL_ADDRESS_BOOKS: true }, []],
+    [{ PREF_ALLOWED_ACCOUNTS: '["account1"]', PREF_ALLOW_ALL_CALENDARS: true }, []],
+    [{ PREF_ALLOWED_ACCOUNTS: '["account1"]', PREF_ALLOW_ALL_ADDRESS_BOOKS: true }, ["PREF_ALLOW_ALL_ADDRESS_BOOKS"]],
+    [{ PREF_ALLOWED_ACCOUNTS: '["account1"]' }, ["PREF_ALLOWED_ACCOUNTS"]],
+  ];
+  for (const [initial, unreadable] of cases) {
+    it(`matches getContact for ${JSON.stringify(initial)} unreadable=${unreadable.join(",") || "none"}`, async () => {
+      const runtime = loadPrivacyRuntime({ initial, unreadable });
+      const blocked = Boolean((await runtime.callTool("getContact", { contactId: "contact" })).error);
+      assert.equal(runtime.isAddressBookAccessRestricted(), blocked);
+    });
+  }
 });
 
 describe("Options-only privacy preferences", () => {

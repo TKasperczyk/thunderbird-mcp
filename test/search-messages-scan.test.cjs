@@ -95,7 +95,7 @@ function makeFolder(name, { account = "account1", count = 0, messages, children 
   return folder;
 }
 
-function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glodaItems, glodaLimit = 20000, waitForGloda = false } = {}) {
+function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glodaItems, glodaLimit = 20000, waitForGloda = false, allowEncrypted = false } = {}) {
   const folders = new Map();
   function addFolder(folder) {
     folders.set(folder.URI, folder);
@@ -127,6 +127,7 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
     Date: SearchDate,
     GlodaMsgSearcher,
     Services: {
+      prefs: { getBoolPref: (name, fallback) => name.endsWith(".allowEncryptedMessages") ? allowEncrypted : fallback },
       tm: {
         dispatchToMainThread(resolve) {
           setImmediate(() => {
@@ -153,7 +154,9 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
       },
     },
     Ci: { nsMsgMessageFlags: { Expunged: 0x8 }, nsITimer: { TYPE_ONE_SHOT: 0 } },
+    NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
     MailServices: {
+      mimeConverter: { decodeMimeHeader: value => value.replace(/=\?utf-8\?q\?([^?]*)\?=/gi, (_, text) => text.replace(/_/g, " ")) },
       folderLookup: { getFolderForURL: uri => folders.get(uri) },
       accounts: { accounts, findAccountForServer: server => accounts.find(account => account.incomingServer === server) },
     },
@@ -165,7 +168,10 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
   const keywordEnd = source.indexOf("]);", keywordStart);
   assert.ok(keywordStart >= 0 && keywordEnd > keywordStart);
   vm.runInContext([
-    ...["DEFAULT_MAX_RESULTS", "MAX_SEARCH_RESULTS_CAP", "SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS"].map(constant),
+    ...["DEFAULT_MAX_RESULTS", "MAX_SEARCH_RESULTS_CAP", "SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS", "PREF_ALLOW_ENCRYPTED_MESSAGES"].map(constant),
+    snippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
+    snippet("// BEGIN RAW MIME PARSING HELPERS", "// END RAW MIME PARSING HELPERS"),
+    snippet("// BEGIN PROTECTED SUBJECT HELPERS", "// END PROTECTED SUBJECT HELPERS"),
     source.slice(keywordStart, keywordEnd + 3),
     snippet("// BEGIN SEARCH RESULT HELPERS", "// END SEARCH RESULT HELPERS"),
     snippet("function isFolderAccessible(", "function toColumnarTable("),
@@ -555,5 +561,84 @@ describe("searchMessages production Gloda collection", () => {
     const result = await h.search({ query: "body query", searchBody: true, offset: 0 });
     assert.equal(result.truncated, true);
     assert.deepEqual(result.messages, []);
+  });
+});
+
+describe("searchMessages protects subjects of encrypted mail", () => {
+  const DECRYPTION_OKAY = 0x00020000;
+  const ENCRYPTED_RAW = "Subject: =?utf-8?q?Encrypted_Message?=\r\nContent-Type: multipart/encrypted; boundary=b\r\n\r\n--b--\r\n";
+  const protectedRow = (subject) => ({
+    mime2DecodedSubject: subject, getUint32Property: name => (name === "enigmail" ? DECRYPTION_OKAY : 0),
+  });
+
+  function makeProtectedFolder(rows) {
+    const folder = makeFolder("Private", { messages: rows });
+    folder.rawReads = 0;
+    folder.getMsgInputStream = () => {
+      folder.rawReads++;
+      let offset = 0;
+      return {
+        available: () => ENCRYPTED_RAW.length - offset,
+        read(count) { const chunk = ENCRYPTED_RAW.slice(offset, offset + count); offset += chunk.length; return chunk; },
+        close() {},
+      };
+    };
+    return folder;
+  }
+
+  it("returns the transmitted subject without a preview and leaves other rows unchanged", async () => {
+    const folder = makeProtectedFolder([protectedRow("Secret plans"), { mime2DecodedSubject: "Lunch" }]);
+    const h = makeHarness({ roots: [folder] });
+    const page = await h.search({ offset: 0, sortOrder: "asc" });
+    assert.equal(page.messages[0].subject, "Encrypted Message");
+    assert.equal(page.messages[0].preview, undefined);
+    assert.equal(page.messages[0].encryptedContentWithheld, true);
+    assert.equal(page.messages[1].subject, "Lunch");
+    assert.equal(page.messages[1].preview, "A preview");
+    assert.equal(page.messages[1].encryptedContentWithheld, undefined);
+    assert.doesNotMatch(JSON.stringify(page), /Secret plans/);
+    assert.equal(folder.rawReads, 1);
+  });
+
+  it("does not match cached subjects or previews of encrypted mail", async () => {
+    const folder = makeProtectedFolder([protectedRow("Secret plans"), { mime2DecodedSubject: "Secret lunch" }]);
+    const h = makeHarness({ roots: [folder] });
+    for (const query of ["secret", "subject:secret", "preview"]) {
+      const result = await h.search({ query, offset: 0 });
+      assert.deepEqual(result.messages.map(row => row.id), ["m-1@example.com"], query);
+    }
+    const byAuthor = await h.search({ query: "alice", offset: 0 });
+    assert.equal(byAuthor.totalMatches, 2);
+    const allowed = makeHarness({ roots: [makeProtectedFolder([protectedRow("Secret plans")])], allowEncrypted: true });
+    const opted = await allowed.search({ query: "secret", offset: 0 });
+    assert.equal(opted.messages[0].subject, "Secret plans");
+    assert.equal(opted.messages[0].encryptedContentWithheld, undefined);
+  });
+
+  it("reads stored messages only for protected rows on the returned page", async () => {
+    const folder = makeProtectedFolder(Array.from({ length: 300 }, () => protectedRow("Secret plans")));
+    const h = makeHarness({ roots: [folder] });
+    assert.deepEqual(await h.search({ countOnly: true }), { count: 300 });
+    assert.equal(folder.rawReads, 0);
+    const page = await h.search({ offset: 0, maxResults: 2 });
+    assert.equal(page.messages.length, 2);
+    assert.ok(page.messages.every(row => row.subject === "Encrypted Message" && row.encryptedContentWithheld === true));
+    assert.equal(folder.rawReads, 2);
+  });
+
+  it("excludes encrypted mail from body-search matches unless opted in", async () => {
+    for (const allowEncrypted of [false, true]) {
+      const folder = makeProtectedFolder([protectedRow("Secret plans"), { mime2DecodedSubject: "Secret lunch" }]);
+      const glodaItems = Array.from(folder.headers.values(), folderMessage => ({ folderMessage }));
+      const h = makeHarness({ roots: [folder], glodaItems, allowEncrypted });
+      const result = await h.search({ query: "secret", searchBody: true, offset: 0, sortOrder: "asc" });
+      if (allowEncrypted) {
+        assert.deepEqual(result.messages.map(row => row.subject), ["Secret plans", "Secret lunch"]);
+      } else {
+        assert.deepEqual(result.messages.map(row => row.id), ["m-1@example.com"]);
+        assert.doesNotMatch(JSON.stringify(result), /Secret plans/);
+      }
+      assert.equal(folder.rawReads, 0);
+    }
   });
 });

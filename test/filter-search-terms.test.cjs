@@ -293,6 +293,7 @@ function buildOneAction(helpers, act, options) {
 function makeFilterHarness({
   ci = makeCi(), allowSend, prefError = false,
   getAccessibleFolder = (uri) => ({ folder: { URI: uri } }),
+  addressBooksRestricted = false,
 } = {}) {
   const prefReads = [];
   const submissions = [];
@@ -357,6 +358,7 @@ function makeFilterHarness({
     },
     globals: {
       isAccountAllowed: (id) => id === account.key,
+      isAddressBookAccessRestricted: () => addressBooksRestricted,
       getAccessibleAccounts: () => [account],
       getAccessibleFolder,
       MailServices: {
@@ -2311,4 +2313,153 @@ describe("reorderFilters uses final destination indices", () => {
       assert.deepEqual(h.filterList.mutations, []);
     });
   }
+});
+
+describe("Move/Copy filter actions never target the Outbox", () => {
+  const OUTBOX_FLAG = 0x800; // nsMsgFolderFlags.Queue
+  const conditions = [{ attrib: "subject", op: "contains", value: "invoice" }];
+  const outbox = "mailbox://nobody@Local%20Folders/Unsent%20Messages";
+  const nested = `${outbox}/Nested`;
+  const legacyOutbox = "imap://account/LegacyOutbox";
+  const archive = "imap://account/Archive";
+  const getAccessibleFolder = (uri) => {
+    if (uri === outbox) return { folder: { URI: uri, isSpecialFolder: (flag) => flag === OUTBOX_FLAG } };
+    if (uri === nested) {
+      return { folder: { URI: uri, isSpecialFolder: (flag, ancestors) => ancestors === true && flag === OUTBOX_FLAG } };
+    }
+    if (uri === legacyOutbox) return { folder: { URI: uri, getFlag: (flag) => flag === OUTBOX_FLAG } };
+    return { folder: { URI: uri, isSpecialFolder: () => false } };
+  };
+  const outboxTargets = [outbox, nested, legacyOutbox];
+
+  for (const type of ["moveToFolder", "copyToFolder"]) {
+    for (const operation of ["create", "update"]) {
+      it(`refuses an Outbox ${type} destination on ${operation} without changing the list`, () => {
+        for (const value of outboxTargets) {
+          const h = makeFilterHarness({ getAccessibleFolder });
+          const original = h.seed();
+          const before = h.snapshot();
+          const actions = [{ type: "markRead" }, { type, value }];
+          const result = operation === "create"
+            ? h.api.createFilter("account", "New", true, undefined, conditions, actions)
+            : h.api.updateFilter("account", 0, undefined, undefined, undefined, undefined, actions);
+          assert.match(result.error, /Outbox \(Unsent Messages\) cannot be used as a move or copy destination/, value);
+          assert.equal(h.snapshot(), before);
+          assert.equal(h.filterList.filters[0], original);
+          assert.equal(h.filterList.saveAttempts, 0);
+          assert.deepEqual(h.filterList.mutations, []);
+        }
+      });
+    }
+
+    it(`refuses updates retaining an Outbox ${type} but permits disabling and repairing it`, () => {
+      const h = makeFilterHarness({ getAccessibleFolder });
+      h.seed({ actions: [{ type, value: outbox }] });
+      const before = h.snapshot();
+      const renamed = h.api.updateFilter("account", 0, "Renamed");
+      assert.match(renamed.error, /Outbox/);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.saveAttempts, 0);
+      const disabled = h.api.updateFilter("account", 0, undefined, false);
+      assert.equal(disabled.success, true, disabled.error);
+      const repaired = h.api.updateFilter("account", 0, undefined, true, undefined, undefined, [{ type, value: archive }]);
+      assert.equal(repaired.success, true, repaired.error);
+      assert.equal(h.filterList.filters[0].getActionAt(0).targetFolderUri, archive);
+    });
+  }
+
+  it("keeps ordinary destinations working", () => {
+    const h = makeFilterHarness({ getAccessibleFolder });
+    const result = h.api.createFilter("account", "Archive", true, undefined, conditions, [{ type: "moveToFolder", value: archive }]);
+    assert.equal(result.success, true, result.error);
+  });
+
+  it("skips existing rules that would place messages in the Outbox", () => {
+    const h = makeFilterHarness({ getAccessibleFolder, allowSend: true });
+    h.seed({ name: "Move to Outbox", actions: [{ type: "moveToFolder", value: outbox }] });
+    h.seed({ name: "Copy to nested", actions: [{ type: "markRead" }, { type: "copyToFolder", value: nested }] });
+    h.seed({ name: "Archive", actions: [{ type: "moveToFolder", value: archive }] });
+    const before = h.snapshot();
+    const result = h.api.applyFilters("account", h.folder.URI);
+    assert.equal(result.success, true, result.error);
+    assert.deepEqual(Array.from(result.submitted), ["Archive"]);
+    assert.deepEqual(Array.from(result.skipped, (entry) => ({ ...entry })), [
+      { name: "Move to Outbox", reason: "outbox-destination" },
+      { name: "Copy to nested", reason: "outbox-destination" },
+    ]);
+    assert.deepEqual(h.submissions[0].filters.map((filter) => filter.filterName), ["Archive"]);
+    assert.equal(h.snapshot(), before);
+  });
+
+  it("treats a folder whose role cannot be read as the Outbox", () => {
+    const h = makeFilterHarness({
+      getAccessibleFolder: (uri) => ({ folder: { URI: uri, isSpecialFolder() { throw new Error("unavailable"); } } }),
+    });
+    const result = h.api.createFilter("account", "New", true, undefined, conditions, [{ type: "moveToFolder", value: archive }]);
+    assert.match(result.error, /Outbox/);
+    assert.equal(h.filterList.saveAttempts, 0);
+  });
+});
+
+describe("address book filter conditions follow address book access", () => {
+  const addressBook = "jsaddrbook://abook.sqlite";
+  const actions = [{ type: "markRead" }];
+  const plain = [{ attrib: "subject", op: "contains", value: "invoice" }];
+  const abConditions = (op) => [{ attrib: "subject", op: "contains", value: "invoice" }, { attrib: "from", op, value: addressBook }];
+
+  for (const op of ["isInAB", "isntInAB"]) {
+    it(`refuses ${op} conditions on create and update while address books are restricted`, () => {
+      const h = makeFilterHarness({ addressBooksRestricted: true });
+      const original = h.seed();
+      const before = h.snapshot();
+      const created = h.api.createFilter("account", "New", true, undefined, abConditions(op), actions);
+      assert.match(created.error, /Address book not accessible/);
+      const updated = h.api.updateFilter("account", 0, undefined, undefined, undefined, abConditions(op));
+      assert.match(updated.error, /Address book not accessible/);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.filters[0], original);
+      assert.equal(h.filterList.saveAttempts, 0);
+      assert.deepEqual(h.filterList.mutations, []);
+    });
+
+    it(`accepts ${op} conditions when address books are accessible`, () => {
+      const h = makeFilterHarness({ addressBooksRestricted: false });
+      const created = h.api.createFilter("account", "New", true, undefined, abConditions(op), actions);
+      assert.equal(created.success, true, created.error);
+      assert.equal(h.api.listFilters("account")[0].filters[0].terms[1].op, op);
+    });
+
+    it(`refuses updates retaining ${op} while restricted but permits disabling and replacing it`, () => {
+      const h = makeFilterHarness({ addressBooksRestricted: true });
+      h.seed({ conditions: abConditions(op) });
+      const before = h.snapshot();
+      assert.match(h.api.updateFilter("account", 0, "Renamed").error, /Address book not accessible/);
+      assert.equal(h.snapshot(), before);
+      assert.equal(h.filterList.saveAttempts, 0);
+      assert.equal(h.api.updateFilter("account", 0, undefined, false).success, true);
+      const replaced = h.api.updateFilter("account", 0, undefined, true, undefined, plain);
+      assert.equal(replaced.success, true, replaced.error);
+    });
+  }
+
+  it("skips existing address book rules only while address books are restricted", () => {
+    for (const addressBooksRestricted of [true, false]) {
+      const h = makeFilterHarness({ addressBooksRestricted });
+      h.seed({ name: "Known senders", conditions: abConditions("isInAB") });
+      h.seed({ name: "Unknown senders", conditions: abConditions("isntInAB") });
+      h.seed({ name: "Plain", conditions: plain });
+      const result = h.api.applyFilters("account", h.folder.URI);
+      assert.equal(result.success, true, result.error);
+      if (addressBooksRestricted) {
+        assert.deepEqual(Array.from(result.submitted), ["Plain"]);
+        assert.deepEqual(Array.from(result.skipped, (entry) => ({ ...entry })), [
+          { name: "Known senders", reason: "inaccessible-address-book" },
+          { name: "Unknown senders", reason: "inaccessible-address-book" },
+        ]);
+      } else {
+        assert.deepEqual(Array.from(result.submitted), ["Known senders", "Unknown senders", "Plain"]);
+        assert.deepEqual(Array.from(result.skipped), []);
+      }
+    }
+  });
 });

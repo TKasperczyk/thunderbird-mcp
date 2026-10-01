@@ -1083,6 +1083,43 @@ function validateFilterText(value, field) {
   }
 }
 
+// BEGIN OUTBOX DESTINATION GUARD
+// nsMsgFolderFlags.Queue marks the Outbox (Unsent Messages). Messages placed
+// there are delivered by Thunderbird's send-later service, so it is never a
+// valid move/copy destination or new folder parent for MCP callers.
+const OUTBOX_FOLDER_FLAG = 0x00000800;
+const OUTBOX_DESTINATION_ERROR = "The Outbox (Unsent Messages) cannot be used as a move or copy destination";
+const OUTBOX_CREATE_PARENT_ERROR = "Cannot create a folder inside the Outbox (Unsent Messages)";
+const OUTBOX_MOVE_PARENT_ERROR = "Cannot move a folder into the Outbox (Unsent Messages)";
+// Thunderbird gives the Outbox role to a top-level folder with one of these
+// names (compared case-insensitively).
+const OUTBOX_FOLDER_NAMES = ["unsent messages", "outbox"];
+const OUTBOX_FOLDER_NAME_ERROR = 'A top-level folder named "Unsent Messages" or "Outbox" would become the Outbox; choose another name or location';
+
+function isOutboxFolder(folder) {
+  if (!folder) return false;
+  try {
+    // Includes folders nested below the Outbox.
+    if (typeof folder.isSpecialFolder === "function") return folder.isSpecialFolder(OUTBOX_FOLDER_FLAG, true) === true;
+    if (typeof folder.getFlag === "function") return folder.getFlag(OUTBOX_FOLDER_FLAG) === true;
+    return typeof folder.flags === "number" && (folder.flags & OUTBOX_FOLDER_FLAG) !== 0;
+  } catch {
+    return true; // Unknown folder role: refuse rather than risk queueing mail.
+  }
+}
+
+// True when a folder called `name` directly below `parent` would take the
+// Outbox role.
+function wouldBecomeOutbox(parent, name) {
+  if (typeof name !== "string" || !OUTBOX_FOLDER_NAMES.includes(name.trim().toLowerCase())) return false;
+  try {
+    return parent?.isServer === true;
+  } catch {
+    return true;
+  }
+}
+// END OUTBOX DESTINATION GUARD
+
 // ── Filter search-term vocabulary ──
 //
 // Attribute and operator ids are resolved from the running Thunderbird by
@@ -1535,6 +1572,8 @@ const FILTER_ACTION_VALUE_DESCRIPTION = (() => {
   return `Action parameter, required for every action that takes one. ${groups.join("; ")}`;
 })();
 
+const ADDRESS_BOOK_CONDITION_ERROR = 'Address book not accessible: isInAB/isntInAB conditions require "Allow all address books" while account restrictions are active';
+
 const CUSTOM_ONLY_NOTE = "needs a customId this API does not expose; listFilters reports existing ones and updateFilter keeps them";
 
 function buildTerms(filter, conditions) {
@@ -1623,6 +1662,7 @@ function buildActions(filter, actions, { checkTargetFolder } = {}) {
         if (targetCheck?.error || typeof canonicalURI !== "string" || !canonicalURI.trim()) {
           throw new Error(`Filter target folder not accessible: ${parsed}`);
         }
+        if (isOutboxFolder(targetCheck.folder)) throw new Error(OUTBOX_DESTINATION_ERROR);
         // Folder lookup accepts spellings the native action setter rejects.
         parsed = canonicalURI;
       }
@@ -1733,6 +1773,7 @@ function getFilterActionRestriction(filter, { allowSending = isFilterSendAllowed
   }
   let sending = false;
   let inaccessibleDestination = false;
+  let outboxDestination = false;
   for (let i = 0; i < filter.actionCount; i++) {
     const action = filter.getActionAt(i);
     const type = action.type;
@@ -1744,16 +1785,33 @@ function getFilterActionRestriction(filter, { allowSending = isFilterSendAllowed
       try {
         const targetCheck = checkTargetFolder(action[spec.member]);
         if (!targetCheck?.folder || targetCheck.error) inaccessibleDestination = true;
+        else if (isOutboxFolder(targetCheck.folder)) outboxDestination = true;
       } catch {
         inaccessibleDestination = true;
       }
     }
   }
   if (inaccessibleDestination) return "inaccessible-destination";
+  if (outboxDestination) return "outbox-destination";
   return sending && !allowSending ? "sending" : null;
 }
 
-function validateFilterForWrite(filter, { onlyDisable = false, checkTargetFolder } = {}) {
+// isInAB/isntInAB conditions consult an address book whenever the rule runs,
+// so they follow the same access policy as the contact tools.
+function getFilterConditionRestriction(filter, { addressBooksRestricted = false } = {}) {
+  if (!addressBooksRestricted) return null;
+  const addressBookOps = [OP_MAP.isInAB, OP_MAP.isntInAB];
+  try {
+    for (const term of filter.searchTerms) {
+      if (!term.matchAll && addressBookOps.includes(term.op)) return "inaccessible-address-book";
+    }
+  } catch {
+    return "inaccessible-address-book"; // Unreadable conditions cannot be shown to be safe.
+  }
+  return null;
+}
+
+function validateFilterForWrite(filter, { onlyDisable = false, checkTargetFolder, addressBooksRestricted = false } = {}) {
   if (typeof filter.filterName !== "string" || !filter.filterName.length) {
     throw new Error("Filter name must be a non-empty string");
   }
@@ -1779,8 +1837,12 @@ function validateFilterForWrite(filter, { onlyDisable = false, checkTargetFolder
   if (restriction === "inaccessible-destination") {
     throw new Error("Filter target folder not accessible: a Move/Copy destination is missing or restricted");
   }
+  if (restriction === "outbox-destination") throw new Error(OUTBOX_DESTINATION_ERROR);
   if (restriction === "sending" && !onlyDisable) {
     throw new Error(`Forward/Reply filter actions are disabled. Enable ${FILTER_SEND_OPTION} to allow them.`);
+  }
+  if (!onlyDisable && getFilterConditionRestriction(filter, { addressBooksRestricted })) {
+    throw new Error(ADDRESS_BOOK_CONDITION_ERROR);
   }
 }
 // END FILTER SEARCH TERM HELPERS
@@ -2469,7 +2531,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "displayMessage",
         group: "messages", crud: "read",
         title: "Display Message",
-        description: "Open or navigate to a message in the Thunderbird GUI. Use '3pane' (default) to select the message in the mail view, 'tab' to open in a new tab, or 'window' to open in a standalone window.",
+        description: "Open or navigate to a message in the Thunderbird GUI. Use '3pane' (default) to select the message in the mail view, 'tab' to open in a new tab, or 'window' to open in a standalone window. Encrypted messages are refused unless encrypted message access is enabled in the extension options.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2614,7 +2676,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "createFilter",
         group: "filters", crud: "create",
         title: "Create Filter",
-        description: `Create and persist a mail filter. Forward/Reply actions require enabling ${FILTER_SEND_OPTION}, even for disabled rules. Custom actions are unsupported. Persisted text cannot contain control characters or backslashes.`,
+        description: `Create and persist a mail filter. Forward/Reply actions require enabling ${FILTER_SEND_OPTION}, even for disabled rules. Move/Copy destinations cannot be the Outbox. isInAB/isntInAB conditions require address book access. Custom actions are unsupported. Persisted text cannot contain control characters or backslashes.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -2662,7 +2724,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "updateFilter",
         group: "filters", crud: "update",
         title: "Update Filter",
-        description: `Validate a complete replacement before updating a filter. A resulting Forward/Reply rule requires ${FILTER_SEND_OPTION}, and all Move/Copy destinations must be accessible, except when enabled:false is the only update field. Custom actions are unsupported. Persisted text cannot contain control characters or backslashes.`,
+        description: `Validate a complete replacement before updating a filter. A resulting Forward/Reply rule requires ${FILTER_SEND_OPTION}, all Move/Copy destinations must be accessible and not the Outbox, and isInAB/isntInAB conditions require address book access, except when enabled:false is the only update field. Custom actions are unsupported. Persisted text cannot contain control characters or backslashes.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -2739,7 +2801,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "applyFilters",
         group: "filters", crud: "update",
         title: "Apply Filters",
-        description: `Start enabled Manual rules on a folder. Skip disabled, non-manual, unparseable rules, rules with inaccessible Move/Copy destinations and, unless ${FILTER_SEND_OPTION} is enabled, Forward/Reply rules. Eligible Custom actions are unsupported. Returns submittedFilters (count), submitted (names), and skipped (names/reasons); processing completes asynchronously.`,
+        description: `Start enabled Manual rules on a folder. Skip disabled, non-manual, unparseable rules, rules with inaccessible or Outbox Move/Copy destinations, rules with isInAB/isntInAB conditions while address books are inaccessible and, unless ${FILTER_SEND_OPTION} is enabled, Forward/Reply rules. Eligible Custom actions are unsupported. Returns submittedFilters (count), submitted (names), and skipped (names/reasons); processing completes asynchronously.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -3071,6 +3133,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 finalResults.sort((a, b) => sortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
                 response = paginate(finalResults, offset, effectiveLimit);
                 const page = Array.isArray(response) ? response : response.messages;
+                const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
                 const messages = [];
                 for (const row of page) {
                   try {
@@ -3096,6 +3159,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tags: getUserTags(msgHdr),
                     };
                     if (preview) message.preview = preview;
+                    if (!allowEncrypted && hasRecordedEncryption(msgHdr)) withholdProtectedSubject(message, msgHdr);
                     if (row.dupLocations) message.dupLocations = row.dupLocations;
                     messages.push(message);
                   } catch {
@@ -3286,6 +3350,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return !disabled.includes(toolName);
             }
 
+            /**
+             * Calendars and address books are blocked while any account
+             * restriction is active, unless the matching opt-in is enabled.
+             */
+            function isPrivacyScopeRestricted(pref) {
+              return getAllowedAccountIds().length > 0 && !isPrivacyOptInEnabled(pref);
+            }
+
+            function isAddressBookAccessRestricted() {
+              return isPrivacyScopeRestricted(PREF_ALLOW_ALL_ADDRESS_BOOKS);
+            }
+
             // END SERVER ACCESS HELPERS
 
             /**
@@ -3420,7 +3496,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (flags & 0x00000400) return "drafts";
                 if (flags & 0x00000100) return "trash";
                 if (flags & 0x00400000) return "templates";
-                if (flags & 0x00000800) return "queue";
+                if (flags & OUTBOX_FOLDER_FLAG) return "queue";
                 if (flags & 0x40000000) return "junk";
                 if (flags & 0x00004000) return "archive";
                 return "folder";
@@ -5194,6 +5270,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               // Gloda limits ranked candidates before excluding deleted/stale rows;
               // even a collection below that limit cannot prove completeness.
               const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: true, glodaLimited: true };
+              const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
               const requestedLimit = Number(maxResults);
               const effectiveLimit = Math.min(
                 Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.floor(requestedLimit) : DEFAULT_MAX_RESULTS,
@@ -5260,6 +5337,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                           } catch { scan.truncated = true; continue; }
                           if (!msgHdr) { scan.truncated = true; continue; }
                           if (msgHdr.flags & Ci.nsMsgMessageFlags.Expunged) continue;
+                          // The full-text index includes cached subjects of encrypted mail.
+                          if (!allowEncrypted && hasRecordedEncryption(msgHdr)) continue;
 
                           // Account access control
                           const folder = msgHdr.folder;
@@ -5314,6 +5393,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                return glodaBodySearch(query, folderPath, startDate, endDate, maxResults, offset, sortOrder, unreadOnly, flaggedOnly, tag, countOnly, dedupByMessageId);
 	              }
 	              const scan = { deadline: Date.now() + SEARCH_TIME_BUDGET_MS, truncated: false };
+	              const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
 	              const results = [];
 	              const lowerQuery = (query || "").toLowerCase();
 	              const hasQuery = !!lowerQuery;
@@ -5370,11 +5450,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (failedQuery) return;
                 if (hasQuery) {
                   // Search decoded headers, preserving field operators and AND tokens.
-                  const subject = (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
+                  // Cached subjects and previews of encrypted mail are not matched.
+                  const protectedText = !allowEncrypted && hasRecordedEncryption(msgHdr);
+                  const subject = protectedText ? "" : (msgHdr.mime2DecodedSubject || msgHdr.subject || "").toLowerCase();
                   const author = (msgHdr.mime2DecodedAuthor || msgHdr.author || "").toLowerCase();
                   const recipients = (msgHdr.mime2DecodedRecipients || msgHdr.recipients || "").toLowerCase();
                   const ccList = (msgHdr.ccList || "").toLowerCase();
-                  const preview = (msgHdr.getStringProperty("preview") || "").toLowerCase();
+                  const preview = protectedText ? "" : (msgHdr.getStringProperty("preview") || "").toLowerCase();
                   const fieldValues = { subject, author, recipients, ccList };
                   const matches = fieldTarget
                     ? queryTokens.every(t => (fieldValues[fieldTarget] || "").includes(t))
@@ -7631,11 +7713,88 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
             }
 
+            // BEGIN PROTECTED SUBJECT HELPERS
+            // OpenPGP status bits (EnigmailConstants) Thunderbird records in the
+            // "enigmail" header property after processing a message: NO_SECKEY,
+            // DECRYPTION_INCOMPLETE, DECRYPTION_FAILED, DECRYPTION_OKAY and
+            // PGP_MIME_ENCRYPTED.
+            const OPENPGP_ENCRYPTION_STATUS_MASK = 0x00000100 | 0x00008000 | 0x00010000 | 0x00020000 | 0x00200000;
+            const OUTER_HEADER_MAX_BYTES = 16 * 1024;
+            const WITHHELD_SUBJECT = "[Encrypted message]";
+            const ENCRYPTED_DISPLAY_ERROR = "Encrypted messages cannot be displayed while encrypted message access is off. Enable \"Allow MCP clients to read encrypted messages\" in the extension options to allow it.";
+
+            // Cheap header-level signal: no message content is read.
+            function hasRecordedEncryption(msgHdr) {
+              try {
+                if (typeof msgHdr?.getUint32Property !== "function") return false;
+                return (msgHdr.getUint32Property("enigmail") & OPENPGP_ENCRYPTION_STATUS_MASK) !== 0;
+              } catch {
+                return true;
+              }
+            }
+
+            // Parses the top-level header block from at most OUTER_HEADER_MAX_BYTES
+            // of the stored message. Returns null when it cannot be read in full.
+            function readOuterHeaders(msgHdr) {
+              let stream = null;
+              try {
+                stream = msgHdr.folder.getMsgInputStream(msgHdr, {});
+                let raw = "";
+                while (raw.length < OUTER_HEADER_MAX_BYTES && !findRawMimeHeaderBodySplit(raw)) {
+                  let available;
+                  try {
+                    available = stream.available();
+                  } catch {
+                    break; // Closed at end of stream.
+                  }
+                  if (available <= 0) break;
+                  const chunk = NetUtil.readInputStreamToString(stream, Math.min(available, OUTER_HEADER_MAX_BYTES - raw.length));
+                  if (!chunk) break;
+                  raw += chunk;
+                }
+                const split = findRawMimeHeaderBodySplit(raw);
+                return split ? parseRawMimeHeaders(split.header) : null;
+              } catch {
+                return null;
+              } finally {
+                if (stream) try { stream.close(); } catch { /* ignore */ }
+              }
+            }
+
+            // The Subject header as transmitted, never the cached database subject.
+            function readOuterSubject(msgHdr) {
+              const headers = readOuterHeaders(msgHdr);
+              if (!headers || (headers.subject || []).length > 1) return null;
+              const value = getRawMimeHeader(headers, "subject");
+              try {
+                return MailServices.mimeConverter.decodeMimeHeader(value, null, false, true) ?? value;
+              } catch {
+                return value;
+              }
+            }
+
+            function withholdProtectedSubject(row, msgHdr) {
+              row.subject = readOuterSubject(msgHdr) ?? WITHHELD_SUBJECT;
+              delete row.preview;
+              row.encryptedContentWithheld = true;
+              return row;
+            }
+
+            function hasEncryptedOuterStructure(msgHdr) {
+              if (hasRecordedEncryption(msgHdr)) return true;
+              const headers = readOuterHeaders(msgHdr);
+              if (!headers) return false;
+              const contentTypes = headers["content-type"] || [];
+              if (contentTypes.length > 1) return true;
+              return classifyMimeContentType(contentTypes[0] || "text/plain") !== "clear";
+            }
+            // END PROTECTED SUBJECT HELPERS
+
             function encryptedMessagePlaceholder(msgHdr, unknown = false) {
               return {
                 id: msgHdr.messageId,
                 // Cached protected headers may already have been decrypted by Thunderbird.
-                subject: "[Encrypted message]",
+                subject: WITHHELD_SUBJECT,
                 author: "",
                 recipients: "",
                 ccList: "",
@@ -9187,6 +9346,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (!VALID_DISPLAY_MODES.includes(mode)) {
                 return { error: `Invalid displayMode: "${mode}". Must be one of: ${VALID_DISPLAY_MODES.join(", ")}` };
               }
+              // Displaying decrypts the message and caches its protected subject.
+              if (!isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && hasEncryptedOuterStructure(msgHdr)) {
+                return { error: ENCRYPTED_DISPLAY_ERROR };
+              }
 
               try {
                 const { MailUtils } = ChromeUtils.importESModule(
@@ -9220,6 +9383,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
               const results = [];
+              const allowEncrypted = isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES);
               const days = Number.isFinite(Number(daysBack)) && Number(daysBack) > 0 ? Math.floor(Number(daysBack)) : 7;
               const cutoffTs = (Date.now() - days * 86400000) * 1000; // Thunderbird uses microseconds
               const requestedLimit = Number(maxResults);
@@ -9260,7 +9424,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       tags: msgTags,
                       _dateTs: msgDateTs
                     };
-                    if (preview) result.preview = preview;
+                    if (!allowEncrypted && hasRecordedEncryption(msgHdr)) {
+                      result.subject = WITHHELD_SUBJECT;
+                      result.encryptedContentWithheld = true;
+                      // Outer subjects are read only for the returned page.
+                      Object.defineProperty(result, "_protectedHdr", { value: msgHdr, configurable: true });
+                    } else if (preview) {
+                      result.preview = preview;
+                    }
                     results.push(result);
                   }
                 } catch {
@@ -9296,7 +9467,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               results.sort((a, b) => b._dateTs - a._dateTs);
 
-              return paginate(results, offset, effectiveLimit);
+              const response = paginate(results, offset, effectiveLimit);
+              for (const row of Array.isArray(response) ? response : response.messages) {
+                if (!row._protectedHdr) continue;
+                withholdProtectedSubject(row, row._protectedHdr);
+                delete row._protectedHdr;
+              }
+              return response;
             }
 
             function isTrashOrDescendant(folder) {
@@ -9464,6 +9641,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const targetResult = getAccessibleFolder(moveTo || copyTo);
                   if (targetResult.error) return targetResult;
                   targetFolder = targetResult.folder;
+                  if (isOutboxFolder(targetFolder)) return { error: OUTBOX_DESTINATION_ERROR };
                 }
 
                 const foundHdrs = [];
@@ -9553,6 +9731,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const parentResult = getAccessibleFolder(parentFolderPath);
                 if (parentResult.error) return parentResult;
                 const parent = parentResult.folder;
+                if (isOutboxFolder(parent)) return { error: OUTBOX_CREATE_PARENT_ERROR };
+                if (wouldBecomeOutbox(parent, name)) return { error: OUTBOX_FOLDER_NAME_ERROR };
 
                 parent.createSubfolder(name, null);
 
@@ -9597,6 +9777,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const renameResult = getAccessibleFolder(folderPath);
                 if (renameResult.error) return renameResult;
                 const folder = renameResult.folder;
+                if (wouldBecomeOutbox(folder.parent, newName)) return { error: OUTBOX_FOLDER_NAME_ERROR };
 
                 folder.rename(newName, null);
                 return {
@@ -9791,6 +9972,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const destResult = getAccessibleFolder(newParentPath);
                 if (destResult.error) return destResult;
                 const newParent = destResult.folder;
+                if (isOutboxFolder(newParent)) return { error: OUTBOX_MOVE_PARENT_ERROR };
+                if ([folder.name, folder.prettyName].some(name => wouldBecomeOutbox(newParent, name))) {
+                  return { error: OUTBOX_FOLDER_NAME_ERROR };
+                }
                 const parentName = newParent.prettyName || newParent.name || newParentPath;
 
                 if (folder.parent && folder.parent.URI === newParentPath) {
@@ -9942,7 +10127,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 buildTerms(filter, conditions);
                 buildActions(filter, actions, { checkTargetFolder: getAccessibleFolder });
-                validateFilterForWrite(filter);
+                validateFilterForWrite(filter, { addressBooksRestricted: isAddressBookAccessRestricted() });
 
                 const idx = (insertAtIndex != null && insertAtIndex >= 0)
                   ? Math.min(insertAtIndex, filterList.filterCount)
@@ -10028,7 +10213,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 const onlyDisable = enabled === false && name === undefined && type === undefined
                   && conditions === undefined && actions === undefined;
-                validateFilterForWrite(candidate, { onlyDisable, checkTargetFolder: getAccessibleFolder });
+                validateFilterForWrite(candidate, {
+                  onlyDisable,
+                  checkTargetFolder: getAccessibleFolder,
+                  addressBooksRestricted: isAddressBookAccessRestricted(),
+                });
 
                 filterList.setFilterAt(filterIndex, candidate);
                 try {
@@ -10143,6 +10332,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const manualType = resolveXpcomConstant("nsMsgFilterType", "Manual");
                 if (manualType === undefined) return { error: "Manual filters are unavailable in this Thunderbird version" };
                 const allowSending = isFilterSendAllowed();
+                const addressBooksRestricted = isAddressBookAccessRestricted();
                 const temporaryList = filterService.getTempFilterList(folder);
                 const submitted = [];
                 const skipped = [];
@@ -10156,6 +10346,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (reason === "custom") {
                     return { error: `Custom filter actions are unsupported (filter: ${filter.filterName})` };
                   }
+                  if (!reason) reason = getFilterConditionRestriction(filter, { addressBooksRestricted });
                   if (reason) {
                     skipped.push({ name: filter.filterName, reason });
                     continue;
@@ -10413,12 +10604,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // BEGIN TOOL DISPATCH
             async function callTool(name, args) {
               const group = buildTools().find(tool => tool.name === name)?.group;
-              if ((group === "calendar" || group === "contacts") && getAllowedAccountIds().length > 0) {
-                const pref = group === "calendar" ? PREF_ALLOW_ALL_CALENDARS : PREF_ALLOW_ALL_ADDRESS_BOOKS;
-                if (!isPrivacyOptInEnabled(pref)) {
-                  const label = group === "calendar" ? "Allow all calendars" : "Allow all address books";
-                  return { error: `Account restrictions block this tool. Enable "${label}" in the extension options to grant access.` };
-                }
+              if ((group === "calendar" || group === "contacts") &&
+                  isPrivacyScopeRestricted(group === "calendar" ? PREF_ALLOW_ALL_CALENDARS : PREF_ALLOW_ALL_ADDRESS_BOOKS)) {
+                const label = group === "calendar" ? "Allow all calendars" : "Allow all address books";
+                return { error: `Account restrictions block this tool. Enable "${label}" in the extension options to grant access.` };
               }
               return sanitizeToolResultText(await dispatchTool(name, args));
             }

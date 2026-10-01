@@ -17,7 +17,7 @@ function snippet(startMarker, endMarker) {
 
 // Load real folder access, handlers, dispatch and sanitization; mock only the
 // account preference and native Thunderbird services they call.
-function loadFolderTools({ accounts, folders, isAccountAllowed = () => true, copyMessages = () => {} }) {
+function loadFolderTools({ accounts, folders, isAccountAllowed = () => true, copyMessages = () => {}, copyFolder = () => {} }) {
   const runtime = vm.createContext({
     console,
     Ci: { nsMsgFolderFlags: { Trash: 0x100 } },
@@ -29,15 +29,18 @@ function loadFolderTools({ accounts, folders, isAccountAllowed = () => true, cop
         findAccountForServer: server => accounts.find(account => account.incomingServer === server),
       },
       folderLookup: { getFolderForURL: uri => folders.find(folder => folder.URI === uri) || null },
-      copy: { copyMessages },
+      copy: { copyMessages, copyFolder },
     },
   });
   vm.runInContext([
+    snippet("// BEGIN OUTBOX DESTINATION GUARD", "// END OUTBOX DESTINATION GUARD"),
     snippet("function isFolderAccessible(", "function toColumnarTable("),
     snippet("function toColumnarTable(", "function listAccounts("),
     snippet("function listFolders(", "function findIdentityIn("),
     snippet("function openFolder(", "function findMessage("),
     snippet("// BEGIN UPDATE MESSAGE TOOL", "// END UPDATE MESSAGE TOOL"),
+    snippet("function createFolder(", "function deleteFolder("),
+    snippet("function moveFolder(", "// BEGIN FILTER TOOL HANDLERS"),
     snippet("// BEGIN MCP TEXT SANITIZATION", "// END MCP TEXT SANITIZATION"),
     snippet("// BEGIN TOOL DISPATCH", "// END TOOL DISPATCH"),
   ].join("\n"), runtime);
