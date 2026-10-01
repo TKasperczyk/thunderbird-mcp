@@ -72,6 +72,7 @@ function normalizeGetMessagesLimit(value) {
 
 const ALL_TOOLS = [
   { name: "listAccounts", group: "system", crud: "read" },
+  { name: "getSignature", group: "system", crud: "read" },
   { name: "listFolders", group: "system", crud: "read" },
   { name: "getAccountAccess", group: "system", crud: "read" },
   { name: "searchMessages", group: "messages", crud: "read" },

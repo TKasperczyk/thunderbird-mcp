@@ -86,6 +86,7 @@ Structured MIME extraction keeps the first body's representation outside multipa
 
 | Tool | Description |
 |------|-------------|
+| `getSignature` | Read the native Thunderbird signature for an identity selected by email address or identity ID |
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
 | `saveDraft` | Save a new or replacement draft without sending or opening a window; supports threading headers and reports an accessible Drafts folder |
 | `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block; `saveAsDraft` saves the threaded reply to Drafts without sending |
@@ -101,7 +102,9 @@ Direct sends report success only after SMTP succeeds, and only then mark origina
 
 - `inReplyTo`: one bracketed Message-ID such as `<original@example.com>`. `references`: up to 100 such IDs, oldest first, separated by single ASCII spaces. Each ID is limited to 998 characters and the full References value to 16,384. Missing brackets, extra tokens, whitespace inside IDs, and control characters (including CR/LF) are rejected, never repaired. References defaults to `inReplyTo` when omitted, and may also be supplied independently. The caller supplies the subject and quoted text.
 - `replaceMessageId` and `replaceFolderPath`: replace an existing draft with the supplied content. The folder must be accessible under account restrictions, carry Thunderbird's Drafts flag, and match the selected `from` identity's configured drafts folder. Other folders and missing messages are rejected before saving. Supply all fields and attachments you want retained; content is not merged from the old draft.
-- `includeSignature`: append the identity's signature, defaulting to `true` for a new draft and `false` for a replacement so re-saving a fetched draft does not duplicate its signature. Set it explicitly when needed. `sendMail` with `skipReview: true` accepts the same option, defaulting to `true`; review windows use Thunderbird's own signature preferences. Signature files are limited to 1 MiB; unreadable or oversized signature files are omitted.
+- `useSignature`: use the native Thunderbird signature for the selected identity. It defaults to `true` for new messages and drafts, and to `false` when replacing an existing draft so re-saving a fetched draft does not duplicate its signature. Set it to `false` or `0` to suppress the signature, or to `true`/`1` to request it explicitly. The mapping from email address to signature remains Thunderbird's own identity configuration; no second MCP signature registry is required. `includeSignature` remains accepted as a backwards-compatible alias for `sendMail` and `saveDraft`. Signature files are limited to 1 MiB; unreadable or oversized signature files are omitted.
+
+**AI assistant signature rule:** If the user says nothing about the signature, keep the default `useSignature: true` (or omit the parameter) for new messages, replies, forwards, and new drafts. Let Thunderbird insert the selected identity's configured signature. Do not invent, rewrite, or manually append a signature, and do not disable it on your own. Only override this behavior when the user explicitly requests it. When replacing an existing draft, preserve the signature already in its body and omit `useSignature` to avoid appending it again.
 
 On success, `saveDraft` returns `folderPath` when Thunderbird exposes the destination and that folder is accessible under account restrictions. Otherwise the save still succeeds without disclosing the folder URI. It does not return the saved message's ID; look up the draft in the returned folder when available.
 
