@@ -265,6 +265,20 @@ For `sendMail`, `saveDraft`, `replyToMessage`, and `forwardMessage`, pass `attac
 
 UNC/network and device paths, dotfiles and dot-directories, application-data directories (Windows `AppData` and the macOS home `Library`), and credential/key filenames are refused. Windows alternate data streams and path components ending in dots or spaces are also refused. Files exported by `getMessage(saveAttachments: true)` can still be attached again, and ordinary local document paths continue to work. If any attachment is refused, missing, invalid, or over a limit, the entire operation fails before sending, saving a draft, or opening a review window. The error identifies refused entries; temporary files created during the failed conversion are removed. Callers that previously relied on partial attachment success must handle this error explicitly.
 
+### Connection retry budgets
+
+MCP clients send the first `tools/list` immediately after `initialize`, which is often while Thunderbird is still booting. Because a client that gets an error on that first call drops the server for the rest of the session, the bridge waits longer on its **first** connection attempt than on later ones.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `THUNDERBIRD_MCP_COLD_START_CONNECTION_RETRIES` | `20` | Attempts before the first successful connection-file read |
+| `THUNDERBIRD_MCP_CONNECTION_RETRIES` | `5` | Attempts once a connection file has been seen |
+| `THUNDERBIRD_MCP_CONNECTION_RETRY_DELAY_MS` | `1000` | Delay between attempts |
+
+With the defaults, a bridge started before Thunderbird waits up to 20 seconds for the extension instead of 5, while later failures still surface after 5. The cold-start budget is never shorter than the warm one. Non-integer, negative and empty values fall back to the default. Set the cold-start value to `0` to fail immediately, or raise the delay on slow sandboxed setups.
+
+---
+
 ## Security
 
 - **Auth tokens**: The HTTP server requires a session-scoped bearer token. Generated on startup, written to `<TmpD>/thunderbird-mcp/connection.json` with 0600 permissions. The bridge re-discovers that file automatically across native installs, Snap, Flatpak, Betterbird Flatpak, and macOS temp directories.
@@ -285,6 +299,7 @@ UNC/network and device paths, dotfiles and dot-directories, application-data dir
 |---------|-----|
 | Extension not loading | Check Tools > Add-ons and Themes. Errors: Tools > Developer Tools > Error Console |
 | Connection refused | Make sure Thunderbird is running and the extension is enabled |
+| Server dead for the whole session, but works when started by hand | The bridge was started before Thunderbird and gave up on the first request. Reconnect MCP (`/mcp` in Claude Code), or raise `THUNDERBIRD_MCP_COLD_START_CONNECTION_RETRIES` |
 | Bridge can't find `connection.json` | Set `THUNDERBIRD_MCP_CONNECTION_FILE` explicitly if your environment uses a non-standard temp/runtime path |
 | Missing recent emails | IMAP folders can be stale. Click the folder in Thunderbird to sync, or right-click > Properties > Repair Folder |
 | Tool not found after update | Reconnect MCP (`/mcp` in Claude Code) to pick up new tools |

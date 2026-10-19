@@ -12,9 +12,39 @@ const path = require('path');
 const os = require('os');
 
 const THUNDERBIRD_HOSTS = ['127.0.0.1'];
-const CONNECTION_RETRY_DELAY_MS = 1000;
-const CONNECTION_MAX_RETRIES = 5;
+
+// Read a non-negative integer from the environment, falling back to the
+// default for anything missing, non-numeric or negative. Invalid input is
+// never repaired into a surprising value.
+function readRetryBudgetEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0) {
+    return fallback;
+  }
+  return value;
+}
+
+const CONNECTION_RETRY_DELAY_MS = readRetryBudgetEnv('THUNDERBIRD_MCP_CONNECTION_RETRY_DELAY_MS', 1000);
+const CONNECTION_MAX_RETRIES = readRetryBudgetEnv('THUNDERBIRD_MCP_CONNECTION_RETRIES', 5);
+// A cold start gets a longer budget: MCP clients send the first tools/list
+// immediately after initialize, which is often while Thunderbird is still
+// booting. Failing that one request makes the client drop the server for the
+// whole session, so waiting there is worth more than failing fast. Once a
+// connection file has been seen, an absent one is a real error and the short
+// budget keeps later failures quick.
+const CONNECTION_COLD_START_MAX_RETRIES = Math.max(
+  CONNECTION_MAX_RETRIES,
+  readRetryBudgetEnv('THUNDERBIRD_MCP_COLD_START_CONNECTION_RETRIES', 20)
+);
 const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
+
+// Set once the extension's connection file has been read successfully. Only
+// the attempts before that count as a cold start.
+let connectionFileSeen = false;
 
 const DEFAULT_PROC_ROOT = '/proc';
 const DEFAULT_DARWIN_FOLDERS_ROOT = '/var/folders';
@@ -1454,7 +1484,14 @@ async function forwardToThunderbird(message) {
   // authentication.
   let connInfo = readConnectionInfo();
   if (!connInfo) {
-    for (let attempt = 0; attempt < CONNECTION_MAX_RETRIES; attempt++) {
+    const maxRetries = connectionFileSeen
+      ? CONNECTION_MAX_RETRIES
+      : CONNECTION_COLD_START_MAX_RETRIES;
+    debugLog(
+      `connection file missing, retrying up to ${maxRetries}x every ` +
+      `${CONNECTION_RETRY_DELAY_MS}ms (coldStart=${!connectionFileSeen})`
+    );
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, CONNECTION_RETRY_DELAY_MS));
       connInfo = readConnectionInfo();
       if (connInfo) {
@@ -1465,6 +1502,7 @@ async function forwardToThunderbird(message) {
       throw new Error(buildConnectionDiscoveryErrorMessage());
     }
   }
+  connectionFileSeen = true;
 
   // Walk through the cached candidate list on retryable failures so a stale
   // connection.json can't permanently mask a live one further down the list.
@@ -1625,5 +1663,10 @@ module.exports = {
     MAX_ATTACHMENT_BYTES,
     MAX_TOTAL_ATTACHMENT_BYTES,
     MAX_ATTACHMENTS_PER_MESSAGE,
+  },
+  connectionRetryBudgets: {
+    CONNECTION_RETRY_DELAY_MS,
+    CONNECTION_MAX_RETRIES,
+    CONNECTION_COLD_START_MAX_RETRIES,
   },
 };

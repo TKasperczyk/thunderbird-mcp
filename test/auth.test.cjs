@@ -31,7 +31,13 @@ beforeEach(() => {
   CONN_DIR = makeAllowedTempDir('tb-mcp-auth-');
   CONN_FILE = path.join(CONN_DIR, 'connection.json');
   // A missing/invalid pin must never fall through to a running instance.
-  BRIDGE_ENV = { ...process.env, THUNDERBIRD_MCP_CONNECTION_FILE: CONN_FILE };
+  // The cold-start budget is pinned to the warm one so these cases keep their
+  // historical ~5s retry window instead of sitting through the longer grace.
+  BRIDGE_ENV = {
+    ...process.env,
+    THUNDERBIRD_MCP_CONNECTION_FILE: CONN_FILE,
+    THUNDERBIRD_MCP_COLD_START_CONNECTION_RETRIES: '5',
+  };
 });
 
 afterEach(() => {
