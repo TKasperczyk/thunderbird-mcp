@@ -59,6 +59,7 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 | `moveFolder` | Move a folder to a new parent within the same account |
 | `emptyTrash` | Permanently delete all messages in Trash (including subfolders) |
 | `emptyJunk` | Permanently delete all messages in Junk/Spam (including subfolders) |
+| `saveMessage` | Save a message's `.eml` and/or its attachments into a directory you choose (unlike `saveAttachments`, which is temp-dir only). Runs on the bridge, so the path is on the machine running the MCP. **Disabled unless `THUNDERBIRD_MCP_SAVE_MESSAGE=1`** -- see [Security](#security). |
 
 `searchMessages` scans cooperatively with a best-effort 20-second budget. Header searches count and sort collected matches before pagination, including those beyond 10,000; only the returned page loads full result fields. Counts and totals are best-effort when folders change during a long search, even if no truncation is reported. Unscoped searches still request an IMAP refresh for each visited folder, but results use the locally available cache. Opening a native database and taking its key snapshot are synchronous and cannot be interrupted by this budget.
 
@@ -297,6 +298,22 @@ External attachment links, including attachments removed with Thunderbird's **De
 - **Encrypted-message access**: "Allow MCP clients to read encrypted messages" is off by default. It gates full-message bodies, attachments, inline images, raw-source reads, and automatic reply drafts; Thunderbird may still decrypt S/MIME locally. Enabling it does not permit unreviewed replies or forwards of encrypted or protected originals: use `skipReview: false` for those operations. Opaque-signed S/MIME messages are also withheld while this setting is off. Clear-signed mail (`multipart/signed` with an OpenPGP or S/MIME detached signature) is not encrypted and stays readable. When Thunderbird hides such a message's signed parts as encrypted, the extension reads it from the stored message instead and never asks Thunderbird to decrypt; the message is withheld if anything inside the signature is encrypted, and a direct forward of it is refused when it has attachments. While it is off, `searchMessages` and `getRecentMessages` return the outer subject without a preview for messages Thunderbird has recorded as OpenPGP-encrypted, searches (including `searchBody`) do not match them, and `displayMessage` refuses encrypted messages. This relies on Thunderbird's recorded OpenPGP status, so a message decrypted without that status being recorded may still show a cached decrypted subject. Thunderbird has no reliable encryption signal on every message header: OpenPGP's `enigmail` property is cached display status, while S/MIME's URI registry only tracks currently displayed decrypted messages. In particular, OpenPGP can [update a protected subject during background processing](https://searchfox.org/comm-central/source/mail/extensions/openpgp/content/modules/mimeDecrypt.sys.mjs#563) without the display callback that records that property; the [S/MIME registry is scoped to the current display](https://searchfox.org/comm-central/source/mailnews/base/public/nsIEncryptedMsgURIsService.idl).
 - **Localhost only**: By default, the server binds to localhost only. The "Listen on all interfaces" option in settings binds to all IPv4 interfaces for WSL, Docker, or remote access. **This exposes the MCP server to every device on your local network.** Only enable on trusted networks. Auth token is always required.
 - **Auto-update integrity**: Auto-update is a code-delivery channel whose integrity depends on continued control of the GitHub repository, the GitHub Actions token, and the `tomaszkasperczyk.name` registration.
+- **Filesystem writes are opt-in**: `saveMessage` writes caller-named files to a caller-named directory, which is an arbitrary-write primitive in the hands of whatever drives the MCP -- a prompt-injected tool call could aim it at `~/.bashrc`, `~/.ssh/`, or an autostart entry. It is therefore off by default: hidden from `tools/list` and refused at dispatch unless `THUNDERBIRD_MCP_SAVE_MESSAGE=1` is set in the MCP server environment. Set `THUNDERBIRD_MCP_SAVE_ROOT=/path/to/dir` as well to confine every write inside one directory; destinations are resolved through symlinks before the check, so a link cannot escape the root. Saved files are created `0600` and new directories `0700`, and existing files are never written through a symlink.
+
+  ```json
+  {
+    "mcpServers": {
+      "thunderbird": {
+        "command": "npx",
+        "args": ["-y", "thunderbird-mcp"],
+        "env": {
+          "THUNDERBIRD_MCP_SAVE_MESSAGE": "1",
+          "THUNDERBIRD_MCP_SAVE_ROOT": "/home/you/Documents/mail-exports"
+        }
+      }
+    }
+  }
+  ```
 
 ---
 
