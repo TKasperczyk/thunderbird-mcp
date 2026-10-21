@@ -48,8 +48,25 @@ function makeHeader(folder, { id, enigmail = 0, raw = CLEAR_RAW, date = 1, subje
   };
 }
 
-function loadTools({ allowed = false, streamError = null } = {}) {
-  const stats = { streams: 0, bytesRead: 0, closed: 0, displayed: 0 };
+// Fires the poll callback on the next turn until cancelled, so read-back
+// deadlines expire after their poll count instead of in wall-clock time.
+function makeImmediateTimer() {
+  let cancelled = false;
+  return {
+    initWithCallback(callback) {
+      const tick = () => {
+        if (cancelled) return;
+        callback.notify();
+        setImmediate(tick);
+      };
+      setImmediate(tick);
+    },
+    cancel() { cancelled = true; },
+  };
+}
+
+function loadTools({ allowed = false, streamError = null, shownOverride = null } = {}) {
+  const stats = { streams: 0, bytesRead: 0, closed: 0, displayed: 0, shown: null };
   const folder = {
     URI: "imap://account/INBOX", prettyName: "INBOX", hasSubFolders: false,
     getMsgInputStream(msgHdr) {
@@ -62,12 +79,19 @@ function loadTools({ allowed = false, streamError = null } = {}) {
   folder.msgDatabase = { enumerateMessages: () => headers };
   const sandbox = {
     console,
-    Services: { prefs: { getBoolPref: (name, fallback) => (name.endsWith(".allowEncryptedMessages") ? allowed : fallback) } },
+    Services: {
+      prefs: { getBoolPref: (name, fallback) => (name.endsWith(".allowEncryptedMessages") ? allowed : fallback) },
+      // The 3-pane read-back looks at the first tab's selected message.
+      wm: { getMostRecentWindow: () => ({ document: { getElementById: () => ({ tabInfo: [{ message: stats.shown }] }) } }) },
+    },
+    Cc: { "@mozilla.org/timer;1": { createInstance: () => makeImmediateTimer() } },
+    Ci: { nsITimer: { TYPE_REPEATING_SLACK: 1 } },
+    isFolderAccessible: () => true,
     NetUtil: { readInputStreamToString: (stream, count) => stream.read(count) },
     MailServices: {
       mimeConverter: { decodeMimeHeader: (value) => value.replace(/=\?utf-8\?q\?([^?]*)\?=/gi, (_, text) => text.replace(/_/g, " ")) },
     },
-    ChromeUtils: { importESModule: () => ({ MailUtils: { displayMessageInFolderTab() { stats.displayed++; } } }) },
+    ChromeUtils: { importESModule: () => ({ MailUtils: { displayMessageInFolderTab(msgHdr) { stats.displayed++; stats.shown = shownOverride ?? msgHdr; } } }) },
     findMessage: (messageId) => {
       const msgHdr = headers.find((header) => header.messageId === messageId);
       return msgHdr ? { msgHdr, folder } : { error: "not found" };
@@ -86,7 +110,7 @@ function loadTools({ allowed = false, streamError = null } = {}) {
     snippet("// BEGIN RAW MIME PARSING HELPERS", "// END RAW MIME PARSING HELPERS"),
     snippet("// BEGIN ENCRYPTED MESSAGE GUARD", "// END ENCRYPTED MESSAGE GUARD"),
     snippet("// BEGIN SEARCH RESULT HELPERS", "// END SEARCH RESULT HELPERS"),
-    snippet("function displayMessage(", "function isTrashOrDescendant("),
+    snippet("async function displayMessage(", "function isTrashOrDescendant("),
   ].join("\n"), sandbox);
   return {
     api: sandbox, stats, folder,
@@ -174,7 +198,7 @@ describe("getRecentMessages protects subjects of encrypted mail", () => {
 });
 
 describe("displayMessage while encrypted message access is off", () => {
-  it("refuses messages that are encrypted or recorded as encrypted, before opening them", () => {
+  it("refuses messages that are encrypted or recorded as encrypted, before opening them", async () => {
     for (const options of [
       { raw: ENCRYPTED_RAW },
       { raw: "Subject: S/MIME\r\nContent-Type: application/pkcs7-mime; smime-type=enveloped-data\r\n\r\nx" },
@@ -183,7 +207,7 @@ describe("displayMessage while encrypted message access is off", () => {
     ]) {
       const h = loadTools();
       h.add({ id: "message", ...options });
-      const result = h.api.displayMessage("message", h.folder.URI);
+      const result = await h.api.displayMessage("message", h.folder.URI);
       assert.match(result.error, /Encrypted messages cannot be displayed while encrypted message access is off/);
       assert.equal(result.subject, undefined);
       assert.equal(h.stats.displayed, 0);
@@ -191,13 +215,33 @@ describe("displayMessage while encrypted message access is off", () => {
     }
   });
 
-  it("displays clear messages and, after opt-in, encrypted ones", () => {
+  it("displays clear messages and, after opt-in, encrypted ones", async () => {
     for (const [allowed, raw] of [[false, CLEAR_RAW], [true, ENCRYPTED_RAW]]) {
       const h = loadTools({ allowed });
       h.add({ id: "message", raw });
-      const result = h.api.displayMessage("message", h.folder.URI);
+      const result = await h.api.displayMessage("message", h.folder.URI);
       assert.equal(result.success, true, result.error);
+      assert.equal(result.displayedMessageId, "message");
       assert.equal(h.stats.displayed, 1);
     }
+  });
+});
+
+describe("displayMessage reads back the displayed message", () => {
+  it("reports an error, not success, when the view shows another message", async () => {
+    const h = loadTools({ shownOverride: { messageId: "neighbour", messageKey: 2, folder: { URI: "imap://account/INBOX" } } });
+    h.add({ id: "message" });
+    const result = await h.api.displayMessage("message", h.folder.URI);
+    assert.equal(result.success, undefined);
+    assert.match(result.error, /shows a different message/);
+    assert.equal(result.displayedMessageId, "neighbour");
+  });
+
+  it("reports an unconfirmed state when the view shows nothing in time", async () => {
+    const h = loadTools({ shownOverride: false });
+    h.add({ id: "message" });
+    const result = await h.api.displayMessage("message", h.folder.URI);
+    assert.equal(result.success, undefined);
+    assert.match(result.error, /did not show the message .* unconfirmed/);
   });
 });

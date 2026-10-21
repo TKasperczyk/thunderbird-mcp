@@ -2789,13 +2789,49 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "displayMessage",
         group: "messages", crud: "read",
         title: "Display Message",
-        description: "Open or navigate to a message in the Thunderbird GUI. Use '3pane' (default) to select the message in the mail view, 'tab' to open in a new tab, or 'window' to open in a standalone window. Encrypted messages are refused unless encrypted message access is enabled in the extension options.",
+        description: "Open or navigate to a message in the Thunderbird GUI. Use '3pane' (default) to select the message in the mail view, 'tab' to open in a new tab, or 'window' to open in a standalone window. The opened view is read back: success means the view holds the requested message (displayedMessageId); a view holding another message, or none within 5 seconds, is an error. Whether the message body finished rendering is not checked. Encrypted messages are refused unless encrypted message access is enabled in the extension options.",
         inputSchema: {
           type: "object",
           properties: {
             messageId: { type: "string", description: "The message ID (from searchMessages results)" },
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             displayMode: { type: "string", enum: ["3pane", "tab", "window"], description: "How to display: '3pane' (navigate in mail view, default), 'tab' (new tab), or 'window' (new window)" },
+          },
+          required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "listTabs",
+        group: "messages", crud: "read",
+        title: "List Tabs",
+        description: "List what the Thunderbird GUI shows right now: every tab of each mail window, standalone message windows, and compose windows, read live from Thunderbird. Message views report messageId, messageFolderPath and subject; folder tabs report folderPath and their selected message; compose windows report subject and the draft they were opened from (draftMessageId). Views in restricted accounts appear only as restricted:true. Use the returned ids with closeTabs.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "closeTabs",
+        group: "messages", crud: "update",
+        title: "Close Tabs",
+        description: "Close message tabs and windows, either by view id (from listTabs) or every message tab/window showing a messageId. Folder tabs are only closed by id. Other tabs (calendar, address book, web content) and compose windows are never closed by this tool: they can hold unsaved input. Closing is read back: ids still open afterwards are reported in stillOpen.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            viewIds: { type: "array", items: { type: "string" }, description: "View ids from listTabs. Use either viewIds or messageId." },
+            messageId: { type: "string", description: "Close every message tab and message window showing this message ID. Use either viewIds or messageId." },
+            folderPath: { type: "string", description: "With messageId: only close views of the message stored in this folder URI." },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "editDraft",
+        group: "messages", crud: "read",
+        title: "Edit Draft",
+        description: "Open a saved draft directly in a compose window for the user to review and send, like Thunderbird's Edit Draft command. Nothing is sent. A compose window already editing the draft is focused instead of opening a second one. The window is read back: success means a compose window for this draft exists (viewId, as in listTabs). Encrypted drafts are refused unless encrypted message access is enabled in the extension options.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The draft's message ID (from searchMessages results)" },
+            folderPath: { type: "string", description: "The Drafts folder URI holding it (from searchMessages results)" },
           },
           required: ["messageId", "folderPath"],
         },
@@ -10910,7 +10946,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // END OUTBOUND MAIL TOOLS
             // END FORWARD TOOL
 
-            function displayMessage(messageId, folderPath, displayMode) {
+            /**
+             * Opens a message in the GUI, then reads back what the opened view
+             * actually shows. Opening only starts asynchronous work, and the view
+             * can end up on another message (a 3-pane selection the current view
+             * filter hides, a tab that loaded something else), so success is
+             * reported only for a view confirmed to show the requested message.
+             */
+            async function displayMessage(messageId, folderPath, displayMode) {
               const found = findMessage(messageId, folderPath);
               if (found.error) return found;
               const { msgHdr } = found;
@@ -10925,6 +10968,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: ENCRYPTED_DISPLAY_ERROR };
               }
 
+              // Returns the header the opened view currently shows, or null.
+              let readDisplayed;
               try {
                 const { MailUtils } = ChromeUtils.importESModule(
                   "resource:///modules/MailUtils.sys.mjs"
@@ -10937,23 +10982,369 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
                     const tabmail = win.document.getElementById("tabmail");
                     if (!tabmail) return { error: "Could not access tabmail interface" };
-                    tabmail.openTab("mailMessageTab", { messageURI: msgUri, msgHdr });
+                    const tab = tabmail.openTab("mailMessageTab", { messageURI: msgUri, msgHdr });
+                    readDisplayed = () => (tab && !tab.closed ? tab.message : null);
                     break;
                   }
-                  case "window":
+                  case "window": {
                     // openMessageInNewWindow doesn't need an existing 3pane window
-                    MailUtils.openMessageInNewWindow(msgHdr);
+                    const win = MailUtils.openMessageInNewWindow(msgHdr);
+                    readDisplayed = () => getMessageWindowMessage(win);
                     break;
+                  }
                   case "3pane":
                     MailUtils.displayMessageInFolderTab(msgHdr);
+                    readDisplayed = () => {
+                      const win = Services.wm.getMostRecentWindow("mail:3pane");
+                      return win?.document.getElementById("tabmail")?.tabInfo?.[0]?.message || null;
+                    };
                     break;
                 }
               } catch (e) {
                 return { error: `Failed to display message: ${e.message || e}` };
               }
 
-              return { success: true, displayMode: mode, subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "" };
+              const confirmed = await waitForCondition(() => isSameMessage(readDisplayed(), msgHdr), VIEW_READBACK_TIMEOUT_MS);
+              if (!confirmed) {
+                let shown = null;
+                try { shown = readDisplayed(); } catch { /* view closed or still loading */ }
+                if (shown) {
+                  const displayedMessageId = isFolderAccessible(shown.folder) ? shown.messageId : undefined;
+                  return { error: `The ${mode} view shows a different message than requested`, displayMode: mode, displayedMessageId };
+                }
+                return { error: `The ${mode} view did not show the message within ${VIEW_READBACK_TIMEOUT_MS / 1000}s; its state is unconfirmed`, displayMode: mode };
+              }
+
+              return { success: true, displayMode: mode, subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "", displayedMessageId: msgHdr.messageId };
             }
+
+            // BEGIN MESSAGE VIEW TOOLS
+            /**
+             * Live view of what the GUI shows: tabs of every 3-pane window,
+             * standalone message windows, and compose windows. Read from tabmail
+             * and the windows themselves, never from session.json, which
+             * Thunderbird writes lazily (a new tab can be missing for minutes).
+             *
+             * View ids are "tab:<window>:<tabId>", "window:<window>" and
+             * "compose:<window>"; tabmail's tabId and the window's outer id stay
+             * fixed while the view exists, unlike tab positions.
+             */
+            const VIEW_READBACK_TIMEOUT_MS = 5000;
+            const VIEW_READBACK_INTERVAL_MS = 100;
+
+            // Resolves with check()'s first truthy value, or null once
+            // timeoutMs worth of polls have passed.
+            function waitForCondition(check, timeoutMs, intervalMs = VIEW_READBACK_INTERVAL_MS) {
+              const probe = () => {
+                try { return check() || null; } catch { return null; }
+              };
+              const first = probe();
+              if (first) return Promise.resolve(first);
+              return new Promise((resolve) => {
+                let pollsLeft = Math.max(1, Math.ceil(timeoutMs / intervalMs));
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                timer.initWithCallback({
+                  notify() {
+                    const value = probe();
+                    if (value || --pollsLeft <= 0) {
+                      timer.cancel();
+                      resolve(value);
+                    }
+                  },
+                }, intervalMs, Ci.nsITimer.TYPE_REPEATING_SLACK);
+              });
+            }
+
+            // The same stored message: XPCOM can hand out distinct wrappers.
+            function isSameMessage(a, b) {
+              if (!a || !b) return false;
+              if (a === b) return true;
+              return a.messageKey === b.messageKey && !!a.folder && a.folder.URI === b.folder?.URI;
+            }
+
+            function getMessageWindowMessage(win) {
+              if (!win || win.closed) return null;
+              return win.document?.getElementById("messageBrowser")?.contentWindow?.gMessage || null;
+            }
+
+            function getViewWindowKey(win, index) {
+              try {
+                const id = win.docShell?.outerWindowID;
+                if (id) return String(id);
+              } catch { /* fall back to enumeration order */ }
+              return `n${index}`;
+            }
+
+            function enumerateMessageViews() {
+              const views = [];
+              let index = 0;
+              for (const win of Services.wm.getEnumerator("mail:3pane")) {
+                const key = getViewWindowKey(win, index++);
+                const tabmail = win.document?.getElementById("tabmail");
+                if (!tabmail) continue;
+                const current = tabmail.currentTabInfo;
+                for (const tab of tabmail.tabInfo) {
+                  views.push({ id: `tab:${key}:${tab.tabId}`, kind: "tab", mode: tab.mode?.name || "", win, tabmail, tab, selected: tab === current });
+                }
+              }
+              for (const win of Services.wm.getEnumerator("mail:messageWindow")) {
+                views.push({ id: `window:${getViewWindowKey(win, index++)}`, kind: "window", mode: "messageWindow", win });
+              }
+              for (const win of Services.wm.getEnumerator("msgcompose")) {
+                views.push({ id: `compose:${getViewWindowKey(win, index++)}`, kind: "compose", mode: "compose", win });
+              }
+              return views;
+            }
+
+            // Message views are what a deleted or replaced message leaves behind:
+            // message tabs and message windows. A 3-pane tab only selects it.
+            function isMessageView(view) {
+              return view.kind === "window" || (view.kind === "tab" && view.mode === "mailMessageTab");
+            }
+
+            function getViewMessage(view) {
+              try {
+                if (view.kind === "window") return getMessageWindowMessage(view.win);
+                if (view.kind === "tab" && (view.mode === "mailMessageTab" || view.mode === "mail3PaneTab")) {
+                  return view.tab.message || null;
+                }
+              } catch { /* view still loading or closing */ }
+              return null;
+            }
+
+            function getViewFolder(view) {
+              try {
+                if (view.kind === "tab" && view.mode === "mail3PaneTab") return view.tab.folder || null;
+              } catch { /* view still loading or closing */ }
+              return null;
+            }
+
+            // The draft a compose window was opened from, if any.
+            function getComposeDraftHeader(win) {
+              try {
+                const draftId = win.gMsgCompose?.compFields?.draftId;
+                if (!draftId) return null;
+                // The compose service may append a query to the message URI.
+                const uri = String(draftId).replace(/\?.*$/, "");
+                return MailServices.messageServiceFromURI(uri).messageURIToMsgHdr(uri);
+              } catch {
+                return null;
+              }
+            }
+
+            function describeMessageView(view) {
+              const row = { id: view.id, kind: view.kind, mode: view.mode };
+              if (view.kind === "tab") row.selected = view.selected;
+
+              if (view.kind === "compose") {
+                const draft = getComposeDraftHeader(view.win);
+                if (draft && !isFolderAccessible(draft.folder)) {
+                  row.restricted = true;
+                  return row;
+                }
+                try { row.subject = view.win.document.getElementById("msgSubject")?.value ?? ""; } catch { /* window closing */ }
+                if (draft) {
+                  row.draftMessageId = draft.messageId;
+                  row.draftFolderPath = draft.folder.URI;
+                }
+                return row;
+              }
+
+              const msgHdr = getViewMessage(view);
+              const folder = getViewFolder(view);
+              if ((msgHdr && !isFolderAccessible(msgHdr.folder)) || (folder && !isFolderAccessible(folder))) {
+                row.restricted = true;
+                return row;
+              }
+              if (folder) row.folderPath = folder.URI;
+              if (msgHdr) {
+                row.messageId = msgHdr.messageId;
+                row.messageFolderPath = msgHdr.folder.URI;
+                row.subject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                if (!isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && hasEncryptedOuterStructure(msgHdr)) {
+                  withholdProtectedSubject(row, msgHdr);
+                }
+              } else if (view.kind === "tab" && view.mode !== "mailMessageTab" && view.mode !== "mail3PaneTab") {
+                // Message and folder tabs title themselves after their content.
+                row.title = view.tab.title || "";
+              }
+              return row;
+            }
+
+            function listTabs() {
+              try {
+                return { views: enumerateMessageViews().map(describeMessageView) };
+              } catch (e) {
+                return { error: `Failed to list tabs: ${e.message || e}` };
+              }
+            }
+
+            function closeMessageView(view) {
+              if (view.kind === "tab") {
+                view.tabmail.closeTab(view.tab);
+              } else {
+                view.win.close();
+              }
+            }
+
+            /**
+             * Closes views by id, or every message tab/window showing messageId.
+             * Only mail tabs and message windows: compose windows can raise a
+             * save prompt, and other tabs can drop unsaved input silently. Closing is read back: an id still present after the
+             * wait is reported in stillOpen, never as closed.
+             */
+            async function closeTabs(viewIds, messageId, folderPath) {
+              try {
+                if (typeof viewIds === "string") {
+                  try { viewIds = JSON.parse(viewIds); } catch { /* leave as-is */ }
+                }
+                const byIds = viewIds !== undefined && viewIds !== null;
+                if (byIds === !!messageId) {
+                  return { error: "Specify either viewIds or messageId" };
+                }
+                if (byIds && (!Array.isArray(viewIds) || viewIds.length === 0 || !viewIds.every(id => typeof id === "string" && id))) {
+                  return { error: "viewIds must be a non-empty array of view ids from listTabs" };
+                }
+                if (folderPath !== undefined && !byIds) {
+                  const accessible = getAccessibleFolder(folderPath);
+                  if (accessible.error) return { error: accessible.error };
+                }
+
+                const views = enumerateMessageViews();
+                const targets = [];
+                const skipped = [];
+                if (byIds) {
+                  for (const id of viewIds) {
+                    const view = views.find(v => v.id === id);
+                    if (!view) { skipped.push({ id, reason: "not found" }); continue; }
+                    if (describeMessageView(view).restricted) { skipped.push({ id, reason: "account not accessible" }); continue; }
+                    if (view.kind === "compose") { skipped.push({ id, reason: "compose windows are not closed by this tool" }); continue; }
+                    // Other tab types can hold unsaved input (an address book
+                    // edit closes without a prompt), and are not mail views.
+                    if (view.kind === "tab" && view.mode !== "mailMessageTab" && view.mode !== "mail3PaneTab") {
+                      skipped.push({ id, reason: "only mail tabs and message windows are closed by this tool" });
+                      continue;
+                    }
+                    if (view.kind === "tab" && !view.tab.canClose) { skipped.push({ id, reason: "tab cannot be closed" }); continue; }
+                    targets.push(view);
+                  }
+                } else {
+                  for (const view of views) {
+                    const msgHdr = getViewMessage(view);
+                    if (!msgHdr || msgHdr.messageId !== messageId) continue;
+                    if (folderPath !== undefined && msgHdr.folder?.URI !== folderPath) continue;
+                    if (!isFolderAccessible(msgHdr.folder)) continue;
+                    if (!isMessageView(view)) {
+                      skipped.push({ id: view.id, reason: "folder tab only selects the message" });
+                      continue;
+                    }
+                    targets.push(view);
+                  }
+                }
+
+                for (const view of targets) {
+                  try { closeMessageView(view); } catch { /* reported through the read-back below */ }
+                }
+                const targetIds = targets.map(v => v.id);
+                await waitForCondition(() => {
+                  const open = new Set(enumerateMessageViews().map(v => v.id));
+                  return targetIds.every(id => !open.has(id));
+                }, VIEW_READBACK_TIMEOUT_MS);
+                const open = new Set(enumerateMessageViews().map(v => v.id));
+                const result = {
+                  success: true,
+                  closed: targetIds.filter(id => !open.has(id)),
+                };
+                const stillOpen = targetIds.filter(id => open.has(id));
+                if (stillOpen.length) result.stillOpen = stillOpen;
+                if (skipped.length) result.skipped = skipped;
+                return result;
+              } catch (e) {
+                return { error: `Failed to close tabs: ${e.message || e}` };
+              }
+            }
+
+            /**
+             * Closes the message tabs and windows showing any of msgHdrs, before
+             * the messages are deleted or replaced. Otherwise Thunderbird moves
+             * such a view to a neighbouring message without any notice (unless
+             * mail.close_message_window.on_delete is set). Returns the closed ids.
+             */
+            function closeViewsShowingMessages(msgHdrs) {
+              const closed = [];
+              for (const view of enumerateMessageViews()) {
+                if (!isMessageView(view)) continue;
+                const shown = getViewMessage(view);
+                if (!msgHdrs.some(hdr => isSameMessage(shown, hdr))) continue;
+                try {
+                  closeMessageView(view);
+                  closed.push(view.id);
+                } catch { /* best effort: the delete itself must still run */ }
+              }
+              return closed;
+            }
+
+            const COMPOSE_READBACK_TIMEOUT_MS = 15000;
+
+            function findComposeViewForDraft(msgHdr) {
+              return enumerateMessageViews().find(view =>
+                view.kind === "compose" && isSameMessage(getComposeDraftHeader(view.win), msgHdr)) || null;
+            }
+
+            /**
+             * Opens a saved draft straight in a compose window, so Send is there
+             * at once instead of a reading tab and its Edit button. Follows
+             * Thunderbird's own Edit Draft command (ComposeMessage in
+             * mailCommands.js): a compose window already editing the draft is
+             * focused rather than a second one opened. The window is read back
+             * by the draft it was opened from.
+             */
+            async function editDraft(messageId, folderPath) {
+              try {
+                const found = findMessage(messageId, folderPath);
+                if (found.error) return { error: found.error };
+                const { msgHdr, folder } = found;
+                let isDrafts = false;
+                try { isDrafts = folder.getFlag(Ci.nsMsgFolderFlags.Drafts); } catch { /* fail closed */ }
+                if (!isDrafts) {
+                  return { error: "editDraft opens messages from a folder with the Drafts flag only" };
+                }
+                // Opening decrypts the draft into the compose window.
+                if (!isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && hasEncryptedOuterStructure(msgHdr)) {
+                  return { error: ENCRYPTED_DISPLAY_ERROR };
+                }
+
+                const existing = findComposeViewForDraft(msgHdr);
+                if (existing) {
+                  existing.win.focus();
+                  return { success: true, alreadyOpen: true, viewId: existing.id, draftMessageId: msgHdr.messageId };
+                }
+
+                let identity = null;
+                try {
+                  identity = folder.customIdentity || MailServices.accounts.getFirstIdentityForServer(folder.server);
+                } catch { /* the draft's own identity header still applies */ }
+                MailServices.compose.OpenComposeWindow(
+                  null,
+                  msgHdr,
+                  folder.getUriForMsg(msgHdr),
+                  Ci.nsIMsgCompType.Draft,
+                  Ci.nsIMsgCompFormat.Default,
+                  identity,
+                  null,
+                  null
+                );
+
+                const view = await waitForCondition(() => findComposeViewForDraft(msgHdr), COMPOSE_READBACK_TIMEOUT_MS);
+                if (!view) {
+                  return { error: `No compose window for the draft appeared within ${COMPOSE_READBACK_TIMEOUT_MS / 1000}s; whether one opens later is unconfirmed` };
+                }
+                return { success: true, viewId: view.id, draftMessageId: msgHdr.messageId };
+              } catch (e) {
+                return { error: `Failed to open draft: ${e.message || e}` };
+              }
+            }
+            // END MESSAGE VIEW TOOLS
 
             function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
               const results = [];
@@ -11110,13 +11501,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (isDrafts) {
                   trashFolder = findTrashFolder(folder);
-
-                  if (trashFolder) {
-                    MailServices.copy.copyMessages(folder, found, trashFolder, true, null, null, false);
-                  } else {
-                    // No trash found, fall back to regular delete
-                    folder.deleteMessages(found, null, false, true, null, false);
-                  }
                 } else {
                   // Thunderbird permanently deletes from Trash (including its
                   // descendants) and for non-move IMAP delete models.
@@ -11131,12 +11515,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return { error: "Trash folder not found" };
                     }
                   }
+                }
+
+                // A view left on a deleted message jumps to its neighbour.
+                const closedViews = closeViewsShowingMessages(found);
+
+                if (isDrafts && trashFolder) {
+                  MailServices.copy.copyMessages(folder, found, trashFolder, true, null, null, false);
+                } else {
+                  // Drafts without a Trash fall back to a regular delete.
                   folder.deleteMessages(found, null, false, true, null, false);
                 }
 
                 let result = { success: true, deleted: found.length };
                 if (isDrafts && trashFolder) result.movedToTrash = true;
                 if (notFound.length > 0) result.notFound = notFound;
+                if (closedViews.length > 0) result.closedViews = closedViews;
                 return result;
               } catch (e) {
                 return { error: e.toString() };
@@ -12237,7 +12631,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "getRecentMessages":
                   return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
                 case "displayMessage":
-                  return displayMessage(args.messageId, args.folderPath, args.displayMode);
+                  return await displayMessage(args.messageId, args.folderPath, args.displayMode);
+                case "listTabs":
+                  return listTabs();
+                case "closeTabs":
+                  return await closeTabs(args.viewIds, args.messageId, args.folderPath);
+                case "editDraft":
+                  return await editDraft(args.messageId, args.folderPath);
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":

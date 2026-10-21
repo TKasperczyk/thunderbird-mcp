@@ -33,6 +33,7 @@ function loadDeleteMessages(dependencies) {
   const sandbox = {
     openFolder: dependencies.openFolder,
     findTrashFolder: dependencies.findTrashFolder,
+    closeViewsShowingMessages: dependencies.closeViewsShowingMessages,
     MailServices: dependencies.MailServices,
     Ci,
   };
@@ -52,7 +53,10 @@ function makeHarness({
   trashFolder = null,
   serverType = "imap",
   deleteModel = Ci.nsMsgImapDeleteModels.MoveToTrash,
+  openViewIds = [],
 } = {}) {
+  const events = [];
+  const closeViewCalls = [];
   const header = { messageId: "message-1@example.com" };
   const deleteCalls = [];
   const copyCalls = [];
@@ -90,6 +94,7 @@ function makeHarness({
       },
     },
     deleteMessages(...args) {
+      events.push("delete");
       deleteCalls.push(args);
     },
   };
@@ -107,9 +112,15 @@ function makeHarness({
       trashLookups.push(sourceFolder);
       return trashFolder;
     },
+    closeViewsShowingMessages(msgHdrs) {
+      events.push("closeViews");
+      closeViewCalls.push(msgHdrs);
+      return openViewIds;
+    },
     MailServices: {
       copy: {
         copyMessages(...args) {
+          events.push("move");
           copyCalls.push(args);
         },
       },
@@ -117,8 +128,10 @@ function makeHarness({
   });
 
   return {
+    closeViewCalls,
     copyCalls,
     deleteCalls,
+    events,
     deleteMessages,
     folder,
     header,
@@ -131,6 +144,32 @@ function makeHarness({
 function toPlainObject(value) {
   return JSON.parse(JSON.stringify(value));
 }
+
+describe("deleteMessages closes the views of deleted messages", () => {
+  for (const [label, options, expected] of [
+    ["a regular delete", { trashFolder: { URI: "imap://account/Trash" } }, "delete"],
+    ["a Drafts move to Trash", { isDrafts: true, trashFolder: { URI: "imap://account/Trash" } }, "move"],
+  ]) {
+    it(`closes them before ${label} and reports their ids`, () => {
+      const harness = makeHarness({ ...options, openViewIds: ["tab:1:4"] });
+
+      const result = harness.deleteMessages([harness.header.messageId], "imap://account/Drafts");
+
+      assert.deepStrictEqual(harness.events, ["closeViews", expected]);
+      assert.equal(harness.closeViewCalls[0][0], harness.header);
+      assert.deepStrictEqual(toPlainObject(result).closedViews, ["tab:1:4"]);
+    });
+  }
+
+  it("closes nothing when the delete is refused", () => {
+    const harness = makeHarness({ openViewIds: ["tab:1:4"] });
+
+    const result = harness.deleteMessages([harness.header.messageId], "imap://account/INBOX");
+
+    assert.equal(result.error, "Trash folder not found");
+    assert.deepStrictEqual(harness.events, []);
+  });
+});
 
 describe("deleteMessages trash lookup", () => {
   it("fails without deleting when a non-Drafts folder has no reachable Trash", () => {
