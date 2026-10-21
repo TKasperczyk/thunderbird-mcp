@@ -1299,6 +1299,10 @@ async function handleMessage(line) {
 // BEGIN BRIDGE HTTP REQUEST HELPERS
 const REQUEST_TIMEOUT = 30000;
 const MAIL_OPERATION_TIMEOUT = 150000;
+// A replacing saveDraft adds its Drafts check to the 120 s save: two folder
+// syncs of up to 30 s and a move of up to 30 s (DRAFT_SYNC_TIMEOUT_MS,
+// DRAFT_MOVE_TIMEOUT_MS) -- 210 s at most, plus margin.
+const DRAFT_REPLACE_TIMEOUT = 240000;
 
 function getThunderbirdRequestPolicy(message) {
   let checkFolders = null;
@@ -1315,10 +1319,14 @@ function getThunderbirdRequestPolicy(message) {
       checkFolders = 'the Sent folder and the Outbox';
     }
   }
-  return {
-    timeoutMs: checkFolders ? MAIL_OPERATION_TIMEOUT : REQUEST_TIMEOUT,
-    checkFolders,
-  };
+  let timeoutMs = REQUEST_TIMEOUT;
+  if (checkFolders) {
+    const replacing = message.params.name === 'saveDraft' &&
+      typeof message.params.arguments?.replaceMessageId === 'string' &&
+      message.params.arguments.replaceMessageId.trim() !== '';
+    timeoutMs = replacing ? DRAFT_REPLACE_TIMEOUT : MAIL_OPERATION_TIMEOUT;
+  }
+  return { timeoutMs, checkFolders };
 }
 
 function tryRequest(hostname, postData, port, token, policy) {

@@ -113,6 +113,7 @@ const mailOperations = [
   ['replyToMessage', { skipReview: 'true' }, /Sent folder and the Outbox/],
   ['forwardMessage', { skipReview: 'true' }, /Sent folder and the Outbox/],
   ['saveDraft', {}, /Drafts/],
+  ['saveDraft', { replaceMessageId: '  ' }, /Drafts/],
   ['replyToMessage', { saveAsDraft: true }, /Drafts/],
   ['replyToMessage', { saveAsDraft: 'true' }, /Drafts/],
 ];
@@ -176,6 +177,15 @@ describe('bridge request outcomes', () => {
       assert.equal(requests.length, 1);
     });
   }
+
+  it("a replacing saveDraft outlasts the extension's save plus Drafts check (240 s)", async () => {
+    const { runtime, requests } = loadRequests();
+    const pending = runtime.forwardToThunderbird(toolCall('saveDraft', { replaceMessageId: 'old@example.test' }));
+    connect(requests[0]);
+    assert.equal(requests[0].timeoutMs, 240000);
+    requests[0].onTimeout();
+    await assert.rejects(pending, /timed out after 240 seconds/);
+  });
 
   for (const message of [
     toolCall('listFolders'),

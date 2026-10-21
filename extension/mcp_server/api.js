@@ -1307,6 +1307,8 @@ const MAX_SEARCH_RESULTS_CAP = 200;
 const SEARCH_COLLECTION_CAP = 10000;
 const SEARCH_YIELD_EVERY = 250;
 const SEARCH_TIME_BUDGET_MS = 20000;
+// A folder-scoped search waits this long for the folder's IMAP sync first.
+const SEARCH_SYNC_TIMEOUT_MS = 5000;
 const DEFAULT_GET_MESSAGES_LIMIT = 10;
 // 20 is a reasonable upper bound for now; adjust later if usage supports it.
 const MAX_GET_MESSAGES_LIMIT = 20;
@@ -2302,7 +2304,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             flaggedOnly: { type: "boolean", description: "Only return flagged/starred messages (default: false)" },
             tag: { type: "string", description: "Filter by tag keyword (e.g. '$label1' for Important, or a custom tag). Only messages with this tag are returned." },
             includeSubfolders: { type: "boolean", description: "If false, only search the specified folder — not its subfolders. Default: true." },
-            countOnly: { type: "boolean", description: "If true, return only the match count instead of full results. Much faster for 'how many unread?' queries." },
+            countOnly: { type: "boolean", description: "If true, return only the match count instead of full results. Much faster for 'how many unread?' queries. Counts exactly the rows a listing would return; with folderPath, both first wait up to 5 seconds for that folder's IMAP sync." },
             searchBody: { type: "boolean", description: "If true, search full message bodies using Thunderbird's Gloda index (slower but finds text beyond the ~200 char preview). Requires query. IMAP accounts need offline sync enabled for body indexing. Gloda supplies relevance-limited candidates without a completeness indicator; object responses report truncated:true. Without offset, message results remain a plain array without completeness information. Narrow the text query; use header search when header/preview matching is sufficient." },
             dedupByMessageId: { type: "boolean", description: "If false, return every folder/label location for messages found in multiple folders. Default: true, which collapses the same RFC Message-ID into one row and lists the other folder paths in dupLocations." },
           },
@@ -2407,7 +2409,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "saveDraft",
         group: "messages", crud: "create",
         title: "Save Draft",
-        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. Returns folderPath when the destination is accessible under account restrictions. Supports threading headers and replacing an existing draft in the selected identity's accessible Drafts folder. Includes the identity signature by default for new drafts, but not replacements.",
+        description: "Save a composed message to the identity's Drafts folder without sending or opening a compose window. Returns folderPath when the destination is accessible under account restrictions. Supports threading headers and replacing an existing draft in the selected identity's accessible Drafts folder. Returns the new draft's messageId. A replacement is verified in the Drafts folder: replaceVerified is true only once the new draft is stored and the previous one is gone (previousDraft: gone or marked-deleted); a previous draft Thunderbird left in place is moved to Trash (previousDraftMovedToTrash), but only after the new draft is confirmed. Message tabs showing the replaced draft are closed first (closedViews). Includes the identity signature by default for new drafts, but not replacements.",
         inputSchema: {
           type: "object",
           properties: {
@@ -2789,13 +2791,49 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "displayMessage",
         group: "messages", crud: "read",
         title: "Display Message",
-        description: "Open or navigate to a message in the Thunderbird GUI. Use '3pane' (default) to select the message in the mail view, 'tab' to open in a new tab, or 'window' to open in a standalone window. Encrypted messages are refused unless encrypted message access is enabled in the extension options.",
+        description: "Open or navigate to a message in the Thunderbird GUI. Use '3pane' (default) to select the message in the mail view, 'tab' to open in a new tab, or 'window' to open in a standalone window. The opened view is read back: success means the view holds the requested message (displayedMessageId); a view holding another message, or none within 5 seconds, is an error. Whether the message body finished rendering is not checked. Encrypted messages are refused unless encrypted message access is enabled in the extension options.",
         inputSchema: {
           type: "object",
           properties: {
             messageId: { type: "string", description: "The message ID (from searchMessages results)" },
             folderPath: { type: "string", description: "The folder URI path (from searchMessages results)" },
             displayMode: { type: "string", enum: ["3pane", "tab", "window"], description: "How to display: '3pane' (navigate in mail view, default), 'tab' (new tab), or 'window' (new window)" },
+          },
+          required: ["messageId", "folderPath"],
+        },
+      },
+      {
+        name: "listTabs",
+        group: "messages", crud: "read",
+        title: "List Tabs",
+        description: "List what the Thunderbird GUI shows right now: every tab of each mail window, standalone message windows, and compose windows, read live from Thunderbird. Message views report messageId, messageFolderPath and subject; folder tabs report folderPath and their selected message; compose windows report subject and the draft they were opened from (draftMessageId). Views in restricted accounts appear only as restricted:true. Use the returned ids with closeTabs.",
+        inputSchema: { type: "object", properties: {}, required: [] },
+      },
+      {
+        name: "closeTabs",
+        group: "messages", crud: "update",
+        title: "Close Tabs",
+        description: "Close message tabs and windows, either by view id (from listTabs) or every message tab/window showing a messageId. Folder tabs are only closed by id. Other tabs (calendar, address book, web content) and compose windows are never closed by this tool: they can hold unsaved input. Closing is read back: ids still open afterwards are reported in stillOpen.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            viewIds: { type: "array", items: { type: "string" }, description: "View ids from listTabs. Use either viewIds or messageId." },
+            messageId: { type: "string", description: "Close every message tab and message window showing this message ID. Use either viewIds or messageId." },
+            folderPath: { type: "string", description: "With messageId: only close views of the message stored in this folder URI." },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "editDraft",
+        group: "messages", crud: "read",
+        title: "Edit Draft",
+        description: "Open a saved draft directly in a compose window for the user to review and send, like Thunderbird's Edit Draft command. Nothing is sent. A compose window already editing the draft is focused instead of opening a second one. The window is read back: success means a compose window for this draft exists (viewId, as in listTabs). Encrypted drafts are refused unless encrypted message access is enabled in the extension options.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            messageId: { type: "string", description: "The draft's message ID (from searchMessages results)" },
+            folderPath: { type: "string", description: "The Drafts folder URI holding it (from searchMessages results)" },
           },
           required: ["messageId", "folderPath"],
         },
@@ -3392,7 +3430,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 ? dedupeSearchMessageResults(accessibleResults) : accessibleResults;
               let response;
               if (countOnly) {
-                response = { count: finalResults.length };
+                // Count exactly what a listing would return: the same per-row
+                // recheck as the page hydration below, over every row.
+                let count = 0;
+                for (const row of finalResults) {
+                  try {
+                    const msgHdr = getSearchHeader(folders.get(row.folderPath).msgDatabase, row._messageKey);
+                    if (msgHdr && msgHdr.messageId === row.id && !(msgHdr.flags & Ci.nsMsgMessageFlags.Expunged)) {
+                      count++;
+                      continue;
+                    }
+                  } catch { /* gone with its database: not counted */ }
+                  scan.truncated = true;
+                }
+                response = { count };
               } else {
                 finalResults.sort((a, b) => sortOrder === "asc" ? a._dateTs - b._dateTs : b._dateTs - a._dateTs);
                 response = paginate(finalResults, offset, effectiveLimit);
@@ -3697,6 +3748,54 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
               }
             }
+
+            // BEGIN FOLDER SYNC HELPER
+            /**
+             * Brings an IMAP folder's database up to date with the server.
+             * Resolves true once Thunderbird reports the update done, false on
+             * failure or timeout. Same listener as MailUtils.updateFolderAsync
+             * (not available on every supported Thunderbird), plus a timeout so
+             * an update that never reports back cannot hang the tool call.
+             * Local folders resolve at once: their database is the store.
+             *
+             * With attemptMs below timeoutMs the request is re-issued after each
+             * unanswered attempt: right after a draft save Thunderbird answers no
+             * update request for about ten seconds, and a request made in that
+             * window is never answered at all (measured live on IMAP 2026-10-21:
+             * two requests unanswered at t+0 s and t+5 s, the next answered in
+             * 0.04 s at t+10 s). A single long wait would never see an answer.
+             */
+            async function syncFolderDatabase(folder, timeoutMs, attemptMs = timeoutMs) {
+              if (folder?.server?.type !== "imap") return true;
+              for (let remaining = timeoutMs; remaining > 0; remaining -= attemptMs) {
+                if (await requestFolderUpdate(folder, Math.min(attemptMs, remaining))) return true;
+              }
+              return false;
+            }
+
+            function requestFolderUpdate(folder, timeoutMs) {
+              return new Promise((resolve) => {
+                let settled = false;
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                const settle = (ok) => {
+                  if (settled) return;
+                  settled = true;
+                  try { timer.cancel(); } catch { /* already fired */ }
+                  resolve(ok);
+                };
+                timer.initWithCallback({ notify: () => settle(false) }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
+                try {
+                  folder.updateFolderWithListener(null, {
+                    QueryInterface: ChromeUtils.generateQI(["nsIUrlListener"]),
+                    OnStartRunningUrl() {},
+                    OnStopRunningUrl(_url, status) { settle(Components.isSuccessCode(status)); },
+                  });
+                } catch {
+                  settle(false);
+                }
+              });
+            }
+            // END FOLDER SYNC HELPER
 
             function toColumnarTable(items, keys) {
               const columns = Array.from(keys).sort();
@@ -6021,6 +6120,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               }
 
               let visitedFolders = 0;
+              let syncedFolder = null;
               async function searchFolder(folder) {
                 if (visitedFolders++ > 0) {
                   await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
@@ -6029,7 +6129,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!isFolderAccessible(folder)) { scan.truncated = true; return; }
 
                 try {
-                  refreshImapFolderSync(folder);
+                  if (folder !== syncedFolder) refreshImapFolderSync(folder);
                   if (!folder.isServer) {
                     // Snapshot primitive keys. A native database enumerator cannot
                     // safely survive event-loop yields or database closure/rebuild.
@@ -6081,6 +6181,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (folderPath) {
                 const result = getAccessibleFolder(folderPath);
                 if (result.error) return result;
+                // A started refresh lands after the scan, so a count taken right
+                // after a change could still see the old folder. Wait for the
+                // named folder's sync (bounded); subfolders keep the cheap refresh.
+                if (await syncFolderDatabase(result.folder, SEARCH_SYNC_TIMEOUT_MS)) syncedFolder = result.folder;
                 await searchFolder(result.folder);
               } else {
                 for (const account of getAccessibleAccounts()) {
@@ -10368,6 +10472,128 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
             // END DRAFT HELPERS
 
+            // BEGIN DRAFT REPLACE VERIFICATION
+            // Re-issued every 3 s for up to 30 s: see syncFolderDatabase.
+            const DRAFT_SYNC_TIMEOUT_MS = 30000;
+            const DRAFT_SYNC_ATTEMPT_MS = 3000;
+            const DRAFT_MOVE_TIMEOUT_MS = 30000;
+
+            // Where the replaced draft stands now: { state, hdr }. state is
+            // "present", "marked-deleted" (IMAP \Deleted, awaiting expunge),
+            // "gone", or "unknown" when the database could not be read -- which
+            // is never evidence that the draft was removed.
+            function readStoredMessage(folder, messageKey, messageId) {
+              let hdr = null;
+              try {
+                const db = folder.msgDatabase;
+                if (!db) return { state: "unknown", hdr: null };
+                if (db.containsKey(messageKey)) hdr = db.getMsgHdrForKey(messageKey);
+                // A reassigned key (a rebuilt database, a UIDVALIDITY reset) can
+                // hold another message: look the draft up by Message-ID as well.
+                if (!hdr || hdr.messageId !== messageId) hdr = db.getMsgHdrForMessageID(messageId) || null;
+              } catch {
+                return { state: "unknown", hdr: null };
+              }
+              if (!hdr || hdr.messageId !== messageId) return { state: "gone", hdr: null };
+              return { state: hdr.flags & Ci.nsMsgMessageFlags.IMAPDeleted ? "marked-deleted" : "present", hdr };
+            }
+
+            function findStoredMessage(folder, messageId) {
+              if (!messageId) return null;
+              let hdr = null;
+              try { hdr = folder.msgDatabase.getMsgHdrForMessageID(messageId); } catch { /* not stored */ }
+              return hdr && !(hdr.flags & Ci.nsMsgMessageFlags.IMAPDeleted) ? hdr : null;
+            }
+
+            // Moves a draft to Trash the way deleteMessages does, and resolves
+            // once the copy service reports back (or the timeout passes) with
+            // the route taken: "trash", or "delete" where no Trash folder exists
+            // (on IMAP that may only mark the draft deleted).
+            function moveDraftToTrash(folder, hdr, timeoutMs = DRAFT_MOVE_TIMEOUT_MS) {
+              return new Promise((resolve) => {
+                let settled = false;
+                let route = "delete";
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                const settle = () => {
+                  if (settled) return;
+                  settled = true;
+                  try { timer.cancel(); } catch { /* already fired */ }
+                  resolve(route);
+                };
+                timer.initWithCallback({ notify: settle }, timeoutMs, Ci.nsITimer.TYPE_ONE_SHOT);
+                const listener = {
+                  QueryInterface: ChromeUtils.generateQI(["nsIMsgCopyServiceListener"]),
+                  onStartCopy() {},
+                  onProgress() {},
+                  setMessageKey() {},
+                  getMessageId() {},
+                  onStopCopy: settle,
+                };
+                try {
+                  const trashFolder = findTrashFolder(folder);
+                  if (trashFolder) {
+                    route = "trash";
+                    MailServices.copy.copyMessages(folder, [hdr], trashFolder, true, listener, null, false);
+                  } else {
+                    folder.deleteMessages([hdr], null, false, true, listener, false);
+                  }
+                } catch {
+                  settle();
+                }
+              });
+            }
+
+            /**
+             * Proves a draft replacement in the Drafts folder itself: the new
+             * draft must be stored and the replaced one gone. Thunderbird drops
+             * the old draft only as a side effect of saving the new one, and on
+             * IMAP that has been observed to leave it in place five times in a
+             * row while the save reported success. A predecessor still present
+             * is therefore moved to Trash here -- but only once the new draft is
+             * confirmed, so a failed save never costs the previous version.
+             */
+            async function verifyDraftReplacement(folder, oldKey, oldMessageId, newMessageId) {
+              const report = {};
+              const synced = await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS, DRAFT_SYNC_ATTEMPT_MS);
+              if (!synced) report.folderSyncConfirmed = false;
+              const newHdr = findStoredMessage(folder, newMessageId);
+              let previous = readStoredMessage(folder, oldKey, oldMessageId);
+              // Without a confirmed sync the local database may not match the
+              // server, so it proves nothing and the old draft is not touched.
+              if (!newHdr || !synced) {
+                report.replaceVerified = false;
+                report.previousDraft = previous.state;
+                report.message = !synced
+                  ? "Draft saved, but the Drafts folder could not be synced with the server, so the replacement is unconfirmed; the previous draft was left untouched. Check Drafts before saving again."
+                  : "Draft saved, but the new draft was not found in the Drafts folder; the previous draft was left untouched. Check Drafts before saving again.";
+                return report;
+              }
+              if (previous.state === "present") {
+                const route = await moveDraftToTrash(folder, previous.hdr);
+                if (!(await syncFolderDatabase(folder, DRAFT_SYNC_TIMEOUT_MS, DRAFT_SYNC_ATTEMPT_MS))) report.folderSyncConfirmed = false;
+                previous = readStoredMessage(folder, oldKey, oldMessageId);
+                if (route === "trash" && previous.state === "gone" && report.folderSyncConfirmed !== false) {
+                  report.previousDraftMovedToTrash = true;
+                }
+              }
+              report.previousDraft = previous.state;
+              report.replaceVerified = (previous.state === "gone" || previous.state === "marked-deleted") &&
+                report.folderSyncConfirmed !== false;
+              if (!report.replaceVerified) {
+                report.message = previous.state === "present"
+                  ? "Draft saved, but the previous draft is still in the Drafts folder and could not be moved to Trash"
+                  : "Draft saved, but whether the previous draft is gone could not be confirmed. Check Drafts before saving again.";
+              } else if (report.previousDraftMovedToTrash) {
+                report.message = "Draft replaced; Thunderbird had left the previous draft in place, so it was moved to Trash";
+              } else if (previous.state === "marked-deleted") {
+                report.message = "Draft replaced; the previous draft is marked deleted in the Drafts folder and disappears at the next expunge";
+              } else {
+                report.message = "Draft replaced";
+              }
+              return report;
+            }
+            // END DRAFT REPLACE VERIFICATION
+
             /**
              * Saves a composed message to the identity's Drafts folder without
              * sending or opening a compose window. The destination folder is
@@ -10470,6 +10696,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 const { descs: fileDescs } = filePathsToAttachDescs(attachments);
 
+                // The replaced header may be invalid once Thunderbird drops it.
+                const oldKey = msgToReplace?.messageKey;
+                const oldMessageId = msgToReplace?.messageId;
+                // A view left on the replaced draft jumps to its neighbour.
+                const closedViews = msgToReplace ? closeViewsShowingMessages([msgToReplace]) : [];
+
                 return sendMessageDirectly(
                   composeFields,
                   msgComposeParams.identity,
@@ -10479,10 +10711,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   Ci.nsIMsgCompDeliverMode.SaveAsDraft,
                   useHtml ? "text/html" : "text/plain",
                   msgToReplace
-                ).then(result => {
+                ).then(async result => {
+                  if (closedViews.length > 0) result.closedViews = closedViews;
                   if (result.success) {
-                    let msg = msgToReplace ? "Draft replaced" : "Draft saved";
-                    result.message = msg;
+                    result.message = "Draft saved";
+                    // The send fills in the Message-ID it generated; search
+                    // results carry it without angle brackets.
+                    const newMessageId = String(composeFields.messageId || "").replace(/^<|>$/g, "");
+                    if (newMessageId) result.messageId = newMessageId;
+                    if (msgToReplace) {
+                      try {
+                        Object.assign(result, await verifyDraftReplacement(replaceFolder, oldKey, oldMessageId, newMessageId));
+                      } catch (e) {
+                        // The draft is saved; an error here would invite a duplicate retry.
+                        result.replaceVerified = false;
+                        result.message = `Draft saved, but the replacement could not be verified (${e.message || e}). Check Drafts before saving again.`;
+                      }
+                    }
 
                     // Thunderbird can populate the identity's folder during save.
                     // Report it only if accessible; lookup errors may contain a
@@ -10910,7 +11155,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // END OUTBOUND MAIL TOOLS
             // END FORWARD TOOL
 
-            function displayMessage(messageId, folderPath, displayMode) {
+            /**
+             * Opens a message in the GUI, then reads back what the opened view
+             * actually shows. Opening only starts asynchronous work, and the view
+             * can end up on another message (a 3-pane selection the current view
+             * filter hides, a tab that loaded something else), so success is
+             * reported only for a view confirmed to show the requested message.
+             */
+            async function displayMessage(messageId, folderPath, displayMode) {
               const found = findMessage(messageId, folderPath);
               if (found.error) return found;
               const { msgHdr } = found;
@@ -10925,6 +11177,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 return { error: ENCRYPTED_DISPLAY_ERROR };
               }
 
+              // Returns the header the opened view currently shows, or null.
+              let readDisplayed;
               try {
                 const { MailUtils } = ChromeUtils.importESModule(
                   "resource:///modules/MailUtils.sys.mjs"
@@ -10937,23 +11191,369 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     const msgUri = msgHdr.folder.getUriForMsg(msgHdr);
                     const tabmail = win.document.getElementById("tabmail");
                     if (!tabmail) return { error: "Could not access tabmail interface" };
-                    tabmail.openTab("mailMessageTab", { messageURI: msgUri, msgHdr });
+                    const tab = tabmail.openTab("mailMessageTab", { messageURI: msgUri, msgHdr });
+                    readDisplayed = () => (tab && !tab.closed ? tab.message : null);
                     break;
                   }
-                  case "window":
+                  case "window": {
                     // openMessageInNewWindow doesn't need an existing 3pane window
-                    MailUtils.openMessageInNewWindow(msgHdr);
+                    const win = MailUtils.openMessageInNewWindow(msgHdr);
+                    readDisplayed = () => getMessageWindowMessage(win);
                     break;
+                  }
                   case "3pane":
                     MailUtils.displayMessageInFolderTab(msgHdr);
+                    readDisplayed = () => {
+                      const win = Services.wm.getMostRecentWindow("mail:3pane");
+                      return win?.document.getElementById("tabmail")?.tabInfo?.[0]?.message || null;
+                    };
                     break;
                 }
               } catch (e) {
                 return { error: `Failed to display message: ${e.message || e}` };
               }
 
-              return { success: true, displayMode: mode, subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "" };
+              const confirmed = await waitForCondition(() => isSameMessage(readDisplayed(), msgHdr), VIEW_READBACK_TIMEOUT_MS);
+              if (!confirmed) {
+                let shown = null;
+                try { shown = readDisplayed(); } catch { /* view closed or still loading */ }
+                if (shown) {
+                  const displayedMessageId = isFolderAccessible(shown.folder) ? shown.messageId : undefined;
+                  return { error: `The ${mode} view shows a different message than requested`, displayMode: mode, displayedMessageId };
+                }
+                return { error: `The ${mode} view did not show the message within ${VIEW_READBACK_TIMEOUT_MS / 1000}s; its state is unconfirmed`, displayMode: mode };
+              }
+
+              return { success: true, displayMode: mode, subject: msgHdr.mime2DecodedSubject || msgHdr.subject || "", displayedMessageId: msgHdr.messageId };
             }
+
+            // BEGIN MESSAGE VIEW TOOLS
+            /**
+             * Live view of what the GUI shows: tabs of every 3-pane window,
+             * standalone message windows, and compose windows. Read from tabmail
+             * and the windows themselves, never from session.json, which
+             * Thunderbird writes lazily (a new tab can be missing for minutes).
+             *
+             * View ids are "tab:<window>:<tabId>", "window:<window>" and
+             * "compose:<window>"; tabmail's tabId and the window's outer id stay
+             * fixed while the view exists, unlike tab positions.
+             */
+            const VIEW_READBACK_TIMEOUT_MS = 5000;
+            const VIEW_READBACK_INTERVAL_MS = 100;
+
+            // Resolves with check()'s first truthy value, or null once
+            // timeoutMs worth of polls have passed.
+            function waitForCondition(check, timeoutMs, intervalMs = VIEW_READBACK_INTERVAL_MS) {
+              const probe = () => {
+                try { return check() || null; } catch { return null; }
+              };
+              const first = probe();
+              if (first) return Promise.resolve(first);
+              return new Promise((resolve) => {
+                let pollsLeft = Math.max(1, Math.ceil(timeoutMs / intervalMs));
+                const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
+                timer.initWithCallback({
+                  notify() {
+                    const value = probe();
+                    if (value || --pollsLeft <= 0) {
+                      timer.cancel();
+                      resolve(value);
+                    }
+                  },
+                }, intervalMs, Ci.nsITimer.TYPE_REPEATING_SLACK);
+              });
+            }
+
+            // The same stored message: XPCOM can hand out distinct wrappers.
+            function isSameMessage(a, b) {
+              if (!a || !b) return false;
+              if (a === b) return true;
+              return a.messageKey === b.messageKey && !!a.folder && a.folder.URI === b.folder?.URI;
+            }
+
+            function getMessageWindowMessage(win) {
+              if (!win || win.closed) return null;
+              return win.document?.getElementById("messageBrowser")?.contentWindow?.gMessage || null;
+            }
+
+            function getViewWindowKey(win, index) {
+              try {
+                const id = win.docShell?.outerWindowID;
+                if (id) return String(id);
+              } catch { /* fall back to enumeration order */ }
+              return `n${index}`;
+            }
+
+            function enumerateMessageViews() {
+              const views = [];
+              let index = 0;
+              for (const win of Services.wm.getEnumerator("mail:3pane")) {
+                const key = getViewWindowKey(win, index++);
+                const tabmail = win.document?.getElementById("tabmail");
+                if (!tabmail) continue;
+                const current = tabmail.currentTabInfo;
+                for (const tab of tabmail.tabInfo) {
+                  views.push({ id: `tab:${key}:${tab.tabId}`, kind: "tab", mode: tab.mode?.name || "", win, tabmail, tab, selected: tab === current });
+                }
+              }
+              for (const win of Services.wm.getEnumerator("mail:messageWindow")) {
+                views.push({ id: `window:${getViewWindowKey(win, index++)}`, kind: "window", mode: "messageWindow", win });
+              }
+              for (const win of Services.wm.getEnumerator("msgcompose")) {
+                views.push({ id: `compose:${getViewWindowKey(win, index++)}`, kind: "compose", mode: "compose", win });
+              }
+              return views;
+            }
+
+            // Message views are what a deleted or replaced message leaves behind:
+            // message tabs and message windows. A 3-pane tab only selects it.
+            function isMessageView(view) {
+              return view.kind === "window" || (view.kind === "tab" && view.mode === "mailMessageTab");
+            }
+
+            function getViewMessage(view) {
+              try {
+                if (view.kind === "window") return getMessageWindowMessage(view.win);
+                if (view.kind === "tab" && (view.mode === "mailMessageTab" || view.mode === "mail3PaneTab")) {
+                  return view.tab.message || null;
+                }
+              } catch { /* view still loading or closing */ }
+              return null;
+            }
+
+            function getViewFolder(view) {
+              try {
+                if (view.kind === "tab" && view.mode === "mail3PaneTab") return view.tab.folder || null;
+              } catch { /* view still loading or closing */ }
+              return null;
+            }
+
+            // The draft a compose window was opened from, if any.
+            function getComposeDraftHeader(win) {
+              try {
+                const draftId = win.gMsgCompose?.compFields?.draftId;
+                if (!draftId) return null;
+                // The compose service may append a query to the message URI.
+                const uri = String(draftId).replace(/\?.*$/, "");
+                return MailServices.messageServiceFromURI(uri).messageURIToMsgHdr(uri);
+              } catch {
+                return null;
+              }
+            }
+
+            function describeMessageView(view) {
+              const row = { id: view.id, kind: view.kind, mode: view.mode };
+              if (view.kind === "tab") row.selected = view.selected;
+
+              if (view.kind === "compose") {
+                const draft = getComposeDraftHeader(view.win);
+                if (draft && !isFolderAccessible(draft.folder)) {
+                  row.restricted = true;
+                  return row;
+                }
+                try { row.subject = view.win.document.getElementById("msgSubject")?.value ?? ""; } catch { /* window closing */ }
+                if (draft) {
+                  row.draftMessageId = draft.messageId;
+                  row.draftFolderPath = draft.folder.URI;
+                }
+                return row;
+              }
+
+              const msgHdr = getViewMessage(view);
+              const folder = getViewFolder(view);
+              if ((msgHdr && !isFolderAccessible(msgHdr.folder)) || (folder && !isFolderAccessible(folder))) {
+                row.restricted = true;
+                return row;
+              }
+              if (folder) row.folderPath = folder.URI;
+              if (msgHdr) {
+                row.messageId = msgHdr.messageId;
+                row.messageFolderPath = msgHdr.folder.URI;
+                row.subject = msgHdr.mime2DecodedSubject || msgHdr.subject || "";
+                if (!isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && hasEncryptedOuterStructure(msgHdr)) {
+                  withholdProtectedSubject(row, msgHdr);
+                }
+              } else if (view.kind === "tab" && view.mode !== "mailMessageTab" && view.mode !== "mail3PaneTab") {
+                // Message and folder tabs title themselves after their content.
+                row.title = view.tab.title || "";
+              }
+              return row;
+            }
+
+            function listTabs() {
+              try {
+                return { views: enumerateMessageViews().map(describeMessageView) };
+              } catch (e) {
+                return { error: `Failed to list tabs: ${e.message || e}` };
+              }
+            }
+
+            function closeMessageView(view) {
+              if (view.kind === "tab") {
+                view.tabmail.closeTab(view.tab);
+              } else {
+                view.win.close();
+              }
+            }
+
+            /**
+             * Closes views by id, or every message tab/window showing messageId.
+             * Only mail tabs and message windows: compose windows can raise a
+             * save prompt, and other tabs can drop unsaved input silently. Closing is read back: an id still present after the
+             * wait is reported in stillOpen, never as closed.
+             */
+            async function closeTabs(viewIds, messageId, folderPath) {
+              try {
+                if (typeof viewIds === "string") {
+                  try { viewIds = JSON.parse(viewIds); } catch { /* leave as-is */ }
+                }
+                const byIds = viewIds !== undefined && viewIds !== null;
+                if (byIds === !!messageId) {
+                  return { error: "Specify either viewIds or messageId" };
+                }
+                if (byIds && (!Array.isArray(viewIds) || viewIds.length === 0 || !viewIds.every(id => typeof id === "string" && id))) {
+                  return { error: "viewIds must be a non-empty array of view ids from listTabs" };
+                }
+                if (folderPath !== undefined && !byIds) {
+                  const accessible = getAccessibleFolder(folderPath);
+                  if (accessible.error) return { error: accessible.error };
+                }
+
+                const views = enumerateMessageViews();
+                const targets = [];
+                const skipped = [];
+                if (byIds) {
+                  for (const id of viewIds) {
+                    const view = views.find(v => v.id === id);
+                    if (!view) { skipped.push({ id, reason: "not found" }); continue; }
+                    if (describeMessageView(view).restricted) { skipped.push({ id, reason: "account not accessible" }); continue; }
+                    if (view.kind === "compose") { skipped.push({ id, reason: "compose windows are not closed by this tool" }); continue; }
+                    // Other tab types can hold unsaved input (an address book
+                    // edit closes without a prompt), and are not mail views.
+                    if (view.kind === "tab" && view.mode !== "mailMessageTab" && view.mode !== "mail3PaneTab") {
+                      skipped.push({ id, reason: "only mail tabs and message windows are closed by this tool" });
+                      continue;
+                    }
+                    if (view.kind === "tab" && !view.tab.canClose) { skipped.push({ id, reason: "tab cannot be closed" }); continue; }
+                    targets.push(view);
+                  }
+                } else {
+                  for (const view of views) {
+                    const msgHdr = getViewMessage(view);
+                    if (!msgHdr || msgHdr.messageId !== messageId) continue;
+                    if (folderPath !== undefined && msgHdr.folder?.URI !== folderPath) continue;
+                    if (!isFolderAccessible(msgHdr.folder)) continue;
+                    if (!isMessageView(view)) {
+                      skipped.push({ id: view.id, reason: "folder tab only selects the message" });
+                      continue;
+                    }
+                    targets.push(view);
+                  }
+                }
+
+                for (const view of targets) {
+                  try { closeMessageView(view); } catch { /* reported through the read-back below */ }
+                }
+                const targetIds = targets.map(v => v.id);
+                await waitForCondition(() => {
+                  const open = new Set(enumerateMessageViews().map(v => v.id));
+                  return targetIds.every(id => !open.has(id));
+                }, VIEW_READBACK_TIMEOUT_MS);
+                const open = new Set(enumerateMessageViews().map(v => v.id));
+                const result = {
+                  success: true,
+                  closed: targetIds.filter(id => !open.has(id)),
+                };
+                const stillOpen = targetIds.filter(id => open.has(id));
+                if (stillOpen.length) result.stillOpen = stillOpen;
+                if (skipped.length) result.skipped = skipped;
+                return result;
+              } catch (e) {
+                return { error: `Failed to close tabs: ${e.message || e}` };
+              }
+            }
+
+            /**
+             * Closes the message tabs and windows showing any of msgHdrs, before
+             * the messages are deleted or replaced. Otherwise Thunderbird moves
+             * such a view to a neighbouring message without any notice (unless
+             * mail.close_message_window.on_delete is set). Returns the closed ids.
+             */
+            function closeViewsShowingMessages(msgHdrs) {
+              const closed = [];
+              for (const view of enumerateMessageViews()) {
+                if (!isMessageView(view)) continue;
+                const shown = getViewMessage(view);
+                if (!msgHdrs.some(hdr => isSameMessage(shown, hdr))) continue;
+                try {
+                  closeMessageView(view);
+                  closed.push(view.id);
+                } catch { /* best effort: the delete itself must still run */ }
+              }
+              return closed;
+            }
+
+            const COMPOSE_READBACK_TIMEOUT_MS = 15000;
+
+            function findComposeViewForDraft(msgHdr) {
+              return enumerateMessageViews().find(view =>
+                view.kind === "compose" && isSameMessage(getComposeDraftHeader(view.win), msgHdr)) || null;
+            }
+
+            /**
+             * Opens a saved draft straight in a compose window, so Send is there
+             * at once instead of a reading tab and its Edit button. Follows
+             * Thunderbird's own Edit Draft command (ComposeMessage in
+             * mailCommands.js): a compose window already editing the draft is
+             * focused rather than a second one opened. The window is read back
+             * by the draft it was opened from.
+             */
+            async function editDraft(messageId, folderPath) {
+              try {
+                const found = findMessage(messageId, folderPath);
+                if (found.error) return { error: found.error };
+                const { msgHdr, folder } = found;
+                let isDrafts = false;
+                try { isDrafts = folder.getFlag(Ci.nsMsgFolderFlags.Drafts); } catch { /* fail closed */ }
+                if (!isDrafts) {
+                  return { error: "editDraft opens messages from a folder with the Drafts flag only" };
+                }
+                // Opening decrypts the draft into the compose window.
+                if (!isPrivacyOptInEnabled(PREF_ALLOW_ENCRYPTED_MESSAGES) && hasEncryptedOuterStructure(msgHdr)) {
+                  return { error: ENCRYPTED_DISPLAY_ERROR };
+                }
+
+                const existing = findComposeViewForDraft(msgHdr);
+                if (existing) {
+                  existing.win.focus();
+                  return { success: true, alreadyOpen: true, viewId: existing.id, draftMessageId: msgHdr.messageId };
+                }
+
+                let identity = null;
+                try {
+                  identity = folder.customIdentity || MailServices.accounts.getFirstIdentityForServer(folder.server);
+                } catch { /* the draft's own identity header still applies */ }
+                MailServices.compose.OpenComposeWindow(
+                  null,
+                  msgHdr,
+                  folder.getUriForMsg(msgHdr),
+                  Ci.nsIMsgCompType.Draft,
+                  Ci.nsIMsgCompFormat.Default,
+                  identity,
+                  null,
+                  null
+                );
+
+                const view = await waitForCondition(() => findComposeViewForDraft(msgHdr), COMPOSE_READBACK_TIMEOUT_MS);
+                if (!view) {
+                  return { error: `No compose window for the draft appeared within ${COMPOSE_READBACK_TIMEOUT_MS / 1000}s; whether one opens later is unconfirmed` };
+                }
+                return { success: true, viewId: view.id, draftMessageId: msgHdr.messageId };
+              } catch (e) {
+                return { error: `Failed to open draft: ${e.message || e}` };
+              }
+            }
+            // END MESSAGE VIEW TOOLS
 
             function getRecentMessages(folderPath, daysBack, maxResults, offset, unreadOnly, flaggedOnly, includeSubfolders) {
               const results = [];
@@ -11110,13 +11710,6 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                 if (isDrafts) {
                   trashFolder = findTrashFolder(folder);
-
-                  if (trashFolder) {
-                    MailServices.copy.copyMessages(folder, found, trashFolder, true, null, null, false);
-                  } else {
-                    // No trash found, fall back to regular delete
-                    folder.deleteMessages(found, null, false, true, null, false);
-                  }
                 } else {
                   // Thunderbird permanently deletes from Trash (including its
                   // descendants) and for non-move IMAP delete models.
@@ -11131,12 +11724,22 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       return { error: "Trash folder not found" };
                     }
                   }
+                }
+
+                // A view left on a deleted message jumps to its neighbour.
+                const closedViews = closeViewsShowingMessages(found);
+
+                if (isDrafts && trashFolder) {
+                  MailServices.copy.copyMessages(folder, found, trashFolder, true, null, null, false);
+                } else {
+                  // Drafts without a Trash fall back to a regular delete.
                   folder.deleteMessages(found, null, false, true, null, false);
                 }
 
                 let result = { success: true, deleted: found.length };
                 if (isDrafts && trashFolder) result.movedToTrash = true;
                 if (notFound.length > 0) result.notFound = notFound;
+                if (closedViews.length > 0) result.closedViews = closedViews;
                 return result;
               } catch (e) {
                 return { error: e.toString() };
@@ -12237,7 +12840,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "getRecentMessages":
                   return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders);
                 case "displayMessage":
-                  return displayMessage(args.messageId, args.folderPath, args.displayMode);
+                  return await displayMessage(args.messageId, args.folderPath, args.displayMode);
+                case "listTabs":
+                  return listTabs();
+                case "closeTabs":
+                  return await closeTabs(args.viewIds, args.messageId, args.folderPath);
+                case "editDraft":
+                  return await editDraft(args.messageId, args.folderPath);
                 case "deleteMessages":
                   return deleteMessages(args.messageIds, args.folderPath);
                 case "updateMessage":

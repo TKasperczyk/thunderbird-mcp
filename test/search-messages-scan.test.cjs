@@ -125,6 +125,8 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
   }
   const runtime = vm.createContext({
     Date: SearchDate,
+    ChromeUtils: { generateQI: () => () => {} },
+    Components: { isSuccessCode: status => status === 0 },
     GlodaMsgSearcher,
     Services: {
       prefs: { getBoolPref: (name, fallback) => name.endsWith(".allowEncryptedMessages") ? allowEncrypted : fallback },
@@ -168,7 +170,7 @@ function makeHarness({ roots = [makeFolder("INBOX", { count: 3 })], onYield, glo
   const keywordEnd = source.indexOf("]);", keywordStart);
   assert.ok(keywordStart >= 0 && keywordEnd > keywordStart);
   vm.runInContext([
-    ...["DEFAULT_MAX_RESULTS", "MAX_SEARCH_RESULTS_CAP", "SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS", "PREF_ALLOW_ENCRYPTED_MESSAGES"].map(constant),
+    ...["DEFAULT_MAX_RESULTS", "MAX_SEARCH_RESULTS_CAP", "SEARCH_YIELD_EVERY", "SEARCH_TIME_BUDGET_MS", "SEARCH_SYNC_TIMEOUT_MS", "PREF_ALLOW_ENCRYPTED_MESSAGES"].map(constant),
     snippet("// BEGIN PRIVACY PREFERENCE HELPERS", "// END PRIVACY PREFERENCE HELPERS"),
     snippet("// BEGIN RAW MIME PARSING HELPERS", "// END RAW MIME PARSING HELPERS"),
     snippet("// BEGIN PROTECTED SUBJECT HELPERS", "// END PROTECTED SUBJECT HELPERS"),
@@ -287,6 +289,55 @@ describe("searchMessages production scan and pagination", () => {
     for (const query of ["subject:budget", "alice missing", "   ", "from:"]) {
       assert.deepEqual(await h.search({ query, unreadOnly: true }), []);
     }
+  });
+});
+
+describe("searchMessages counts and folder freshness", () => {
+  it("countOnly counts exactly the rows the listing returns when rows vanish after the scan", async () => {
+    // Fresh, identical fixtures per run: First's message 2 disappears while
+    // the scan has moved on to Second, i.e. after it was collected.
+    function run(args) {
+      const first = makeFolder("First", { messages: [1, 2, 3].map(n => ({ messageId: `first-${n}@example.com`, date: n * 1000000 })) });
+      const second = makeFolder("Second", { messages: [4, 5].map(n => ({ messageId: `second-${n}@example.com`, date: n * 1000000 })) });
+      const root = makeFolder("Root", { isServer: true, children: [first, second] });
+      const h = makeHarness({ roots: [root], onYield() { if (first.stats.snapshots > 0) first.headers.delete(2); } });
+      return h.search({ folderPath: null, ...args });
+    }
+    const count = await run({ countOnly: true });
+    const listing = await run({ offset: 0, maxResults: 50 });
+    assert.deepEqual(listing.messages.map(row => row.id).sort(), ["first-1@example.com", "first-3@example.com", "second-4@example.com", "second-5@example.com"]);
+    assert.equal(count.count, listing.messages.length);
+    assert.equal(count.truncated, true);
+  });
+
+  it("a folder-scoped search scans only after the folder's sync has completed", async () => {
+    const folder = makeFolder("Drafts", { count: 13 });
+    folder.updateFolderWithListener = (_window, listener) => {
+      folder.stats.syncs = (folder.stats.syncs || 0) + 1;
+      // The server already expunged six drafts; the database learns it on sync.
+      setImmediate(() => {
+        for (const key of [1, 2, 3, 4, 5, 6]) folder.headers.delete(key);
+        listener.OnStopRunningUrl(null, 0);
+      });
+    };
+    const h = makeHarness({ roots: [folder] });
+    assert.deepEqual(await h.search({ countOnly: true }), { count: 7 });
+    assert.equal(folder.stats.syncs, 1);
+    assert.equal(folder.stats.refreshes, 0, "a synced folder needs no second, unawaited refresh");
+    assert.equal((await h.search()).length, 7);
+  });
+
+  it("a sync that never reports back delays a scoped search only until its timeout", async () => {
+    const folder = makeFolder("Drafts", { count: 3 });
+    folder.updateFolderWithListener = () => {};
+    const h = makeHarness({ roots: [folder] });
+    const pending = h.search({ countOnly: true });
+    await new Promise(resolve => setImmediate(resolve));
+    const timer = h.timers.find(t => t.interval === 5000);
+    assert.ok(timer, "the sync wait is bounded by SEARCH_SYNC_TIMEOUT_MS");
+    timer.callback.notify();
+    assert.deepEqual(await pending, { count: 3 });
+    assert.equal(folder.stats.refreshes, 1, "an unconfirmed sync keeps the usual refresh");
   });
 });
 

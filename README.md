@@ -50,9 +50,12 @@ The bridge starts when executed directly or loaded by a desktop client's Node bo
 | `getMessage` | Read full email content -- `bodyFormat`: `markdown` (default), `text`, or `html`. Set `rawSource: true` for the complete RFC 2822 source (all headers + MIME parts). Optional attachment saving. Set `includeInlineImages: true` to append supported inline CID images as MCP image blocks (PNG, JPEG, GIF, or WebP; max 1 MiB base64 per image and 4 MiB total). Skipped images are reported in attachment metadata. |
 | `getMessages` | Read full email content for up to the configured batch limit in one call (default 10, max 20). Uses the same `bodyFormat`, `rawSource`, and attachment options as `getMessage`; each item supplies `messageId` and `folderPath`. |
 | `getRecentMessages` | Get recent messages with date, unread, and tag filtering. Supports pagination. Results include `threadId` and `preview`. |
-| `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode |
+| `displayMessage` | Open a message in Thunderbird's GUI -- `3pane` (default), `tab`, or `window` mode. Reads back the opened view and reports `displayedMessageId`; a view showing another message is an error |
+| `listTabs` | List what the GUI shows right now: tabs, message windows, and compose windows with their message or draft IDs |
+| `closeTabs` | Close message tabs/windows by view ID or by message ID; reports views that stayed open |
+| `editDraft` | Open a saved draft directly in a compose window for review and sending (nothing is sent); focuses the window if the draft is already open |
 | `updateMessage` | Mark read/unread, flag/unflag, add/remove tags, move or copy between folders, or trash -- supports bulk via `messageIds`. `copyTo` preserves the source and can add a Gmail label. |
-| `deleteMessages` | Delete messages -- drafts are safely moved to Trash |
+| `deleteMessages` | Delete messages -- drafts are safely moved to Trash. Message tabs/windows showing a deleted message are closed first instead of jumping to a neighbouring message |
 | `createFolder` | Create new subfolders to organize your mail |
 | `renameFolder` | Rename an existing mail folder |
 | `deleteFolder` | Delete a folder (moves to Trash, or permanently deletes if already in Trash) |
@@ -87,7 +90,7 @@ Structured MIME extraction keeps the first body's representation outside multipa
 | Tool | Description |
 |------|-------------|
 | `sendMail` | Compose a new email -- opens a review window; direct sending requires explicitly disabling the `skipReview` safety block |
-| `saveDraft` | Save a new or replacement draft without sending or opening a window; supports threading headers and reports an accessible Drafts folder |
+| `saveDraft` | Save a new or replacement draft without sending or opening a window; supports threading headers, reports the new draft's `messageId` and an accessible Drafts folder. A replacement is verified in the Drafts folder (`replaceVerified`); a previous draft Thunderbird left in place is moved to Trash once the new one is confirmed |
 | `replyToMessage` | Reply with quoted original and proper threading -- `skipReview` is subject to the same safety block; `saveAsDraft` saves the threaded reply to Drafts without sending |
 | `forwardMessage` | Forward with all original attachments preserved -- `skipReview` is subject to the same safety block |
 
