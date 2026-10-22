@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { loadCalendarRuntime } = require("./helpers/calendar-runtime.cjs");
 
 // Event `reminders` (whole minutes before the start, one display alarm each):
 // set on createEvent, replaced on updateEvent, read back by listEvents. The
@@ -264,4 +265,54 @@ describe("updateEvent / listEvents reminders wiring (source contract)", () => {
     const j = api.indexOf('name: "updateEvent"', i);
     assert.match(api.slice(i, j), /reminders/);
   });
+});
+
+// Reminder writes are event writes: the same Block skipReview guard that makes
+// meetings with other attendees read-only must apply when only `reminders` is
+// supplied, because calendar servers can email updates for any change.
+describe("updateEvent reminders obey the Block skipReview attendee guard (production runtime)", () => {
+  const updateArgs = { eventId: "event-1", calendarId: "calendar-1" };
+  const recurrenceId = "2026-09-28T10:00:00.000Z";
+  const otherAttendee = { id: "mailto:old@example.com", participationStatus: "ACCEPTED", role: "REQ-PARTICIPANT" };
+
+  for (const [label, options] of [
+    ["default", {}], ["enabled", { blockSkipReview: true }], ["unreadable", { unreadableSkipReview: true }],
+  ]) {
+    for (const occurrence of [false, true]) {
+      for (const reminders of [[60], []]) {
+        it(`rejects reminders ${JSON.stringify(reminders)} on ${occurrence ? "an occurrence" : "a series"} with other attendees while ${label}`, async () => {
+          const runtime = loadCalendarRuntime(options);
+          const { master } = runtime.seedSeries({ attendees: [otherAttendee] });
+          const result = await runtime.invoke("updateEvent", {
+            ...updateArgs, reminders, ...(occurrence ? { recurrenceId } : {}),
+          });
+          assert.match(result.error, /Block skipReview/i);
+          assert.equal(runtime.calls.modifies.length, 0);
+          assert.deepEqual(master.alarms, []);
+        });
+      }
+    }
+  }
+
+  for (const occurrence of [false, true]) {
+    it(`allows reminders on ${occurrence ? "an occurrence" : "a series"} with other attendees once the setting is off`, async () => {
+      const runtime = loadCalendarRuntime({ blockSkipReview: false });
+      runtime.seedSeries({ attendees: [otherAttendee] });
+      const result = await runtime.invoke("updateEvent", {
+        ...updateArgs, reminders: [60], ...(occurrence ? { recurrenceId } : {}),
+      });
+      assert.equal(result.success, true, result.error);
+      assert.equal(runtime.calls.modifies.length, 1);
+    });
+
+    it(`allows reminders on ${occurrence ? "an occurrence" : "a series"} with no other attendees while the setting is on`, async () => {
+      const runtime = loadCalendarRuntime();
+      runtime.seedSeries({ attendees: [] });
+      const result = await runtime.invoke("updateEvent", {
+        ...updateArgs, reminders: [60], ...(occurrence ? { recurrenceId } : {}),
+      });
+      assert.equal(result.success, true, result.error);
+      assert.equal(runtime.calls.modifies.length, 1);
+    });
+  }
 });

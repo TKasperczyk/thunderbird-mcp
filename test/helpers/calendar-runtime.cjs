@@ -42,6 +42,8 @@ class CalendarDuration {
   clone() { return new CalendarDuration(this.inSeconds); }
 }
 
+class CalendarAlarm {}
+
 class CalendarDate {
   constructor(value = "2026-09-28T10:00:00Z", timezone = { tzid: "UTC" }) {
     this.nativeTime = new Date(value).getTime() * 1000;
@@ -95,6 +97,7 @@ class CalendarItem {
     this.properties = new Map();
     this.attendees = [];
     this.categories = [];
+    this.alarms = [];
     this.recurrenceInfo = null;
   }
 
@@ -110,12 +113,16 @@ class CalendarItem {
   getAttendees() { return this.attendees.slice(); }
   addAttendee(attendee) { this.attendees.push(attendee); }
   removeAttendee(attendee) { this.attendees = this.attendees.filter(value => value !== attendee); }
+  getAlarms() { return this.alarms.slice(); }
+  addAlarm(alarm) { this.alarms.push(alarm); }
+  clearAlarms() { this.alarms = []; }
 
   clone() {
     const clone = Object.assign(new this.constructor(), this);
     clone.properties = new Map(this.properties);
     clone.attendees = this.attendees.slice();
     clone.categories = this.categories.slice();
+    clone.alarms = this.alarms.slice();
     for (const name of ["startDate", "endDate", "entryDate", "dueDate", "completedDate", "recurrenceId"]) {
       if (this[name]) clone[name] = this[name].clone();
     }
@@ -369,6 +376,7 @@ function loadCalendarRuntime({
     };
   }
   const cal = {
+    createDuration: () => new CalendarDuration(0),
     manager: { getCalendars() { calls.reads.push({ kind: "calendars" }); return [calendar]; } },
     iterate: {
       async *streamValues(stream) {
@@ -410,8 +418,8 @@ function loadCalendarRuntime({
     },
   };
   const sandbox = {
-    cal, CalEvent: CalendarItem, CalTodo: CalendarTodo, CalAttendee: CalendarAttendee, Cc,
-    Ci: { nsIPrefBranch: prefTypes, calICalendar: CALENDAR_FILTERS },
+    cal, CalEvent: CalendarItem, CalTodo: CalendarTodo, CalAttendee: CalendarAttendee, CalAlarm: CalendarAlarm, Cc,
+    Ci: { nsIPrefBranch: prefTypes, calICalendar: CALENDAR_FILTERS, calIAlarm: { ALARM_RELATED_START: 0 } },
     Services: { prefs: preferences, wm: { getMostRecentWindow: () => window } },
     MailServices: { accounts: { getIdentity() {
       if (unreadableIdentity) throw new Error("Unreadable calendar identity");
