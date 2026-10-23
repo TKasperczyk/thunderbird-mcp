@@ -17,7 +17,7 @@ function snippet(name) {
   return source.slice(start, end);
 }
 
-function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError, imap = null, hdr: headerOverrides = {} } = {}) {
+function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError, imap = null, remote = imap, localStream = false, hdr: headerOverrides = {} } = {}) {
   const attachments = makeDirectSendAttachments();
   const calls = {
     options: [], imports: 0, streams: 0, sends: [], reviews: 0, logs: [], order: [], timers: [],
@@ -26,19 +26,30 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     serverStreams: 0,
   };
   const folder = {
-    server: imap ? { type: "imap" } : {},
+    server: remote ? { type: remote.type ?? "imap" } : {},
     getUriForMsg: () => "message-uri",
     getMsgInputStream() {
       calls.streams++;
+      calls.genericStreams++;
       calls.order.push("raw");
       if (streamError) throw streamError;
       return { close() {} };
     },
+    // Thunderbird 145+ bounds this stream to the message; older builds lack it.
+    ...(localStream ? { getLocalMsgStream() {
+      calls.streams++;
+      calls.localStreams++;
+      calls.order.push("raw");
+      if (streamError) throw streamError;
+      return { close() {} };
+    } } : {}),
   };
+  calls.genericStreams = 0;
+  calls.localStreams = 0;
   const hdr = {
     messageId: "message-1", subject: "protected subject", author: "sender@example.test",
     recipients: "reader@example.test", folder, date: 0,
-    flags: imap?.offline ? 0x80 : 0,
+    flags: remote?.offline ? 0x80 : 0,
     ...headerOverrides,
   };
   const sandbox = {
@@ -110,8 +121,8 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     },
     async openComposeWindowWithCustomizations() { calls.reviews++; return { success: true }; },
   };
-  if (imap) {
-    // An IMAP message service streaming the server's copy in two chunks.
+  if (remote) {
+    // A remote (IMAP or add-on) message service streaming the server's copy in two chunks.
     Object.assign(sandbox.Ci, { nsMsgMessageFlags: { Offline: 0x80 } });
     sandbox.Cr = { NS_BINDING_ABORTED: 0x804b0002 };
     sandbox.Components = { isSuccessCode: status => status === 0 };
@@ -121,14 +132,14 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
       messageServiceFromURI: () => ({
         streamMessage(_uri, listener) {
           calls.serverStreams++;
-          const data = imap.serverRaw;
+          const data = remote.serverRaw;
           let offset = 0;
           const stream = { read(count) { const chunk = data.slice(offset, offset + count); offset += chunk.length; return chunk; } };
           listener.onStartRequest({ cancel() {} });
           const half = Math.floor(data.length / 2);
           listener.onDataAvailable(null, stream, 0, half);
           listener.onDataAvailable(null, stream, half, data.length - half);
-          listener.onStopRequest(null, imap.status ?? 0);
+          listener.onStopRequest(null, remote.status ?? 0);
         },
       }),
     };
@@ -2607,5 +2618,102 @@ describe("getMessage rawSource reads the complete message", () => {
     const result = await api.getMessage("message-1", "folder", false, "text", true);
     assert.equal(result.rawSource, undefined);
     assert.equal(result.error, "Failed to read raw source");
+  });
+});
+
+// Add-on providers (Owl for Exchange) keep the IMAP offline-store contract: the
+// Offline flag marks a complete local copy, and the message service streams the
+// rest. Owl also writes "From - <date>" plus X-Mozilla-* headers in front of
+// every cached message; the mbox store escapes that line to ">From ".
+describe("getMessage reads add-on provider (Owl) messages like IMAP", () => {
+  const FULL = "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nhello\r\n--b--\r\n";
+  const ENVELOPES = [">From - Sat Oct 24 2026 04:51:38\r\n", ">>From - escaped twice\r\n", "From - Fri Oct 23 17:51:38 2026\n"];
+
+  it("streams an Owl message without an offline copy from its message service", async () => {
+    const { api, calls } = loadMessageTools({ streamError: new Error("not available offline"), remote: { type: "owl", offline: false, serverRaw: FULL } });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, FULL);
+    assert.equal(calls.serverStreams, 1);
+    assert.equal(calls.streams, 0, "no local read without an offline copy");
+  });
+
+  it("reads the offline copy of an Owl message without touching the server", async () => {
+    const { api, calls } = loadMessageTools({ raw: FULL, remote: { type: "owl", offline: true, serverRaw: "unused" } });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, FULL);
+    assert.equal(calls.serverStreams, 0);
+    assert.equal(calls.streams, 1);
+  });
+
+  it("opens the stored copy through getLocalMsgStream when Thunderbird offers it", async () => {
+    const { api, calls } = loadMessageTools({ raw: FULL, localStream: true, remote: { type: "owl", offline: true, serverRaw: "unused" } });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, FULL);
+    assert.equal(calls.localStreams, 1);
+    assert.equal(calls.genericStreams, 0, "the unbounded folder stream is not opened");
+  });
+
+  it("falls back to getMsgInputStream on builds without getLocalMsgStream", async () => {
+    const { api, calls } = loadMessageTools({ raw: FULL });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, FULL);
+    assert.equal(calls.genericStreams, 1);
+    assert.equal(calls.localStreams, 0);
+  });
+
+  it("streams from the message service when a stale Offline flag hides a missing copy", async () => {
+    const { api, calls } = loadMessageTools({ streamError: new Error("missing"), remote: { type: "owl", offline: true, serverRaw: FULL } });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, FULL);
+    assert.equal(calls.serverStreams, 1);
+  });
+
+  for (const envelope of ENVELOPES) {
+    it(`drops the stored envelope line ${JSON.stringify(envelope)} from local and streamed copies`, async () => {
+      const local = await loadMessageTools({ raw: envelope + FULL, remote: { type: "owl", offline: true, serverRaw: "unused" } })
+        .api.getMessage("message-1", "folder", false, "text", true);
+      assert.equal(local.rawSource, FULL);
+      const streamed = await loadMessageTools({ remote: { type: "owl", offline: false, serverRaw: envelope + FULL } })
+        .api.getMessage("message-1", "folder", false, "text", true);
+      assert.equal(streamed.rawSource, FULL);
+    });
+  }
+
+  it("completes a provider slice that ends inside the final CRLF", async () => {
+    const short = ENVELOPES[0] + FULL.slice(0, -1);
+    assert.ok(short.endsWith("\r"));
+    const local = await loadMessageTools({ raw: short, remote: { type: "owl", offline: true, serverRaw: "unused" } })
+      .api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(local.rawSource, FULL);
+    const streamed = await loadMessageTools({ remote: { type: "owl", offline: false, serverRaw: short } })
+      .api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(streamed.rawSource, FULL);
+    // Only a final bare CR is completed; one inside the message stays a hazard.
+    const inner = await loadMessageTools({ raw: "Content-Type: text/plain\r\n\rvisible", remote: { type: "owl", offline: true, serverRaw: "unused" } })
+      .api.getMessage("message-1", "folder", false, "text", false);
+    assert.equal(inner.encryptedContentWithheld, true);
+  });
+
+  it("reads a cached message behind an envelope line without the encrypted-message opt-in", async () => {
+    const { api } = loadMessageTools({ raw: ENVELOPES[0] + "X-Mozilla-Status: 0001\r\nContent-Type: text/plain\r\n\r\nvisible" });
+    const result = await api.getMessage("message-1", "folder", false, "text", false);
+    assert.equal(result.encryptedContentWithheld, undefined);
+    assert.equal(result.body, "visible");
+  });
+
+  it("keeps an envelope-looking header-less line inside the body", async () => {
+    const raw = "Content-Type: text/plain\r\n\r\n>From - Sat Oct 24 2026 04:51:38\r\nquoted";
+    const { api } = loadMessageTools({ raw, remote: { type: "owl", offline: true, serverRaw: "unused" } });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, raw);
+  });
+
+  it("does not download for a local store, or for an empty server type", async () => {
+    for (const type of ["none", "pop3", ""]) {
+      const { api, calls } = loadMessageTools({ streamError: new Error("missing"), remote: { type, offline: false, serverRaw: FULL } });
+      const result = await api.getMessage("message-1", "folder", false, "text", true);
+      assert.equal(result.error, "Failed to read raw source", type);
+      assert.equal(calls.serverStreams, 0, type);
+    }
   });
 });
