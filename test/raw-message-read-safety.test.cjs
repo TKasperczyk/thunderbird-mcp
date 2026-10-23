@@ -78,6 +78,12 @@ describe("raw message read safety: strict classification is authoritative", () =
     ["base64 inline armor", entity([
       "Content-Type: text/plain", "Content-Transfer-Encoding: base64",
     ], Buffer.from("-----BEGIN PGP MESSAGE-----\r\nopaque").toString("base64")), "encrypted"],
+    // RFC 2046 boundaries as real mailers write them: Nodemailer ("?"),
+    // SendGrid-style ("?:") and base64-derived ones ("/").
+    ...[
+      "----sinikael-?=_1-17921379240460.35633616077122277", "PBPdHT12M9bc=_?:",
+      "=-p0R/2+5WwzTrhcFfiTYprg==", "_----D6UXZgYpxMB+JLLpXo/OVg===_F3/A5-28119-65C97DA6", "a:b/c?d",
+    ].map(boundary => [`an RFC 2046 boundary ${JSON.stringify(boundary)}`, multipart([plain], { boundary, padding: "" }), "clear"]),
   ]) {
     it(`retains strict ${expected} for ${name} without scanning tier 2`, () => {
       const h = loadReadSafety();
@@ -127,6 +133,9 @@ describe("raw message read safety: ordinary unusual MIME remains readable", () =
   const cases = [
     ["RFC boundary punctuation and transport padding", unusual],
     ["spaces within the quoted boundary", multipart([plain], { boundary: "ordinary boundary" })],
+    ["spaces within the quoted boundary, no padding", multipart([plain], { boundary: "ordinary boundary", padding: "" })],
+    ["a quote or characters outside RFC 2046 bchars in the boundary", multipart([plain], { boundary: "quote'd~bound#ary", padding: "" })],
+    ["parentheses or commas in the boundary", multipart([plain], { boundary: "odd:(boundary),x", padding: "" })],
     ["a folded boundary parameter", unusual.replace('; boundary=', ';\r\n\tboundary=')],
     ["a folded quoted boundary value", multipart([plain], { boundary: "ordinary boundary" }).replace('="ordinary boundary"', '="ordinary\r\n boundary"')],
     ["opening and closing delimiter padding", multipart([plain], { boundary: "simple", padding: " \t " })],
