@@ -545,3 +545,31 @@ describe("raw message read safety: HTML and charset transformations", () => {
     });
   }
 });
+
+describe("raw message read safety: HTML comment delimiters are not armor prefixes", () => {
+  const htmlPart = (html, encoding = null) => entity([
+    "Content-Type: text/html; charset=utf-8", ...(encoding ? [`Content-Transfer-Encoding: ${encoding}`] : []),
+  ], encoding === "base64" ? Buffer.from(html).toString("base64").split("").join("!")
+    : encoding === "quoted-printable" ? html.replaceAll("=", "=3D") : html);
+
+  for (const [name, html] of [
+    ["Outlook conditional comments", '<html><body><!--[if !mso]><!--><p>ordinary mail</p><!--<![endif]--><!-- tracking --></body></html>'],
+    ["a comment delimiter cut by an entity", "<p>x</p><!--&nbsp;-->"],
+    ["a bogus comment", "<p>x</p><!-<![endif]>"],
+  ]) {
+    it(`still reads ${name}`, () => {
+      for (const encoding of [null, "base64", "quoted-printable"]) {
+        assertFallback(multipart([htmlPart(html, encoding)]), "clear", `${name}, ${encoding}`);
+      }
+    });
+  }
+
+  for (const [name, html] of [
+    ["armor cut by a comment", "<p>-----<!-- -->BEGIN PGP MESSAGE-----</p>"],
+    ["armor after a comment delimiter", "<!--<![endif]-->-----<i>BEGIN PGP MESSAGE-----</i>"],
+    ["a dash run split by tags", "<p>-<b>-</b>-<b>-</b>-BEGIN PGP MESSAGE-----</p>"],
+    ["armor inside a comment opener's dashes", "<!-----BEGIN PGP MESSAGE-----"],
+    ["a comment-looking dash run longer than the tail window", `<!--${"-".repeat(20)}<b>BEGIN PGP MESSAGE-----</b>`],
+    ["a dash run after a closed comment", "<!-- x -->--<!-- y -->---BEGIN PGP MESSAGE-----"],
+  ]) it(`withholds ${name}`, () => assertFallback(multipart([htmlPart(html)]), "unknown", name));
+});
