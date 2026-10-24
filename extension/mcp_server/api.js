@@ -9584,6 +9584,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const MESSAGE_STREAM_DEADLINE_ERROR = "message read deadline exceeded";
             const MESSAGE_STREAM_ZERO_ERROR = "Message has zero size - cannot read raw source";
             const MESSAGE_READ_STOPPED_ERROR = "Message read stopped";
+            // Server types that store mail locally; every other type (imap, nntp,
+            // and add-on providers such as Owl or EWS) is remote.
+            const LOCAL_SERVER_TYPES = ["none", "pop3", "movemail", "rss"];
+
+            // A stored message can begin with a mailbox envelope line ("From - <date>",
+            // which the mbox store escapes to ">From "). Add-on providers write one in
+            // front of every message they cache (Owl: "From - " + date + X-Mozilla-*
+            // headers). It is not a header: libmime skips it (mimehdrs.cpp, the BSD
+            // mailbox delimiter hack) and parseRawMimeHeaders reads past it, while
+            // the strict raw gate would reject the whole message on it. A header
+            // field name cannot contain a space, so this never matches header text.
+            const MBOX_ENVELOPE_LINE_RE = /^>*From [^\r\n]*(?:\r\n|\n)/;
+            // A provider that records its copy's size before the store escapes the
+            // envelope line (Owl: offlineMessageSize = unescaped length) serves a
+            // slice one byte short, ending inside the final CRLF. A bare CR at the
+            // very end has nothing after it to hide; complete it rather than fail
+            // closed on a lone CR.
+            function normalizeStoredMessageCopy(raw) {
+              if (typeof raw !== "string") return raw;
+              raw = raw.replace(MBOX_ENVELOPE_LINE_RE, "");
+              return raw.endsWith("\r") ? raw + "\n" : raw;
+            }
 
             // Reads a message stream fully, looping on stream.available() to handle
             // mbox-stored messages where msgHdr.offlineMessageSize/messageSize can
@@ -9625,12 +9647,27 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return raw;
             }
 
+            // Opens the stored copy of one message. Thunderbird 145+ (bug 1968399)
+            // bounds getLocalMsgStream to the message; add-on providers implement
+            // it the same way (Owl slices its store to offlineMessageSize). The
+            // older getMsgInputStream reads the store from the message's offset
+            // until it recognises the next separator, which it does not do for
+            // records that start with a provider's own ">From - <date>" line, so
+            // on an Owl folder it ran on into the following messages (observed:
+            // a 14 KB message read back as 50 KB holding three messages).
+            function openStoredMessageStream(msgHdr) {
+              const folder = msgHdr.folder;
+              return typeof folder.getLocalMsgStream === "function"
+                ? folder.getLocalMsgStream(msgHdr)
+                : folder.getMsgInputStream(msgHdr, {});
+            }
+
             // Reads the stored message within RAW_MESSAGE_MAX_BYTES. Throws on
             // read failure or overflow.
             function readBoundedRawMessage(msgHdr, deadline, maxBytes = RAW_MESSAGE_MAX_BYTES) {
               let stream = null;
               try {
-                stream = msgHdr.folder.getMsgInputStream(msgHdr, {});
+                stream = openStoredMessageStream(msgHdr);
                 return readMessageStreamFully(stream, Math.min(maxBytes, RAW_MESSAGE_MAX_BYTES), deadline);
               } finally {
                 if (stream) try { stream.close(); } catch { /* ignore */ }
@@ -9658,15 +9695,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             }
 
             /**
-             * Reads a message's complete raw source. An IMAP message's local copy
-             * is complete only once Thunderbird flags it Offline; before that the
-             * store can hold a prefix of it (observed: a 15.2 MB message read back
-             * as 7.9 MB without any error), so such messages are streamed from the
-             * server, the way the direct-send preflight retrieves uncached
-             * originals. Rejects on failure, timeout, or more than
-             * RAW_MESSAGE_MAX_BYTES. Bulk callers may impose a smaller maxBytes
-             * and forbid server fallback with allowDownload:false. A Partial
-             * local copy cannot establish completeness for those callers.
+             * Reads a message's complete raw source. A remote message's local copy
+             * (IMAP, or an add-on provider such as Owl, which keeps the same Offline
+             * flag and offline store) is complete only once Thunderbird flags it
+             * Offline; before that the store can hold a prefix of it (observed: a
+             * 15.2 MB IMAP message read back as 7.9 MB without any error) or nothing
+             * at all (an Owl message never opened in Thunderbird), so such messages
+             * are streamed from the server through their message service, the way
+             * the direct-send preflight retrieves uncached originals. A leading
+             * mailbox envelope line is dropped from either copy. Rejects on failure,
+             * timeout, or more than RAW_MESSAGE_MAX_BYTES. Bulk callers may impose a
+             * smaller maxBytes and forbid server fallback with allowDownload:false.
+             * A Partial local copy cannot establish completeness for those callers.
              */
             function readCompleteRawMessage(msgHdr, {
               deadline = Date.now() + MESSAGE_READ_TIMEOUT_MS, checkAccess = () => {}, pending,
@@ -9677,23 +9717,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 checkAccess();
                 if (Date.now() >= deadline) throw new Error(MESSAGE_STREAM_DEADLINE_ERROR);
               };
-              const isImap = msgHdr.folder?.server?.type === "imap";
+              // An unknown (empty) type stays local-only, as before.
+              const serverType = msgHdr.folder?.server?.type;
+              const isRemote = !!serverType && !LOCAL_SERVER_TYPES.includes(serverType);
               try {
                 check();
                 if (!allowDownload && ((msgHdr.flags & Ci.nsMsgMessageFlags.Partial) ||
-                    (isImap && !(msgHdr.flags & Ci.nsMsgMessageFlags.Offline)))) {
+                    (isRemote && !(msgHdr.flags & Ci.nsMsgMessageFlags.Offline)))) {
                   throw new Error("Complete local message unavailable");
                 }
-                if (!isImap || (msgHdr.flags & Ci.nsMsgMessageFlags.Offline)) {
+                if (!isRemote || (msgHdr.flags & Ci.nsMsgMessageFlags.Offline)) {
                   let raw;
                   try {
-                    raw = readBoundedRawMessage(msgHdr, deadline, maxBytes);
+                    raw = normalizeStoredMessageCopy(readBoundedRawMessage(msgHdr, deadline, maxBytes));
                     if (!raw) throw new Error(MESSAGE_STREAM_ZERO_ERROR);
                   } catch (error) {
                     check();
                     // A stale Offline flag may hide a missing local store. Size
                     // failures are final, even when the server could be retried.
-                    if (!allowDownload || !isImap || error?.isStreamSizeLimit || error?.message === MESSAGE_STREAM_DEADLINE_ERROR) throw error;
+                    if (!allowDownload || !isRemote || error?.isStreamSizeLimit || error?.message === MESSAGE_STREAM_DEADLINE_ERROR) throw error;
                   }
                   check();
                   if (raw) return Promise.resolve(raw);
@@ -9717,7 +9759,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     raw = "";
                     reject(error);
                   } else {
-                    resolve(raw);
+                    resolve(normalizeStoredMessageCopy(raw));
                   }
                 };
                 try {
@@ -11778,8 +11820,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	            }
 
             // BEGIN ATTACHMENT SEARCH TOOL
-            // Server types that store mail locally; every other type is remote.
-            const LOCAL_SERVER_TYPES = ["none", "pop3", "movemail", "rss"];
+            // LOCAL_SERVER_TYPES is defined with the raw message readers.
 
             // Searched getMessageReadAccessError/finishSearchResults: use their
             // access + key/ID checks, without findMessage's fallback folder scan.
