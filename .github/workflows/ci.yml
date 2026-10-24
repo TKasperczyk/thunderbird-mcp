@@ -62,3 +62,26 @@ jobs:
             exit 1
           fi
           echo "Versions in sync: $PKG"
+
+  security-scan:
+    name: "Security Scan (Trivy: secrets + workflow misconfiguration)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          scan-type: "fs"
+          # No lockfile is committed and the extension ships no runtime
+          # dependencies, so Trivy's vulnerability scanner has nothing to
+          # resolve. These two are the checks that apply to this repository:
+          # committed secrets, and GitHub Actions misconfiguration.
+          scanners: "secret,misconfig"
+          hide-progress: true
+          format: "table"
+          # Report-only for now: a new advisory should not turn a contributor's
+          # branch red on a transitive finding they cannot fix.
+          exit-code: "0"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
