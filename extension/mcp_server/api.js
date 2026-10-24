@@ -10346,6 +10346,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const RAW_READ_ARMOR_TAIL_LENGTH = 16;
             const RAW_READ_HTML_HYPHEN_CODEPOINT = 45;
             const RAW_READ_ARMOR_PREFIX_RE = /-(?:b(?:e(?:g(?:i(?:n(?:p(?:g)?)?)?)?)?)?|e(?:n(?:d(?:p(?:g)?)?)?)?)?$/;
+            // A dash run that opens an HTML comment ("<!--", or the bogus comment
+            // "<!-") is never rendered text: everything up to the closing ">" or
+            // "-->" is hidden, so markup after it cannot complete an armor line.
+            // Outlook writes "<!--<![endif]-->" into most HTML mail; the armor
+            // prefix rule alone withheld every such message that reached this
+            // scan. A run longer than the tail window loses its "<!" and stays
+            // fail-closed.
+            const RAW_READ_COMMENT_DELIMITER_RE = /<!-+$/;
             // TextDecoder canonical names, not MIME label aliases. UTF-8 and
             // these single-byte encodings keep ASCII separate from other text.
             // Other multibyte encodings can put ASCII-valued trail bytes inside
@@ -10381,7 +10389,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   // This also covers comments, malformed tags and long tags:
                   // their exact interpretation is deliberately not guessed.
                   if (char === "<" || char === "&" || char === "\x1B") {
-                    if (RAW_READ_ARMOR_PREFIX_RE.test(tail) || (char === "\x1B" && (reference || radix))) return true;
+                    if ((RAW_READ_ARMOR_PREFIX_RE.test(tail) && !RAW_READ_COMMENT_DELIMITER_RE.test(tail)) ||
+                        (char === "\x1B" && (reference || radix))) return true;
                   }
                   // A numeric HTML reference can supply the FIRST ASCII dash,
                   // with no literal prefix. Read only its numeric value, across
