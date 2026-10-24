@@ -10039,10 +10039,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const STRICT_MIME_RFC2231_KEY_RE = /^(?:name|filename)\*(?:\d+\*?)?$/;
             // Narrower than RFC 2046 bchars: no quotes (mimeVerify strips matching
             // quotes from the boundary), no spaces (folding is normalised
-            // differently by each parser) and no other punctuation. Thunderbird,
-            // Outlook, Apple Mail, Gmail, K-9/FairEmail, Evolution and KMail
-            // boundaries all fit.
-            const STRICT_MIME_BOUNDARY_RE = /^[A-Za-z0-9_.=+-]{1,70}$/;
+            // differently by each parser), no parentheses or commas (comment and
+            // list delimiters in header syntax). "/", ":" and "?" are plain
+            // characters in every parser and carry real traffic: Nodemailer's
+            // default boundary is "----sinikael-?=_<n>-<id>", SendGrid-style
+            // boundaries end in "=_?:", base64-derived ones contain "/".
+            // Thunderbird, Outlook, Apple Mail, Gmail, K-9/FairEmail, Evolution and
+            // KMail boundaries fit as before. Delimiters are matched literally
+            // (indexOf, or a pattern built with escapeRawMimeRegExp).
+            const STRICT_MIME_BOUNDARY_RE = /^[A-Za-z0-9_.=+\-/:?]{1,70}$/;
             const STRICT_MIME_LINE_RE = /([^\r\n]*)(\r\n|\n|\r|$)/y;
             const STRICT_MIME_SINGLE_HEADERS = ["content-type", "content-disposition", "content-transfer-encoding", "content-name", "x-sun-data-name"];
 
