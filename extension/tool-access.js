@@ -27,6 +27,7 @@ this.ToolAccess = (() => {
     getMessageHeaders: "0.10.0",
     batchGetMessageHeaders: "0.10.0",
     searchAttachments: "0.10.0",
+    findMessageById: "0.10.0",
     createVirtualFolder: "0.10.0",
     listVirtualFolders: "0.10.0",
     deleteVirtualFolder: "0.10.0",
