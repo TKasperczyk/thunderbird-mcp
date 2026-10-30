@@ -80,6 +80,7 @@ const ALL_TOOLS = [
   { name: "getMessageHeaders", group: "messages", crud: "read" },
   { name: "batchGetMessageHeaders", group: "messages", crud: "read" },
   { name: "searchAttachments", group: "messages", crud: "read" },
+  { name: "getUnsubscribeInfo", group: "messages", crud: "read" },
   { name: "getRecentMessages", group: "messages", crud: "read" },
   { name: "displayMessage", group: "messages", crud: "read" },
   { name: "refreshFolder", group: "messages", crud: "read" },

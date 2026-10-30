@@ -30,6 +30,7 @@ this.ToolAccess = (() => {
     createVirtualFolder: "0.10.0",
     listVirtualFolders: "0.10.0",
     deleteVirtualFolder: "0.10.0",
+    getUnsubscribeInfo: "0.10.0",
   });
   const stateVersion = 1;
   // Searched version comparisons and preference parsers: none handles our
