@@ -669,9 +669,8 @@ nsHttpServer.prototype = {
       throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);
     }
 
-    // XXX determine behavior of nonexistent /foo/bar when a /foo/bar/ mapping
-    //     exists!
-
+    // determine behavior of nonexistent /foo/bar when a /foo/bar/ mapping
+    // exists (now redirects 301 to /foo/bar/)
     this._handler.registerDirectory(path, directory);
   },
 
@@ -2729,6 +2728,16 @@ ServerHandler.prototype = {
     // the "file" might be a directory, in which case we either serve the
     // contained index.html or make the index handler write the response
     if (file.exists() && file.isDirectory()) {
+      if (path.charAt(path.length - 1) != "/") {
+        response.setStatusLine(metadata.httpVersion, 301, "Moved Permanently");
+        var redirectLocation = path + "/";
+        if (metadata.queryString) {
+          redirectLocation += "?" + metadata.queryString;
+        }
+        response.setHeader("Location", redirectLocation, false);
+        return;
+      }
+
       file.append("index.html"); // make configurable?
       if (!file.exists() || file.isDirectory()) {
         metadata._ensurePropertyBag();
@@ -3211,19 +3220,7 @@ ServerHandler.prototype = {
       // do we have a match for current head of the path?
       var file = pathMap.get(tmp);
       if (file) {
-        // XXX hack; basically disable showing mapping for /foo/bar/ when the
-        //     requested path was /foo/bar, because relative links on the page
-        //     will all be incorrect -- we really need the ability to easily
-        //     redirect here instead
-        if (
-          tmp == path.substring(1) &&
-          !!tmp.length &&
-          tmp.charAt(tmp.length - 1) != "/"
-        ) {
-          file = null;
-        } else {
-          break;
-        }
+        break;
       }
 
       // if we've finished trying all prefixes, exit
