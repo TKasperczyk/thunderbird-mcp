@@ -5108,15 +5108,19 @@ const headerUtils = {
     // that should have taken care of all CTLs, so val should contain no CTLs
     dumpn("*** Normalized value: '" + val + "'");
     for (var i = 0, len = val.length; i < len; i++) {
-      if (isCTL(val.charCodeAt(i))) {
+      if (
+        val.charCodeAt(i) == 92 &&
+        i + 1 < len &&
+        val.charCodeAt(i + 1) <= 127
+      ) {
+        // quoted-pair = "\" CHAR; skip the escaped CHAR from CTL check
+        i++;
+      } else if (isCTL(val.charCodeAt(i))) {
         dump("*** Char " + i + " has charcode " + val.charCodeAt(i));
         throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);
       }
     }
 
-    // XXX disallows quoted-pair where CHAR is a CTL -- will not invalidly
-    //     normalize, however, so this can be construed as a tightening of the
-    //     spec and not entirely as a bug
     return val;
   },
 };
