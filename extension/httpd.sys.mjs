@@ -649,7 +649,10 @@ nsHttpServer.prototype = {
   // see nsIHttpServer.registerFile
   //
   registerFile(path, file, handler) {
-    if (file && (!file.exists() || file.isDirectory())) {
+    if (
+      !_isValidPath(path, false) ||
+      (file && (!file.exists() || file.isDirectory()))
+    ) {
       throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);
     }
 
@@ -660,17 +663,13 @@ nsHttpServer.prototype = {
   // see nsIHttpServer.registerDirectory
   //
   registerDirectory(path, directory) {
-    // XXX true path validation!
     if (
-      path.charAt(0) != "/" ||
+      !_isValidPath(path, false) ||
       path.charAt(path.length - 1) != "/" ||
       (directory && (!directory.exists() || !directory.isDirectory()))
     ) {
       throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);
     }
-
-    // XXX determine behavior of nonexistent /foo/bar when a /foo/bar/ mapping
-    //     exists!
 
     this._handler.registerDirectory(path, directory);
   },
@@ -679,6 +678,9 @@ nsHttpServer.prototype = {
   // see nsIHttpServer.registerPathHandler
   //
   registerPathHandler(path, handler) {
+    if (!_isValidPath(path, true)) {
+      throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);
+    }
     this._handler.registerPathHandler(path, handler);
   },
 
@@ -686,6 +688,9 @@ nsHttpServer.prototype = {
   // see nsIHttpServer.registerPrefixHandler
   //
   registerPrefixHandler(prefix, handler) {
+    if (!_isValidPath(prefix, false) || prefix.charAt(prefix.length - 1) != "/") {
+      throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);
+    }
     this._handler.registerPrefixHandler(prefix, handler);
   },
 
@@ -2222,6 +2227,43 @@ function fileSort(a, b) {
  * @throws URIError
  *   if path is incorrectly encoded
  */
+// BEGIN PATH VALIDATION HELPERS
+function _isValidPath(path, allowConnect = false) {
+  if (typeof path !== "string" || path.length === 0) {
+    return false;
+  }
+  if (allowConnect && path === "CONNECT") {
+    return true;
+  }
+  if (path.charAt(0) !== "/") {
+    return false;
+  }
+  try {
+    decodeURI(path);
+  } catch (e) {
+    return false;
+  }
+  if (
+    path.includes("?") ||
+    path.includes("#") ||
+    path.includes(";") ||
+    path.includes("\\") ||
+    path.includes("\0")
+  ) {
+    return false;
+  }
+  if (
+    path === "/.." ||
+    path.startsWith("/../") ||
+    path.includes("/../") ||
+    path.endsWith("/..")
+  ) {
+    return false;
+  }
+  return true;
+}
+// END PATH VALIDATION HELPERS
+
 function toInternalPath(path, encoded) {
   if (encoded) {
     path = decodeURI(path);
@@ -2555,6 +2597,10 @@ ServerHandler.prototype = {
   // see nsIHttpServer.registerFile
   //
   registerFile(path, file, handler) {
+    if (!_isValidPath(path, false)) {
+      throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);
+    }
+
     if (!file) {
       dumpn("*** unregistering '" + path + "' mapping");
       delete this._overridePaths[path];
@@ -2584,15 +2630,7 @@ ServerHandler.prototype = {
   // see nsIHttpServer.registerPathHandler
   //
   registerPathHandler(path, handler) {
-    if (!path.length) {
-      throw Components.Exception(
-        "Handler path cannot be empty",
-        Cr.NS_ERROR_INVALID_ARG
-      );
-    }
-
-    // XXX true path validation!
-    if (path.charAt(0) != "/" && path != "CONNECT") {
+    if (!_isValidPath(path, true)) {
       throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);
     }
 
@@ -2603,8 +2641,7 @@ ServerHandler.prototype = {
   // see nsIHttpServer.registerPrefixHandler
   //
   registerPrefixHandler(path, handler) {
-    // XXX true path validation!
-    if (path.charAt(0) != "/" || path.charAt(path.length - 1) != "/") {
+    if (!_isValidPath(path, false) || path.charAt(path.length - 1) != "/") {
       throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);
     }
 
@@ -2615,6 +2652,9 @@ ServerHandler.prototype = {
   // see nsIHttpServer.registerDirectory
   //
   registerDirectory(path, directory) {
+    if (!_isValidPath(path, false) || path.charAt(path.length - 1) != "/") {
+      throw Components.Exception("", Cr.NS_ERROR_INVALID_ARG);
+    }
     // strip off leading and trailing '/' so that we can use lastIndexOf when
     // determining exactly how a path maps onto a mapped directory --
     // conditional is required here to deal with "/".substring(1, 0) being
