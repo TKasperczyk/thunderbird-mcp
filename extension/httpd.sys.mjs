@@ -421,7 +421,18 @@ nsHttpServer.prototype = {
       );
       var reader = new RequestReader(conn);
 
-      // XXX add request timeout functionality here!
+      // Set socket transport read timeout (type 1 = TIMEOUT_READ_WRITE, 30s duration)
+      if (typeof trans.setTimeout === "function") {
+        var timeoutType = 1;
+        if (typeof Ci !== "undefined" && Ci.nsISocketTransport) {
+          if ("TIMEOUT_READ_WRITE" in Ci.nsISocketTransport) {
+            timeoutType = Ci.nsISocketTransport.TIMEOUT_READ_WRITE;
+          } else if ("TIMEOUT_READ" in Ci.nsISocketTransport) {
+            timeoutType = Ci.nsISocketTransport.TIMEOUT_READ;
+          }
+        }
+        trans.setTimeout(timeoutType, 30);
+      }
 
       // Note: must use main thread here, or we might get a GC that will cause
       //       threadsafety assertions.  We really need to fix XPConnect so that
