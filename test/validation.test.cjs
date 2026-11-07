@@ -39,6 +39,7 @@ function loadProductionAttachmentValidation(overrides = {}, transform = code => 
   const sandbox = {
     ...clearOriginalRawFixture,
     getConfiguredGetMessagesLimit: () => 20,
+    buildSignatureFragment: () => "",
     _tempAttachFiles: new Set(),
     _tempFileCounter: 0,
     Cc: { '@mozilla.org/messengercompose/attachment;1': { createInstance: () => ({}) } },

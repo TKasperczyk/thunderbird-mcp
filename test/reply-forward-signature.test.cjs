@@ -120,7 +120,8 @@ function loadCompose(options = {}) {
   ].join("\n"), sandbox);
   sandbox.assessComposeSize = plan => {
     calls.sizePlans.push(plan);
-    return options.rejectIfSigned && plan.body.includes(signature)
+    return options.rejectIfSigned && plan.body.includes(signature) &&
+      (plan.body.includes("On ") || plan.body.includes("-------- Forwarded Message --------"))
       ? { warning: "encoded size exceeds threshold" }
       : { warning: null };
   };
@@ -154,7 +155,14 @@ for (const [tool, subject] of [["replyToMessage", "Reply"], ["forwardMessage", "
         if (tool === "forwardMessage") args.to = "recipient@example.test";
         const result = await api.dispatchTool(tool, args);
         assert.equal(result.success, true, result.error);
-        assert.ok(!sentBody(tool, calls).includes(signature));
+        const unsignedBody = sentBody(tool, calls);
+        assert.ok(!unsignedBody.includes(signature));
+        const { api: noSignatureApi, calls: noSignatureCalls } = loadCompose({ composeHtml: isHtml });
+        const noSignatureArgs = { messageId: hdrId, folderPath: "folder", body: "Reply text", isHtml, skipReview: true, includeSignature: false };
+        if (tool === "forwardMessage") noSignatureArgs.to = "recipient@example.test";
+        const noSignatureResult = await noSignatureApi.dispatchTool(tool, noSignatureArgs);
+        assert.equal(noSignatureResult.success, true, noSignatureResult.error);
+        assert.equal(unsignedBody, sentBody(tool, noSignatureCalls), "identity without a signature preserves the unsigned body");
       });
 
       for (const sigBottom of [false, true]) {
@@ -186,6 +194,9 @@ for (const [tool, subject] of [["replyToMessage", "Reply"], ["forwardMessage", "
       if (tool === "forwardMessage") args.to = "recipient@example.test";
       const result = await api.dispatchTool(tool, args);
       assert.ok(calls.sizePlans.some(plan => plan.body.includes(signature)), "size plan must include the body that will be sent");
+      const finalPlanBody = calls.sizePlans.at(-1).body;
+      assert.ok(finalPlanBody.includes(signature));
+      assert.ok(finalPlanBody.includes(tool === "replyToMessage" ? "On " : "-------- Forwarded Message --------"));
       assert.match(result.error, /encoded size exceeds threshold/);
       assert.equal(calls.sends.length, 0);
     });

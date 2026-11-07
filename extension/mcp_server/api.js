@@ -3153,6 +3153,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
+            includeSignature: { type: "boolean", default: true, description: "Append the identity signature when skipReview is true (default: true). Set false if the body already includes it. Compose review windows use Thunderbird's signature preferences." },
             saveAsDraft: { type: "boolean", description: "Build a native reply, save it to the current compose identity's accessible Drafts-flagged folder, and close the window without sending (default: false). Requires saveDraft to be enabled; cannot be combined with skipReview. Protected or unverifiable originals require a review window, even with encrypted-message access enabled. A save timeout reports an uncertain outcome; check Drafts before retrying." },
             attachments: {
               type: "array",
@@ -3200,6 +3201,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
+            includeSignature: { type: "boolean", default: true, description: "Append the identity signature when skipReview is true (default: true). Set false if the body already includes it. Compose review windows use Thunderbird's signature preferences." },
             attachments: {
               type: "array",
               maxItems: MAX_ATTACHMENTS_PER_MESSAGE,
@@ -13191,7 +13193,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * to Drafts and closes the window instead of leaving it open.
              */
 	            // BEGIN REPLY TOOL
-	            async function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview, saveAsDraft) {
+	            async function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview, saveAsDraft, includeSignature = true) {
 	              try {
 	                if (skipReview && saveAsDraft) {
 	                  return { error: "saveAsDraft cannot be combined with skipReview" };
@@ -13253,7 +13255,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  const { useHtml } = resolveComposeFormat(selectedIdentity.identity, isHtml, compType);
 	                  sizePlan = {
 	                    identity: selectedIdentity.identity, useHtml,
-	                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, false),
+	                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, includeSignature),
 	                    headers: [to || "", cc || "", bcc || "", messageId || "",
 	                      msgHdr.subject || "", msgHdr.mime2DecodedSubject || "", msgHdr.author || "",
 	                      msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || ""],
@@ -13331,10 +13333,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                      const quoteBlock = isHtml
 	                        ? `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<blockquote type="cite">${quotedHtml}</blockquote>`
 	                        : `<br><br>On ${dateStr}, ${escapeHtml(author)} wrote:<br>${quotedLines}`;
-	                      composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${formatBodyHtml(body, isHtml)}${quoteBlock}</body></html>`;
+                      const sigFragment = includeSignature ? buildSignatureFragment(msgComposeParams.identity, replyUseHtml) : "";
+                      const introHtml = formatBodyHtml(body, isHtml);
+                      composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${msgComposeParams.identity.sig_bottom ? quoteBlock + sigFragment : sigFragment + quoteBlock}</body></html>`;
 	                    } else {
 	                      const quotedLines = originalBody.split('\n').map(line => `> ${line}`).join('\n');
-	                      composeFields.body = `${body || ""}\n\nOn ${dateStr}, ${author} wrote:\n${quotedLines}`;
+                      const quoteBlock = `On ${dateStr}, ${author} wrote:\n${quotedLines}`;
+                      const sigFragment = includeSignature ? buildSignatureFragment(msgComposeParams.identity, replyUseHtml) : "";
+                      composeFields.body = msgComposeParams.identity.sig_bottom
+                        ? `${body || ""}\n\n${quoteBlock}${sigFragment}`
+                        : `${body || ""}${sigFragment}\n\n${quoteBlock}`;
 	                    }
 
 	                    // On success Thunderbird marks the original replied.
@@ -13425,7 +13433,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Thunderbird sets the subject, References and $Forwarded disposition.
              */
             // BEGIN FORWARD TOOL
-            async function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
+	            async function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview, includeSignature = true) {
               try {
                 if (skipReview && isSkipReviewBlocked()) {
                   return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
@@ -13477,7 +13485,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const { useHtml } = resolveComposeFormat(selectedIdentity.identity, isHtml, compType);
                   sizePlan = {
                     identity: selectedIdentity.identity, useHtml,
-                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, false),
+                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, includeSignature),
                     headers: [to || "", cc || "", bcc || "", messageId || "",
                       msgHdr.subject || "", msgHdr.mime2DecodedSubject || "", msgHdr.author || "",
                       msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || ""],
@@ -13548,7 +13556,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         ? `<blockquote type="cite">${fwdHeaderHtml}${quotedHtml}</blockquote>`
                         : `${fwdHeaderHtml}${quotedLinesHtml}`;
                       const introHtml = body ? formatBodyHtml(body, isHtml) + '<br><br>' : "";
-                      composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${forwardBlock}</body></html>`;
+                      const sigFragment = includeSignature ? buildSignatureFragment(msgComposeParams.identity, fwdUseHtml) : "";
+                      composeFields.body = `<html><head><meta charset="UTF-8"></head><body>${introHtml}${msgComposeParams.identity.sig_bottom ? forwardBlock + sigFragment : sigFragment + forwardBlock}</body></html>`;
                     } else {
                       const fwdHeader =
                         `-------- Forwarded Message --------\n` +
@@ -13556,7 +13565,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                         `Date: ${dateStr}\n` +
                         `From: ${fwdAuthor}\n` +
                         `To: ${fwdRecipients}\n\n`;
-                      composeFields.body = `${body ? body + '\n\n' : ''}${fwdHeader}${originalBody}`;
+                      const forwardBlock = `${fwdHeader}${originalBody}`;
+                      const introText = body ? body + '\n\n' : "";
+                      const sigFragment = includeSignature ? buildSignatureFragment(msgComposeParams.identity, fwdUseHtml) : "";
+                      composeFields.body = msgComposeParams.identity.sig_bottom
+                        ? `${introText}${forwardBlock}${sigFragment}`
+                        : `${introText}${sigFragment}${sigFragment ? '\n\n' : ''}${forwardBlock}`;
                     }
 
                     // Original attachments must be stored in the message and pass
@@ -15895,9 +15909,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "saveDraft":
                   return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.inReplyTo, args.references, args.replaceMessageId, args.replaceFolderPath, args.includeSignature, args.sendAt);
                 case "replyToMessage":
-                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.saveAsDraft);
+                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.saveAsDraft, args.includeSignature);
                 case "forwardMessage":
-                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
+                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.includeSignature);
                 case "getRecentMessages":
                   return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders, args.fullRecipients);
                 case "displayMessage":

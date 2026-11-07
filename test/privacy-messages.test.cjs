@@ -73,6 +73,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     filePathsToAttachDescs: attachments.convert,
     materializeAttachmentDescs: attachments.materialize,
     buildBodyWithSignature: body => body || "",
+    buildSignatureFragment: () => "",
     MailServices: { accounts: { accounts: [{ key: "account", identities: [{ key: "sender" }] }] } },
     descsToMsgAttachments: attachments.toNative,
     Cc: {
