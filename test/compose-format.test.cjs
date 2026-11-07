@@ -159,7 +159,7 @@ describe("direct compose format matrix (24 cases)", () => {
           } else {
             assert.ok(sent.body.startsWith(body));
           }
-          assert.equal(sent.body.includes("Sender signature"), tool === "sendMail", "direct replies/forwards do not gain signatures");
+          assert.equal(sent.body.includes("Sender signature"), true, "direct sends include the identity signature by default");
         });
       }
     }

@@ -80,6 +80,7 @@ function loadReply(options = {}) {
     findMessage() { calls.finds++; return access.original ? { msgHdr: { folder }, folder } : { error: "Original account access denied" }; },
     materializeAttachmentDescs: descs => descs,
     buildBodyWithSignature: body => body || "",
+    buildSignatureFragment: () => "",
     filePathsToAttachDescs(attachments) {
       if (attachmentError) throw new Error(attachmentError);
       return { descs: attachments || [] };

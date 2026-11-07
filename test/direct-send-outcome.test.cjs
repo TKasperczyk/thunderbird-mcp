@@ -130,6 +130,7 @@ function loadSend(options = {}) {
     filePathsToAttachDescs: () => ({ descs: [] }),
     materializeAttachmentDescs: descs => descs,
     buildBodyWithSignature: body => body || "",
+    buildSignatureFragment: () => "",
     setComposeIdentity(params) { params.identity = identity; },
     resolveComposeFormat: () => ({ useHtml: false, format: 0 }),
     PREF_ALLOW_ENCRYPTED_MESSAGES: "encrypted",

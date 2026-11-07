@@ -139,6 +139,7 @@ function loadEncryptionTools(options = {}) {
     materializeAttachmentDescs: attachments.materialize,
     descsToMsgAttachments: attachments.toNative,
     buildBodyWithSignature: body => body,
+    buildSignatureFragment: () => "",
     getDirectQuoteContent: () => ({ body: "Original text" }),
     getReplyAllCcRecipients: () => "",
     rawMessageHasForwardableParts: () => false,
