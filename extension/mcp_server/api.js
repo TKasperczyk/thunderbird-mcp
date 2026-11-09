@@ -5966,6 +5966,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 getComposeBase64Size(2 * bytes));
             }
 
+            function usesBase64Attachment(contentType) {
+              if (typeof contentType !== "string") return false;
+              const type = contentType.split(";")[0].trim().toLowerCase();
+              if (!type || type.startsWith("text/")) return false;
+              if (type === "application/json" || type === "application/xml"
+                || type === "application/xhtml+xml" || type === "application/javascript"
+                || type === "application/x-javascript") return false;
+              return true;
+            }
+
             function estimateComposeSize(plan) {
               const { identity, body, headers = [], attachments = [], useHtml = false } = plan;
               const inheritedRawBytes = Object.hasOwn(plan, "inheritedRawBytes") ? plan.inheritedRawBytes : 0;
@@ -6009,21 +6019,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               let bytes = COMPOSE_SIZE_FIXED_BYTES + 4 * getComposeTextSize(headerBytes);
               // Reserve an HTML part and its possible generated plain alternative.
               bytes += getComposeTextSize(textBytes(body) * (useHtml ? 3 : 1));
-              // The complete raw snapshot bounds inherited attachment bytes and
-              // headers before re-encoding. Gloda's allUserAttachments excludes
-              // attachments inside an attached message, so their bytes are not
-              // repeated. The final quote is measured in body above, including
-              // charset conversion, escaping and quote prefixes; applying those
-              // expansions to every raw attachment byte would double-count them.
+              // Fallback only when an original attachment size is unavailable:
+              // the raw snapshot bounds the inherited bytes. Normal forwards pass
+              // per-attachment sizes instead, so binary attachments are not
+              // conservatively tripled here.
               bytes += getComposeTextSize(validSize(inheritedRawBytes));
               for (const attachment of attachments) {
                 const size = validSize(attachment.size);
                 bytes += COMPOSE_SIZE_PART_BYTES;
                 bytes += 2 * getComposeTextSize(textBytes(attachment.name) + textBytes(attachment.contentType ?? "")
                   + textBytes(attachment.url ?? ""));
-                // Only a known binary type guarantees base64. Path/type inference
-                // and textual attachments need the QP worst case instead.
-                bytes += attachment.contentType === "application/octet-stream"
+                // Binary attachments use base64; text and textual application
+                // types need the QP worst case instead.
+                bytes += usesBase64Attachment(attachment.contentType)
                   ? getComposeBase64Size(size) : getComposeTextSize(size);
               }
               if (identity.attachVCard) {
@@ -13257,7 +13265,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    headers: [to || "", cc || "", bcc || "", messageId || "",
 	                      msgHdr.subject || "", msgHdr.mime2DecodedSubject || "", msgHdr.author || "",
 	                      msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || ""],
-	                    attachments: inspectedDescs, inheritedRawBytes: directOriginal.rawBytes,
+	                    attachments: inspectedDescs,
 	                  };
 	                  const size = assessComposeSize(sizePlan);
 	                  if (size.warning) return { error: size.warning };
@@ -13470,6 +13478,28 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (directOriginal && Date.now() >= directOriginal.deadline) return { error: DIRECT_SEND_ORIGINAL_ERROR };
                 const { descs: inspectedDescs } = filePathsToAttachDescs(attachments, { dryRun: true });
+                const originalDescs = [];
+                let unknownOriginalAttachmentSize = !directOriginal?.mime;
+                try {
+                  for (const att of directOriginal?.mime?.allUserAttachments || []) {
+                    if (!att) {
+                      unknownOriginalAttachmentSize = true;
+                      continue;
+                    }
+                    const size = typeof att.size === "number" && Number.isSafeInteger(att.size) && att.size >= 0
+                      ? att.size : null;
+                    if (size === null) unknownOriginalAttachmentSize = true;
+                    originalDescs.push({
+                      url: att.url,
+                      name: att.name,
+                      contentType: att.contentType,
+                      size: size ?? 0,
+                    });
+                  }
+                } catch {
+                  unknownOriginalAttachmentSize = true;
+                }
+                const inheritedRawBytesFallback = unknownOriginalAttachmentSize ? (directOriginal?.rawBytes ?? 0) : 0;
                 let preparedAccountKey;
                 let sizePlan;
                 if (skipReview) {
@@ -13477,11 +13507,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   const { useHtml } = resolveComposeFormat(selectedIdentity.identity, isHtml, compType);
                   sizePlan = {
                     identity: selectedIdentity.identity, useHtml,
-                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, false),
+                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, false)
+                      + (directOriginal?.quoted?.body ? `\n\n${directOriginal.quoted.body}` : ""),
                     headers: [to || "", cc || "", bcc || "", messageId || "",
                       msgHdr.subject || "", msgHdr.mime2DecodedSubject || "", msgHdr.author || "",
                       msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || ""],
-                    attachments: inspectedDescs, inheritedRawBytes: directOriginal.rawBytes,
+                    attachments: [...inspectedDescs, ...originalDescs],
+                    ...(inheritedRawBytesFallback ? { inheritedRawBytes: inheritedRawBytesFallback } : {}),
                   };
                   const size = assessComposeSize(sizePlan);
                   if (size.warning) return { error: size.warning };
@@ -13575,27 +13607,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                       }
                     }
 
-                    const origDescs = [];
-                    if (aMimeMsg && aMimeMsg.allUserAttachments) {
-                      for (const att of aMimeMsg.allUserAttachments) {
-                        try {
-                          origDescs.push({ url: att.url, name: att.name, contentType: att.contentType });
-                        } catch {
-                          // Skip unreadable original attachments
-                        }
-                      }
-                    }
-
-                    // Original payload bytes are already covered by the raw
-                    // snapshot. Count each emitted part's new metadata/boundary
-                    // separately, including provider URLs used as Content-Location.
+                    // Original attachment sizes and the inherited raw fallback
+                    // are already in the plan. Measure the final body and metadata.
                     const size = assessComposeSize({ ...sizePlan, body: composeFields.body,
-                      attachments: [...fileDescs, ...origDescs.map(desc => ({ ...desc, size: 0 }))] });
+                      attachments: [...fileDescs, ...originalDescs] });
                     if (size.warning) {
                       resolve({ error: size.warning });
                       return;
                     }
-                    const allDescs = [...origDescs, ...materializeAttachmentDescs(fileDescs)];
+                    const allDescs = [...originalDescs, ...materializeAttachmentDescs(fileDescs)];
                     // On success Thunderbird marks the original forwarded.
                     sendThroughCompose(msgComposeParams, allDescs, fwdUseHtml, preparedAccountKey).then(result => {
                       if (result.success) {
