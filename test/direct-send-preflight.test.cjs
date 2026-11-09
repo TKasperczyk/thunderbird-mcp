@@ -848,27 +848,25 @@ if (require.main === module) describe("direct-send preflight deadline and late c
 
 module.exports = { loadPreflight, assertPreflightRefused };
 
-if (require.main === module) describe("reply/forward size assessment uses the complete raw snapshot", () => {
+if (require.main === module) describe("reply/forward size assessment counts inherited content correctly", () => {
   for (const tool of tools) {
-    for (const uncached of [false, true]) {
-      it(`${tool}: ${uncached ? "downloaded" : "local"} raw bytes dominate a short MIME quote before caller attachments are materialized`, async () => {
-        const raw = RAW_HEADER + "x".repeat(200000);
-        const h = loadPreflight({ raw, uncached, prefs: { [SIZE_WARNING_PREF]: SMALL_SIZE_WARNING_BYTES } });
-        const plans = [];
-        const assess = h.api.assessComposeSize;
-        h.api.assessComposeSize = plan => { plans.push(plan); return assess(plan); };
-        const result = await h.run(tool);
-        assert.match(result.error, /encoded size estimate.*exceeds/);
-        assert.equal(plans[0].inheritedRawBytes, raw.length);
-        assert.ok(plans[0].body.length < 100);
-        assert.equal(h.calls.rawOpens + h.calls.rawFetches.length, 1);
-        assert.equal(h.calls.mime.length, 1);
-        assert.equal(h.calls.sends, 0);
-        assert.deepEqual(h.calls.created, { params: 0, fields: 0, compose: 0, sender: 0 });
-        assert.equal(h.attachments.calls.tempCreates.length + h.attachments.calls.writes.length + h.attachments.calls.nativeCreates + h.attachments.calls.removals.length, 0);
-      });
-    }
-    it(`${tool}: both pre-materialization and final-body checks use the same estimator with the original-byte floor`, async () => {
+    it(`${tool}: a large original raw body does not dominate a short MIME quote`, async () => {
+      const raw = RAW_HEADER + "x".repeat(200000);
+      const h = loadPreflight({ raw, prefs: { [SIZE_WARNING_PREF]: SMALL_SIZE_WARNING_BYTES } });
+      const plans = [];
+      const assess = h.api.assessComposeSize;
+      h.api.assessComposeSize = plan => { plans.push(plan); return assess(plan); };
+      const result = await h.run(tool);
+      assert.equal(result.success, true, result.error);
+      assert.equal(plans.length, 2);
+      assert.equal(plans[0].inheritedRawBytes, undefined);
+      assert.equal(plans[1].inheritedRawBytes, undefined);
+      assert.ok(plans[0].body.length < 100);
+      assert.equal(h.calls.rawOpens + h.calls.rawFetches.length, 1);
+      assert.equal(h.calls.mime.length, 1);
+      assert.equal(h.calls.sends, 1);
+    });
+    it(`${tool}: both checks use the same estimator without an original-byte floor`, async () => {
       const h = loadPreflight({ prefs: { [SIZE_WARNING_PREF]: DEFAULT_SIZE_WARNING_BYTES } });
       const plans = [];
       const assess = h.api.assessComposeSize;
@@ -876,8 +874,8 @@ if (require.main === module) describe("reply/forward size assessment uses the co
       const result = await h.run(tool);
       assert.equal(result.success, true, result.error);
       assert.equal(plans.length, 2);
-      assert.equal(plans[0].inheritedRawBytes, RAW_HEADER.length + "Original text".length);
-      assert.equal(plans[1].inheritedRawBytes, plans[0].inheritedRawBytes);
+      assert.equal(plans[0].inheritedRawBytes, undefined);
+      assert.equal(plans[1].inheritedRawBytes, undefined);
       assert.ok(plans[1].body.length > plans[0].body.length);
       assert.equal(h.calls.sends, 1);
     });
@@ -931,33 +929,80 @@ if (require.main === module) describe("final reply/forward size boundaries befor
     { contentType: "text/plain", body: "intro" }, { contentType: originalAttachment.contentType },
   ], allUserAttachments: [originalAttachment] };
 
-  it("includes original forward attachments in the raw snapshot even when the MIME body is tiny", async () => {
+  it("counts original forward attachments by decoded size, not the raw snapshot", async () => {
     const h = loadPreflight({ raw: rawWithAttachment, mime: originalMime,
-      prefs: { [SIZE_WARNING_PREF]: SMALL_SIZE_WARNING_BYTES } });
+      prefs: { [SIZE_WARNING_PREF]: 100000 } });
+    const plans = [];
+    const assess = h.api.assessComposeSize;
+    h.api.assessComposeSize = plan => { plans.push(plan); return assess(plan); };
     const result = await h.run('forwardMessage');
     assert.match(result.error, /encoded size estimate.*exceeds/);
+    assert.equal(plans[0].attachments.some(att => att.name === originalAttachment.name
+      && att.size === originalAttachment.size), true);
+    assert.equal(plans[0].inheritedRawBytes, undefined);
     assert.equal(h.calls.bytesRead, rawWithAttachment.length);
     assert.equal(h.calls.sends + h.calls.created.compose, 0);
     assert.equal(h.attachments.calls.writes.length + h.attachments.calls.nativeCreates, 0);
   });
 
-  for (const tool of tools) {
-    it(`${tool}: an ordinary original with a 150 KB attachment fits the default threshold`, async () => {
-      const h = loadPreflight({ raw: rawWithAttachment, mime: originalMime,
-        prefs: { [SIZE_WARNING_PREF]: DEFAULT_SIZE_WARNING_BYTES } });
-      const estimates = [];
-      const assess = h.api.assessComposeSize;
-      h.api.assessComposeSize = plan => {
-        const result = assess(plan);
-        estimates.push(result.estimatedEncodedBytes);
-        return result;
-      };
-      assert.equal((await h.run(tool)).success, true);
-      assert.equal(h.calls.sends, 1);
-      assert.equal(estimates.length, 2);
-      assert.ok(estimates.every(bytes => bytes > rawWithAttachment.length && bytes < 2 * 1024 * 1024));
-    });
-  }
+  it("a reply does not count the original attachment bytes", async () => {
+    const h = loadPreflight({ raw: rawWithAttachment, mime: originalMime,
+      prefs: { [SIZE_WARNING_PREF]: 150000 } });
+    const plans = [];
+    const assess = h.api.assessComposeSize;
+    h.api.assessComposeSize = plan => { plans.push(plan); return assess(plan); };
+    const result = await h.run('replyToMessage');
+    assert.equal(result.success, true, result.error);
+    assert.equal(plans[0].inheritedRawBytes, undefined);
+    assert.equal(h.calls.sends, 1);
+  });
+
+  it("a forward with an ordinary 150 KB attachment fits the default threshold", async () => {
+    const h = loadPreflight({ raw: rawWithAttachment, mime: originalMime,
+      prefs: { [SIZE_WARNING_PREF]: DEFAULT_SIZE_WARNING_BYTES } });
+    const estimates = [];
+    const assess = h.api.assessComposeSize;
+    h.api.assessComposeSize = plan => {
+      const result = assess(plan);
+      estimates.push(result.estimatedEncodedBytes);
+      return result;
+    };
+    assert.equal((await h.run('forwardMessage')).success, true);
+    assert.equal(h.calls.sends, 1);
+    assert.equal(estimates.length, 2);
+    assert.ok(estimates.every(bytes => bytes > originalAttachment.size && bytes < 2 * 1024 * 1024));
+  });
+
+  const videoAttachment = { name: "video.mp4", contentType: "video/mp4",
+    url: "imap://fixture/original?part=1.3", size: 10 * 1024 * 1024 };
+  const videoMime = { contentType: "multipart/mixed", parts: [
+    { contentType: "text/plain", body: "intro" }, { contentType: videoAttachment.contentType },
+  ], allUserAttachments: [videoAttachment] };
+
+  it("a 10 MiB video forward fits the 20 MiB threshold", async () => {
+    const h = loadPreflight({ raw: RAW_HEADER + "intro", mime: videoMime,
+      prefs: { [SIZE_WARNING_PREF]: DEFAULT_SIZE_WARNING_BYTES } });
+    const result = await h.run('forwardMessage');
+    assert.equal(result.success, true, result.error);
+    assert.equal(h.calls.sends, 1);
+  });
+
+  it("a 10 MiB video is still blocked by a lower threshold", async () => {
+    const h = loadPreflight({ raw: RAW_HEADER + "intro", mime: videoMime,
+      prefs: { [SIZE_WARNING_PREF]: 15 * 1024 * 1024 } });
+    const result = await h.run('forwardMessage');
+    assert.match(result.error, /encoded size estimate.*exceeds/);
+    assert.equal(h.calls.sends, 0);
+    assert.equal(h.calls.created.compose, 0);
+  });
+
+  it("a reply to a 10 MiB video original is not blocked", async () => {
+    const h = loadPreflight({ raw: RAW_HEADER + "intro", mime: videoMime,
+      prefs: { [SIZE_WARNING_PREF]: 1024 * 1024 } });
+    const result = await h.run('replyToMessage');
+    assert.equal(result.success, true, result.error);
+    assert.equal(h.calls.sends, 1);
+  });
 
   it("bounds new headers from inherited attachments before materializing caller attachments", async () => {
     for (const metadata of [
@@ -969,7 +1014,7 @@ if (require.main === module) describe("final reply/forward size boundaries befor
         prefs: { [SIZE_WARNING_PREF]: 1000000 } });
       const result = await h.run("forwardMessage");
       assert.match(result.error, /encoded size estimate.*exceeds/);
-      assert.equal(h.calls.created.fields, 1, "the assembled-quote check includes inherited part metadata");
+      assert.ok(h.calls.created.fields <= 1, "metadata is counted before or at the assembled-quote check");
       assert.equal(h.calls.created.compose + h.calls.sends, 0);
       assert.equal(h.attachments.calls.writes.length + h.attachments.calls.nativeCreates, 0);
     }
