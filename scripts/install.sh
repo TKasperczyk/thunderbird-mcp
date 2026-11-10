@@ -9,6 +9,32 @@ DIST_DIR="$PROJECT_DIR/dist"
 XPI_FILE="$DIST_DIR/thunderbird-mcp.xpi"
 DEFAULT_PROFILE_FILE="$SCRIPT_DIR/default-profile"
 
+DRY_RUN=0
+PRINT_PROFILE=0
+for arg in "$@"; do
+    case "$arg" in
+    --dry-run|-n)
+        DRY_RUN=1
+        ;;
+    --print-profile)
+        PRINT_PROFILE=1
+        DRY_RUN=1
+        ;;
+    esac
+done
+
+canonical_path() {
+    local target="$1"
+
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$target" 2>/dev/null || echo "$target"
+    elif command -v readlink >/dev/null 2>&1; then
+        readlink -f "$target" 2>/dev/null || echo "$target"
+    else
+        (cd "$target" 2>/dev/null && pwd -P) || echo "$target"
+    fi
+}
+
 format_mtime() {
     local profile_dir="$1"
 
@@ -25,6 +51,48 @@ profile_size() {
     du -sh "$profile_dir" 2>/dev/null | awk '{print $1}'
 }
 
+linux_profile_dirs() {
+    # Traditional .thunderbird
+    printf '%s\n' "$HOME/.thunderbird"
+
+    # Modern Snap with current symlink (.config/thunderbird and .thunderbird)
+    printf '%s\n' \
+        "$HOME/snap/thunderbird/current/.config/thunderbird" \
+        "$HOME/snap/thunderbird/current/.thunderbird"
+
+    # Snap common directory
+    printf '%s\n' \
+        "$HOME/snap/thunderbird/common/.config/thunderbird" \
+        "$HOME/snap/thunderbird/common/.thunderbird"
+
+    # Versioned numeric Snap directories (newest revision first)
+    if [[ -d "$HOME/snap/thunderbird" ]]; then
+        local rev_dirs=()
+        local d
+        for d in "$HOME/snap/thunderbird/"[0-9]*; do
+            if [[ -d "$d" ]]; then
+                rev_dirs+=("$d")
+            fi
+        done
+        if [[ "${#rev_dirs[@]}" -gt 0 ]]; then
+            while IFS= read -r d; do
+                if [[ -n "$d" ]]; then
+                    printf '%s\n' "$d/.config/thunderbird" "$d/.thunderbird"
+                fi
+            done < <(printf '%s\n' "${rev_dirs[@]}" | sort -V -r)
+        fi
+    fi
+
+    # Flatpak directories (.thunderbird and .config/thunderbird)
+    printf '%s\n' \
+        "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird" \
+        "$HOME/.var/app/org.mozilla.Thunderbird/.config/thunderbird" \
+        "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird" \
+        "$HOME/.var/app/org.mozilla.thunderbird/.config/thunderbird" \
+        "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird" \
+        "$HOME/.var/app/eu.betterbird.Betterbird/.config/thunderbird"
+}
+
 platform_profile_roots() {
     case "$(uname -s)" in
     Darwin)
@@ -33,12 +101,7 @@ platform_profile_roots() {
             "$HOME/Library/Application Support/Thunderbird/Profiles"
         ;;
     Linux)
-        printf '%s\n' \
-            "$HOME/.thunderbird" \
-            "$HOME/snap/thunderbird/common/.thunderbird" \
-            "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird" \
-            "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird" \
-            "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
+        linux_profile_dirs
         ;;
     *)
         echo "Error: Unsupported platform: $(uname -s)" >&2
@@ -55,12 +118,7 @@ platform_profile_config_dirs() {
             "$HOME/Library/Application Support/Thunderbird"
         ;;
     Linux)
-        printf '%s\n' \
-            "$HOME/.thunderbird" \
-            "$HOME/snap/thunderbird/common/.thunderbird" \
-            "$HOME/.var/app/org.mozilla.Thunderbird/.thunderbird" \
-            "$HOME/.var/app/org.mozilla.thunderbird/.thunderbird" \
-            "$HOME/.var/app/eu.betterbird.Betterbird/.thunderbird"
+        linux_profile_dirs
         ;;
     *)
         echo "Error: Unsupported platform: $(uname -s)" >&2
@@ -173,12 +231,29 @@ find_profile_dirs() {
     local root
     local profile
     local ini_profiles=()
+    local seen_canons=()
+    local canon
+
+    is_already_seen() {
+        local check="$1"
+        local s
+        for s in "${seen_canons[@]}"; do
+            if [[ "$s" == "$check" ]]; then
+                return 0
+            fi
+        done
+        return 1
+    }
 
     while IFS= read -r profile; do
         if [[ -z "$profile" ]]; then
             continue
         fi
-        ini_profiles+=("$profile")
+        canon="$(canonical_path "$profile")"
+        if ! is_already_seen "$canon"; then
+            seen_canons+=("$canon")
+            ini_profiles+=("$profile")
+        fi
     done < <(find_profiles_from_ini)
 
     if [[ "${#ini_profiles[@]}" -gt 0 ]]; then
@@ -196,24 +271,32 @@ find_profile_dirs() {
         fi
 
         while IFS= read -r profile; do
-            emit_profile_if_valid "$profile"
+            canon="$(canonical_path "$profile")"
+            if ! is_already_seen "$canon"; then
+                seen_canons+=("$canon")
+                emit_profile_if_valid "$profile"
+            fi
         done < <(
             find "$root" \
                 -maxdepth 1 \
                 -type d \
-                \( -name "*.default-release" -o -name "*.default" \) |
+                \( -name "*.default-release" -o -name "*.default" \) 2>/dev/null |
                 sort
         )
 
         while IFS= read -r profile; do
-            emit_profile_if_valid "$profile"
+            canon="$(canonical_path "$profile")"
+            if ! is_already_seen "$canon"; then
+                seen_canons+=("$canon")
+                emit_profile_if_valid "$profile"
+            fi
         done < <(
             find "$root" \
                 -maxdepth 1 \
                 -type d \
                 ! -path "$root" \
                 ! -name "*.default-release" \
-                ! -name "*.default" |
+                ! -name "*.default" 2>/dev/null |
                 sort
         )
     done
@@ -262,7 +345,9 @@ select_profile() {
     fi
 
     if [[ "${#profiles[@]}" -eq 1 ]]; then
-        save_default_profile "${profiles[0]}"
+        if [[ "$DRY_RUN" -eq 0 ]]; then
+            save_default_profile "${profiles[0]}"
+        fi
         echo "${profiles[0]}"
         return
     fi
@@ -319,13 +404,24 @@ find_profile() {
     select_profile "${profiles[@]}"
 }
 
+PROFILE_DIR=$(find_profile)
+
+if [[ "$PRINT_PROFILE" -eq 1 ]]; then
+    echo "$PROFILE_DIR"
+    exit 0
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "Dry run: would install to profile: $PROFILE_DIR"
+    exit 0
+fi
+
 # Build if needed
 if [[ ! -f "$XPI_FILE" ]]; then
     echo "Building extension first..."
     "$SCRIPT_DIR/build.sh"
 fi
 
-PROFILE_DIR=$(find_profile)
 EXTENSIONS_DIR="$PROFILE_DIR/extensions"
 
 echo "Installing to profile: $PROFILE_DIR"
