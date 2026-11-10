@@ -30,6 +30,9 @@ function loadServerLifecycle(overrides = {}) {
   // Reuse the access harness's preference services and production helpers, but
   // leave initialization to the real getAPI-scope code below, before start().
   const access = overrides.accessRuntime || loadPrivacyRuntime({ initialize: false });
+  // Seed the stable token like a configured profile without recording a write;
+  // production getStableAuthTokenPref semantics apply on top of the map.
+  access.values.set("extensions.thunderbird-mcp.stableAuthToken", "a".repeat(64));
 
   const state = {
     attempts: 0,
@@ -52,6 +55,13 @@ function loadServerLifecycle(overrides = {}) {
       this.stops = 0;
       this.handlers = new Map();
       this.bindModes = [];
+      this.identityAdds = [];
+      this.identity = {
+        add: (scheme, host, port) => {
+          if (state.identityAddError) throw state.identityAddError;
+          this.identityAdds.push({ scheme, host, port });
+        },
+      };
       state.servers.push(this);
     }
     registerPathHandler(path, handler) {
@@ -310,12 +320,14 @@ function loadServerLifecycle(overrides = {}) {
         },
       },
     },
-    getStableAuthTokenPref: () => "a".repeat(64),
+    getStableAuthTokenPref: () => access.Services.prefs.getStringPref(sandbox.PREF_STABLE_AUTH_TOKEN, ""),
     generateAuthToken() {
       if (state.nonceError) throw state.nonceError;
       return (++state.nonce).toString(16).padStart(64, "0");
     },
     isListenAllEnabled: () => !!state.listenAll,
+    AUTH_TOKEN_PATTERN: /^[0-9a-f]{64}$/,
+    PREF_STABLE_AUTH_TOKEN: "extensions.thunderbird-mcp.stableAuthToken",
     PREF_LISTEN_ALL: "extensions.thunderbird-mcp.listenAll",
     readConnectionInfo: () => ({ path: connectionPath, data: state.connection }),
     removeConnectionInfo() {
@@ -381,6 +393,7 @@ function loadServerLifecycle(overrides = {}) {
       return {
         ${markedSnippet("SERVER LIFECYCLE")}
         ${markedSnippet("OPTIONS ACCESS API")}
+        ${markedSnippet("STABLE TOKEN OPTIONS")}
         ${markedSnippet("LISTEN ALL SETTER")}
       };
     };
@@ -1010,6 +1023,94 @@ describe("post-bind listener ownership", () => {
     assert.equal(state.servers[0].listening, false);
     assert.equal(state.connectionWrites.length, 1, "shutdown must not republish connection info");
     assert.equal(state.connection, null);
+  });
+});
+
+describe("host.docker.internal Host alias registration", () => {
+  it("registers the alias on the bound port in loopback mode", async () => {
+    const { api, state } = loadServerLifecycle();
+    assert.equal((await api.start()).port, 8765);
+    assert.deepEqual(state.servers[0].identityAdds, [
+      { scheme: "http", host: "host.docker.internal", port: 8765 },
+    ]);
+  });
+
+  it("registers the alias only for the final port after rebinding", async () => {
+    const { api, state } = loadServerLifecycle({
+      probeResult: port => port === 8765 ? "foreign" : "ours",
+    });
+    assert.equal((await api.start()).port, 8766);
+    assert.deepEqual(state.servers[0].binds, [8765, 8766]);
+    assert.deepEqual(state.servers[0].identityAdds, [
+      { scheme: "http", host: "host.docker.internal", port: 8766 },
+    ]);
+  });
+
+  it("does not register the alias in listenAll mode", async () => {
+    const { api, state } = loadServerLifecycle({ listenAll: true });
+    assert.equal((await api.start()).port, 8765);
+    assert.deepEqual(state.servers[0].identityAdds, []);
+  });
+
+  it("keeps startup successful when the identity API rejects the alias", async () => {
+    const { api, state } = loadServerLifecycle({ identityAddError: new Error("identity unavailable") });
+    assert.equal((await api.start()).success, true);
+    assert.deepEqual(state.servers[0].identityAdds, []);
+    assert.equal(state.connection.port, 8765);
+    assert.ok(state.logs.some(args => String(args[0]).includes("host.docker.internal")));
+  });
+});
+
+describe("stable auth token option", () => {
+  it("rebinds the running listener so a new token takes effect immediately", async () => {
+    const { api, state } = loadServerLifecycle();
+    assert.equal((await api.start()).success, true);
+    const result = await api.setStableAuthToken("b".repeat(64));
+    assert.equal(result.success, true);
+    assert.equal(result.stableAuthToken, "b".repeat(64));
+    assert.deepEqual(state.connectionWrites.map(info => info.token), ["a".repeat(64), "b".repeat(64)]);
+    assert.equal(state.servers[0].stops, 1);
+    assert.equal(state.servers.length, 2);
+    assert.equal(state.servers[1].listening, true);
+    assert.deepEqual(state.servers[1].binds, [8765]);
+    assert.equal((await api.getStableAuthToken()).stableAuthToken, "b".repeat(64));
+  });
+
+  it("keeps the listener when the saved token is already effective", async () => {
+    const { api, state } = loadServerLifecycle();
+    assert.equal((await api.start()).success, true);
+    const result = await api.setStableAuthToken("a".repeat(64));
+    assert.equal(result.success, true);
+    assert.equal(result.stableAuthToken, "a".repeat(64));
+    assert.equal(state.connectionWrites.length, 1);
+    assert.equal(state.servers[0].stops, 0);
+    assert.equal(state.servers.length, 1);
+  });
+
+  it("rejects malformed tokens before touching the pref or the listener", async () => {
+    const { api, state } = loadServerLifecycle();
+    assert.equal((await api.start()).success, true);
+    const result = await api.setStableAuthToken("Not-A-Token");
+    assert.match(result.error, /64 lowercase hex/);
+    assert.equal(state.connectionWrites.length, 1);
+    assert.equal(state.servers[0].stops, 0);
+    assert.equal((await api.getStableAuthToken()).stableAuthToken, "a".repeat(64));
+  });
+
+  it("falls back to a session token on the listener restarted after clearing the stable token", async () => {
+    const { api, state } = loadServerLifecycle();
+    await api.start();
+    await api.setStableAuthToken("b".repeat(64));
+    const cleared = await api.setStableAuthToken("");
+    assert.equal(cleared.success, true);
+    assert.equal(cleared.stableAuthToken, "");
+    const tokens = state.connectionWrites.map(info => info.token);
+    assert.equal(tokens.length, 3);
+    assert.equal(tokens[0], "a".repeat(64));
+    assert.equal(tokens[1], "b".repeat(64));
+    assert.match(tokens[2], /^[0-9a-f]{64}$/);
+    assert.notEqual(tokens[2], "a".repeat(64));
+    assert.notEqual(tokens[2], "b".repeat(64));
   });
 });
 
