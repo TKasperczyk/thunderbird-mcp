@@ -16191,6 +16191,21 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               throw new Error(`Could not bind to any port in range ${MCP_DEFAULT_PORT}-${lastPort}: ${lastBindError}`, { cause: lastBindError });
             }
 
+            // Containers reach this loopback-only bind through the
+            // host.docker.internal gateway and echo that name in the Host
+            // header. Registering the fixed name in the identity lets those
+            // requests through while the socket stays bound to loopback; the
+            // bearer token remains the security boundary. A rebinding
+            // attacker cannot control DNS for this name, and browsers never
+            // let scripts set Host directly.
+            if (!listenAll) {
+              try {
+                server.identity.add("http", "host.docker.internal", boundPort);
+              } catch (e) {
+                console.warn("thunderbird-mcp: could not accept host.docker.internal Host headers:", e);
+              }
+            }
+
             // Write the connection file fresh on initial start so the secure
             // create path (0600 perms, directory checks) always runs. The
             // refresh timer self-heals it afterward via ensureConnectionInfo
@@ -16583,6 +16598,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
         // END PRIVACY OPTIONS API
 
+        // BEGIN STABLE TOKEN OPTIONS
         getStableAuthToken: async function() {
           return { stableAuthToken: getStableAuthTokenPref() };
         },
@@ -16595,13 +16611,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
           if (stableAuthToken && !AUTH_TOKEN_PATTERN.test(stableAuthToken)) {
             return { error: "stableAuthToken must be empty or 64 lowercase hex characters" };
           }
-          if (stableAuthToken) {
-            Services.prefs.setStringPref(PREF_STABLE_AUTH_TOKEN, stableAuthToken);
-          } else {
-            try { Services.prefs.clearUserPref(PREF_STABLE_AUTH_TOKEN); } catch { /* ignore */ }
+          // The running listener captured its token at startup, so a change
+          // must rebind it for the new value to apply without a Thunderbird
+          // restart.
+          if (stableAuthToken === getStableAuthTokenPref()) {
+            return { success: true, stableAuthToken };
           }
+          const restarted = await this.restartListener(() => {
+            if (stableAuthToken) {
+              Services.prefs.setStringPref(PREF_STABLE_AUTH_TOKEN, stableAuthToken);
+            } else {
+              try { Services.prefs.clearUserPref(PREF_STABLE_AUTH_TOKEN); } catch { /* ignore */ }
+            }
+          }, `[MCP] setStableAuthToken called with: ${stableAuthToken ? "stable token" : "session token"}`);
+          if (!restarted.success) return restarted;
           return { success: true, stableAuthToken };
         },
+        // END STABLE TOKEN OPTIONS
 
         generateAuthToken: async function() {
           return { authToken: generateAuthToken() };
@@ -16616,17 +16642,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         },
 
         // BEGIN LISTEN ALL SETTER
-        setListenAll: async function(listenAll) {
-          if (typeof listenAll !== "boolean") {
-            return { error: "listenAll must be a boolean" };
-          }
-          // Serialize settings changes through the entire restart, including
-          // failure cleanup, so another setter cannot bypass a pending stop.
+        // Serialize settings changes through the entire restart, including
+        // failure cleanup, so another setter cannot bypass a pending stop.
+        // applyPref runs after older startup attempts settle and before the
+        // current listener stops, so the restarted listener reads the new pref.
+        restartListener: async function(applyPref, logMessage) {
           const previousRestart = globalThis.__tbMcpRestartPromise;
           const restartPromise = (async () => {
             try { await previousRestart; } catch { /* previous restart failed */ }
             if (serverLifecycle.shutdown) return { success: false, error: SERVER_START_CANCELLED };
-            console.log(`[MCP] setListenAll called with: ${listenAll}`);
+            console.log(logMessage);
             // A failed start may still be stopping its listener. Follow any
             // newer attempt another caller installs while we are waiting.
             let startPromise;
@@ -16638,11 +16663,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (serverLifecycle.shutdown) return { success: false, error: SERVER_START_CANCELLED };
             } while (globalThis.__tbMcpStartPromise &&
                      globalThis.__tbMcpStartPromise !== startPromise);
-            if (listenAll) {
-              Services.prefs.setBoolPref(PREF_LISTEN_ALL, true);
-            } else {
-              try { Services.prefs.clearUserPref(PREF_LISTEN_ALL); } catch { /* ignore */ }
-            }
+            applyPref();
 
             // Remove stale info before yielding so this stop cannot remove a
             // newer attempt's connection file.
@@ -16675,6 +16696,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               globalThis.__tbMcpRestartPromise = null;
             }
           }
+        },
+
+        setListenAll: async function(listenAll) {
+          if (typeof listenAll !== "boolean") {
+            return { error: "listenAll must be a boolean" };
+          }
+          return await this.restartListener(() => {
+            if (listenAll) {
+              Services.prefs.setBoolPref(PREF_LISTEN_ALL, true);
+            } else {
+              try { Services.prefs.clearUserPref(PREF_LISTEN_ALL); } catch { /* ignore */ }
+            }
+          }, `[MCP] setListenAll called with: ${listenAll}`);
         },
         // END LISTEN ALL SETTER
       }
