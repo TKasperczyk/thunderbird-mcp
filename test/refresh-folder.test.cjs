@@ -17,7 +17,7 @@ const FOLDER_URI = "imap://account/Inbox";
 const FRESH_UPDATE = { requireFreshUpdate: true };
 
 // Keep the original count fixture on the shared IMAP event-order model.
-function loadRefresh({ type = "imap", offline = false, denied = false, delay = UPDATE_MS, exitCode = 0 } = {}) {
+function loadRefresh({ type = "imap", offline = false, denied = false, delay = UPDATE_MS, exitCode = 0, mfn } = {}) {
   let harness;
   const folder = {
     URI: FOLDER_URI, server: { type }, flags: 0, isServer: false,
@@ -39,7 +39,7 @@ function loadRefresh({ type = "imap", offline = false, denied = false, delay = U
     globals: {
       Services: { io: { offline } },
       Ci: { nsMsgFolderFlags: FLAGS, nsIFolderListener: { event: 0x80 }, nsIMsgImapMailFolder: "imap", nsIMsgMailNewsUrl: "mail-url" },
-      MailServices: { mailSession },
+      MailServices: { mailSession, ...(mfn ? { mfn } : {}) },
       getAccessibleFolder: uri => denied ? { error: "Account not accessible" }
         : uri === folder.URI ? { folder } : { error: "Folder not found" },
     },
@@ -275,14 +275,145 @@ describe("refreshFolder lifecycle and access", () => {
     }
   });
 
-  it("skips unsupported individual local, POP, RSS and news folders", async () => {
-    for (const type of ["none", "pop3", "rss", "nntp"]) {
+  it("skips individual news folders", async () => {
+    const h = loadRefresh({ type: "nntp" });
+    const result = await h.refresh();
+    assert.equal(result.success, true);
+    assert.match(result.skipped, /not supported/);
+    assert.equal(h.folder.updateCalls, 0);
+  });
+
+  it("refuses rebuildIndex on server folders without starting an update", async () => {
+    for (const type of ["imap", "owl", "ews"]) {
       const h = loadRefresh({ type });
-      const result = await h.refresh();
-      assert.equal(result.success, true);
-      assert.match(result.skipped, /not supported/);
-      assert.equal(h.folder.updateCalls, 0);
+      const result = await h.runtime.refreshFolder(h.folder.URI, WAIT_MS, true);
+      assert.match(result.error, /rebuildIndex applies only to Local Folders, POP and RSS folders/);
+      assert.equal(h.folder.updateCalls + h.folder.imapUpdateCalls, 0);
+      assert.equal(h.listeners.size, 0);
     }
+  });
+});
+
+// A local store's folder with the calls Repair Folder makes, recorded in order.
+function loadLocal(options = {}) {
+  const calls = [];
+  const mfn = { notifyFolderReindexTriggered(folder) { calls.push(["reindex", folder.URI]); } };
+  const h = loadRefresh({ type: "none", ...options, mfn });
+  let valid = true;
+  const update = h.folder.updateFolder.bind(h.folder);
+  Object.assign(h.folder, {
+    msgDatabase: {
+      get summaryValid() { return valid; },
+      set summaryValid(value) { calls.push(["summaryValid", value]); valid = value; },
+    },
+    closeAndBackupFolderDB(name) { calls.push(["closeAndBackup", name]); },
+    ForceDBClosed() { calls.push(["forceClosed"]); },
+    msgStore: { ensureLocalStore(folder) { calls.push(["ensureLocalStore", folder.URI]); } },
+    updateFolder(window) {
+      calls.push(["updateFolder", window]);
+      return update(window);
+    },
+  });
+  return { ...h, calls, rebuild: timeout => h.runtime.refreshFolder(h.folder.URI, timeout ?? WAIT_MS, true) };
+}
+
+describe("refreshFolder local stores", () => {
+  for (const type of ["none", "pop3", "rss"]) {
+    it(`re-reads the summary of a ${type} folder without rebuilding it`, async () => {
+      const h = loadLocal({ type });
+      const pending = h.refresh();
+      await h.clock.advance(UPDATE_MS);
+      const result = await pending;
+      assert.equal(result.success, true);
+      assert.equal(result.status, "loaded");
+      assert.equal(result.localStore, true);
+      assert.equal(result.indexRebuilt, false);
+      assert.equal(result.updateConfirmed, undefined);
+      assert.equal(result.elapsedMs, UPDATE_MS);
+      assert.equal(result.totalBefore, 10);
+      assert.equal(result.netMessageDelta, 0);
+      assert.deepEqual(h.calls, [["updateFolder", null]]);
+      assert.equal(h.listeners.size, 0);
+      assert.equal(h.clock.activeTimers.length, 0);
+    });
+  }
+
+  it("rebuilds the index with the steps of Thunderbird's Repair Folder, in order", async () => {
+    const h = loadLocal();
+    const pending = h.rebuild();
+    await h.clock.advance(UPDATE_MS);
+    const result = await pending;
+    assert.equal(result.success, true);
+    assert.equal(result.status, "loaded");
+    assert.equal(result.indexRebuilt, true);
+    assert.deepEqual(h.calls, [
+      ["reindex", FOLDER_URI], ["summaryValid", false], ["closeAndBackup", ""],
+      ["ensureLocalStore", FOLDER_URI], ["updateFolder", null],
+    ]);
+    assert.equal(h.listeners.size, 0);
+  });
+
+  it("closes the database by force when closing it with a backup fails", async () => {
+    const h = loadLocal();
+    h.folder.closeAndBackupFolderDB = () => { h.calls.push(["closeAndBackup"]); throw new Error("NS_ERROR_FAILURE"); };
+    const pending = h.rebuild();
+    await h.clock.advance(UPDATE_MS);
+    assert.equal((await pending).status, "loaded");
+    assert.deepEqual(h.calls.slice(2), [["closeAndBackup"], ["forceClosed"], ["ensureLocalStore", FOLDER_URI], ["updateFolder", null]]);
+  });
+
+  it("works on local folders while Thunderbird is offline", async () => {
+    const h = loadLocal({ offline: true });
+    const pending = h.rebuild();
+    await h.clock.advance(UPDATE_MS);
+    const result = await pending;
+    assert.equal(result.status, "loaded");
+    assert.equal(result.indexRebuilt, true);
+  });
+
+  it("refuses a busy folder without touching its index", async () => {
+    const h = loadLocal();
+    h.folder.locked = true;
+    const result = await h.rebuild();
+    assert.equal(result.success, false);
+    assert.match(result.error, /busy/);
+    assert.deepEqual(h.calls, []);
+    assert.equal(h.folder.countReads, 0);
+    assert.equal(h.listeners.size, 0);
+  });
+
+  it("reports a store that fails to update and releases its listener", async () => {
+    const h = loadLocal();
+    h.folder.updateFolder = () => { throw new Error("Store unavailable"); };
+    const result = await h.rebuild();
+    assert.equal(result.success, false);
+    assert.equal(result.status, "error");
+    assert.match(result.error, /Store unavailable/);
+    assert.equal(result.indexRebuilt, false);
+    assert.equal(h.listeners.size, 0);
+  });
+
+  it("times out when the store never reports loaded", async () => {
+    const h = loadLocal({ delay: null });
+    const pending = h.rebuild(WAIT_MS);
+    await h.clock.advance(WAIT_MS);
+    const result = await pending;
+    assert.equal(result.success, false);
+    assert.equal(result.status, "timeout");
+    assert.equal(result.indexRebuilt, false);
+  });
+
+  it("does not let a rebuild join a plain refresh of the same folder", async () => {
+    const h = loadLocal();
+    const plain = h.refresh();
+    const rebuilt = h.rebuild();
+    await h.clock.advance(UPDATE_MS);
+    const [first, second] = await Promise.all([plain, rebuilt]);
+    assert.equal(first.indexRebuilt, false);
+    assert.equal(second.indexRebuilt, true);
+    assert.equal(second.joinedInFlight, undefined);
+    assert.equal(h.calls.filter(([name]) => name === "updateFolder").length, 2);
+    assert.equal(h.listeners.size, 0);
   });
 });
 

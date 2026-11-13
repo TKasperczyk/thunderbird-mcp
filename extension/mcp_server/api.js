@@ -3304,12 +3304,13 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         name: "refreshFolder",
         group: "messages", crud: "read",
         title: "Refresh Folder",
-        description: `Refresh one IMAP, built-in Exchange (EWS/Graph), or Owl folder. Returns before/after counts and netMessageDelta (net change, not arrivals). loaded means Thunderbird reported loading; updateConfirmed requires a successful update URL. An unconfirmed first load gets one shared trailing update within the remaining timeout; the final outcome may still be unconfirmed. Warnings explain unconfirmed updates or a busy folder where no update ran. Account roots, saved searches and no-select folders are refused; local, POP, RSS and news folders are skipped. Offline calls fail. ${REFRESH_COMPLETION_DESCRIPTION}`,
+        description: `Refresh one IMAP, built-in Exchange (EWS/Graph), Owl, or local folder. Returns before/after counts and netMessageDelta (net change, not arrivals). loaded means Thunderbird reported loading; updateConfirmed requires a successful update URL. An unconfirmed first load gets one shared trailing update within the remaining timeout; the final outcome may still be unconfirmed. Warnings explain unconfirmed updates or a busy folder where no update ran. Local Folders, POP and RSS folders (localStore:true) have no server: a refresh re-reads their summary file, and rebuildIndex:true rebuilds it from the stored messages, as Thunderbird's Folder Properties > Repair Folder does (for an index that lists missing messages or misses stored ones). Account roots, saved searches and no-select folders are refused; news folders are skipped. Offline calls fail, except on local folders. ${REFRESH_COMPLETION_DESCRIPTION}`,
         inputSchema: {
           type: "object",
           properties: {
             folderPath: { type: "string", description: "Folder URI from listFolders. Select an individual folder; account roots, saved searches and no-select folders are refused." },
             timeoutMs: { type: "integer", minimum: REFRESH_MIN_TIMEOUT_MS, maximum: REFRESH_MAX_TIMEOUT_MS, description: REFRESH_TIMEOUT_DESCRIPTION },
+            rebuildIndex: { type: "boolean", description: "Local Folders, POP and RSS folders only: rebuild the folder's summary (.msf) from its stored messages, like Repair Folder. The old summary is backed up by Thunderbird. Default: false." },
           },
           required: ["folderPath"],
         },
@@ -15059,7 +15060,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
             // BEGIN REFRESH FOLDER TOOL
             const refreshInFlight = new Map();
-            const REFRESH_LOCAL_SERVER_TYPES = new Set(["none", "pop3", "rss", "nntp"]);
+            // A rebuild never joins a plain refresh of the same folder, which would not rebuild anything.
+            const rebuildInFlight = new Map();
+            // Local stores (Local Folders, POP, RSS) have no server to update: their refresh re-reads the summary
+            // and can rebuild it from the store. News folders are still skipped.
+            const REFRESH_LOCAL_STORE_TYPES = new Set(["none", "pop3", "rss"]);
+            const REFRESH_SKIPPED_SERVER_TYPES = new Set(["nntp"]);
 
             function refreshFolderCounts(folder) {
               try {
@@ -15193,12 +15199,92 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return result;
             }
 
-            async function refreshFolder(folderPath, timeoutMs) {
+            // Thunderbird's own repair: rebuildFolderSummary() in FolderCommands.mjs (Thunderbird 160) for a local
+            // store, without its fix of classic Mac OS line endings in mbox files. The summary is marked invalid,
+            // closed and backed up; the following updateFolder() reparses the store and fires FolderLoaded.
+            function rebuildLocalFolderIndex(folder) {
+              // Lets open views of the folder rebuild themselves.
+              try { MailServices.mfn.notifyFolderReindexTriggered(folder); } catch { /* Older Thunderbird. */ }
+              folder.msgDatabase.summaryValid = false;
+              try {
+                folder.closeAndBackupFolderDB("");
+              } catch {
+                // As Thunderbird does: in a failure, proceed with the database closed.
+                folder.ForceDBClosed();
+              }
+              folder.msgStore.ensureLocalStore(folder);
+            }
+
+            function startLocalFolderUpdate(folder, rebuild, { settle, addCleanup }) {
+              let active = true;
+              const stop = () => {
+                if (!active) return;
+                active = false;
+                try { MailServices.mailSession.RemoveFolderListener(listener); } catch { /* Retire callbacks even if removal fails. */ }
+              };
+              const finish = outcome => {
+                if (!active) return;
+                stop();
+                settle(outcome);
+              };
+              const listener = {
+                QueryInterface: ChromeUtils.generateQI(["nsIFolderListener"]),
+                onFolderEvent(eventFolder, event) {
+                  if (!active || event !== "FolderLoaded" || eventFolder?.URI !== folder.URI) return;
+                  // A valid summary loads synchronously, inside updateFolder(): settle on a later turn.
+                  Services.tm.dispatchToMainThread(() => finish({ status: "loaded" }));
+                },
+              };
+              const fail = error => finish({ status: "error", error: String(error?.message || error) });
+              addCleanup(stop);
+              try {
+                MailServices.mailSession.AddFolderListener(listener, Ci.nsIFolderListener.event);
+                if (rebuild) rebuildLocalFolderIndex(folder);
+                const pending = folder.updateFolder(null);
+                if (pending && typeof pending.then === "function") Promise.resolve(pending).catch(fail);
+              } catch (error) {
+                fail(error);
+              }
+            }
+
+            async function refreshLocalFolder(folder, timeoutMs, rebuild) {
+              const uri = folder.URI;
+              if (folder.locked) {
+                return { success: false, folderPath: uri, status: "error", localStore: true,
+                  error: "The folder is busy (another operation holds it); try again later." };
+              }
+              const started = Date.now();
+              const before = refreshFolderCounts(folder);
+              const outcome = await waitForRefresh(rebuild ? rebuildInFlight : refreshInFlight, uri, timeoutMs,
+                lifecycle => startLocalFolderUpdate(folder, rebuild, lifecycle));
+              const after = refreshFolderCounts(folder);
+              const result = {
+                success: outcome.status === "loaded",
+                folderPath: uri,
+                status: outcome.status,
+                localStore: true,
+                indexRebuilt: rebuild && outcome.status === "loaded",
+                elapsedMs: Date.now() - started,
+                totalBefore: before.total,
+                totalAfter: after.total,
+                unreadBefore: before.unread,
+                unreadAfter: after.unread,
+                netMessageDelta: (before.total !== null && after.total !== null) ? after.total - before.total : null,
+              };
+              if (outcome.joinedInFlight) result.joinedInFlight = true;
+              if (outcome.error) result.error = outcome.error;
+              if (outcome.warning) result.warning = outcome.warning;
+              return result;
+            }
+
+            async function refreshFolder(folderPath, timeoutMs, rebuildIndex = false) {
               try {
                 const lookup = getAccessibleFolder(folderPath);
                 if (lookup.error) return { error: lookup.error };
                 const folder = lookup.folder;
-                if (Services.io.offline) return { success: false, status: "error", error: REFRESH_OFFLINE_ERROR };
+                const local = !!folder.server && REFRESH_LOCAL_STORE_TYPES.has(folder.server.type);
+                // Local stores need no network.
+                if (Services.io.offline && !local) return { success: false, status: "error", error: REFRESH_OFFLINE_ERROR };
                 const timeout = clampRefreshTimeout(timeoutMs);
                 if (folder.isServer) {
                   return { error: `Account roots cannot be refreshed; select an individual folder: ${folderPath}` };
@@ -15209,7 +15295,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (folder.flags & Ci.nsMsgFolderFlags.ImapNoselect) {
                   return { error: `IMAP folder cannot be selected (no-select): ${folderPath}` };
                 }
-                if (!folder.server || REFRESH_LOCAL_SERVER_TYPES.has(folder.server.type)) {
+                if (local) return await refreshLocalFolder(folder, timeout, rebuildIndex === true);
+                if (rebuildIndex === true) {
+                  return { error: `rebuildIndex applies only to Local Folders, POP and RSS folders: ${folderPath}` };
+                }
+                if (!folder.server || REFRESH_SKIPPED_SERVER_TYPES.has(folder.server.type)) {
                   return { success: true, folderPath: folder.URI, skipped: "refresh is not supported for this folder type" };
                 }
                 return await syncOneFolder(folder, timeout);
@@ -15907,7 +15997,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "updateMessage":
                   return updateMessage(args.messageId, args.messageIds, args.folderPath, args.read, args.flagged, args.addTags, args.removeTags, args.moveTo, args.trash, args.copyTo);
                 case "refreshFolder":
-                  return await refreshFolder(args.folderPath, args.timeoutMs);
+                  return await refreshFolder(args.folderPath, args.timeoutMs, args.rebuildIndex);
                 case "createFolder":
                   return createFolder(args.parentFolderPath, args.name);
                 case "createVirtualFolder":
