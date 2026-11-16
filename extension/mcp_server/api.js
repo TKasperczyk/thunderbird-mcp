@@ -13033,7 +13033,23 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * correction of a saved draft would accumulate one more copy in the
              * Drafts folder, and the caller has no way to remove the stale one.
              */
+            // BEGIN SAVE DRAFT QUEUE
+            let _saveDraftQueue = Promise.resolve();
+
+            /**
+             * Serializes saveDraft operations in FIFO order so concurrent calls
+             * do not contend on nsIMsgSend or IMAP APPEND on the Drafts folder.
+             */
+            function enqueueSaveDraft(task) {
+              const run = () => Promise.resolve().then(task);
+              const next = _saveDraftQueue.then(run, run);
+              _saveDraftQueue = next.catch(() => {});
+              return next;
+            }
+            // END SAVE DRAFT QUEUE
+
             function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, inReplyTo, references, replaceMessageId, replaceFolderPath, includeSignature, sendAt) {
+              return enqueueSaveDraft(() => {
               try {
                 // Omitted or null sendAt keeps the plain draft behavior unchanged.
                 let scheduled = null;
@@ -13174,6 +13190,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               } catch (e) {
                 return { error: e.toString() };
               }
+              });
             }
             // END SAVE DRAFT TOOL
 
