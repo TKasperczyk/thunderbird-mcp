@@ -110,7 +110,7 @@ function loadDraftTools(options = {}) {
   vm.createContext(sandbox);
   vm.runInContext([
     snippet("TWO DIGIT PADDING"), snippet("DIRECT SEND ENCRYPTION GUARD"),
-    snippet("DRAFT HELPERS"), snippet("SAVE DRAFT TOOL"),
+    snippet("OUTBOUND ATTACHMENT LIMITS"), snippet("CUSTOM HEADER HELPERS"), snippet("DRAFT HELPERS"), snippet("SAVE DRAFT TOOL"),
     snippet("DIRECT SEND HELPER"), snippet("TOOL CALL DISPATCH"),
   ].join("\n"), sandbox);
   return {

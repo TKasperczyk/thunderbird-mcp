@@ -142,7 +142,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
     snippet("INLINE ATTACHMENT BASE64 HELPERS"), snippet("ENCRYPTED MESSAGE GUARD"),
     snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("COMPOSE SIZE GUARD"), snippet("COMPOSE ACCOUNT KEY"),
-    snippet("MESSAGE READ TOOLS"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
+    snippet("OUTBOUND ATTACHMENT LIMITS"), snippet("CUSTOM HEADER HELPERS"), snippet("MESSAGE READ TOOLS"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
   // The production stream reader is loaded with its helper block; serve the fixture instead.
   sandbox.readMessageStreamFully = () => raw;

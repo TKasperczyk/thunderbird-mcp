@@ -2366,10 +2366,16 @@ describe('saveDraft dedicated scheduling schema', () => {
     }
   });
 
-  it('rejects raw header writing, caller UUIDs, and a saveDraft skipReview shortcut', () => {
-    for (const [name, value] of [['headers', { 'X-Send-Later-At': 'tomorrow' }], ['uuid', 'caller-instance'], ['skipReview', true]]) {
+  it('rejects caller UUIDs and a saveDraft skipReview shortcut', () => {
+    for (const [name, value] of [['uuid', 'caller-instance'], ['skipReview', true]]) {
       assert.match(runtime.validateToolArgs('saveDraft', { [name]: value })[0], /Unknown parameter/);
     }
+  });
+
+  // Send Later headers stay out of reach: the custom headers argument is a
+  // list of { name, value } entries whose reserved names the handler refuses.
+  it('rejects a raw header map in place of the custom headers list', () => {
+    assert.match(runtime.validateToolArgs('saveDraft', { headers: { 'X-Send-Later-At': 'tomorrow' } })[0], /must be an array/);
   });
 
   it('rejects wrong-type scheduling arguments', () => {

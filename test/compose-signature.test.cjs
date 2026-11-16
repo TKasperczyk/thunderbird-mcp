@@ -129,14 +129,14 @@ function loadComposeTools(identity = { htmlSigText: "Team signature" }, options 
   });
   Object.assign(api.Cc, {
     "@mozilla.org/messengercompose/composeparams;1": { createInstance: () => ({}) },
-    "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({ setHeader() {}, addAttachment() {} }) },
+    "@mozilla.org/messengercompose/composefields;1": { createInstance: () => ({ headers: {}, setHeader(name, value) { this.headers[name] = value; }, addAttachment() {} }) },
     "@mozilla.org/messengercompose;1": { getService: () => ({
       OpenComposeWindowWithParams(_parent, params) { calls.reviews.push(params); },
     }) },
   });
   vm.runInContext([
     snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
-    snippet("COMPOSE SIZE GUARD"), snippet("COMPOSE ACCOUNT KEY"), snippet("OUTBOUND MAIL TOOLS"), snippet("TOOL CALL DISPATCH"),
+    snippet("COMPOSE SIZE GUARD"), snippet("COMPOSE ACCOUNT KEY"), snippet("OUTBOUND ATTACHMENT LIMITS"), snippet("OUTBOUND MAIL TOOLS"), snippet("TOOL CALL DISPATCH"),
   ].join("\n"), api);
   return loaded;
 }
@@ -522,5 +522,31 @@ describe("Bounded identity signature files", () => {
     const { api, file, calls } = loadSignatureHelpers({ bytes: "Jane", closeError: new Error("already closed") });
     assert.equal(api.readSignatureFileText(file), "Jane");
     assert.equal(calls.closes, 1);
+  });
+});
+
+describe("sendMail custom headers", () => {
+  const headers = [{ name: "X-AI-Assisted", value: "Drafted with AI" }];
+  const args = { to: "to@example.test", subject: "Subject", body: "Hello", headers };
+
+  it("adds caller X- headers to the review window fields", async () => {
+    const { api, calls } = loadComposeTools();
+    assert.equal((await api.dispatchTool("sendMail", args)).success, true);
+    assert.equal(calls.reviews[0].composeFields.headers["X-AI-Assisted"], "Drafted with AI");
+  });
+
+  it("adds caller X- headers to a direct send", async () => {
+    const { api, calls } = loadComposeTools();
+    assert.equal((await api.dispatchTool("sendMail", { ...args, skipReview: true })).success, true);
+    assert.equal(calls.sends[0].fields.headers["X-AI-Assisted"], "Drafted with AI");
+  });
+
+  it("refuses invalid headers before opening a window, also in dryRunCompose", async () => {
+    const { api, calls } = loadComposeTools();
+    const bad = { ...args, headers: [{ name: "Bcc", value: "spy@example.test" }] };
+    assert.match((await api.dispatchTool("sendMail", bad)).error, /must start with X-/);
+    assert.match(api.dryRunCompose(bad).blockers[0], /must start with X-/);
+    assert.equal(calls.reviews.length, 0);
+    assert.equal(calls.sends.length, 0);
   });
 });
