@@ -269,17 +269,55 @@ describe("direct send SMTP completion", () => {
 });
 
 describe("draft and queued completion", () => {
+  it("waits for onStopCopy in SaveAsDraft mode even after createAndSendMessage fulfills", async () => {
+    const h = loadSend();
+    const result = h.start("direct", modes.SaveAsDraft);
+    h.state.deliveryStarted();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.state.result, undefined, "SaveAsDraft must wait for onStopCopy after creation promise fulfills");
+    assert.equal(h.timer.cancelled, false);
+    h.state.listener.onStopCopy(0);
+    assert.equal((await result).success, true);
+    assert.equal(h.timer.cancelled, true);
+  });
+
+  it("reports SaveAsDraft copy failure even when createAndSendMessage fulfills first", async () => {
+    const h = loadSend();
+    const result = h.start("direct", modes.SaveAsDraft);
+    h.state.deliveryStarted();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.state.result, undefined);
+    h.state.listener.onStopCopy(failure);
+    const value = await result;
+    assert.match(value.error, /Save failed.*80004005/);
+    assert.equal(value.success, undefined);
+    assert.equal(h.timer.cancelled, true);
+  });
+
+  it("reports uncertain saveOutcome when SaveAsDraft times out waiting for onStopCopy", async () => {
+    const h = loadSend();
+    const result = h.start("direct", modes.SaveAsDraft);
+    h.state.deliveryStarted();
+    await new Promise(resolve => setImmediate(resolve));
+    h.timer.callback.notify();
+    const value = await result;
+    assert.match(value.error, /uncertain/i);
+    assert.equal(value.saveOutcome, "uncertain");
+    assert.equal(value.success, undefined);
+  });
+
+  for (const completion of ["promise", "copy"]) {
+    it(`still completes Later via ${completion}`, async () => {
+      const h = loadSend();
+      const result = h.start("direct", modes.Later);
+      if (completion === "promise") h.state.deliveryStarted();
+      else h.state.listener.onStopCopy(0);
+      assert.equal((await result).success, true);
+      assert.equal(h.timer.cancelled, true);
+    });
+  }
+
   for (const mode of [modes.SaveAsDraft, modes.Later]) {
-    for (const completion of ["promise", "copy"]) {
-      it(`still completes ${mode} via ${completion}`, async () => {
-        const h = loadSend();
-        const result = h.start("direct", mode);
-        if (completion === "promise") h.state.deliveryStarted();
-        else h.state.listener.onStopCopy(0);
-        assert.equal((await result).success, true);
-        assert.equal(h.timer.cancelled, true);
-      });
-    }
     it(`reports copy failure for ${mode} even if creation later fulfills`, async () => {
       const h = loadSend();
       const result = h.start("direct", mode);

@@ -5742,6 +5742,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
               return new Promise((resolve) => {
                 let settled = false;
+                let creationFulfilled = false;
                 const settle = (result) => {
                   if (!settled) {
                     settled = true;
@@ -5753,6 +5754,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 const timer = Cc["@mozilla.org/timer;1"].createInstance(Ci.nsITimer);
                 timer.initWithCallback({
                   notify() {
+                    if (mode === Ci.nsIMsgCompDeliverMode.SaveAsDraft) {
+                      settle({
+                        error: creationFulfilled
+                          ? "Save timed out after 120s waiting for folder copy confirmation; the outcome is uncertain. Check Drafts before retrying."
+                          : "Save timed out after 120s. The outcome is unknown; check Drafts and the Outbox before retrying.",
+                        saveOutcome: "uncertain",
+                      });
+                      return;
+                    }
                     settle({ error: mode === Ci.nsIMsgCompDeliverMode.Now
                       ? "Send timed out after 120s. The outcome is unknown; check Sent and the Outbox before retrying."
                       : "Save timed out after 120s. The outcome is unknown; check Drafts and the Outbox before retrying." });
@@ -5883,12 +5893,16 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   }
                   // Modern TB (128+) returns a Promise from createAndSendMessage.
                   // For immediate sends this fulfills when delivery starts, so
-                  // only onStopSending may report success. Saves/queued mail
-                  // still support promise completion as well as onStopCopy.
+                  // only onStopSending may report success. For SaveAsDraft it
+                  // likewise fulfills before the async nsIMsgCopyService APPEND
+                  // completes, so only onStopCopy may report draft save success.
+                  // Queued mail (Later) still supports promise completion as well
+                  // as onStopCopy.
                   if (sendResult && typeof sendResult.then === "function") {
                     sendResult.then(
                       () => {
-                        if (mode !== Ci.nsIMsgCompDeliverMode.Now) {
+                        creationFulfilled = true;
+                        if (mode !== Ci.nsIMsgCompDeliverMode.Now && mode !== Ci.nsIMsgCompDeliverMode.SaveAsDraft) {
                           timer.cancel();
                           settle({ success: true });
                         }
