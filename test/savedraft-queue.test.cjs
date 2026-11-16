@@ -3,8 +3,8 @@
 /**
  * saveDraft serializes concurrent draft saves through an async FIFO queue.
  *
- * Overlapping nsIMsgSend / IMAP APPEND calls contend on the Drafts folder and
- * provider rate limits. These tests verify FIFO ordering, non-overlapping
+ * Overlapping nsIMsgSend / IMAP APPEND calls can contend on the same Drafts
+ * folder and replacement state. These tests verify FIFO ordering, non-overlapping
  * execution, and queue recovery after failures or thrown exceptions.
  */
 
