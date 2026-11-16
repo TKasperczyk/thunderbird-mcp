@@ -67,7 +67,7 @@ function loadSaveDraft(identity, options = {}) {
   vm.createContext(sandbox);
   vm.runInContext([
     snippet("DRAFT HELPERS"),
-    snippet("SAVE DRAFT TOOL"),
+    snippet("OUTBOUND ATTACHMENT LIMITS"), snippet("CUSTOM HEADER HELPERS"), snippet("SAVE DRAFT TOOL"),
     "this.saveDraft = saveDraft;",
   ].join("\n"), sandbox);
   return { saveDraft: sandbox.saveDraft, lookups };

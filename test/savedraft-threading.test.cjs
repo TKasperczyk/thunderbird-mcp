@@ -90,7 +90,7 @@ function loadSaveDraft(options = {}) {
     snippet("TWO DIGIT PADDING"),
     snippet("DIRECT SEND ENCRYPTION GUARD"),
     snippet("DRAFT HELPERS"),
-    snippet("SAVE DRAFT TOOL"),
+    snippet("OUTBOUND ATTACHMENT LIMITS"), snippet("CUSTOM HEADER HELPERS"), snippet("SAVE DRAFT TOOL"),
     snippet("TOOL CALL DISPATCH"),
     "this.saveDraft = saveDraft;",
   ].join("\n"), sandbox);
@@ -372,4 +372,23 @@ describe("saveDraft scheduling permissions and identity policy", () => {
       assert.equal(h.sent.length, 1);
     });
   }
+});
+
+describe("saveDraft custom headers", () => {
+  it("adds caller X- headers to the draft", async () => {
+    const harness = loadSaveDraft();
+    const result = await harness.save({ headers: [{ name: "X-AI-Assisted", value: "Drafted with AI" }] });
+
+    assert.equal(result.success, true);
+    assert.equal(harness.composeFields.headers.get("X-AI-Assisted"), "Drafted with AI");
+  });
+
+  it("refuses a Send Later header so scheduling stays behind sendAt", async () => {
+    const harness = loadSaveDraft();
+    const result = await harness.save({ headers: [{ name: "X-Send-Later-At", value: "Mon, 1 Feb 2027 10:00:00 +0000" }] });
+
+    assert.match(result.error, /reserved/);
+    assert.equal(harness.sent.length, 0);
+    assert.equal(harness.composeFields.headers.size, 0);
+  });
 });

@@ -140,7 +140,7 @@ function loadSend(options = {}) {
   vm.runInContext([
     snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
     snippet("DIRECT SEND HELPER"), snippet("COMPOSE SEND HELPER"),
-    snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
+    snippet("OUTBOUND ATTACHMENT LIMITS"), snippet("CUSTOM HEADER HELPERS"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
   return {
     state, timer, hdr, identity,
@@ -154,10 +154,10 @@ function loadSend(options = {}) {
           options.attachments || [], options.useHtml ?? false);
       } else if (tool === "reply") {
         result = sandbox.replyToMessage("original", "folder", "Reply", false, false,
-          undefined, undefined, undefined, undefined, undefined, true);
+          undefined, undefined, undefined, undefined, undefined, true, undefined, options.headers);
       } else if (tool === "forward") {
         result = sandbox.forwardMessage("original", "folder", "recipient@example.test", "Forward", false,
-          undefined, undefined, undefined, undefined, true);
+          undefined, undefined, undefined, undefined, true, options.headers);
       } else {
         result = sandbox.sendMessageDirectly({ body: "Body", addAttachment() {} },
           options.noIdentity ? null : identity, [], "message-uri", 0, mode, "text/plain");
@@ -443,6 +443,22 @@ describe("reply and forward send through nsIMsgCompose", () => {
         assert.equal((await result).success, true);
       });
     }
+
+    it(`adds caller X- headers to the ${tool} fields`, async () => {
+      const h = loadSend({ headers: [{ name: "X-AI-Assisted", value: "Drafted with AI" }] });
+      const result = h.start(tool);
+      await assertPending(h);
+      assert.equal(h.compose.init.params.composeFields.headers["X-AI-Assisted"], "Drafted with AI");
+      h.state.listener.onStopSending("id", 0);
+      assert.equal((await result).success, true);
+    });
+
+    it(`refuses a reserved ${tool} header before composing`, async () => {
+      const h = loadSend({ headers: [{ name: "X-Mozilla-Draft-Info", value: "internal" }] });
+      const value = await h.start(tool);
+      assert.match(value.error, /reserved/);
+      assert.equal(h.state.composes.length, 0);
+    });
 
     for (const [label, trigger, pattern] of errors) {
       it(`reports ${tool} ${label}`, async () => {

@@ -1084,6 +1084,8 @@ const MAX_BASE64_SIZE = 25 * 1024 * 1024; // 25 MB limit for inline base64 data 
 const MAX_FILE_PATH_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_MESSAGE = 20;
+// Caller-supplied X- headers per outgoing message (compose, reply, forward, draft).
+const MAX_CUSTOM_HEADERS = 10;
 // END OUTBOUND ATTACHMENT LIMITS
 // Must be large enough to carry MAX_BASE64_SIZE plus JSON-RPC framing overhead.
 // The httpd.sys.mjs pre-buffer cap uses the same value.
@@ -2590,6 +2592,20 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
     function buildTools() {
       const getMessagesLimit = getConfiguredGetMessagesLimit();
       const fullRecipientsDescription = 'If true, return complete recipients and ccList. By default, each list shows the first 3 addresses plus "(+N more)". Matching uses full headers; getMessage and the header readers always return full lists.';
+      const customHeadersSchema = {
+        type: "array",
+        maxItems: MAX_CUSTOM_HEADERS,
+        description: `Extra X- headers to add to the outgoing message, e.g. [{ "name": "X-AI-Assisted", "value": "yes" }]. At most ${MAX_CUSTOM_HEADERS}. Names must start with X- and use letters, digits and hyphens; X-Mozilla-*, X-Send-Later-*, X-Account-Key and X-Identity-Key are reserved. Values must be one line of printable ASCII. Invalid headers are rejected, never repaired.`,
+        items: {
+          type: "object",
+          properties: {
+            name: { type: "string", minLength: 3, description: "Header name starting with X-" },
+            value: { type: "string", minLength: 1, description: "Header value, printable ASCII on one line" },
+          },
+          required: ["name", "value"],
+          additionalProperties: false,
+        },
+      };
       const attendeeSchema = {
         type: "object",
         properties: {
@@ -2818,6 +2834,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             isHtml: { type: "boolean", description: "True for HTML, false for plain text; omitted/null follows the identity preference." },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            headers: customHeadersSchema,
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             includeSignature: { type: "boolean", default: true, description: "Append the identity signature when skipReview is true (default: true). Set false if the body already includes it. Compose review windows use Thunderbird's signature preferences." },
             attachments: {
@@ -2866,6 +2883,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             isHtml: { type: "boolean", description: "Set to true if body contains HTML markup (default: false)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            headers: customHeadersSchema,
             includeSignature: { type: "boolean", description: "Append the identity signature. Defaults to true for a new draft and false when replacing a draft, whose body may already include it. Set false for a body with its own signature, or true to append one explicitly." },
             inReplyTo: { type: "string", minLength: 5, maxLength: 998, description: "One bracketed Message-ID, e.g. <id@example.com>, at most 998 characters, without whitespace or control characters. Invalid input is rejected, never repaired. Sets In-Reply-To and defaults References to this ID. Subject and quoted text remain the caller's responsibility." },
             references: { type: "string", minLength: 5, maxLength: 16384, description: "Up to 100 bracketed Message-IDs separated by single ASCII spaces, oldest first; at most 998 characters per ID and 16384 total. No whitespace within IDs or control characters. Invalid input is rejected. Defaults to inReplyTo when omitted; may also be supplied independently." },
@@ -3152,6 +3170,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            headers: customHeadersSchema,
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             saveAsDraft: { type: "boolean", description: "Build a native reply, save it to the current compose identity's accessible Drafts-flagged folder, and close the window without sending (default: false). Requires saveDraft to be enabled; cannot be combined with skipReview. Protected or unverifiable originals require a review window, even with encrypted-message access enabled. A save timeout reports an uncertain outcome; check Drafts before retrying." },
             attachments: {
@@ -3199,6 +3218,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             cc: { type: "string", description: "CC recipients (comma-separated)" },
             bcc: { type: "string", description: "BCC recipients (comma-separated)" },
             from: { type: "string", description: "Sender identity (email address or identity ID from listAccounts)" },
+            headers: customHeadersSchema,
             skipReview: { type: "boolean", description: "Request direct sending without a compose window. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
             attachments: {
               type: "array",
@@ -5482,7 +5502,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return header;
             }
 
-            async function openComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs, afterInsert, checkAccess) {
+            async function openComposeWindowWithCustomizations(msgComposeParams, originalMsgURI, compType, identity, body, isHtml, to, cc, bcc, attachDescs, afterInsert, checkAccess, customHeaders) {
               const nativeOpen = shouldUseDirectComposeOpen(compType);
               let releaseOpen = null;
               let nativeOpenStarted = false;
@@ -5623,6 +5643,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 
                           try {
                             checkAccess?.();
+                            // Native forwards build their own fields object.
+                            if (customHeaders?.length) applyCustomHeaders(composeWin.gMsgCompose.compFields, customHeaders);
                             applyComposeRecipientOverrides(composeWin, identity, to, cc, bcc);
                             insertReplyBodyIntoComposeWindow(composeWin, body, isHtml);
                             addAttachmentsToComposeWindow(composeWin, attachDescs);
@@ -12805,6 +12827,58 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              *    with emojis/unicode even with <meta charset="UTF-8">
              */
             // BEGIN OUTBOUND MAIL TOOLS
+            // BEGIN CUSTOM HEADER HELPERS
+            // Thunderbird stores account/identity/draft state and Send Later its
+            // schedule in these headers; a caller must not forge them.
+            const RESERVED_CUSTOM_HEADER = /^X-(?:Mozilla-|Send-Later-|Identity-Key$|Account-Key$)/i;
+            const MAX_HEADER_LINE_LENGTH = 998;
+
+            /**
+             * Validates the optional `headers` argument of the outbound tools.
+             * Only X- headers are accepted, so standard fields (From, To, Bcc,
+             * Date, Message-ID, threading) keep coming from the identity, the
+             * recipients and Thunderbird. Values must be one line of printable
+             * ASCII, which rules out header injection through CR/LF and needs no
+             * RFC 2047 encoding. Invalid input is rejected, never repaired.
+             * Returns { headers: [{ name, value }] } or { error }.
+             */
+            function resolveCustomHeaders(headers) {
+              if (headers === undefined || headers === null) return { headers: [] };
+              if (!Array.isArray(headers)) return { error: "headers must be an array of { name, value } objects" };
+              if (headers.length > MAX_CUSTOM_HEADERS) return { error: `headers accepts at most ${MAX_CUSTOM_HEADERS} entries` };
+              const seen = new Set();
+              const resolved = [];
+              for (const header of headers) {
+                const name = header?.name;
+                const value = header?.value;
+                if (typeof name !== "string" || !/^X-[A-Za-z0-9][A-Za-z0-9-]*$/i.test(name)) {
+                  return { error: `Header name ${JSON.stringify(name)} must start with X- followed by letters, digits and hyphens` };
+                }
+                if (RESERVED_CUSTOM_HEADER.test(name)) {
+                  return { error: `Header ${name} is reserved for Thunderbird or Send Later` };
+                }
+                if (seen.has(name.toLowerCase())) return { error: `Header ${name} is given more than once` };
+                seen.add(name.toLowerCase());
+                if (typeof value !== "string" || !value.trim() || !/^[\x20-\x7e]*$/.test(value)) {
+                  return { error: `Header ${name} needs a non-empty value of printable ASCII characters on one line` };
+                }
+                if (name.length + 2 + value.length > MAX_HEADER_LINE_LENGTH) {
+                  return { error: `Header ${name} is longer than ${MAX_HEADER_LINE_LENGTH} characters` };
+                }
+                resolved.push({ name, value });
+              }
+              return { headers: resolved };
+            }
+
+            function applyCustomHeaders(composeFields, headers) {
+              for (const { name, value } of headers || []) composeFields.setHeader(name, value);
+            }
+
+            function customHeaderLines(headers) {
+              return (headers || []).map(({ name, value }) => `${name}: ${value}`);
+            }
+            // END CUSTOM HEADER HELPERS
+
             // BEGIN COMPOSE PREPARATION
             const SKIP_REVIEW_BLOCK_ERROR = "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead.";
 
@@ -12833,6 +12907,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             function prepareCompose(args) {
               const { body, isHtml, from, attachments, skipReview, includeSignature = true } = args;
               if (skipReview && isSkipReviewBlocked()) return { error: SKIP_REVIEW_BLOCK_ERROR };
+              const custom = resolveCustomHeaders(args.headers);
+              if (custom.error) return { error: custom.error };
               const selected = {};
               const identityResult = setComposeIdentity(selected, from, null);
               if (identityResult?.error) return identityResult;
@@ -12854,12 +12930,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const reviewSignature = { attachments: [], excluded: false };
               const size = assessComposeSize({ identity, useHtml, body: skipReview ? preparedBody
                 : buildBodyWithSignature(body, identity, useHtml, isHtml, true, reviewSignature),
-              headers: [...Object.values(recipients.headers), args.subject || ""], attachments: [...descs, ...reviewSignature.attachments] });
+              headers: [...Object.values(recipients.headers), args.subject || "", ...customHeaderLines(custom.headers)],
+              attachments: [...descs, ...reviewSignature.attachments] });
               if (reviewSignature.excluded) {
                 size.estimatedEncodedBytes = null;
                 size.warning = "The encoded size estimate excludes the identity signature because it could not be safely bounded read-only. Check the signature and message size in Thunderbird's review window.";
               }
               return { identity, accountKey, recipients, useHtml, format, descs, body: preparedBody, size,
+                customHeaders: custom.headers,
                 ...(skipReview && size.warning ? { error: size.warning } : {}) };
             }
             // END COMPOSE PREPARATION
@@ -12876,7 +12954,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               const refuse = error => dryRun ? { ...report, blockers: [error] } : { error };
               try {
                 const plan = prepareCompose(args);
-                const { identity, accountKey, recipients, useHtml, format, descs, body, size } = plan;
+                const { identity, accountKey, recipients, useHtml, format, descs, body, size, customHeaders } = plan;
                 if (identity) Object.assign(report, {
                   resolvedIdentity: { id: identity.key, email: identity.email, name: identity.fullName || null },
                   isHtml: useHtml, recipients: recipients.counts,
@@ -12895,6 +12973,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   to: args.to || "", cc: args.cc || "", bcc: args.bcc || "",
                   subject: args.subject || "", body,
                 });
+                applyCustomHeaders(composeFields, customHeaders);
                 msgComposeParams.identity = identity;
                 msgComposeParams.type = Ci.nsIMsgCompType.New;
                 msgComposeParams.composeFields = composeFields;
@@ -13033,8 +13112,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * correction of a saved draft would accumulate one more copy in the
              * Drafts folder, and the caller has no way to remove the stale one.
              */
-            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, inReplyTo, references, replaceMessageId, replaceFolderPath, includeSignature, sendAt) {
+            function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, inReplyTo, references, replaceMessageId, replaceFolderPath, includeSignature, sendAt, headers) {
               try {
+                const custom = resolveCustomHeaders(headers);
+                if (custom.error) return { error: custom.error };
                 // Omitted or null sendAt keeps the plain draft behavior unchanged.
                 let scheduled = null;
                 if (sendAt !== undefined && sendAt !== null) {
@@ -13074,6 +13155,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   composeFields.references = inReplyTo;
                 }
                 if (references !== undefined) composeFields.references = references;
+                applyCustomHeaders(composeFields, custom.headers);
                 if (scheduled) {
                   composeFields.setHeader("X-Send-Later-Uuid", scheduled.uuid);
                   composeFields.setHeader("X-Send-Later-At", scheduled.header);
@@ -13191,8 +13273,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * to Drafts and closes the window instead of leaving it open.
              */
 	            // BEGIN REPLY TOOL
-	            async function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview, saveAsDraft) {
+	            async function replyToMessage(messageId, folderPath, body, replyAll, isHtml, to, cc, bcc, from, attachments, skipReview, saveAsDraft, headers) {
 	              try {
+	                const custom = resolveCustomHeaders(headers);
+	                if (custom.error) return { error: custom.error };
 	                if (skipReview && saveAsDraft) {
 	                  return { error: "saveAsDraft cannot be combined with skipReview" };
 	                }
@@ -13256,7 +13340,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                    body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, false),
 	                    headers: [to || "", cc || "", bcc || "", messageId || "",
 	                      msgHdr.subject || "", msgHdr.mime2DecodedSubject || "", msgHdr.author || "",
-	                      msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || ""],
+	                      msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || "",
+                      ...customHeaderLines(custom.headers)],
 	                    attachments: inspectedDescs, inheritedRawBytes: directOriginal.rawBytes,
 	                  };
 	                  const size = assessComposeSize(sizePlan);
@@ -13274,6 +13359,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
 	                  msgComposeParams.type = compType;
 	                  msgComposeParams.originalMsgURI = msgURI;
 	                  msgComposeParams.composeFields = composeFields;
+	                  // Direct and review replies both send this fields object.
+	                  applyCustomHeaders(composeFields, custom.headers);
 
 	                  try {
 	                    msgComposeParams.origMsgHdr = msgHdr;
@@ -13425,8 +13512,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Thunderbird sets the subject, References and $Forwarded disposition.
              */
             // BEGIN FORWARD TOOL
-            async function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview) {
+            async function forwardMessage(messageId, folderPath, to, body, isHtml, cc, bcc, from, attachments, skipReview, headers) {
               try {
+                const custom = resolveCustomHeaders(headers);
+                if (custom.error) return { error: custom.error };
                 if (skipReview && isSkipReviewBlocked()) {
                   return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review window instead." };
                 }
@@ -13480,7 +13569,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     body: buildBodyWithSignature(body, selectedIdentity.identity, useHtml, isHtml, false),
                     headers: [to || "", cc || "", bcc || "", messageId || "",
                       msgHdr.subject || "", msgHdr.mime2DecodedSubject || "", msgHdr.author || "",
-                      msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || ""],
+                      msgHdr.mime2DecodedAuthor || "", msgHdr.recipients || "", msgHdr.mime2DecodedRecipients || "", msgHdr.ccList || "",
+                      ...customHeaderLines(custom.headers)],
                     attachments: inspectedDescs, inheritedRawBytes: directOriginal.rawBytes,
                   };
                   const size = assessComposeSize(sizePlan);
@@ -13498,6 +13588,9 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   msgComposeParams.type = compType;
                   msgComposeParams.originalMsgURI = msgURI;
                   msgComposeParams.composeFields = composeFields;
+                  // Direct forwards send this fields object. The native review
+                  // window builds its own, so it gets the headers once it opens.
+                  applyCustomHeaders(composeFields, custom.headers);
 
                   try {
                     msgComposeParams.origMsgHdr = msgHdr;
@@ -13628,7 +13721,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     to,
                     cc,
                     bcc,
-                    fileDescs
+                    fileDescs,
+                    undefined,
+                    undefined,
+                    custom.headers
                   ).then(result => {
                     if (result.success) {
                       let msg = "Forward window opened";
@@ -15893,11 +15989,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "sendMail":
                   return await composeMail(args);
                 case "saveDraft":
-                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.inReplyTo, args.references, args.replaceMessageId, args.replaceFolderPath, args.includeSignature, args.sendAt);
+                  return await saveDraft(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.inReplyTo, args.references, args.replaceMessageId, args.replaceFolderPath, args.includeSignature, args.sendAt, args.headers);
                 case "replyToMessage":
-                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.saveAsDraft);
+                  return await replyToMessage(args.messageId, args.folderPath, args.body, args.replyAll, args.isHtml, args.to, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.saveAsDraft, args.headers);
                 case "forwardMessage":
-                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview);
+                  return await forwardMessage(args.messageId, args.folderPath, args.to, args.body, args.isHtml, args.cc, args.bcc, args.from, args.attachments, args.skipReview, args.headers);
                 case "getRecentMessages":
                   return getRecentMessages(args.folderPath, args.daysBack, args.maxResults, args.offset, args.unreadOnly, args.flaggedOnly, args.includeSubfolders, args.fullRecipients);
                 case "displayMessage":

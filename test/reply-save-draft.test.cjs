@@ -150,7 +150,7 @@ function loadReply(options = {}) {
     source.slice(accessStart, accessEnd),
     snippet("COMPOSE WINDOW DRAFT HELPER"),
     snippet("DIRECT SEND ENCRYPTION GUARD"), snippet("DIRECT SEND ORIGINAL GUARD"),
-    snippet("REPLY TOOL"),
+    snippet("OUTBOUND ATTACHMENT LIMITS"), snippet("CUSTOM HEADER HELPERS"), snippet("REPLY TOOL"),
     snippet("TOOL CALL DISPATCH"),
   ].join("\n"), sandbox);
   sandbox.readMessageStreamFully = () => "Content-Type: text/plain\r\n\r\noriginal text";

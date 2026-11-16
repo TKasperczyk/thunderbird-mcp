@@ -232,7 +232,7 @@ function loadPreflight(options = {}) {
     snippet("RAW MIME PARSING HELPERS"), snippet("RAW MIME ATTACHMENT HELPERS"),
     snippet("ENCRYPTED MESSAGE GUARD"), snippet("DIRECT SEND ENCRYPTION GUARD"),
     snippet("DIRECT SEND ORIGINAL GUARD"), snippet("COMPOSE SIGNATURE HELPERS"), snippet("COMPOSE FORMAT HELPER"),
-    snippet("COMPOSE SEND HELPER"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
+    snippet("OUTBOUND ATTACHMENT LIMITS"), snippet("CUSTOM HEADER HELPERS"), snippet("COMPOSE SEND HELPER"), snippet("REPLY TOOL"), snippet("FORWARD TOOL"),
   ].join("\n"), sandbox);
   return {
     api: sandbox, calls, clock, attachments,
