@@ -2029,6 +2029,11 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
     { label: "an RFC 2231 charset", leaf: ["Content-Type: text/plain; charset*=utf-8''utf-8", "", "visible"] },
     { label: "a backslash in a quoted charset", leaf: ['Content-Type: text/plain; charset="utf\\-8"', "", "visible"] },
     { label: "text after a quoted disposition parameter", leaf: ['Content-Type: application/pdf', 'Content-Disposition: attachment; filename="a.pdf" x', "", "data"] },
+    // Unquoted values with spaces are accepted for name and filename only.
+    { label: "an unquoted charset with a space", leaf: ["Content-Type: text/plain; charset=utf-8 x", "", "visible"] },
+    { label: "a quote inside an unquoted filename", leaf: ["Content-Type: application/pdf", 'Content-Disposition: attachment; filename=a "b.pdf', "", "data"] },
+    { label: "a backslash inside an unquoted name", leaf: ["Content-Type: application/pdf; name=a \\b.pdf", "", "data"] },
+    { label: "an unquoted continuation segment with a space", leaf: ["Content-Type: application/pdf", "Content-Disposition: attachment; filename*0=a b; filename*1=.pdf", "", "data"] },
     { label: "an unknown transfer encoding", leaf: ["Content-Type: text/plain", "Content-Transfer-Encoding: x-uuencode", "", "visible"] },
     { label: "a duplicate transfer encoding", leaf: ["Content-Type: text/plain", "Content-Transfer-Encoding: 7bit", "Content-Transfer-Encoding: base64", "", "dmlzaWJsZQ=="] },
     { label: "a line prefixed with an enclosing boundary", leaf: ["Content-Type: text/plain", "", "visible", "--sig-not-a-separator"] },
@@ -2147,6 +2152,43 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
         "", "-----BEGIN PGP SIGNATURE-----", "", "iQEz", "-----END PGP SIGNATURE-----", "",
         "--Apple-Mail=_5A1B2C3D-0000-4000-8000-ABCDEFABCDEF--", "",
       ] },
+    // Italian certified email (PEC): the provider signs an envelope that
+    // carries the original message as postacert.eml; JavaMail-based senders
+    // leave names with spaces and parentheses unquoted.
+    { label: "Italian certified email (PEC) S/MIME envelope with unquoted attachment names",
+      header: 'multipart/signed; protocol="application/pkcs7-signature"; micalg=sha-256; boundary="----=_Part_3_1000000003.1700000000003"',
+      attachments: ["postacert.eml", "daticert.xml"],
+      lines: [
+        'Content-Type: multipart/signed; protocol="application/pkcs7-signature"; micalg=sha-256; ',
+        '\tboundary="----=_Part_3_1000000003.1700000000003"', "MIME-Version: 1.0", "X-Trasporto: posta-certificata",
+        "", "------=_Part_3_1000000003.1700000000003",
+        "Content-Type: multipart/mixed; ", '\tboundary="----=_Part_1_1000000001.1700000000001"',
+        "", "------=_Part_1_1000000001.1700000000001",
+        "Content-Type: multipart/alternative; ", '\tboundary="----=_Part_2_1000000002.1700000000002"',
+        "", "------=_Part_2_1000000002.1700000000002",
+        'Content-Type: text/plain; charset="ISO-8859-1"', "Content-Transfer-Encoding: quoted-printable",
+        "", "signed text, caf=E9", "------=_Part_2_1000000002.1700000000002",
+        'Content-Type: text/html; charset="ISO-8859-1"', "Content-Transfer-Encoding: 7bit",
+        "", "<p>signed text</p>", "------=_Part_2_1000000002.1700000000002--", "",
+        "------=_Part_1_1000000001.1700000000001",
+        "Content-Type: message/rfc822; name=postacert.eml", 'Content-Disposition: attachment; filename="postacert.eml"',
+        "", "From: sender@example.test", "To: reader@example.test", "Subject: decision",
+        "MIME-Version: 1.0", "Content-Type: multipart/mixed; ", '\tboundary="----=_Part_4_1000000004.1700000000004"',
+        "", "------=_Part_4_1000000004.1700000000004",
+        "Content-Type: text/plain; charset=UTF-8", "Content-Transfer-Encoding: 7bit", "", "inner text",
+        "------=_Part_4_1000000004.1700000000004",
+        "Content-Type: application/pdf; name=Signed decision (1).pdf", "Content-Transfer-Encoding: base64",
+        'Content-Disposition: attachment; filename="Signed decision (1).pdf"', "", "JVBERi0=",
+        "------=_Part_4_1000000004.1700000000004--", "",
+        "------=_Part_1_1000000001.1700000000001",
+        "Content-Type: application/xml; charset=UTF-8; name=daticert.xml", "Content-Transfer-Encoding: quoted-printable",
+        'Content-Disposition: attachment; filename="daticert.xml"', "", "<postacert tipo=3D\"posta-certificata\"/>",
+        "------=_Part_1_1000000001.1700000000001--", "",
+        "------=_Part_3_1000000003.1700000000003",
+        "Content-Type: application/pkcs7-signature; name=smime.p7s; smime-type=signed-data", "Content-Transfer-Encoding: base64",
+        'Content-Disposition: attachment; filename="smime.p7s"', "", "MIIB", "",
+        "------=_Part_3_1000000003.1700000000003--", "",
+      ] },
   ];
   for (const { label, header, attachments, lines, html = "<p>signed text</p>" } of realisticSigned) {
     it(`passes the gate and reads realistic ${label}`, async () => {
@@ -2166,6 +2208,26 @@ describe("Clear-signed mail with the encrypted-message preference off", () => {
       assertNoDecryption(calls);
     });
   }
+
+  it("still withholds protected and encrypted parts behind unquoted names in a PEC envelope", async () => {
+    const pec = realisticSigned.find(fixture => fixture.label.startsWith("Italian"));
+    const pdf = "Content-Type: application/pdf; name=Signed decision (1).pdf";
+    for (const [type, state] of [
+      ["application/octet-stream; name=Signed decision.p7m", "unknown"],
+      ["application/pkcs7-mime; smime-type=enveloped-data; name=smime 1.p7m", "encrypted"],
+    ]) {
+      const raw = pec.lines.join("\r\n").replace(pdf, `Content-Type: ${type}`);
+      assert.notEqual(raw, pec.lines.join("\r\n"));
+      const { api } = loadMessageTools({ mime: signedContainer([], { headerValue: pec.header }), raw });
+      assert.equal(api.isStrictlyWellFormedRawMime(raw), true);
+      assert.equal(api.classifyRawMessageEncryption(raw, 0, { signedRaw: true }), state);
+      for (const rawSource of [false, true]) {
+        const result = await api.getMessage("message-1", "folder", false, "text", rawSource);
+        assert.equal(result.encryptedContentWithheld, true);
+        assert.equal(result.rawSource, undefined);
+      }
+    }
+  });
 
   // Every occurrence of a delimiter must be an exact line, as Thunderbird's own
   // multipart/signed splitter finds them with indexOf.

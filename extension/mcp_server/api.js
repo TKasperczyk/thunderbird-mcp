@@ -10031,9 +10031,18 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const STRICT_MIME_TOKEN = "[!#$%&'*+.0-9A-Z^_`a-z{|}~-]+";
             const STRICT_MIME_TYPE_HEAD_RE = new RegExp(`^[ \\t]*${STRICT_MIME_TOKEN}/${STRICT_MIME_TOKEN}`);
             const STRICT_MIME_DISPOSITION_HEAD_RE = new RegExp(`^[ \\t]*${STRICT_MIME_TOKEN}`);
+            // Some mailers, e.g. Italian certified email (PEC) gateways, send
+            // name=Report 2026 (1).pdf unquoted. libmime reads an unquoted value
+            // up to the next ';' and trims trailing whitespace
+            // (nsMIMEHeaderParamImpl::DoParameterInternal), as
+            // parseRawMimeHeaderValue does. Such values, with spaces and
+            // parentheses but no quotes or backslashes, are accepted only for
+            // name and filename, like their quoted form.
+            const STRICT_MIME_NAME_WORD = "[!#$%&'()*+.0-9A-Z^_`a-z{|}~-]+";
             const STRICT_MIME_PARAMETER_RE = new RegExp(
-              `[ \\t]*;[ \\t]*(${STRICT_MIME_TOKEN})[ \\t]*=[ \\t]*(${STRICT_MIME_TOKEN}|"[^"\\\\\\0\\r\\n]*")`, "y"
+              `[ \\t]*;[ \\t]*(${STRICT_MIME_TOKEN})[ \\t]*=[ \\t]*(${STRICT_MIME_NAME_WORD}(?:[ \\t]+${STRICT_MIME_NAME_WORD})*|"[^"\\\\\\0\\r\\n]*")`, "y"
             );
+            const STRICT_MIME_TOKEN_RE = new RegExp(`^${STRICT_MIME_TOKEN}$`);
             const STRICT_MIME_TAIL_RE = /[ \t]*;?[ \t]*$/y;
             // RFC 2231 forms are accepted only for name and filename.
             const STRICT_MIME_RFC2231_KEY_RE = /^(?:name|filename)\*(?:\d+\*?)?$/;
@@ -10057,6 +10066,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (!match) break;
                 const key = match[1].toLowerCase();
                 if (seen.has(key) || (key.includes("*") && !STRICT_MIME_RFC2231_KEY_RE.test(key))) return false;
+                if (!match[2].startsWith("\"") && !STRICT_MIME_TOKEN_RE.test(match[2]) &&
+                    key !== "name" && key !== "filename") return false;
                 seen.add(key);
                 index = STRICT_MIME_PARAMETER_RE.lastIndex;
               }
