@@ -26,6 +26,7 @@ function loadRequests({ candidates = 1, profileRoots = [], inlineAttachmentPaths
   const runtime = {
     Buffer,
     setTimeout,
+    clearTimeout,
     process: { platform: process.platform },
     inlineAttachmentPaths,
     cachedCandidateList: Array.from({ length: candidates }, (_, index) => ({

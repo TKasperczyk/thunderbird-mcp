@@ -11,7 +11,35 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const THUNDERBIRD_HOSTS = ['127.0.0.1'];
+// WSL2 (NAT networking): the Thunderbird server on the Windows host is
+// reachable from the WSL VM through the NAT gateway, not 127.0.0.1.
+// The gateway (the Windows host IP) is the nameserver in /etc/resolv.conf;
+// read it at startup so the bridge dials the right machine without
+// manual configuration.
+function isWsl({ fsImpl = fs } = {}) {
+  try {
+    const version = fsImpl.readFileSync('/proc/version', 'utf8');
+    return /microsoft/i.test(version) && /wsl/i.test(version);
+  } catch {
+    return false;
+  }
+}
+
+function detectWslGatewayIp({ fsImpl = fs } = {}) {
+  if (!isWsl({ fsImpl })) return null;
+  try {
+    const resolv = fsImpl.readFileSync('/etc/resolv.conf', 'utf8');
+    const match = resolv.match(/^nameserver\s+(\S+)/m);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+const wslGatewayIp = detectWslGatewayIp();
+const THUNDERBIRD_HOSTS = wslGatewayIp && wslGatewayIp !== '127.0.0.1'
+  ? [wslGatewayIp, '127.0.0.1']
+  : ['127.0.0.1'];
 const CONNECTION_RETRY_DELAY_MS = 1000;
 const CONNECTION_MAX_RETRIES = 5;
 const CONNECTION_CACHE_TTL_MS = 5000; // 5 seconds
@@ -128,6 +156,9 @@ function createDiscoveryContext(options = {}) {
       : osImpl.homedir(),
     procRoot: options.procRoot || DEFAULT_PROC_ROOT,
     darwinFoldersRoot: options.darwinFoldersRoot || DEFAULT_DARWIN_FOLDERS_ROOT,
+    // Injectable mountinfo text (tests); in production it is read from
+    // ${procRoot}/self/mountinfo lazily by getWindowsDriveMounts.
+    mountinfo: options.mountinfo,
     runtimeDir: Object.prototype.hasOwnProperty.call(options, 'runtimeDir')
       ? options.runtimeDir
       : getRuntimeDir({ env, pathImpl, uid }),
@@ -497,6 +528,52 @@ function resolveConfinedWindowsConnectionFile(filePath, context) {
   return realPath;
 }
 
+// WSL2 exposes Windows drives as 9p mounts with aname=drvfs. The ownership
+// and mode bits they report are synthetic (the mount's uid, fixed modes), not
+// the real Windows ACLs, so the owner-only mode check must not apply to files
+// on those mounts; the Windows-side ACL is the real boundary there.
+function parseWindowsDriveMounts(mountinfoText) {
+  const mounts = new Set();
+  if (typeof mountinfoText !== 'string') return mounts;
+  for (const line of mountinfoText.split('\n')) {
+    const fields = line.trim().split(/\s+/);
+    const sep = fields.indexOf('-');
+    if (sep < 5 || fields.length < sep + 2) continue;
+    const fstype = fields[sep + 1];
+    const opts = fields.slice(sep + 2).join(' ');
+    if (fstype === '9p' && /(^|[,;\s])aname=drvfs([,;\s]|$)/.test(opts)) {
+      mounts.add(fields[4]);
+    }
+  }
+  return mounts;
+}
+
+function getWindowsDriveMounts(context) {
+  if (context.windowsDriveMounts) return context.windowsDriveMounts;
+  let text;
+  if (typeof context.mountinfo === 'string') {
+    text = context.mountinfo;
+  } else {
+    try {
+      text = context.fsImpl.readFileSync(
+        context.pathImpl.join(context.procRoot, 'self', 'mountinfo'), 'utf8');
+    } catch {
+      text = '';
+    }
+  }
+  context.windowsDriveMounts = parseWindowsDriveMounts(text);
+  return context.windowsDriveMounts;
+}
+
+function isOnWindowsDriveMount(filePath, mounts) {
+  for (const mountpoint of mounts) {
+    const base = mountpoint === '/' ? ''
+      : mountpoint.endsWith('/') ? mountpoint.slice(0, -1) : mountpoint;
+    if (filePath === base || filePath.startsWith(base + '/')) return true;
+  }
+  return false;
+}
+
 function validateConnectionDirectory(filePath, context) {
   const { fsImpl, pathImpl, uid } = context;
   const stat = fsImpl.lstatSync(pathImpl.dirname(filePath));
@@ -605,7 +682,8 @@ function tryReadConnectionCandidate(candidate, context, { discovered = false, ch
       if (!Number.isInteger(uid) || stat.uid !== uid) {
         throw new Error('connection file is not owned by the current user');
       }
-      if ((stat.mode & 0o077) !== 0) {
+      if (!isOnWindowsDriveMount(candidate.path, getWindowsDriveMounts(context)) &&
+          (stat.mode & 0o077) !== 0) {
         throw new Error('connection file permissions must be owner-only (0600)');
       }
     }
@@ -1297,6 +1375,9 @@ async function handleMessage(line) {
 }
 
 // BEGIN BRIDGE HTTP REQUEST HELPERS
+// Fail fast on unreachable candidates (e.g. a filtered WSL NAT gateway) so
+// the host fallback can move on without waiting out REQUEST_TIMEOUT.
+const CONNECT_TIMEOUT = 2000;
 const REQUEST_TIMEOUT = 30000;
 const MAIL_OPERATION_TIMEOUT = 150000;
 // Whole message reads (including batches) have a 120 s extension deadline.
@@ -1390,9 +1471,19 @@ function tryRequest(hostname, postData, port, token, policy) {
       });
     });
 
+    // The connect phase gets its own short deadline: an unreachable
+    // candidate must fail fast so tryAllHosts can try the next host.
+    const connectTimer = setTimeout(() => {
+      if (!connected) {
+        const error = new Error(`Connection to ${hostname} timed out after ${CONNECT_TIMEOUT}ms`);
+        error.code = 'ETIMEDOUT';
+        connectionFailed(error);
+        req.destroy();
+      }
+    }, CONNECT_TIMEOUT);
     req.on('socket', (socket) => {
-      if (socket.connecting) socket.once('connect', () => { connected = true; });
-      else connected = true;
+      if (socket.connecting) socket.once('connect', () => { connected = true; clearTimeout(connectTimer); });
+      else { connected = true; clearTimeout(connectTimer); }
     });
     req.on('error', connectionFailed);
     req.on('close', () => connectionFailed(new Error('Connection to Thunderbird closed before a complete response')));
@@ -1439,7 +1530,7 @@ function isJsonRpcResponse(response, requestId) {
 function tryAllHosts(hosts, postData, port, token, policy) {
   const tryNext = ([hostname, ...rest]) => {
     return tryRequest(hostname, postData, port, token, policy).catch((err) => {
-      if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL')) {
+      if (rest.length > 0 && (err.code === 'ECONNREFUSED' || err.code === 'EADDRNOTAVAIL' || err.code === 'ETIMEDOUT')) {
         return tryNext(rest);
       }
       throw err;
@@ -1667,6 +1758,7 @@ module.exports = {
   buildConnectionDiscoveryErrorMessage,
   clearConnectionCache,
   createDiscoveryContext,
+  detectWslGatewayIp,
   discoverConnectionInfo,
   findFlatpakConnectionCandidates,
   findMacOsConnectionCandidates,
@@ -1675,6 +1767,7 @@ module.exports = {
   compactToolResultJsonText,
   inlineAttachmentPaths,
   isSensitiveFilePath,
+  isWsl,
   isValidAuthToken,
   readConnectionInfo,
   startBridge,
