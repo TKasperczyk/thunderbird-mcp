@@ -156,6 +156,9 @@ function createDiscoveryContext(options = {}) {
       : osImpl.homedir(),
     procRoot: options.procRoot || DEFAULT_PROC_ROOT,
     darwinFoldersRoot: options.darwinFoldersRoot || DEFAULT_DARWIN_FOLDERS_ROOT,
+    // Injectable mountinfo text (tests); in production it is read from
+    // ${procRoot}/self/mountinfo lazily by getWindowsDriveMounts.
+    mountinfo: options.mountinfo,
     runtimeDir: Object.prototype.hasOwnProperty.call(options, 'runtimeDir')
       ? options.runtimeDir
       : getRuntimeDir({ env, pathImpl, uid }),
@@ -525,6 +528,52 @@ function resolveConfinedWindowsConnectionFile(filePath, context) {
   return realPath;
 }
 
+// WSL2 exposes Windows drives as 9p mounts with aname=drvfs. The ownership
+// and mode bits they report are synthetic (the mount's uid, fixed modes), not
+// the real Windows ACLs, so the owner-only mode check must not apply to files
+// on those mounts; the Windows-side ACL is the real boundary there.
+function parseWindowsDriveMounts(mountinfoText) {
+  const mounts = new Set();
+  if (typeof mountinfoText !== 'string') return mounts;
+  for (const line of mountinfoText.split('\n')) {
+    const fields = line.trim().split(/\s+/);
+    const sep = fields.indexOf('-');
+    if (sep < 5 || fields.length < sep + 2) continue;
+    const fstype = fields[sep + 1];
+    const opts = fields.slice(sep + 2).join(' ');
+    if (fstype === '9p' && /(^|[,;\s])aname=drvfs([,;\s]|$)/.test(opts)) {
+      mounts.add(fields[4]);
+    }
+  }
+  return mounts;
+}
+
+function getWindowsDriveMounts(context) {
+  if (context.windowsDriveMounts) return context.windowsDriveMounts;
+  let text;
+  if (typeof context.mountinfo === 'string') {
+    text = context.mountinfo;
+  } else {
+    try {
+      text = context.fsImpl.readFileSync(
+        context.pathImpl.join(context.procRoot, 'self', 'mountinfo'), 'utf8');
+    } catch {
+      text = '';
+    }
+  }
+  context.windowsDriveMounts = parseWindowsDriveMounts(text);
+  return context.windowsDriveMounts;
+}
+
+function isOnWindowsDriveMount(filePath, mounts) {
+  for (const mountpoint of mounts) {
+    const base = mountpoint === '/' ? ''
+      : mountpoint.endsWith('/') ? mountpoint.slice(0, -1) : mountpoint;
+    if (filePath === base || filePath.startsWith(base + '/')) return true;
+  }
+  return false;
+}
+
 function validateConnectionDirectory(filePath, context) {
   const { fsImpl, pathImpl, uid } = context;
   const stat = fsImpl.lstatSync(pathImpl.dirname(filePath));
@@ -633,7 +682,8 @@ function tryReadConnectionCandidate(candidate, context, { discovered = false, ch
       if (!Number.isInteger(uid) || stat.uid !== uid) {
         throw new Error('connection file is not owned by the current user');
       }
-      if ((stat.mode & 0o077) !== 0) {
+      if (!isOnWindowsDriveMount(candidate.path, getWindowsDriveMounts(context)) &&
+          (stat.mode & 0o077) !== 0) {
         throw new Error('connection file permissions must be owner-only (0600)');
       }
     }
