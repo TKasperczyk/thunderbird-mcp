@@ -12445,7 +12445,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const DIRECT_SEND_BODY_UNAVAILABLE = "Message body is not available offline and could not be downloaded from the server";
             const DIRECT_SEND_UNAVAILABLE_ERROR = `Direct reply/forward needs the complete original message. ${DIRECT_SEND_BODY_UNAVAILABLE}. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
             const DRAFT_ORIGINAL_ERROR = "Automatic drafting of encrypted messages is blocked, including protected or unknown MIME content. Drafts are saved unencrypted. Use saveAsDraft: false and skipReview: false to review in Thunderbird.";
-            const DRAFT_RAW_ERROR = "Automatic drafting needs the complete original message, which could not be retrieved within the drafting limits (too large or too slow to download). Retry, or use saveAsDraft: false and skipReview: false to review in Thunderbird.";
+            const DRAFT_RAW_ERROR = "Automatic drafting needs the complete original message, which could not be read within the drafting limits (for example too large, too slow to download, or unreadable in the local store). Retry, or use saveAsDraft: false and skipReview: false to review in Thunderbird.";
             const DRAFT_UNAVAILABLE_ERROR = `Automatic drafting needs the complete original message. ${DIRECT_SEND_BODY_UNAVAILABLE}. Retry when Thunderbird can reach the server, or use saveAsDraft: false and skipReview: false to review in Thunderbird.`;
             // Leaves room for the 120s sender within the bridge's 150s mail timeout.
             const DIRECT_SEND_PREFLIGHT_TIMEOUT_MS = 15000;
