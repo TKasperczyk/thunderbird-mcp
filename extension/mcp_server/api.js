@@ -9663,11 +9663,19 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // records that start with a provider's own ">From - <date>" line, so
             // on an Owl folder it ran on into the following messages (observed:
             // a 14 KB message read back as 50 KB holding three messages).
+            // Thunderbird 128/140 declare getLocalMsgStream on every folder, but
+            // the nsMsgDBFolder base implementation throws NS_ERROR_NOT_IMPLEMENTED,
+            // so a throw falls back to getMsgInputStream rather than failing the read.
             function openStoredMessageStream(msgHdr) {
               const folder = msgHdr.folder;
-              return typeof folder.getLocalMsgStream === "function"
-                ? folder.getLocalMsgStream(msgHdr)
-                : folder.getMsgInputStream(msgHdr, {});
+              if (typeof folder.getLocalMsgStream === "function") {
+                try {
+                  return folder.getLocalMsgStream(msgHdr);
+                } catch (error) {
+                  console.debug?.("thunderbird-mcp: getLocalMsgStream unavailable, using getMsgInputStream:", error);
+                }
+              }
+              return folder.getMsgInputStream(msgHdr, {});
             }
 
             // Reads the stored message within RAW_MESSAGE_MAX_BYTES. Throws on

@@ -17,7 +17,7 @@ function snippet(name) {
   return source.slice(start, end);
 }
 
-function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError, imap = null, remote = imap, localStream = false, hdr: headerOverrides = {} } = {}) {
+function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" }, allowed = false, unreadable = false, raw = "Content-Type: text/plain\r\n\r\nvisible", DOMParser: Parser = null, streamError, mimeError, imap = null, remote = imap, localStream = false, localStreamError = null, hdr: headerOverrides = {} } = {}) {
   const attachments = makeDirectSendAttachments();
   const calls = {
     options: [], imports: 0, streams: 0, sends: [], reviews: 0, logs: [], order: [], timers: [],
@@ -40,6 +40,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
       calls.streams++;
       calls.localStreams++;
       calls.order.push("raw");
+      if (localStreamError) throw localStreamError;
       if (streamError) throw streamError;
       return { close() {} };
     } } : {}),
@@ -2652,6 +2653,17 @@ describe("getMessage reads add-on provider (Owl) messages like IMAP", () => {
     assert.equal(result.rawSource, FULL);
     assert.equal(calls.localStreams, 1);
     assert.equal(calls.genericStreams, 0, "the unbounded folder stream is not opened");
+  });
+
+  it("falls back to getMsgInputStream when getLocalMsgStream is the unimplemented 128/140 stub", async () => {
+    for (const remote of [null, { type: "owl", offline: true, serverRaw: "unused" }]) {
+      const { api, calls } = loadMessageTools({ raw: FULL, localStream: true, localStreamError: new Error("NS_ERROR_NOT_IMPLEMENTED"), remote });
+      const result = await api.getMessage("message-1", "folder", false, "text", true);
+      assert.equal(result.rawSource, FULL);
+      assert.equal(calls.localStreams, 1);
+      assert.equal(calls.genericStreams, 1);
+      assert.equal(calls.serverStreams, 0, "a local copy is still read locally");
+    }
   });
 
   it("falls back to getMsgInputStream on builds without getLocalMsgStream", async () => {
