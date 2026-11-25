@@ -30,10 +30,16 @@ function snippet(name) {
 
 function loadDraftTools(options = {}) {
   const clock = makeSendLaterClock();
-  const calls = { finds: [], accessible: [], flags: [], sends: [], attachments: [], bodies: [], timerCancels: 0 };
+  const calls = { finds: [], accessible: [], flags: [], sends: [], attachments: [], bodies: [], deletes: [], events: [], timerCancels: 0 };
   const folder = options.folder || {
     URI: DRAFTS_URI,
     getFlag(flag) { calls.flags.push(flag); return options.draftsFlag !== false; },
+    deleteMessages(...args) {
+      calls.events.push("delete");
+      // Copy arrays built in the vm realm so deepEqual compares plain values.
+      calls.deletes.push(args.map(arg => Array.isArray(arg) ? Array.from(arg) : arg));
+      if (options.deleteThrows) throw options.deleteThrows;
+    },
   };
   const hdr = {
     messageId: "old-draft-id", subject: "Old subject", recipients: "old@example.test",
@@ -74,7 +80,9 @@ function loadDraftTools(options = {}) {
             throw Object.assign(new Error("Not enough arguments"), { result: 0x80570001 });
           }
           const listener = args[args.length === 16 ? 12 : 14];
-          listener.onStopCopy(0);
+          calls.events.push("save");
+          args[3].messageId = "<new-draft-id@example.test>";
+          listener.onStopCopy(options.saveStatus ?? 0);
         },
       }) },
     },
@@ -128,11 +136,12 @@ function assertNoComposeSideEffects(calls) {
   assert.equal(calls.sends.length, 0, "must not submit a draft or replacement header");
   assert.equal(calls.attachments.length, 0, "must reject before attachment processing");
   assert.equal(calls.bodies.length, 0, "must reject before reading or appending a signature");
+  assert.equal(calls.deletes.length, 0, "must not delete the old draft");
 }
 
 describe("saveDraft replacement", () => {
   for (const legacy of [false, true]) {
-    it(`passes only an accessible identity Drafts header to send slot 8, legacy=${legacy}`, async () => {
+    it(`saves a new draft, then deletes the accessible old one, legacy=${legacy}`, async () => {
       const { save, calls, hdr, identity } = loadDraftTools({ legacy });
       const result = await save({ from: "sender@example.test" });
       assert.equal(result.success, true);
@@ -148,14 +157,36 @@ describe("saveDraft replacement", () => {
       assert.equal(args[1], identity);
       assert.equal(args[2], "account-1");
       assert.equal(args[6], Ci.nsIMsgCompDeliverMode.SaveAsDraft);
-      assert.equal(args[7], hdr);
+      // Local folders' CopyFileMessage copies a msgToReplace header's metadata
+      // onto the new copy and keeps the old message, so it must stay null.
+      assert.equal(args[7], null);
       assert.equal(args[8], "text/plain");
       assert.equal(args[9], "New body");
       assert.equal(args.at(-1), Ci.nsIMsgCompType.Draft);
       assert.equal(calls.bodies[0].includeSignature, false);
       assert.equal(calls.timerCancels, 1);
+      assert.deepEqual(calls.events.slice(-2), ["save", "delete"], "delete only after the new draft is stored");
+      assert.deepEqual(calls.deletes, [[[hdr], null, true, false, null, false]]);
+      assert.equal(result.messageId, "new-draft-id@example.test");
     });
   }
+
+  it("keeps the old draft when the new one cannot be saved", async () => {
+    const { save, calls } = loadDraftTools({ saveStatus: 0x80004005 });
+    const result = await save();
+    assert.match(result.error, /Save failed/);
+    assert.equal(calls.deletes.length, 0);
+  });
+
+  it("reports success with a warning when the old draft cannot be deleted", async () => {
+    const { save, calls } = loadDraftTools({ deleteThrows: new Error("delete refused") });
+    const result = await save();
+    assert.equal(result.success, true);
+    assert.match(result.message, /old draft could not be removed/);
+    assert.match(result.warning, /delete refused/);
+    assert.equal(result.messageId, "new-draft-id@example.test");
+    assert.equal(calls.deletes.length, 1);
+  });
 
   it("replaces all supplied content and attachments while preserving supplied threading", async () => {
     const { save, calls, hdr } = loadDraftTools();
@@ -196,6 +227,8 @@ describe("saveDraft replacement", () => {
     assert.equal(result.message, "Draft saved");
     assert.equal(calls.finds.length, 0);
     assert.equal(calls.sends[0][7], null);
+    assert.equal(calls.deletes.length, 0);
+    assert.equal(result.messageId, "new-draft-id@example.test");
     assert.equal(calls.sends[0].at(-1), Ci.nsIMsgCompType.New);
     assert.equal(calls.bodies[0].includeSignature, true);
   });
@@ -315,7 +348,8 @@ describe("replacing scheduled drafts", () => {
         assert.equal(result.success, true, result.error);
         const native = h.calls.sends.at(-1);
         assert.equal(native[6], Ci.nsIMsgCompDeliverMode.SaveAsDraft);
-        assert.equal(native[7], h.hdr, "replace the exact original, never append a second draft");
+        assert.equal(native[7], null);
+        assert.deepEqual(h.calls.deletes, [[[h.hdr], null, true, false, null, false]], "replace the exact original, never keep a second draft");
         const fields = native[3];
         if (sendAt) {
           assert.equal(result.sendAt, new Date(newAt).toISOString());

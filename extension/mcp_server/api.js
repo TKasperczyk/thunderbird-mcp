@@ -2857,7 +2857,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
         inputSchema: {
           type: "object",
           properties: {
-            replaceMessageId: { type: "string", minLength: 1, description: "Message ID of an existing draft to REPLACE (from searchMessages). The new draft carries the full content given here -- nothing is merged from the old one, so pass every field you want kept. Omit to create a new draft." },
+            replaceMessageId: { type: "string", minLength: 1, description: "Message ID of an existing draft to REPLACE (from searchMessages). The new draft carries the full content given here -- nothing is merged from the old one, so pass every field you want kept. The old draft is deleted once the new one is saved; the new draft has a new Message-ID, returned as messageId. Omit to create a new draft." },
             replaceFolderPath: { type: "string", minLength: 1, description: "Folder URI holding the draft named by replaceMessageId (from searchMessages). Required with replaceMessageId. Must be accessible under account restrictions, carry the Drafts flag, and match the selected identity's configured drafts folder; other folders are rejected." },
             to: { type: "string", description: "Recipient email address(es), comma-separated. Optional -- a draft can have no recipient." },
             subject: { type: "string", description: "Email subject line (optional)" },
@@ -5719,9 +5719,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Saves a message directly via nsIMsgSend without opening a compose window.
              * Used by saveDraft. Sending goes through sendThroughCompose instead.
              *
-             * Drafts stay on nsIMsgSend because replacing a draft needs msgToReplace,
-             * which nsMsgCompose::SendMsgToServer always passes as null (the compose
-             * window deletes the old draft itself after saving).
+             * msgToReplace is always null, as in nsMsgCompose::SendMsgToServer:
+             * local folders' CopyFileMessage stamps the replaced header's metadata
+             * (Message-ID, subject, date) onto the new copy and never removes the
+             * old one. saveDraft deletes the old draft itself, like the compose window.
              *
              * Handles two createAndSendMessage signatures:
              * - TB 102-127 (C++): 18 args, includes aAttachments + aPreloadedAttachments
@@ -5731,7 +5732,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * NS_ERROR_XPC_NOT_ENOUGH_ARGS, fall back to the legacy 18-arg call.
              */
             // BEGIN DIRECT SEND HELPER
-            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType, deliverMode, bodyType, msgToReplace) {
+            function sendMessageDirectly(composeFields, identity, attachDescs, originalMsgURI, compType, deliverMode, bodyType) {
               if (!identity) {
                 return Promise.resolve({ error: "No identity available for direct send" });
               }
@@ -5849,7 +5850,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     false,                          // isDigest
                     false,                          // dontDeliver
                     mode,                           // deliver mode
-                    msgToReplace || null,           // msgToReplace
+                    null,                           // msgToReplace (see above)
                     bodyMimeType,                   // body type
                     body,                           // body
                   ];
@@ -13026,12 +13027,10 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * resolved by Thunderbird from the identity's draft-folder pref.
              *
              * With replaceMessageId set, the named draft is REPLACED rather than
-             * a second one added: the resolved header goes to createAndSendMessage
-             * as msgToReplace, which is what makes Thunderbird drop the original
-             * once the new draft is written. A draft body cannot be edited in
-             * place through this API surface, so without that argument every
-             * correction of a saved draft would accumulate one more copy in the
-             * Drafts folder, and the caller has no way to remove the stale one.
+             * a second one added: the new draft is saved first and, only once it
+             * is stored, the old one is deleted permanently, as Thunderbird's
+             * compose window does on every draft save. The new draft gets a new
+             * Message-ID, reported as messageId for the next replacement.
              */
             function saveDraft(to, subject, body, cc, bcc, isHtml, from, attachments, inReplyTo, references, replaceMessageId, replaceFolderPath, includeSignature, sendAt) {
               try {
@@ -13150,11 +13149,25 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   null,
                   msgComposeParams.type,
                   Ci.nsIMsgCompDeliverMode.SaveAsDraft,
-                  useHtml ? "text/html" : "text/plain",
-                  msgToReplace
+                  useHtml ? "text/html" : "text/plain"
                 ).then(result => {
                   if (result.success) {
-                    let msg = msgToReplace ? "Draft replaced" : "Draft saved";
+                    let msg = "Draft saved";
+                    // Stored ids carry no angle brackets (see getMessageHeaders).
+                    if (typeof composeFields.messageId === "string" && composeFields.messageId) {
+                      result.messageId = composeFields.messageId.replace(/^<|>$/g, "");
+                    }
+                    if (msgToReplace) {
+                      // Same call as nsMsgCompose's RemoveCurrentDraftMessage:
+                      // delete storage, no Trash copy, no undo.
+                      try {
+                        replaceFolder.deleteMessages([msgToReplace], null, true, false, null, false);
+                        msg = "Draft replaced";
+                      } catch (e) {
+                        msg = "Draft saved, but the old draft could not be removed; delete it with deleteMessages";
+                        result.warning = e.toString();
+                      }
+                    }
                     if (scheduled) {
                       msg += `, scheduled by Send Later for ${scheduled.header}`;
                       result.sendAt = scheduled.date.toISOString();
