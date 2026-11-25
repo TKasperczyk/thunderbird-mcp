@@ -9584,6 +9584,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             const MESSAGE_STREAM_DEADLINE_ERROR = "message read deadline exceeded";
             const MESSAGE_STREAM_ZERO_ERROR = "Message has zero size - cannot read raw source";
             const MESSAGE_READ_STOPPED_ERROR = "Message read stopped";
+            // A remote message with no complete local copy whose message service
+            // could not deliver it (offline, server error, provider failure).
+            const MESSAGE_BODY_UNAVAILABLE_ERROR = "Message body is not available offline and could not be downloaded from the server";
+            function messageBodyUnavailableError(cause) {
+              const error = new Error(MESSAGE_BODY_UNAVAILABLE_ERROR, { cause });
+              error.isBodyUnavailable = true;
+              return error;
+            }
             // Server types that store mail locally; every other type (imap, nntp,
             // and add-on providers such as Owl or EWS) is remote.
             const LOCAL_SERVER_TYPES = ["none", "pop3", "movemail", "rss"];
@@ -9684,6 +9692,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               if (error?.isStreamSizeLimit) return `message too large (> ${RAW_MESSAGE_MAX_BYTES} bytes)`;
               if (error?.message === MESSAGE_STREAM_DEADLINE_ERROR) return MESSAGE_STREAM_DEADLINE_ERROR;
               if (error?.message === MESSAGE_STREAM_ZERO_ERROR) return MESSAGE_STREAM_ZERO_ERROR;
+              if (error?.isBodyUnavailable) return MESSAGE_BODY_UNAVAILABLE_ERROR;
               return fallback;
             }
 
@@ -9769,55 +9778,68 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   timer.initWithCallback({ notify: cancel }, Math.max(1, deadline - Date.now()), Ci.nsITimer.TYPE_ONE_SHOT);
                   if (settled) return;
                   check();
-                  const msgURI = msgHdr.folder.getUriForMsg(msgHdr);
-                  const service = MailServices.messageServiceFromURI(msgURI);
+                  let msgURI, service;
+                  try {
+                    msgURI = msgHdr.folder.getUriForMsg(msgHdr);
+                    service = MailServices.messageServiceFromURI(msgURI);
+                  } catch (error) {
+                    settle(messageBodyUnavailableError(error));
+                    return;
+                  }
                   if (settled) return;
                   check();
-                  service.streamMessage(msgURI, {
-                    QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
-                    onStartRequest(startedRequest) {
-                      if (settled) {
-                        try { startedRequest.cancel(Cr.NS_BINDING_ABORTED); } catch {}
-                        return;
-                      }
-                      request = startedRequest;
-                      try { check(); } catch (error) { settle(error); }
-                    },
-                    onDataAvailable(_request, stream, _offset, count) {
-                      if (settled) return;
-                      try {
-                        check();
-                        if (count > maxBytes - raw.length) {
-                          const error = new Error(`message too large (> ${maxBytes} bytes)`);
-                          error.isStreamSizeLimit = true;
-                          throw error;
+                  try {
+                    service.streamMessage(msgURI, {
+                      QueryInterface: ChromeUtils.generateQI(["nsIStreamListener"]),
+                      onStartRequest(startedRequest) {
+                        if (settled) {
+                          try { startedRequest.cancel(Cr.NS_BINDING_ABORTED); } catch {}
+                          return;
                         }
-                        while (count > 0) {
+                        request = startedRequest;
+                        try { check(); } catch (error) { settle(error); }
+                      },
+                      onDataAvailable(_request, stream, _offset, count) {
+                        if (settled) return;
+                        try {
                           check();
-                          const length = Math.min(count, MESSAGE_STREAM_READ_CHUNK_BYTES);
-                          const bytes = NetUtil.readInputStreamToString(stream, length);
-                          if (bytes.length !== length) throw new Error("message stream read made no progress");
-                          check();
-                          raw += bytes;
-                          count -= length;
+                          if (count > maxBytes - raw.length) {
+                            const error = new Error(`message too large (> ${maxBytes} bytes)`);
+                            error.isStreamSizeLimit = true;
+                            throw error;
+                          }
+                          while (count > 0) {
+                            check();
+                            const length = Math.min(count, MESSAGE_STREAM_READ_CHUNK_BYTES);
+                            const bytes = NetUtil.readInputStreamToString(stream, length);
+                            if (bytes.length !== length) throw new Error("message stream read made no progress");
+                            check();
+                            raw += bytes;
+                            count -= length;
+                          }
+                        } catch (e) {
+                          settle(e);
                         }
-                      } catch (e) {
-                        settle(e);
-                      }
-                    },
-                    onStopRequest(_request, status) {
-                      if (settled) return;
-                      try {
-                        check();
-                        if (!Components.isSuccessCode(status)) throw new Error(`raw message fetch failed (status 0x${status.toString(16)})`);
-                        if (!raw) throw new Error(MESSAGE_STREAM_ZERO_ERROR);
-                        request = null;
-                        settle(null);
-                      } catch (error) {
-                        settle(error);
-                      }
-                    },
-                  }, null, null, false, "", false);
+                      },
+                      onStopRequest(_request, status) {
+                        if (settled) return;
+                        try {
+                          check();
+                          if (!Components.isSuccessCode(status)) {
+                            throw messageBodyUnavailableError(new Error(`raw message fetch failed (status 0x${status.toString(16)})`));
+                          }
+                          if (!raw) throw new Error(MESSAGE_STREAM_ZERO_ERROR);
+                          request = null;
+                          settle(null);
+                        } catch (error) {
+                          settle(error);
+                        }
+                      },
+                    }, null, null, false, "", false);
+                  } catch (error) {
+                    // A synchronous refusal by the message service.
+                    settle(messageBodyUnavailableError(error));
+                  }
                 } catch (e) {
                   settle(e);
                 }
@@ -12408,6 +12430,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             // BEGIN DIRECT SEND ORIGINAL GUARD
             const DIRECT_SEND_ORIGINAL_ERROR = `Direct reply/forward of encrypted messages is blocked, including protected or unknown MIME content. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
             const DIRECT_SEND_RAW_ERROR = `${DIRECT_SEND_ORIGINAL_ERROR} The complete original could not be retrieved within the direct-send limits. You can also make the folder available offline and retry.`;
+            // The original was never classified: it had no complete local copy and
+            // its message service could not deliver it (readCompleteRawMessage
+            // marks this isBodyUnavailable). Still refused, but not reported as
+            // protected content.
+            const DIRECT_SEND_BODY_UNAVAILABLE = "Message body is not available offline and could not be downloaded from the server";
+            const DIRECT_SEND_UNAVAILABLE_ERROR = `Direct reply/forward needs the complete original message. ${DIRECT_SEND_BODY_UNAVAILABLE}. ${DIRECT_SEND_REVIEW_INSTRUCTION}`;
+            const DRAFT_ORIGINAL_ERROR = "Automatic drafting of encrypted messages is blocked, including protected or unknown MIME content. Drafts are saved unencrypted. Use saveAsDraft: false and skipReview: false to review in Thunderbird.";
+            const DRAFT_RAW_ERROR = "Automatic drafting needs the complete original message, which could not be retrieved within the drafting limits (too large or too slow to download). Retry, or use saveAsDraft: false and skipReview: false to review in Thunderbird.";
+            const DRAFT_UNAVAILABLE_ERROR = `Automatic drafting needs the complete original message. ${DIRECT_SEND_BODY_UNAVAILABLE}. Retry when Thunderbird can reach the server, or use saveAsDraft: false and skipReview: false to review in Thunderbird.`;
             // Leaves room for the 120s sender within the bridge's 150s mail timeout.
             const DIRECT_SEND_PREFLIGHT_TIMEOUT_MS = 15000;
 
@@ -12528,7 +12559,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                   if (!canContinue()) return;
                   readCompleteRawMessage(msgHdr, { deadline, checkAccess, pending })
                     .then(inspectRaw)
-                    .catch(() => settle({ error: failure }));
+                    .catch(error => settle({ error: error?.isBodyUnavailable ? DIRECT_SEND_UNAVAILABLE_ERROR : failure }));
                 } catch {
                   settle({ error: failure });
                 }
@@ -13274,8 +13305,15 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     };
 	                const directOriginal = skipReview || saveAsDraft ? await getDirectSendOriginal(msgHdr, checkOriginalAccess) : null;
 	                if (directOriginal?.error) {
-                      if (saveAsDraft && [DIRECT_SEND_ORIGINAL_ERROR, DIRECT_SEND_RAW_ERROR].includes(directOriginal.error)) {
-                        return { error: "Automatic drafting of encrypted messages is blocked, including protected or unknown MIME content. Drafts are saved unencrypted. Use saveAsDraft: false and skipReview: false to review in Thunderbird." };
+                      // Only content that was read and classified is reported as
+                      // protected; a body that could not be retrieved says so.
+                      if (saveAsDraft) {
+                        const draftError = {
+                          [DIRECT_SEND_ORIGINAL_ERROR]: DRAFT_ORIGINAL_ERROR,
+                          [DIRECT_SEND_RAW_ERROR]: DRAFT_RAW_ERROR,
+                          [DIRECT_SEND_UNAVAILABLE_ERROR]: DRAFT_UNAVAILABLE_ERROR,
+                        }[directOriginal.error];
+                        if (draftError) return { error: draftError };
                       }
                       return directOriginal;
                     }

@@ -132,6 +132,7 @@ function loadMessageTools({ mime = { contentType: "text/plain", body: "visible" 
       messageServiceFromURI: () => ({
         streamMessage(_uri, listener) {
           calls.serverStreams++;
+          if (remote.syncError) throw remote.syncError;
           const data = remote.serverRaw;
           let offset = 0;
           const stream = { read(count) { const chunk = data.slice(offset, offset + count); offset += chunk.length; return chunk; } };
@@ -2617,7 +2618,7 @@ describe("getMessage rawSource reads the complete message", () => {
     const { api } = loadMessageTools({ raw: PREFIX, imap: { offline: false, serverRaw: FULL.slice(0, 30), status: 0x80004005 } });
     const result = await api.getMessage("message-1", "folder", false, "text", true);
     assert.equal(result.rawSource, undefined);
-    assert.equal(result.error, "Failed to read raw source");
+    assert.equal(result.error, "Message body is not available offline and could not be downloaded from the server");
   });
 });
 
@@ -2715,5 +2716,111 @@ describe("getMessage reads add-on provider (Owl) messages like IMAP", () => {
       assert.equal(result.error, "Failed to read raw source", type);
       assert.equal(calls.serverStreams, 0, type);
     }
+  });
+});
+
+// Thunderbird's native Microsoft Graph accounts (server type "graph", folder
+// URIs graph://...) do not download bodies until a message is displayed, and
+// clear the Offline flag until then (issues #265, #275). Reads and automatic
+// reply drafts must stream such messages through the folder's message service,
+// and a body that cannot be fetched must not be reported as protected content.
+describe("undownloaded Microsoft Graph messages", () => {
+  const CLEAR = "Message-ID: <graph-1@example.test>\r\nSubject: hello\r\nContent-Type: text/plain\r\n\r\nvisible graph body\r\n";
+  const PGP = "Content-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=b\r\n\r\n" +
+    "--b\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n--b\r\n" +
+    "Content-Type: application/octet-stream\r\n\r\n-----BEGIN PGP MESSAGE-----\r\nciphertext\r\n-----END PGP MESSAGE-----\r\n--b--\r\n";
+  const UNAVAILABLE = "Message body is not available offline and could not be downloaded from the server";
+  const graph = (extra = {}) => ({ type: "graph", offline: false, serverRaw: CLEAR, ...extra });
+  const draft = api => api.replyToMessage("message-1", "folder", "intro", false, false,
+    undefined, undefined, undefined, undefined, undefined, false, true);
+  const direct = api => api.replyToMessage("message-1", "folder", "intro", false, false,
+    undefined, undefined, undefined, undefined, undefined, true, false);
+
+  it("getMessage streams the body from the message service without a local read", async () => {
+    const { api, calls } = loadMessageTools({ remote: graph() });
+    const result = await api.getMessage("message-1", "folder", false, "text", false);
+    assert.equal(result.error, undefined);
+    assert.equal(result.body, "visible");
+    assert.equal(calls.serverStreams, 1);
+    assert.equal(calls.streams, 0, "no local read without an offline copy");
+  });
+
+  it("getMessage rawSource returns the downloaded source", async () => {
+    const { api, calls } = loadMessageTools({ remote: graph() });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, CLEAR);
+    assert.equal(calls.serverStreams, 1);
+  });
+
+  it("an already downloaded Graph message is read locally, as before", async () => {
+    const { api, calls } = loadMessageTools({ raw: CLEAR, remote: graph({ offline: true, serverRaw: "unused" }) });
+    const result = await api.getMessage("message-1", "folder", false, "text", true);
+    assert.equal(result.rawSource, CLEAR);
+    assert.equal(calls.serverStreams, 0);
+    assert.equal(calls.streams, 1);
+  });
+
+  for (const [label, extra] of [
+    ["a failed server fetch", { status: 0x804b001e }],
+    ["a message service that refuses synchronously", { syncError: new Error("offline") }],
+  ]) {
+    it(`getMessage reports ${label} as an unavailable body`, async () => {
+      for (const rawSource of [false, true]) {
+        const { api, calls } = loadMessageTools({ remote: graph(extra) });
+        const result = await api.getMessage("message-1", "folder", false, "text", rawSource);
+        assert.equal(result.error, UNAVAILABLE);
+        assert.equal(result.encryptedContentWithheld, undefined);
+        assert.equal(calls.options.length, 0, "Gloda is not consulted");
+        assert.doesNotMatch(JSON.stringify(result), /visible|0x/);
+      }
+    });
+
+    it(`saveAsDraft reports ${label} without calling it protected content`, async () => {
+      const { api, calls } = loadMessageTools({ remote: graph(extra) });
+      const result = await draft(api);
+      assert.match(result.error, /^Automatic drafting needs the complete original message\. Message body is not available offline/);
+      assert.doesNotMatch(result.error, /encrypted|protected|unknown MIME/);
+      assert.equal(result.success, undefined);
+      assert.equal(calls.reviews, 0);
+      assert.equal(calls.sends.length, 0);
+      assert.equal(calls.options.length, 0);
+    });
+
+    it(`direct reply still refuses after ${label}, with the same clear reason`, async () => {
+      const { api, calls } = loadMessageTools({ remote: graph(extra) });
+      const result = await direct(api);
+      assert.match(result.error, /^Direct reply\/forward needs the complete original message\. Message body is not available offline/);
+      assert.match(result.error, /skipReview: false/);
+      assert.equal(result.success, undefined);
+      assert.equal(calls.sends.length, 0);
+      assert.deepEqual(calls.created, { params: 0, fields: 0, compose: 0, sender: 0 });
+    });
+  }
+
+  it("saveAsDraft drafts a reply to a clear message streamed from the server", async () => {
+    const { api, calls } = loadMessageTools({ remote: graph() });
+    const result = await draft(api);
+    assert.equal(result.error, undefined);
+    assert.equal(calls.serverStreams, 1);
+    assert.equal(calls.reviews, 1);
+    assert.equal(calls.sends.length, 0, "a draft is never sent");
+    assert.equal(calls.options[0].examineEncryptedParts, false);
+  });
+
+  it("saveAsDraft still blocks an encrypted message streamed from the server", async () => {
+    const { api, calls } = loadMessageTools({ remote: graph({ serverRaw: PGP }) });
+    const result = await draft(api);
+    assert.match(result.error, /Automatic drafting of encrypted messages is blocked/);
+    assert.equal(calls.serverStreams, 1);
+    assert.equal(calls.reviews, 0);
+    assert.equal(calls.sends.length, 0);
+    assert.equal(calls.options.length, 0, "Gloda never sees content that failed the raw gate");
+  });
+
+  it("a local folder whose store cannot be read keeps the generic error and never downloads", async () => {
+    const { api, calls } = loadMessageTools({ streamError: new Error("missing"), remote: { type: "none", offline: false, serverRaw: CLEAR } });
+    const result = await api.getMessage("message-1", "folder", false, "text", false);
+    assert.equal(result.error, "Failed to get message");
+    assert.equal(calls.serverStreams, 0);
   });
 });
